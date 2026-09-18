@@ -1,5 +1,7 @@
 # pi-rust
 
+![coverage](https://coveralls.io/repos/github/PhillipChaffee/pi-rust/badge.svg?branch=main)
+
 Rust port of [earendil-works/pi](https://github.com/earendil-works/pi) (MIT,
 Copyright (c) 2025 Mario Zechner): an AI coding agent with a terminal UI,
 provider layer, and RPC protocol.
