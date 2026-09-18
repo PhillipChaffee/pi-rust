@@ -29,3 +29,18 @@ This repo adds four rules of its own:
 - Nothing may display a number no provider or session backend sends. Token
   counts, usage, timings, and model metadata come from the wire; the rule
   excludes instrumentation-fabricated numbers from docs and examples.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub issues on `PhillipChaffee/pi-rust` via `gh`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles, labels equal to role names. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
