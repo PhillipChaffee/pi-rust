@@ -32,6 +32,16 @@ jobs:
       # rustup reads rust-toolchain.toml (channel, components incl.
       # llvm-tools-preview) on the first cargo call; no toolchain step needed.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+      # cargo-llvm-cov is not preinstalled on the runner and a fresh repo has
+      # no rust-cache entry for it; pinned download with embedded digest, the
+      # same trust-anchor model as the hygiene installs below.
+      - name: Install pinned cargo-llvm-cov
+        run: |
+          LLVMCOV_VERSION=0.9.0
+          curl --connect-timeout 10 --max-time 300 -sSfL "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${LLVMCOV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz" -o /tmp/llvmcov.tar.gz
+          echo "bc2122fd7bd9b6d3eb371690ed085f82e5a8bf1851f4645ef521d12ed04b2616  /tmp/llvmcov.tar.gz" | sha256sum --check --status
+          mkdir /tmp/llvmcovx && tar xz -C /tmp/llvmcovx -f /tmp/llvmcov.tar.gz
+          sudo mv /tmp/llvmcovx/cargo-llvm-cov /usr/local/bin/
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
