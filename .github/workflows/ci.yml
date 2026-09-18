@@ -14,13 +14,19 @@ on:
 env:
   RUSTFLAGS: -D warnings
 
+# Workflow-level (not job-level): the three jobs below would queue and cancel
+# each other inside one run if they shared one job-level concurrency group
+# (observed: every push run self-canceled). Workflow level keeps the intended
+# behavior — a new push supersedes the in-progress run — without serializing
+# the jobs of a single run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20  # bounds a hung network gate; GitHub's default is 360
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       # rustup reads rust-toolchain.toml (channel, components incl.
@@ -50,9 +56,6 @@ jobs:
   doc-comments:
     runs-on: ubuntu-latest
     timeout-minutes: 20  # bounds a hung network gate; GitHub's default is 360
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
-      cancel-in-progress: true
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -64,9 +67,6 @@ jobs:
   hygiene:
     runs-on: ubuntu-latest
     timeout-minutes: 20  # bounds a hung network gate; GitHub's default is 360
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
-      cancel-in-progress: true
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
