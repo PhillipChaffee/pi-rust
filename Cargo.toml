@@ -1,0 +1,75 @@
+[package]
+name = "pi-rust"
+version = "0.1.0"
+edition = "2024"
+description = "Rust port of earendil-works/pi: AI coding agent with terminal UI, provider layer, and RPC protocol"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["coding-agent", "ai", "terminal", "tui", "llm"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+
+[lints]
+workspace = true
+
+# The lint-bearing skeleton of a strict Rust workspace, merged from
+# Cargo.toml.example (kept beside this file as documentation of the table's
+# shape). Rule of the house: every non-default setting carries its reason. An
+# entry without a reason gets deleted on the next review.
+#
+# CI (see .github/workflows/ci.yml) makes every warn level an error via
+# -D warnings; the doc lints skip that courtesy and deny outright, locally as
+# well as CI.
+
+[workspace.lints.rust]
+unsafe_code = "forbid"                # a panic on the product is a crash; you may flip to deny if you ship unsafe
+missing_docs = "deny"                 # an undocumented public item is an error to fix, not a taste
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.rustdoc]
+# The whole stable group in one entry: no hand-enumeration to mistype, and
+# lints rustdoc gains stay owned by the group by default. The nightly-only
+# missing_doc_code_examples is deliberately outside the group: unstable means
+# it churns with the channel, and it demands a runnable example on every
+# documented item. missing_crate_level_docs overlaps rustc's missing_docs on
+# the crate-line omission; a second gate on the same omission costs nothing.
+all = "deny"
+
+[workspace.lints.clippy]
+# Individual entries at priority 0 override these groups because the groups
+# sit at priority -1 (cargo manifest reference: lower priority numbers are
+# overridden by higher ones).
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }   # experimental; the pin makes its emission deterministic
+cargo = { level = "warn", priority = -1 }     # lints the manifest itself (wildcard dependencies and friends); cheap group, no code noise
+
+# --- group exceptions carry reasons; start empty and add them as they fire
+# future_not_send = "allow"             # e.g. template: single-threaded UI executor
+
+# --- restriction picks: not enabled by default; pick the ones your codebase
+# has real failure modes for, one reason each
+unwrap_used = "warn"                  # where a panic would be a crash, not a stack trace somebody reads
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+# An allow without a why is the bug: the suppression outlives its reason and
+# nothing records why the rule was silenced. The documented suppression path
+# is `#[expect(..., reason = "...")]` — an expect that stops firing fails the
+# build, so stale suppressions surface on their own; a bare allow silences a
+# lint forever and reads as code that passed review by accident.
+allow_attributes_without_reason = "warn"
+
+# Every crate in the workspace inherits the table ([lints] workspace = true
+# above); cargo will not mix an inherited table with a package-local one, so
+# all levels belong here, workspace-wide.

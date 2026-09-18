@@ -1,0 +1,49 @@
+# Nightly mutation testing: a mutant run multiplies the test suite by the
+# mutant count, so it stays off the PR path — this workflow runs on a cron
+# and fails the scheduled run only when the mutation score drops below the
+# floor. Command, pin, floor, and reason: see the README's mutation-testing
+# section.
+permissions:
+  contents: read  # least privilege: no step in this workflow writes to the repo (GitHub secure-use reference)
+name: mutation
+
+on:
+  schedule:
+    - cron: "23 4 * * *"  # nightly, off the hour so it does not race the shared-runner rush
+  workflow_dispatch:  # manual trigger to verify the gate without waiting for the schedule
+
+jobs:
+  mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # bounds a hung network gate; GitHub's default is 360
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      # rustup reads rust-toolchain.toml (pinned channel) on the first
+      # cargo call; no toolchain step needed.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+      - name: Install cargo-mutants v27.1.0
+        run: |
+          mkdir /tmp/mutx && curl --connect-timeout 10 --max-time 300 -sSfL "https://github.com/sourcefrog/cargo-mutants/releases/download/v27.1.0/cargo-mutants-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/mutants.tar.gz
+          echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  /tmp/mutants.tar.gz" | sha256sum --check --status
+          mkdir -p /tmp/mutx && tar xz -C /tmp/mutx -f /tmp/mutants.tar.gz
+          sudo mv /tmp/mutx/cargo-mutants /usr/local/bin/
+      # The run's own zero-missed CI mode exits 2 on ANY surviving mutant, and
+      # the template fixture provably carries equivalent mutants (clamp's
+      # boundary comparisons return the same bound either way) that no test
+      # can kill. The floor step below is the gate. Internal errors exit 1+ —
+      # those must stay red, and outcomes.json is written incrementally, so a
+      # mid-run crash with partial data could otherwise read as green: the
+      # wrapper tolerates ONLY exit 2 and fails on every other code.
+      - name: Run cargo-mutants (survivors tolerated, errors fail)
+        run: |
+          cargo mutants || code=$?
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
+            echo "cargo mutants failed with exit $code"
+            exit "$code"
+          fi
+      - name: Mutation score floor (85, reason in the README)
+        run: |
+          python3 -c "import json, sys; s = json.load(open('mutants.out/outcomes.json')); score = 100 * s['caught'] // s['total_mutants']; print('mutation score %d%% (caught %d/%d, floor 85)' % (score, s['caught'], s['total_mutants'])); sys.exit(0 if score >= 85 else 1)"

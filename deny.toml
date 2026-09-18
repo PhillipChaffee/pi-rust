@@ -1,0 +1,87 @@
+# The supply-chain gate configuration for a strict Rust workspace.
+#
+# Rule of the house: every non-default setting carries its reason. An entry
+# without a reason gets deleted on the next review. CI runs one labeled step
+# per check (advisories, licenses, bans) so a failure names its gate; see
+# ci.yml for the step names.
+#
+# Install: cargo install cargo-deny --locked --version 0.20.2
+
+[graph]
+# Audit every feature path the build can take, so a vulnerable dependency
+# hidden behind an off-by-default feature cannot pass the gate.
+all-features = true
+
+[advisories]
+# A yanked release is a recalled release: the author pulled it for a defect
+# or a breach. Nothing in a strict workspace may resolve to one.
+yanked = "deny"
+# An unmaintained crate the workspace asks for directly is a choice the owner
+# can act on (bump or replace); a transitive one is out of this workspace's
+# hands today, so only direct dependencies fail the gate.
+unmaintained = "workspace"
+# Unsound advisories fail the same way as unmaintained: a direct dependency
+# on a release with a known soundness defect is a choice, not an accident.
+unsound = "workspace"
+# Ignore only with a parsed advisory id and a reason that carries the review
+# date; an entry without a reason gets deleted on the next review.
+ignore = [
+]
+# The advisory database refreshes on every run; when fetching is disabled and
+# the cached database is older than this, the gate fails instead of scanning
+# with stale data (fail-closed).
+maximum-db-staleness = "P90D"
+
+[licenses]
+# Licenses inferred from text must reach this confidence, or the gate fails;
+# 0.93 is the value the cargo-deny authors recommend.
+confidence-threshold = 0.93
+# The allow-list is the policy: a permissive license a strict workspace may
+# carry. Every entry below names why it is allowed; add a new entry only with
+# its reason.
+allow = [
+    # Permissive; the default choice for new code in this workspace.
+    "MIT",
+    # Permissive with a patent grant; the other default choice for new code.
+    "Apache-2.0",
+    # Apache-2.0 plus the LLVM redistribution terms that llvm-tools data
+    # carries.
+    "Apache-2.0 WITH LLVM-exception",
+    # The 2- and 3-clause BSD pair; both are permissive with attribution.
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # ISC: permissive, the license small utility crates have settled on.
+    "ISC",
+    # The unicode-* crates moved to this license when Unicode took over
+    # their maintenance.
+    "Unicode-3.0",
+    # miniz_oxide and friends ship under Zlib.
+    "Zlib",
+    # Public-domain-equivalent; a few small utility crates use it.
+    "CC0-1.0",
+]
+
+[bans]
+# Multiple versions of one crate in the graph are a version-conflict trap and
+# a build-time tax. The graph must converge; if two versions are truly
+# unavoidable, record a skip with its reason and revisit it, never widen the
+# gate for the whole workspace.
+multiple-versions = "deny"
+# Each banned crate names what to use instead, so the error carries the fix.
+deny = [
+    { crate = "openssl", use-instead = "rustls", reason = "the OpenSSL bindings drag libssl into the build; rustls is the maintained pure-Rust TLS stack" },
+    { crate = "openssl-sys", use-instead = "rustls", reason = "the FFI layer under openssl; banned with it" },
+]
+# Windows-only foundational crates enter the graph on every target and bump
+# too often to ever share one version, so the whole tree is skipped.
+skip-tree = [
+    { crate = "windows-sys", reason = "a foundational crate for many that bumps far too frequently to ever have a shared version" },
+]
+
+[sources]
+# A dependency may come from crates.io and nothing else: any other registry
+# fails the gate.
+unknown-registry = "deny"
+# Git-sourced dependencies bypass review and lockfile integrity, so they fail
+# the gate too.
+unknown-git = "deny"

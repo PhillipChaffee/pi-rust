@@ -1,0 +1,18 @@
+# The toolchain this repo builds and lints with, pinned deliberately.
+#
+# Cargo.toml turns on clippy's pedantic and nursery groups, so every stable
+# Rust release can add lints that turn CI red on a commit which changed
+# nothing — that is not a signal anyone should be trained to ignore. Pinning
+# also means a local `cargo clippy` sees exactly what CI sees; an unpinned
+# workstation four releases behind reports a clean tree that CI then rejects.
+#
+# Bumping is a deliberate change: raise the channel here, run
+# `cargo clippy --workspace --all-targets -- -D warnings`, and fix what the
+# newer lints found in the same commit.
+#
+# rustup reads this file automatically — locally and on CI runners — and
+# installs the toolchain plus the components below on the first cargo call,
+# which is why the workflow no longer installs a toolchain of its own.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]

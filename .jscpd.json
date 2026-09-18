@@ -1,0 +1,11 @@
+{
+  "//": "Threshold: fail when more than 5% of tokens are duplicated; ignore globs exclude the install-time byte copies (templates, ci.yml, run-gates.sh). Markdown is excluded because the four folder READMEs share hygiene prose whose drift is caught by review (jscpd measures code shape, not prose).",
+  "threshold": 5,
+  "ignore": [
+    "**/init-*-repo/templates/**",
+    "**/ci.yml",
+    "**/run-gates.sh",
+    "**/coverage/**",
+    "**/*.md"
+  ]
+}

@@ -1,0 +1,6 @@
+# rustfmt: stable-only keys here. The powerful comment options
+# (wrap_comments, format_code_in_doc_comments, normalize_doc_attributes,
+# comment_width, normalize_comments) are all "Stable: No" in rustfmt's
+# Configurations.md — enable them only if you pin nightly rustfmt for fmt
+# runs, and re-read that table on the toolchain bump.
+edition = "2024"

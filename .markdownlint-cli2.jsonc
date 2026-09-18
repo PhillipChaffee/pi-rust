@@ -1,0 +1,24 @@
+{
+  // Reasons live next to each entry; everything else runs at markdownlint
+  // defaults.
+  "config": {
+    // the docs wrap by hand and carry wide tables; an 80-column gate would
+    // force a mass restyle instead of a fix
+    "MD013": false,
+    // skill documents open several top-level sections by convention
+    // (# Goal, # Inputs, # Workflow)
+    "MD025": false,
+    // the landing README centers its banner image with HTML on purpose
+    "MD033": false,
+    // shell scripts legitimately use tab indentation; tabs inside fenced
+    // shell blocks are the script's own style, not doc sloppiness
+    "MD010": { "code_blocks": false }
+  },
+  "globs": [
+    "**/*.md",
+    // rustdoc vendors license .md files into target/doc/static.files on every
+    // doc build; CI lints a fresh checkout without target/, and the exclusion
+    // keeps the local runner deterministic after a doc build
+    "!target/**"
+  ]
+}

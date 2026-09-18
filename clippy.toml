@@ -1,0 +1,8 @@
+# clippy noise control, per the house rule that every entry carries its
+# measured why (AGENTS.md, "Comment and doc-comment rules").
+#
+# doc-valid-idents REPLACES clippy's default list unless the `..` sentinel
+# appears, so the sentinel stays and the list holds only the house names the
+# doc comments actually carry — spelled verbatim from the code, since the
+# whole point is that prose may reference them bare.
+doc-valid-idents = ["AcpClient", "OpenCode", "WKWebView", ".."]

@@ -1,0 +1,6 @@
+# Spell-check configuration for this bootstrapped repository. Default
+# dictionary on; the two seeded-proof quote words the folder READMEs
+# carry are the only allowances a fresh repo needs.
+[default.extend-identifiers]
+recieve = "recieve"
+calender = "calender"
