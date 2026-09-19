@@ -12,8 +12,20 @@ categories = ["development-tools", "development-tools::build-utils"]
 # Upstream packages/chord imports no other Pi workspace package and pins that
 # boundary with its own test; its one npm dependency (esbuild) belongs to the
 # JS bundling pipeline the port replaces with an in-process loader seam.
-# Keeping this table empty is the ported boundary, not a placeholder.
+# Upstream packages/chord imports no other Pi workspace package and pins
+# that boundary with its own test; its one npm dependency (esbuild) belongs
+# to the JS bundling pipeline the port replaces with an in-process loader
+# seam, and sha256 carries the artifact-integrity verification esbuild's
+# Node host did inline. The workspace-package boundary stands: the table
+# names no Pi crate.
 [dependencies]
+# Artifact-integrity verification: the sha256 digest the manifests carry.
+sha2 = "0.10"
+# The base64 form the `sha256-` integrity values carry.
+base64 = "0.22"
+# Manifest reads and writes; the crate owns its JsonValue enum, so serde
+# types never leak into the public API.
+serde_json = "1"
 
 [dev-dependencies]
 # The async runtime the TS event loop's concurrency cases port onto; chord
