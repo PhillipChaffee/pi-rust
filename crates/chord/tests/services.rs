@@ -26,8 +26,13 @@
     clippy::type_complexity,
     reason = "the ported cases spell their fixture types inline, as the upstream suite does"
 )]
+#![allow(
+    trivial_casts,
+    reason = "the fixture dispatch maps spell the dyn transport the binding options take"
+)]
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use pi_chord::api::{
@@ -38,7 +43,10 @@ use pi_chord::delta::{Op, Seg};
 use pi_chord::errors::{ChordError, RemoteServiceErrorCode};
 use pi_chord::handle::{ServiceImplementation, ServiceView};
 use pi_chord::services::loopback::create_loopback_service_transport;
-use pi_chord::services::provider::{RemoteServiceProvider, singleton_definition};
+use pi_chord::services::provider::{
+    RemoteServiceProvider, create_remote_service_endpoint, singleton_definition,
+    validate_remote_service_implementation,
+};
 use pi_chord::services::state::MutableReplicatedState;
 use pi_chord::types::{
     JsonValue, RemoteServiceTransport, Service, ServiceCall, ServiceInstanceAddress,
@@ -2183,5 +2191,1341 @@ fn keyed_bindings_reject_snapshot_and_update_contract_breaks() {
             "the address-less state update is reported: {reported:?}"
         );
         let _ = address;
+    });
+}
+
+/// A transport whose snapshot, replay queue, listener, start delay, and
+/// resolve-time hook the case controls, upstream's hand-rolled fixtures.
+struct HookTransport {
+    snapshot: Rc<RefCell<ServiceSubscriptionSnapshot>>,
+    updates: Rc<RefCell<Vec<ServiceProviderUpdate>>>,
+    listener: Rc<RefCell<Option<ServiceProviderListener>>>,
+    on_resolve: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    delay: usize,
+}
+
+impl HookTransport {
+    fn singleton_snapshot(
+        service_id: &str,
+        members: Vec<ServiceMemberSnapshot>,
+    ) -> Rc<RefCell<ServiceSubscriptionSnapshot>> {
+        Rc::new(RefCell::new(ServiceSubscriptionSnapshot {
+            service_id: service_id.to_string(),
+            mode: ServiceMode::Singleton,
+            instances: vec![ServiceInstanceSnapshot {
+                instance: None,
+                members,
+            }],
+        }))
+    }
+
+    fn keyed_snapshot(
+        service_id: &str,
+        address: &ServiceInstanceAddress,
+        members: Vec<ServiceMemberSnapshot>,
+    ) -> Rc<RefCell<ServiceSubscriptionSnapshot>> {
+        Rc::new(RefCell::new(ServiceSubscriptionSnapshot {
+            service_id: service_id.to_string(),
+            mode: ServiceMode::Keyed,
+            instances: vec![ServiceInstanceSnapshot {
+                instance: Some(address.clone()),
+                members,
+            }],
+        }))
+    }
+}
+
+impl RemoteServiceTransport for HookTransport {
+    fn invoke(
+        &self,
+        _call: ServiceCall,
+        _context: Context,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JsonValue>, ChordError>>>> {
+        boxed(async { Err(ChordError::Message("unexpected invocation".to_string())) })
+    }
+
+    fn subscribe(
+        &self,
+        _service_id: String,
+        _mode: ServiceMode,
+        listener: ServiceProviderListener,
+        _context: Context,
+    ) -> Pin<Box<dyn Future<Output = Result<ServiceSubscription, ChordError>>>> {
+        *self.listener.borrow_mut() = Some(listener.clone());
+        let snapshot = self.snapshot.borrow().clone();
+        let updates = self.updates.clone();
+        let listener = listener.clone();
+        let on_resolve = self.on_resolve.clone();
+        let delay = self.delay;
+        boxed(async move {
+            for _ in 0..delay {
+                tokio::task::yield_now().await;
+            }
+            if let Some(hook) = on_resolve.borrow_mut().take() {
+                hook();
+            }
+            Ok(ServiceSubscription {
+                snapshot,
+                activate: Box::new(move || {
+                    for update in updates.borrow().clone() {
+                        listener(&update, &background_context());
+                    }
+                    Ok(())
+                }),
+                close: Box::new(|_| boxed(std::future::ready(Ok(())))),
+            })
+        })
+    }
+}
+
+/// Routes every transport operation to the transport registered for the
+/// service, the fixture a binding over several transports rides on.
+struct DispatcherTransport {
+    by_id: HashMap<String, Rc<dyn RemoteServiceTransport>>,
+}
+
+impl RemoteServiceTransport for DispatcherTransport {
+    fn invoke(
+        &self,
+        call: ServiceCall,
+        context: Context,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JsonValue>, ChordError>>>> {
+        self.by_id[&call.service_id].invoke(call, context)
+    }
+
+    fn subscribe(
+        &self,
+        service_id: String,
+        mode: ServiceMode,
+        listener: ServiceProviderListener,
+        context: Context,
+    ) -> Pin<Box<dyn Future<Output = Result<ServiceSubscription, ChordError>>>> {
+        self.by_id[&service_id].subscribe(service_id, mode, listener, context)
+    }
+}
+
+fn state_member(name: &str, sequence: u64, value: JsonValue) -> ServiceMemberSnapshot {
+    ServiceMemberSnapshot::State {
+        name: name.to_string(),
+        sequence,
+        ops: vec![Op::Replace(value)],
+    }
+}
+
+fn method_member(name: &str) -> ServiceMemberSnapshot {
+    ServiceMemberSnapshot::Method {
+        name: name.to_string(),
+    }
+}
+
+fn hook_binding(
+    services: Vec<Service>,
+    transport: Rc<dyn RemoteServiceTransport>,
+    on_error: Option<pi_chord::handle::ErrorReporter>,
+) -> pi_chord::consumer::RemoteServiceBinding {
+    create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+        services,
+        transport,
+        bound: true,
+        on_error: on_error.unwrap_or_else(pi_chord::handle::no_error_reporter),
+        assert_access: None,
+    })
+    .unwrap_or_else(|e| panic!("binding: {e}"))
+}
+
+#[test]
+fn bindings_fence_singleton_snapshot_contracts_at_install() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.hook.models").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // A snapshot whose single instance carries an address rejects the
+        // install: singleton facades have no address.
+        let (errors, on_error) = error_sink();
+        let snapshot = HookTransport::singleton_snapshot("test.hook.models", vec![]);
+        snapshot.borrow_mut().instances[0].instance = Some(ServiceInstanceAddress {
+            key: "wrong".to_string(),
+            generation: 1,
+        });
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+            snapshot,
+            updates: Rc::new(RefCell::new(Vec::new())),
+            listener: Rc::new(RefCell::new(None)),
+            on_resolve: Rc::new(RefCell::new(None)),
+            delay: 0,
+        });
+        let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        let error = binding
+            .ready(background_context())
+            .await
+            .expect_err("the wrong-address snapshot rejects");
+        assert!(error_message(&error).contains("wrong address"));
+        assert!(
+            errors
+                .borrow()
+                .iter()
+                .any(|error| error.to_string().contains("wrong address")),
+            "the break is reported: {:?}",
+            errors.borrow()
+        );
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        // A snapshot with empty or duplicate member names rejects.
+        for members in [
+            vec![
+                state_member("state", 0, JsonValue::Null),
+                state_member("state", 0, JsonValue::Null),
+            ],
+            vec![method_member("")],
+        ] {
+            let (errors, on_error) = error_sink();
+            let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+                snapshot: HookTransport::singleton_snapshot("test.hook.models", members),
+                updates: Rc::new(RefCell::new(Vec::new())),
+                listener: Rc::new(RefCell::new(None)),
+                on_resolve: Rc::new(RefCell::new(None)),
+                delay: 0,
+            });
+            let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
+            let _view = binding
+                .use_service(&models)
+                .unwrap_or_else(|e| panic!("use: {e}"));
+            let error = binding
+                .ready(background_context())
+                .await
+                .expect_err("the member-shape break rejects");
+            assert!(error_message(&error).contains("invalid member descriptions"));
+            assert_eq!(errors.borrow().len(), 1);
+            binding
+                .dispose(background_context())
+                .await
+                .unwrap_or_else(|e| panic!("dispose: {e}"));
+        }
+    });
+}
+
+#[test]
+fn singleton_listeners_report_and_swallow_update_contract_breaks() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.hook.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let initial = jo(vec![("selected", JsonValue::Null), ("revision", number(0))]);
+
+        // A replacement carrying an instance address is reported.
+        let (errors, on_error) = error_sink();
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+            snapshot: HookTransport::singleton_snapshot(
+                "test.hook.models",
+                vec![
+                    state_member("state", 0, initial.clone()),
+                    method_member("select"),
+                ],
+            ),
+            updates: Rc::new(RefCell::new(vec![ServiceProviderUpdate::Replaced {
+                snapshot: ServiceInstanceSnapshot {
+                    instance: Some(ServiceInstanceAddress {
+                        key: "wrong".to_string(),
+                        generation: 1,
+                    }),
+                    members: vec![state_member("state", 0, initial.clone())],
+                },
+            }])),
+            listener: Rc::new(RefCell::new(None)),
+            on_resolve: Rc::new(RefCell::new(None)),
+            delay: 0,
+        });
+        let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        assert!(
+            errors.borrow().iter().any(|error| error
+                .to_string()
+                .contains("Singleton replacement has an instance address")),
+            "the replacement break is reported: {:?}",
+            errors.borrow()
+        );
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        // A replacement dropping a member the facade already holds reports
+        // the unknown member; a replacement flipping the member kind reports
+        // the kind change.
+        for (replacement, expected) in [
+            (
+                ServiceInstanceSnapshot {
+                    instance: None,
+                    members: vec![method_member("select")],
+                },
+                "Unknown remote service member",
+            ),
+            (
+                ServiceInstanceSnapshot {
+                    instance: None,
+                    members: vec![method_member("state"), method_member("select")],
+                },
+                "changed kind",
+            ),
+        ] {
+            let (errors, on_error) = error_sink();
+            let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+                snapshot: HookTransport::singleton_snapshot(
+                    "test.hook.models",
+                    vec![
+                        state_member("state", 0, initial.clone()),
+                        method_member("select"),
+                    ],
+                ),
+                updates: Rc::new(RefCell::new(vec![ServiceProviderUpdate::Replaced {
+                    snapshot: replacement,
+                }])),
+                listener: Rc::new(RefCell::new(None)),
+                on_resolve: Rc::new(RefCell::new(None)),
+                delay: 0,
+            });
+            let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
+            let _view = binding
+                .use_service(&models)
+                .unwrap_or_else(|e| panic!("use: {e}"));
+            binding
+                .ready(background_context())
+                .await
+                .unwrap_or_else(|e| panic!("ready: {e}"));
+            assert!(
+                errors
+                    .borrow()
+                    .iter()
+                    .any(|error| error.to_string().contains(expected)),
+                "the {expected} break is reported: {:?}",
+                errors.borrow()
+            );
+            binding
+                .dispose(background_context())
+                .await
+                .unwrap_or_else(|e| panic!("dispose: {e}"));
+        }
+
+        // State updates for non-state members are reported: one for a member
+        // described as a method, one for an undescribed member.
+        for member in ["select", "ghost"] {
+            let (errors, on_error) = error_sink();
+            let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+                snapshot: HookTransport::singleton_snapshot(
+                    "test.hook.models",
+                    vec![
+                        state_member("state", 0, initial.clone()),
+                        method_member("select"),
+                    ],
+                ),
+                updates: Rc::new(RefCell::new(vec![ServiceProviderUpdate::State {
+                    instance: None,
+                    member: member.to_string(),
+                    sequence: 1,
+                    ops: vec![Op::Replace(initial.clone())],
+                }])),
+                listener: Rc::new(RefCell::new(None)),
+                on_resolve: Rc::new(RefCell::new(None)),
+                delay: 0,
+            });
+            let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
+            let _view = binding
+                .use_service(&models)
+                .unwrap_or_else(|e| panic!("use: {e}"));
+            binding
+                .ready(background_context())
+                .await
+                .unwrap_or_else(|e| panic!("ready: {e}"));
+            assert!(
+                errors
+                    .borrow()
+                    .iter()
+                    .any(|error| error.to_string().contains("targets non-state member")),
+                "the {member} update is reported: {:?}",
+                errors.borrow()
+            );
+            binding
+                .dispose(background_context())
+                .await
+                .unwrap_or_else(|e| panic!("dispose: {e}"));
+        }
+
+        // Updates the closed-off listener sees are swallowed: a revision
+        // mismatch after rebind, and keyed-shaped updates a singleton
+        // listener cannot act on.
+        let (errors, on_error) = error_sink();
+        let snapshot = HookTransport::singleton_snapshot(
+            "test.hook.models",
+            vec![
+                state_member("state", 0, initial.clone()),
+                method_member("select"),
+            ],
+        );
+        let _updates: Rc<RefCell<Vec<ServiceProviderUpdate>>> = Rc::new(RefCell::new(Vec::new()));
+        let listener_cell: Rc<RefCell<Option<ServiceProviderListener>>> =
+            Rc::new(RefCell::new(None));
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+            snapshot: snapshot.clone(),
+            updates: Rc::new(RefCell::new(Vec::new())),
+            listener: listener_cell.clone(),
+            on_resolve: Rc::new(RefCell::new(None)),
+            delay: 0,
+        });
+        let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        binding
+            .rebind(false, background_context())
+            .await
+            .unwrap_or_else(|e| panic!("rebind: {e}"));
+        let listener = listener_cell.borrow().clone().expect("listener captured");
+        listener(
+            &ServiceProviderUpdate::State {
+                instance: None,
+                member: "state".to_string(),
+                sequence: 1,
+                ops: vec![Op::Replace(initial.clone())],
+            },
+            &background_context(),
+        );
+        for update in [
+            ServiceProviderUpdate::Unavailable,
+            ServiceProviderUpdate::Spawned {
+                instance: ServiceInstanceSnapshot {
+                    instance: Some(ServiceInstanceAddress {
+                        key: "k".to_string(),
+                        generation: 1,
+                    }),
+                    members: Vec::new(),
+                },
+            },
+            ServiceProviderUpdate::Closed {
+                instance: ServiceInstanceAddress {
+                    key: "k".to_string(),
+                    generation: 1,
+                },
+            },
+            ServiceProviderUpdate::State {
+                instance: Some(ServiceInstanceAddress {
+                    key: "k".to_string(),
+                    generation: 1,
+                }),
+                member: "state".to_string(),
+                sequence: 1,
+                ops: Vec::new(),
+            },
+        ] {
+            listener(&update, &background_context());
+        }
+        assert!(
+            errors.borrow().is_empty(),
+            "stale and keyed-shaped updates stay silent: {:?}",
+            errors.borrow()
+        );
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn readiness_and_disposal_settle_through_slow_subscribe_boundaries() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.slow.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let initial = jo(vec![("selected", JsonValue::Null), ("revision", number(0))]);
+        let slow_models_transport = || -> Rc<dyn RemoteServiceTransport> {
+            Rc::new(HookTransport {
+                snapshot: HookTransport::singleton_snapshot(
+                    "test.slow.models",
+                    vec![state_member("state", 0, initial.clone())],
+                ),
+                updates: Rc::new(RefCell::new(Vec::new())),
+                listener: Rc::new(RefCell::new(None)),
+                on_resolve: Rc::new(RefCell::new(None)),
+                delay: 1,
+            })
+        };
+
+        // Disposal collects a start that is still stored: the settle runs
+        // inside the disposal, and no close failure surfaces.
+        let binding = hook_binding(vec![models.clone()], slow_models_transport(), None);
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        let second = define_service("test.slow.second").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = RemoteServiceProvider::new(vec![
+            singleton_definition(models.clone()),
+            singleton_definition(second.clone()),
+        ])
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+        provider
+            .provide(
+                &models,
+                implementation_with_state_and_noop_select(replicated_state(initial.clone())),
+            )
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+        provider
+            .provide(&second, method_only_implementation())
+            .unwrap_or_else(|e| panic!("provide second: {e}"));
+        let second_transport = create_loopback_service_transport(&provider);
+
+        // A disposal issued from inside the subscribe boundary marks the
+        // binding disposed before the start resumes; the stale start closes
+        // its subscription and readiness reports the disposal. The second
+        // dispatcher acquires a second service mid-boundary instead, so the
+        // readiness loop settles a second generation; both share the
+        // fixture below, only their hooks differ.
+        let mid_boundary_transport = |hook: Option<Box<dyn Fn()>>| {
+            let by_id: HashMap<String, Rc<dyn RemoteServiceTransport>> = HashMap::from([
+                (
+                    models.id.clone(),
+                    Rc::new(HookTransport {
+                        snapshot: HookTransport::singleton_snapshot(
+                            "test.slow.models",
+                            vec![state_member("state", 0, initial.clone())],
+                        ),
+                        updates: Rc::new(RefCell::new(Vec::new())),
+                        listener: Rc::new(RefCell::new(None)),
+                        on_resolve: Rc::new(RefCell::new(hook)),
+                        delay: 1,
+                    }) as Rc<dyn RemoteServiceTransport>,
+                ),
+                (second.id.clone(), second_transport.clone()),
+            ]);
+            Rc::new(DispatcherTransport { by_id })
+        };
+        let late_binding: Rc<RefCell<Option<pi_chord::consumer::RemoteServiceBinding>>> =
+            Rc::new(RefCell::new(None));
+        let transport = mid_boundary_transport(Some({
+            let late = late_binding.clone();
+            Box::new(move || {
+                let binding = late.borrow().clone().expect("binding registered");
+                let disposal = binding.dispose(background_context());
+                assert!(
+                    pi_chord::future::settle_now(disposal)
+                        .expect("the disposal settles inside the boundary")
+                        .is_ok()
+                );
+            })
+        }));
+        let binding = hook_binding(vec![models.clone()], transport, None);
+        *late_binding.borrow_mut() = Some(binding.clone());
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        let error = binding
+            .ready(background_context())
+            .await
+            .expect_err("the mid-boundary disposal surfaces through readiness");
+        assert!(error_message(&error).contains("binding is disposed"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        // A second service acquired mid-boundary bumps the readiness
+        // revision, so the readiness loop settles a second generation.
+        let late_binding: Rc<RefCell<Option<pi_chord::consumer::RemoteServiceBinding>>> =
+            Rc::new(RefCell::new(None));
+        let transport = mid_boundary_transport(Some({
+            let late = late_binding.clone();
+            let second = second.clone();
+            Box::new(move || {
+                let binding = late.borrow().clone().expect("binding registered");
+                binding
+                    .use_service(&second)
+                    .unwrap_or_else(|e| panic!("use second: {e}"));
+            })
+        }));
+        let binding = hook_binding(vec![models.clone(), second.clone()], transport, None);
+        *late_binding.borrow_mut() = Some(binding.clone());
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+    });
+}
+
+#[test]
+fn keyed_listeners_route_updates_and_fence_their_contract() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dialogs = define_service("test.hook.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let address = ServiceInstanceAddress {
+            key: "dialog".to_string(),
+            generation: 1,
+        };
+        let initial = jo(vec![("question", js("First?"))]);
+        let updates: Rc<RefCell<Vec<ServiceProviderUpdate>>> = Rc::new(RefCell::new(Vec::new()));
+        let listener_cell: Rc<RefCell<Option<ServiceProviderListener>>> =
+            Rc::new(RefCell::new(None));
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+            snapshot: HookTransport::keyed_snapshot(
+                "test.hook.dialogs",
+                &address,
+                vec![
+                    state_member("request", 0, initial.clone()),
+                    method_member("submit"),
+                ],
+            ),
+            updates: updates.clone(),
+            listener: listener_cell.clone(),
+            on_resolve: Rc::new(RefCell::new(None)),
+            delay: 0,
+        });
+        let (errors, on_error) = error_sink();
+        let binding = hook_binding(vec![dialogs.clone()], transport, Some(on_error));
+        let views_sink: Rc<RefCell<Vec<ServiceView>>> = Rc::new(RefCell::new(Vec::new()));
+        let _views = views_sink.clone();
+        let observed = Rc::new(std::cell::Cell::new(0u32));
+        let stop = binding
+            .observe(&dialogs, {
+                let observed = observed.clone();
+                let views = views_sink.clone();
+                Rc::new(move |view: ServiceView, _context: Context| {
+                    observed.set(observed.get() + 1);
+                    views.borrow_mut().push(view);
+                })
+            })
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        assert_eq!(observed.get(), 1);
+
+        // A state update for the live generation routes to the facade; a
+        // stale generation is swallowed.
+        let listener = listener_cell.borrow().clone().expect("listener captured");
+        listener(
+            &ServiceProviderUpdate::State {
+                instance: Some(address.clone()),
+                member: "request".to_string(),
+                sequence: 1,
+                ops: vec![Op::Replace(jo(vec![("question", js("Updated?"))]))],
+            },
+            &background_context(),
+        );
+        listener(
+            &ServiceProviderUpdate::State {
+                instance: Some(ServiceInstanceAddress {
+                    key: "dialog".to_string(),
+                    generation: 2,
+                }),
+                member: "request".to_string(),
+                sequence: 1,
+                ops: Vec::new(),
+            },
+            &background_context(),
+        );
+        assert!(
+            errors.borrow().is_empty(),
+            "routed and stale updates stay silent: {:?}",
+            errors.borrow()
+        );
+        let question = views_sink.borrow()[0]
+            .state("request")
+            .and_then(|state| state.value())
+            .unwrap_or_else(|e| panic!("state read: {e}"));
+        assert_eq!(question, Some(jo(vec![("question", js("Updated?"))])));
+
+        // Rebinding keeps the observation: the keyed transition closes and
+        // restarts the subscription, and the observation still routes.
+        binding
+            .rebind(false, background_context())
+            .await
+            .unwrap_or_else(|e| panic!("rebind off: {e}"));
+        binding
+            .rebind(true, background_context())
+            .await
+            .unwrap_or_else(|e| panic!("rebind on: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        assert_eq!(observed.get(), 2);
+
+        // Unsubscribing twice is a no-op, and the last unsubscribe releases
+        // the keyed binding: a fresh observe starts a fresh subscription.
+        stop();
+        stop();
+        let _stop = binding
+            .observe(&dialogs, {
+                Rc::new(move |_view: ServiceView, _context: Context| ())
+            })
+            .unwrap_or_else(|e| panic!("observe again: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready again: {e}"));
+        assert_eq!(observed.get(), 2);
+
+        // A disposed binding's listener stays silent on later updates.
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        listener(
+            &ServiceProviderUpdate::State {
+                instance: Some(address.clone()),
+                member: "request".to_string(),
+                sequence: 2,
+                ops: Vec::new(),
+            },
+            &background_context(),
+        );
+        assert!(
+            errors.borrow().is_empty(),
+            "the disposed listener stays silent: {:?}",
+            errors.borrow()
+        );
+    });
+}
+
+#[test]
+fn providers_fence_member_and_address_resolution() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.fence2.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let foreign =
+            define_service("test.fence2.foreign").unwrap_or_else(|e| panic!("define: {e}"));
+        let dialogs =
+            define_service("test.fence2.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = RemoteServiceProvider::new(vec![
+            singleton_definition(models.clone()),
+            pi_chord::services::provider::ServiceProviderDefinition {
+                service: dialogs.clone(),
+                mode: ServiceMode::Keyed,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+        let state = replicated_state(jo(vec![("selected", JsonValue::Null)]));
+        let mut implementation = ServiceImplementation::new();
+        implementation.state("state", state);
+        implementation.method(
+            "select",
+            Rc::new(|_args: Vec<JsonValue>, _context: Context| boxed(async { Ok(None) })),
+        );
+        provider
+            .provide(&models, implementation)
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+
+        let call_of = |member: &str, instance: Option<ServiceInstanceAddress>| ServiceCall {
+            service_id: models.id.clone(),
+            instance,
+            member: member.to_string(),
+            args: Vec::new(),
+        };
+        let error = pi_chord::future::drive_once(
+            provider.invoke(call_of("absent", None), background_context()),
+        )
+        .ok()
+        .and_then(Result::err)
+        .expect("an unknown member rejects");
+        assert!(
+            error.to_string().contains("Unknown remote service member"),
+            "unknown member: {error}"
+        );
+        let error = pi_chord::future::drive_once(
+            provider.invoke(call_of("state", None), background_context()),
+        )
+        .ok()
+        .and_then(Result::err)
+        .expect("a state member is not callable");
+        assert!(
+            error.to_string().contains("is not a method"),
+            "state member: {error}"
+        );
+        let error = pi_chord::future::drive_once(provider.invoke(
+            call_of(
+                "select",
+                Some(ServiceInstanceAddress {
+                    key: "k".to_string(),
+                    generation: 1,
+                }),
+            ),
+            background_context(),
+        ))
+        .ok()
+        .and_then(Result::err)
+        .expect("a singleton rejects an instance address");
+        assert!(
+            error.to_string().contains("is singleton"),
+            "singleton: {error}"
+        );
+
+        let close = provider
+            .spawn(&dialogs, "dialog", method_only_implementation())
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let call_of_keyed = |member: &str, instance: Option<ServiceInstanceAddress>| ServiceCall {
+            service_id: dialogs.id.clone(),
+            instance,
+            member: member.to_string(),
+            args: Vec::new(),
+        };
+        let error = pi_chord::future::drive_once(
+            provider.invoke(call_of_keyed("submit", None), background_context()),
+        )
+        .ok()
+        .and_then(Result::err)
+        .expect("a keyed service rejects an address-less call");
+        assert!(error.to_string().contains("is keyed"), "keyed: {error}");
+        let error = pi_chord::future::drive_once(provider.invoke(
+            call_of_keyed(
+                "submit",
+                Some(ServiceInstanceAddress {
+                    key: "absent".to_string(),
+                    generation: 1,
+                }),
+            ),
+            background_context(),
+        ))
+        .ok()
+        .and_then(Result::err)
+        .expect("an unknown keyed instance rejects");
+        assert!(
+            error.to_string().contains("no instance"),
+            "unknown instance: {error}"
+        );
+        let error = pi_chord::future::drive_once(provider.invoke(
+            ServiceCall {
+                service_id: foreign.id,
+                instance: None,
+                member: "submit".to_string(),
+                args: Vec::new(),
+            },
+            background_context(),
+        ))
+        .ok()
+        .and_then(Result::err)
+        .expect("a foreign service rejects");
+        assert!(
+            error.to_string().contains("is not allowlisted"),
+            "foreign: {error}"
+        );
+        let _ = close;
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+    });
+}
+
+#[test]
+fn providers_fence_stale_generations_and_subscription_gates() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dialogs =
+            define_service("test.fence3.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = RemoteServiceProvider::new(vec![
+            pi_chord::services::provider::ServiceProviderDefinition {
+                service: dialogs.clone(),
+                mode: ServiceMode::Keyed,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+        let close_first = provider
+            .spawn(&dialogs, "dialog", method_only_implementation())
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+
+        // The snapshot carries the live generation; closing and respawning
+        // the key bumps it, so the retained address is stale.
+        let listener: ServiceProviderListener =
+            Rc::new(|_update: &ServiceProviderUpdate, _context: &Context| ());
+        let subscription = provider
+            .subscribe(&dialogs.id, ServiceMode::Keyed, listener)
+            .unwrap_or_else(|e| panic!("subscribe: {e}"));
+        let stale_address = subscription.snapshot.instances[0]
+            .instance
+            .clone()
+            .expect("the keyed instance carries an address");
+        // Activating twice is a no-op the second time.
+        (subscription.activate)().unwrap_or_else(|e| panic!("activate: {e}"));
+        (subscription.activate)().unwrap_or_else(|e| panic!("activate again: {e}"));
+        (subscription.close)(None)
+            .await
+            .unwrap_or_else(|e| panic!("close: {e}"));
+        close_first().unwrap_or_else(|e| panic!("close instance: {e}"));
+        let _close_second = provider
+            .spawn(&dialogs, "dialog", method_only_implementation())
+            .unwrap_or_else(|e| panic!("respawn: {e}"));
+        let error = pi_chord::future::drive_once(provider.invoke(
+            ServiceCall {
+                service_id: dialogs.id.clone(),
+                instance: Some(stale_address),
+                member: "submit".to_string(),
+                args: Vec::new(),
+            },
+            background_context(),
+        ))
+        .ok()
+        .and_then(Result::err)
+        .expect("a stale generation rejects");
+        assert!(error.to_string().contains("is stale"), "stale: {error}");
+
+        // A closed subscription is skipped by later publications, and
+        // disposal reports a Closed delivery that fails.
+        let (errors, on_error) = error_sink();
+        let state = replicated_state(jo(vec![("selected", JsonValue::Null)]));
+        let mut implementation = ServiceImplementation::new();
+        implementation.state("state", state.clone());
+        let _close = provider
+            .spawn(&dialogs, "later", implementation)
+            .unwrap_or_else(|e| panic!("spawn later: {e}"));
+        let subscriber = provider
+            .subscribe(&dialogs.id, ServiceMode::Keyed, {
+                Rc::new(|update: &ServiceProviderUpdate, _context: &Context| {
+                    if matches!(update, ServiceProviderUpdate::Closed { .. }) {
+                        panic!("listener failed on close");
+                    }
+                })
+            })
+            .unwrap_or_else(|e| panic!("subscribe second: {e}"));
+        (subscriber.activate)().unwrap_or_else(|e| panic!("activate second: {e}"));
+        let quiet = provider
+            .subscribe(&dialogs.id, ServiceMode::Keyed, {
+                Rc::new(|_update: &ServiceProviderUpdate, _context: &Context| {
+                    panic!("a closed subscription still delivers");
+                })
+            })
+            .unwrap_or_else(|e| panic!("subscribe third: {e}"));
+        (quiet.close)(None)
+            .await
+            .unwrap_or_else(|e| panic!("close third: {e}"));
+        state
+            .publish(&background_context())
+            .unwrap_or_else(|e| panic!("publish: {e}"));
+        let error = provider
+            .dispose()
+            .expect_err("the Closed delivery failure aggregates");
+        assert!(error.to_string().contains("listener failed on close"));
+        let _ = (errors, on_error, close_first);
+    });
+}
+
+#[test]
+fn remote_service_endpoints_guard_their_grammar() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models =
+            define_service("test.endpoint.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = provider_for(&[&models]);
+        provider
+            .provide(&models, method_only_implementation())
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+        let endpoint = create_remote_service_endpoint(&provider);
+        assert!(format!("{endpoint:?}").contains("RemoteServiceEndpoint"));
+
+        let publish: pi_chord::types::ServiceUpdatePublisher = Rc::new(
+            |_subscription_id: &str, _update: &ServiceProviderUpdate, _context: &Context| (),
+        );
+
+        // A plain invocation routes through the provider.
+        let answer = endpoint
+            .invoke(
+                ServiceCall {
+                    service_id: models.id.clone(),
+                    instance: None,
+                    member: "select".to_string(),
+                    args: Vec::new(),
+                },
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("invoke: {e}"));
+        assert!(answer.is_none());
+
+        // The subscribe control call opens and unsubscriptions close; a
+        // duplicate ID and an unknown service reject; a missing
+        // subscription rejects.
+        let snapshot = endpoint
+            .invoke(
+                pi_chord::services::wire::create_service_subscribe_call(
+                    "sub-1",
+                    &models.id,
+                    ServiceMode::Singleton,
+                ),
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("subscribe: {e}"));
+        assert!(snapshot.is_some());
+        let error = endpoint
+            .invoke(
+                pi_chord::services::wire::create_service_subscribe_call(
+                    "sub-1",
+                    &models.id,
+                    ServiceMode::Singleton,
+                ),
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .expect_err("a duplicate subscription ID rejects");
+        assert!(error_message(&error).contains("already active"));
+        let error = endpoint
+            .invoke(
+                pi_chord::services::wire::create_service_subscribe_call(
+                    "sub-2",
+                    "test.endpoint.absent",
+                    ServiceMode::Singleton,
+                ),
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .expect_err("an unknown service rejects");
+        assert!(error_message(&error).contains("not allowlisted"));
+        let error = endpoint
+            .invoke(
+                pi_chord::services::wire::create_service_unsubscribe_call("sub-9"),
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .expect_err("an unknown subscription rejects");
+        assert!(error_message(&error).contains("was not found"));
+        endpoint
+            .invoke(
+                pi_chord::services::wire::create_service_unsubscribe_call("sub-1"),
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unsubscribe: {e}"));
+
+        // Disposal settles once; later invocations reject.
+        endpoint.dispose();
+        endpoint.dispose();
+        let error = endpoint
+            .invoke(
+                pi_chord::services::wire::create_service_catalogue_call(),
+                publish.clone(),
+                background_context(),
+            )
+            .await
+            .expect_err("a disposed endpoint rejects");
+        assert!(error_message(&error).contains("endpoint is disposed"));
+
+        // The implementation validator surfaces its rejections.
+        let error =
+            validate_remote_service_implementation(&models.id, &ServiceImplementation::new())
+                .expect_err("an empty implementation rejects");
+        assert!(error_message(&error).contains("has no members"));
+        let mut non_exposable = ServiceImplementation::new();
+        non_exposable.method(
+            "read",
+            Rc::new(|_args: Vec<JsonValue>, _context: Context| boxed(async { Ok(None) })),
+        );
+        non_exposable.value("payload", Rc::new(()));
+        let error = validate_remote_service_implementation(&models.id, &non_exposable)
+            .expect_err("a value member is not exposable");
+        assert!(error_message(&error).contains("not remotely exposable"));
+        let mut valid = ServiceImplementation::new();
+        valid.method(
+            "read",
+            Rc::new(|_args: Vec<JsonValue>, _context: Context| boxed(async { Ok(None) })),
+        );
+        assert!(validate_remote_service_implementation(&models.id, &valid).is_ok());
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+    });
+}
+
+#[test]
+fn deferred_bindings_settle_empty_starts_and_route_through_the_trait() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.trait.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let keyed = define_service("test.trait.keyed").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = RemoteServiceProvider::new(vec![
+            singleton_definition(models.clone()),
+            pi_chord::services::provider::ServiceProviderDefinition {
+                service: keyed.clone(),
+                mode: ServiceMode::Keyed,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+        provider
+            .provide(
+                &models,
+                implementation_with_state_and_noop_select(replicated_state(jo(vec![(
+                    "selected",
+                    JsonValue::Null,
+                )]))),
+            )
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+        let close = provider
+            .spawn(&keyed, "dialog", method_only_implementation())
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let _ = close;
+
+        // A deferred binding observes keyed services without starting them;
+        // readiness settles the empty stored start.
+        let binding = binding_deferred(vec![models.clone(), keyed.clone()], &provider, None);
+        let observation_stop = binding
+            .observe(&keyed, Rc::new(|_view: ServiceView, _context: Context| ()))
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        let _ = &observation_stop;
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+
+        // A local service rejects the binding, and a disposed binding
+        // rejects acquisition.
+        let local =
+            define_local_service("test.trait.local").unwrap_or_else(|e| panic!("define: {e}"));
+        let error = binding
+            .use_service(&local)
+            .expect_err("a local service rejects");
+        assert!(error.to_string().contains("process-local"));
+
+        // Every surface routes through the trait object.
+        let view = use_via_trait(&binding, &models).unwrap_or_else(|e| panic!("trait use: {e}"));
+        let ready = use_via_trait_ready(&binding).await;
+        ready.unwrap_or_else(|e| panic!("trait ready: {e}"));
+        assert!(view.same_handle(&view));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let error = binding
+            .use_service(&models)
+            .expect_err("a disposed binding rejects acquisition");
+        assert!(error.to_string().contains("disposed"));
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+    });
+}
+
+fn use_via_trait(
+    services: &dyn pi_chord::types::RemoteServices,
+    service: &Service,
+) -> Result<ServiceView, ChordError> {
+    services.use_service(service)
+}
+
+async fn use_via_trait_ready(
+    binding: &pi_chord::consumer::RemoteServiceBinding,
+) -> Result<(), ChordError> {
+    pi_chord::types::RemoteServices::ready(binding, background_context()).await
+}
+
+#[test]
+fn keyed_observations_release_their_binding_when_the_last_observer_stops() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dialogs =
+            define_service("test.release.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let address = ServiceInstanceAddress {
+            key: "dialog".to_string(),
+            generation: 1,
+        };
+        let listener_cell: Rc<RefCell<Option<ServiceProviderListener>>> =
+            Rc::new(RefCell::new(None));
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+            snapshot: HookTransport::keyed_snapshot(
+                "test.release.dialogs",
+                &address,
+                vec![state_member("request", 0, jo(vec![("question", js("Q?"))]))],
+            ),
+            updates: Rc::new(RefCell::new(Vec::new())),
+            listener: listener_cell.clone(),
+            on_resolve: Rc::new(RefCell::new(None)),
+            delay: 0,
+        });
+        let (errors, on_error) = error_sink();
+        let binding = hook_binding(vec![dialogs.clone()], transport, Some(on_error));
+        let first_observation_stop = binding
+            .observe(
+                &dialogs,
+                Rc::new(|_view: ServiceView, _context: Context| ()),
+            )
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+
+        // The last unsubscribe closes the keyed subscription and releases
+        // the binding; the release settles quietly.
+        let release_stop = binding
+            .observe(
+                &dialogs,
+                Rc::new(|_view: ServiceView, _context: Context| ()),
+            )
+            .unwrap_or_else(|e| panic!("observe first: {e}"));
+        let close_stop = binding
+            .observe(
+                &dialogs,
+                Rc::new(|_view: ServiceView, _context: Context| ()),
+            )
+            .unwrap_or_else(|e| panic!("observe second: {e}"));
+        close_stop();
+        release_stop();
+        first_observation_stop();
+        assert!(
+            errors.borrow().is_empty(),
+            "the release stays quiet: {:?}",
+            errors.borrow()
+        );
+
+        // The closed subscription's listener stays silent afterwards.
+        let listener = listener_cell.borrow().clone().expect("listener captured");
+        listener(
+            &ServiceProviderUpdate::State {
+                instance: Some(address),
+                member: "request".to_string(),
+                sequence: 1,
+                ops: Vec::new(),
+            },
+            &background_context(),
+        );
+        assert!(
+            errors.borrow().is_empty(),
+            "the released binding stays silent: {:?}",
+            errors.borrow()
+        );
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn keyed_disposal_during_a_pending_start_closes_the_subscription() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dialogs =
+            define_service("test.slowkey.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let address = ServiceInstanceAddress {
+            key: "dialog".to_string(),
+            generation: 1,
+        };
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(HookTransport {
+            snapshot: HookTransport::keyed_snapshot(
+                "test.slowkey.dialogs",
+                &address,
+                vec![state_member("request", 0, jo(vec![("question", js("Q?"))]))],
+            ),
+            updates: Rc::new(RefCell::new(Vec::new())),
+            listener: Rc::new(RefCell::new(None)),
+            on_resolve: Rc::new(RefCell::new(None)),
+            delay: 1,
+        });
+        let (errors, on_error) = error_sink();
+        let binding = hook_binding(vec![dialogs.clone()], transport, Some(on_error));
+        let _stop = binding
+            .observe(
+                &dialogs,
+                Rc::new(|_view: ServiceView, _context: Context| ()),
+            )
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        // The keyed start parked at the transport boundary; disposal waits
+        // for it, and the stale start closes its own subscription.
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert!(
+            errors.borrow().is_empty(),
+            "the disposal stays quiet: {:?}",
+            errors.borrow()
+        );
+    });
+}
+
+#[test]
+fn remote_views_reject_value_reads_and_delegate_through_view_targets() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.value.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = provider_for(&[&models]);
+        provider
+            .provide(&models, method_only_implementation())
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+        let binding = binding_for(vec![models.clone()], &provider, None);
+        let view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        let error: Result<u32, ChordError> = view
+            .with_value("select", |_never: &dyn std::any::Any| {
+                unreachable!("the read rejects before the closure")
+            });
+        let error = error.expect_err("a remote facade member is not a value");
+        assert!(error_message(&error).contains("Remote service members are not values"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+    });
+}
+
+#[test]
+fn spawn_closures_settle_after_disposal() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dialogs =
+            define_service("test.close.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = RemoteServiceProvider::new(vec![
+            pi_chord::services::provider::ServiceProviderDefinition {
+                service: dialogs.clone(),
+                mode: ServiceMode::Keyed,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+        let close = provider
+            .spawn(&dialogs, "dialog", method_only_implementation())
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        // Disposal removes the instance; the retained close is a no-op.
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        close().unwrap_or_else(|e| panic!("close after dispose: {e}"));
     });
 }

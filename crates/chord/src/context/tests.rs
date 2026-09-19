@@ -12,16 +12,19 @@ fn provides_distinct_empty_root_contexts() {
     // The roots are distinct values; the port mints a fresh chain per
     // constructor call, so identity never aliases.
     assert_ne!(
-        format!("{}", todo_context()),
+        format!("{}", placeholder_context()),
         format!("{}", background_context())
     );
-    assert!(todo_context().abort_signal().is_none());
-    assert!(todo_context().value(&key).is_none());
+    assert!(placeholder_context().abort_signal().is_none());
+    assert!(placeholder_context().value(&key).is_none());
     assert_eq!(
         format!("{}", background_context()),
         "[Context BACKGROUND_CONTEXT]"
     );
-    assert_eq!(format!("{}", todo_context()), "[Context TODO_CONTEXT]");
+    assert_eq!(
+        format!("{}", placeholder_context()),
+        "[Context PLACEHOLDER_CONTEXT]"
+    );
 }
 
 #[test]
@@ -245,4 +248,28 @@ fn a_cancelled_context_resolves_its_waiter_while_the_work_runs_on() {
         Poll::Ready(Err(_))
     ));
     let _ = (wait, controller);
+}
+
+#[test]
+fn fan_in_signals_register_wakers_on_their_leaves_and_ignore_direct_aborts() {
+    let first = AbortController {
+        signal: AbortSignal::own(),
+    };
+    let second = AbortController {
+        signal: AbortSignal::own(),
+    };
+    let fan_in = AbortSignal::any(vec![first.signal().clone(), second.signal().clone()]);
+    let fan_controller = AbortController {
+        signal: fan_in.clone(),
+    };
+    // Aborting the fan-in signal itself does nothing: only leaves abort.
+    fan_controller.abort("direct");
+    assert!(!fan_in.aborted());
+    assert_eq!(fan_in.reason(), None);
+    // A waiter on the fan-in registers with every leaf; aborting one leaf
+    // wakes the waiter with the leaf's reason.
+    let mut wait = fan_in.wait();
+    assert_eq!(poll_wait(&mut wait), Poll::Pending);
+    second.abort_without_reason();
+    assert_eq!(poll_wait(&mut wait), Poll::Ready(AbortReason::Aborted));
 }

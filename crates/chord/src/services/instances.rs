@@ -48,7 +48,10 @@ struct Observer {
 /// instances, upstream's `InstanceDirectory`.
 pub struct InstanceDirectory {
     entries: RefCell<Vec<(String, Rc<InstanceDirectoryEntry>)>>,
-    observers: RefCell<Vec<Rc<Observer>>>,
+    // Shared, not owned: the unsubscribe closure outlives the observe call
+    // and must retain its observer out of the live list, upstream's
+    // `this.observers.filter(...)` on the same array.
+    observers: Rc<RefCell<Vec<Rc<Observer>>>>,
     report_error: ErrorReporter,
     ready: Cell<bool>,
     disposed: Cell<bool>,
@@ -69,7 +72,7 @@ impl InstanceDirectory {
     pub fn new(ready: bool, report_error: ErrorReporter) -> Self {
         Self {
             entries: RefCell::new(Vec::new()),
-            observers: RefCell::new(Vec::new()),
+            observers: Rc::new(RefCell::new(Vec::new())),
             report_error,
             ready: Cell::new(ready),
             disposed: Cell::new(false),
@@ -230,7 +233,7 @@ impl InstanceDirectory {
                 self.start(&observer, &entry);
             }
         }
-        let observers = self.observers.clone();
+        let observers = Rc::clone(&self.observers);
         Ok(Box::new(move || {
             if observer.closed.get() {
                 return;
@@ -341,6 +344,12 @@ impl InstanceDirectory {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::redundant_clone,
+        clippy::panic,
+        reason = "the directory fixtures settle results and panics the case's own assertions pin"
+    )]
     use super::*;
     use crate::handle::ServiceImplementation;
 
@@ -362,14 +371,15 @@ mod tests {
         let directory = directory();
         assert!(format!("{directory:?}").starts_with("InstanceDirectory { ready: false"));
         let live = entry("dialog", 1);
+        assert!(format!("{live:?}").starts_with("InstanceDirectoryEntry { key: \"dialog\""));
         assert!(directory.insert(live.clone()).is_ok());
-        let Err(error) = directory.insert(entry("dialog", 2)) else {
-            unreachable!("a live key rejects")
-        };
+        let error = directory
+            .insert(entry("dialog", 2))
+            .expect_err("a live key rejects");
         assert!(error.to_string().contains("already has a live instance"));
-        let Err(error) = directory.replace(entry("dialog", 1)) else {
-            unreachable!("a repeated generation rejects")
-        };
+        let error = directory
+            .replace(entry("dialog", 1))
+            .expect_err("a repeated generation rejects");
         assert!(error.to_string().contains("repeated a live generation"));
 
         // Replacing with a newer generation retires the previous entry.
@@ -386,14 +396,64 @@ mod tests {
         // Observations stop when the unsubscribe runs; a closed observer
         // ignores later starts.
         let handler: KeyedServiceHandler = Box::new(|_target, _context| ());
-        let Ok(unsubscribe) = directory.observe(handler) else {
-            unreachable!("the observation starts")
-        };
+        let unsubscribe = directory.observe(handler).expect("the observation starts");
         unsubscribe();
         unsubscribe();
+        // A closed observer ignores starts for later entries.
+        let insertion = directory.insert(entry("late", 1));
+        assert!(insertion.is_ok());
         // Reset drops entries; a later ready restarts observations.
         directory.reset();
         assert!(directory.get("dialog").is_none());
+    }
+
+    #[test]
+    fn disposal_cancels_tasked_observations_and_reports_handler_panics() {
+        // A handler panic surfaces through the directory's reporter while
+        // the observation context is still live.
+        let errors: Rc<RefCell<Vec<ChordError>>> = Rc::new(RefCell::new(Vec::new()));
+        let reporter: ErrorReporter = {
+            let errors = errors.clone();
+            Rc::new(move |error| errors.borrow_mut().push(error.clone()))
+        };
+        let directory = InstanceDirectory::new(true, reporter);
+        let panicking: KeyedServiceHandler = Box::new(|_target, _context| {
+            panic!("handler failed");
+        });
+        let unsubscribe = directory
+            .observe(panicking)
+            .expect("the observation starts");
+        let live = entry("dialog", 1);
+        directory.insert(live).expect("the insertion lands");
+        assert_eq!(errors.borrow().len(), 1);
+        assert!(errors.borrow()[0].to_string().contains("handler failed"));
+
+        // An aborted context swallows the report: the task is cancelled
+        // before the panic would report again.
+        unsubscribe();
+        directory.reset();
+        assert_eq!(errors.borrow().len(), 1);
+
+        // Disposal cancels every task and deactivates every entry.
+        let deactivated = Rc::new(Cell::new(0u32));
+        let second = Rc::new(InstanceDirectoryEntry {
+            key: "second".to_string(),
+            generation: 1,
+            service: ServiceTarget::Local(Rc::new(ServiceImplementation::new())),
+            deactivate: Rc::new({
+                let deactivated = deactivated.clone();
+                move || deactivated.set(deactivated.get() + 1)
+            }),
+        });
+        directory
+            .insert(second)
+            .expect("the second insertion lands");
+        let watched: KeyedServiceHandler = Box::new(|_target, _context| ());
+        let _watcher = directory.observe(watched).expect("the watcher starts");
+        directory.dispose();
+        directory.dispose();
+        directory.reset();
+        assert_eq!(deactivated.get(), 1);
     }
 
     fn newer_entry() -> Rc<InstanceDirectoryEntry> {
@@ -410,5 +470,15 @@ mod tests {
         assert!(directory.ready().is_err());
         let handler: KeyedServiceHandler = Box::new(|_target, _context| ());
         assert!(directory.observe(handler).is_err());
+    }
+
+    #[test]
+    fn disposed_directories_reject_insertion() {
+        let directory = directory();
+        directory.dispose();
+        let error = directory
+            .insert(entry("late", 1))
+            .expect_err("a disposed directory rejects insertion");
+        assert!(error.to_string().contains("disposed"));
     }
 }

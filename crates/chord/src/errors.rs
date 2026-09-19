@@ -215,6 +215,12 @@ mod tests {
             "service_not_found",
         ));
         assert_eq!(remote.to_string(), "service_not_found");
+        // The remote error spells itself the same way on its own.
+        let bare = RemoteServiceError::new(
+            RemoteServiceErrorCode::ServiceMemberMismatch,
+            "member mismatch",
+        );
+        assert_eq!(bare.to_string(), "member mismatch");
         assert_eq!(ChordError::from("plain").to_string(), "plain");
         assert_eq!(ChordError::from(String::from("owned")).to_string(), "owned");
         assert_eq!(ChordError::message("plain").to_string(), "plain");

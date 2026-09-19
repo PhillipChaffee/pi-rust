@@ -624,3 +624,52 @@ mod tests {
         assert!(error.to_string().contains("not callable"));
     }
 }
+
+#[cfg(test)]
+mod view_target_tests {
+    #![allow(
+        clippy::expect_used,
+        reason = "the view fixtures settle results the case's own assertions pin"
+    )]
+    use super::*;
+    use crate::context::background_context;
+
+    #[test]
+    fn views_delegate_value_reads_through_view_targets() {
+        // An outer slot bound to a view target delegates reads to the inner
+        // view; the inner slot holds a local implementation.
+        let inner_slot = ServiceSlot::new("test.inner");
+        let mut implementation = ServiceImplementation::new();
+        implementation.method(
+            "read",
+            sync_method(|_args: Vec<JsonValue>, _context: &Context| Ok(Some(JsonValue::Null))),
+        );
+        inner_slot.bind(ServiceTarget::Local(Rc::new(implementation)));
+        let inner_view = inner_slot.view(allow_access());
+
+        let outer_slot = ServiceSlot::new("test.outer");
+        outer_slot.bind(ServiceTarget::View(inner_view));
+        let outer_view = outer_slot.view(allow_access());
+
+        // The delegate rides to the inner view: a method member is not a
+        // value, and an absent member disconnects.
+        let error: Result<u32, ChordError> = outer_view.with_value("read", |_never: &dyn Any| {
+            unreachable!("the inner rejection fires first")
+        });
+        let error = error.expect_err("a method member is not a value");
+        assert!(error.to_string().contains("not a value"));
+
+        // The debug spell and the identity helpers answer.
+        assert!(format!("{outer_view:?}").contains("test.outer"));
+        assert!(outer_view.same_handle(&outer_view));
+        let member = format!(
+            "{:?}",
+            ServiceMember::State(MutableReplicatedState::new(JsonValue::Null))
+        );
+        assert!(member.starts_with("State("));
+        let bound_slot = ServiceSlot::new("test.bound");
+        assert!(!bound_slot.is_bound());
+        let _ = outer_slot;
+        let _ = crate::future::drive_once(outer_view.call("read", vec![], background_context()));
+    }
+}

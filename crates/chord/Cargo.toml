@@ -37,9 +37,6 @@ tokio = { version = "1.47", default-features = false, features = [
     "sync",
     "time",
 ] }
-# Cancellation tokens carry the Context cancellation port and per-observer
-# task cancellation; the `rt` feature is what its spawn helpers need.
-tokio-util = { version = "0.7", features = ["rt"] }
 # Test-only: the crate owns its JsonValue enum to keep `Number.isFinite`
 # semantics and the hostile-payload restatement, so serde types cannot leak
 # into the public API.

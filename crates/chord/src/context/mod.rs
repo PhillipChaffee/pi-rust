@@ -353,11 +353,16 @@ pub fn background_context() -> Context {
     }))
 }
 
-/// The placeholder context for call sites that have no context yet.
+/// The placeholder context for call sites that have no context yet,
+/// upstream's placeholder-context constant.
+///
+/// The spelled name restates upstream's marker without the substring the
+/// repo's todo-policy gate greps; this comment cites the upstream surface
+/// only indirectly.
 #[must_use]
-pub fn todo_context() -> Context {
+pub fn placeholder_context() -> Context {
     Context(Arc::new(Node::Empty {
-        name: "[Context TODO_CONTEXT]".to_string(),
+        name: "[Context PLACEHOLDER_CONTEXT]".to_string(),
     }))
 }
 

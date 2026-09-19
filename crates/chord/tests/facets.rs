@@ -36,6 +36,10 @@
     clippy::type_complexity,
     reason = "the ported cases spell their fixture types inline, as the upstream suite does"
 )]
+#![allow(
+    trivial_casts,
+    reason = "the fixture maps coerce their concrete hosts into the dyn surface the loaders take"
+)]
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -2598,5 +2602,690 @@ fn startup_failures_aggregate_with_cleanup_failures() {
             message.contains("startup and cleanup failed"),
             "the failures aggregate: {message}"
         );
+    });
+}
+
+#[test]
+fn facets_fence_their_setup_and_spawner_lifecycles() {
+    rt().block_on(async {
+        let singleton = define_service("test.fence1.svc").unwrap_or_else(|e| panic!("define: {e}"));
+        let keyed = define_service("test.fence1.keyed").unwrap_or_else(|e| panic!("define: {e}"));
+        let local_keyed = define_local_service("test.fence1.local-keyed")
+            .unwrap_or_else(|e| panic!("define: {e}"));
+        let _setup_read_error: Rc<RefCell<Option<ChordError>>> = Rc::new(RefCell::new(None));
+        let spawner_cell: Rc<RefCell<Option<Rc<pi_chord::facets::host::StagedServiceSpawner>>>> =
+            Rc::new(RefCell::new(None));
+        let local_spawner_cell: Rc<
+            RefCell<Option<Rc<pi_chord::facets::host::StagedServiceSpawner>>>,
+        > = Rc::new(RefCell::new(None));
+        let setup_error = Rc::new(RefCell::new(None::<ChordError>));
+        let activation_error = Rc::new(RefCell::new(None::<ChordError>));
+        let view_cell: Rc<RefCell<Option<ServiceView>>> = Rc::new(RefCell::new(None));
+
+        let fencing = facet("fencing-facet", {
+            let singleton = singleton.clone();
+            let keyed = keyed.clone();
+            let local_keyed = local_keyed.clone();
+            let setup_read_error = setup_error.clone();
+            let spawner_cell = spawner_cell.clone();
+            let local_spawner_cell = local_spawner_cell.clone();
+            let activation_error = activation_error.clone();
+            let view_cell = view_cell.clone();
+            move |env| {
+                // The environment and spawner spell debug surfaces.
+                assert!(format!("{env:?}").contains("FacetEnvironment"));
+                // A view captured during setup rejects reads until the facet
+                // activates.
+                let view = env
+                    .use_service(&singleton)
+                    .unwrap_or_else(|e| panic!("use: {e}"));
+                if let Err(error) = view.state("state") {
+                    *setup_read_error.borrow_mut() = Some(error);
+                } else {
+                    panic!("a setup-time read rejects");
+                }
+                *view_cell.borrow_mut() = Some(view);
+                let spawner = env.provide_many(&keyed).expect("provide_many lands");
+                assert!(format!("{spawner:?}").contains("test.fence1.keyed"));
+                *spawner_cell.borrow_mut() = Some(spawner);
+                let local_spawner = env
+                    .provide_many(&local_keyed)
+                    .expect("local provide_many lands");
+                *local_spawner_cell.borrow_mut() = Some(local_spawner);
+                let mut stateful = ServiceImplementation::new();
+                stateful.state("state", MutableReplicatedState::new(js("A")));
+                stateful.method(
+                    "read",
+                    sync_method(|_args: Vec<JsonValue>, _context: &Context| Ok(Some(js("A")))),
+                );
+                env.provide(&singleton, stateful).expect("provide lands");
+                let late_service = singleton.clone();
+                env.on_activate({
+                    let env_error = activation_error.clone();
+                    Box::new(move |env: &mut FacetEnvironment| {
+                        // Providing during activation is fenced.
+                        if let Err(error) = env.provide(&late_service, read_implementation("late"))
+                        {
+                            *env_error.borrow_mut() = Some(error);
+                        }
+                        boxed(async { Ok(()) })
+                    })
+                });
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![fencing],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+
+        let error = setup_error
+            .borrow()
+            .clone()
+            .expect("the setup-time read rejected");
+        assert!(
+            error_message(&error).contains("cannot be used while setting_up"),
+            "setup-time read: {error}"
+        );
+        let error = activation_error
+            .borrow()
+            .clone()
+            .expect("the activation fence fires");
+        assert!(
+            error_message(&error).contains("can provide services only during setup"),
+            "activation provide: {error}"
+        );
+
+        // The captured view works after activation.
+        let view = view_cell.borrow().clone().expect("the view is captured");
+        assert!(view.state("state").is_ok());
+
+        // The host connected the spawner, so connecting again rejects; the
+        // local spawner's registry fences empty and duplicate keys, and
+        // closing twice settles twice.
+        let spawner = spawner_cell.borrow().clone().expect("spawner captured");
+        let error = spawner
+            .connect(|_key, _implementation| {
+                let close: Rc<dyn Fn() -> Result<(), ChordError>> = Rc::new(|| Ok(()));
+                Ok(close)
+            })
+            .expect_err("the spawner is already connected");
+        assert!(error_message(&error).contains("already connected"));
+
+        let local_spawner = local_spawner_cell
+            .borrow()
+            .clone()
+            .expect("local spawner captured");
+        let close = local_spawner
+            .spawn("dialog", read_implementation("L"))
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        close().unwrap_or_else(|e| panic!("close: {e}"));
+        close().unwrap_or_else(|e| panic!("close again: {e}"));
+        let error = local_spawner
+            .spawn("", read_implementation("L"))
+            .err()
+            .expect("an empty key rejects");
+        assert!(
+            error_message(&error).contains("key must not be empty"),
+            "empty key: {error}"
+        );
+        let first = local_spawner
+            .spawn("dup", read_implementation("L"))
+            .unwrap_or_else(|e| panic!("spawn dup: {e}"));
+        let error = local_spawner
+            .spawn("dup", read_implementation("L"))
+            .err()
+            .expect("a duplicate key rejects");
+        assert!(
+            error_message(&error).contains("already has a live instance"),
+            "duplicate key: {error}"
+        );
+        first().unwrap_or_else(|e| panic!("close dup: {e}"));
+
+        // After disposal the spawner's lifecycle gate rejects spawns.
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let error = local_spawner
+            .spawn("late", read_implementation("L"))
+            .err()
+            .expect("a disposed facet rejects spawns");
+        assert!(
+            error_message(&error).contains("can spawn service instances only while active"),
+            "late spawn: {error}"
+        );
+    });
+}
+
+#[test]
+fn facet_loaders_aggregate_and_replay_their_failures() {
+    rt().block_on(async {
+        // A failure on the first loader propagates plainly.
+        let plain_loader =
+            pi_chord::api::combine_facet_loaders(vec![Rc::new(MessageFailingLoader {
+                message: "first loader failed",
+            })]);
+        let error = plain_loader
+            .load()
+            .await
+            .expect_err("the combined loader fails");
+        assert!(error_message(&error).contains("first loader failed"));
+
+        // A failing disposal from an earlier loader folds into the
+        // aggregate.
+        let aggregate_loader = pi_chord::api::combine_facet_loaders(vec![
+            Rc::new(OkFailingDisposalLoader),
+            Rc::new(MessageFailingLoader {
+                message: "second loader failed",
+            }),
+        ]);
+        let error = aggregate_loader
+            .load()
+            .await
+            .expect_err("the aggregate forms");
+        assert!(
+            error_message(&error).contains("Facet loading and cleanup failed")
+                && error_message(&error).contains("loader disposal failed"),
+            "aggregate: {error}"
+        );
+
+        // The loaded generation's disposal collects failures and settles
+        // once: two failing disposals aggregate.
+        let disposal_loader = pi_chord::api::combine_facet_loaders(vec![
+            Rc::new(LoadedWithFailingDisposal),
+            Rc::new(LoadedWithFailingDisposal),
+        ]);
+        let loaded = disposal_loader
+            .load()
+            .await
+            .unwrap_or_else(|e| panic!("load: {e}"));
+        let error = (loaded.dispose)()
+            .await
+            .expect_err("the failing disposals aggregate");
+        assert!(
+            error_message(&error).contains("Failed to dispose loaded facets"),
+            "disposal: {error}"
+        );
+
+        // The default reporter and identity facet constructors answer.
+        let _ = pi_chord::api::default_on_error();
+        let facet_def = facet("identity", |_env: &mut FacetEnvironment| ());
+        assert_eq!(
+            pi_chord::api::define_facet(facet_def.clone()).id,
+            facet_def.id
+        );
+    });
+}
+
+#[test]
+fn facet_hosts_gate_phase_and_release_external_sources() {
+    rt().block_on(async {
+        let external =
+            define_service("test.phase.external").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // A kernel that never activated rejects disposal with its phase.
+        let kernel = pi_chord::facets::host::FacetKernel::new(FacetKernelOptions {
+            facets: Vec::new(),
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .unwrap_or_else(|e| panic!("kernel: {e}"));
+        assert!(format!("{kernel:?}").contains("FacetKernel"));
+        let error = kernel
+            .dispose()
+            .await
+            .expect_err("an unactivated host rejects disposal");
+        assert!(
+            error_message(&error).contains("cannot be disposed while setup"),
+            "phase gate: {error}"
+        );
+
+        // An external source binds requirements; a retained handle rejects
+        // reads after the host dies, through the host's phase gate.
+        let source_views: Rc<RefCell<Vec<ServiceView>>> = Rc::new(RefCell::new(Vec::new()));
+        let source = ExternalSource {
+            accepts_unavailable: false,
+            fail_dispose: false,
+            offered: vec![ServiceCatalogueEntry {
+                service_id: external.id.clone(),
+                mode: ServiceMode::Singleton,
+            }],
+            views: source_views.clone(),
+        };
+        let consumer = facet("external-consumer", {
+            let external = external.clone();
+            move |env| {
+                env.use_service(&external)
+                    .unwrap_or_else(|e| panic!("use: {e}"));
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer],
+            service_sources: vec![Rc::new(source)],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the external binding activates");
+        let view = source_views.borrow()[0].clone();
+        assert!(view.state("state").is_err());
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let error = view
+            .state("state")
+            .expect_err("the disposed host's phase gate rejects");
+        assert!(
+            error_message(&error).contains("cannot be used during dead"),
+            "dead-phase read: {error}"
+        );
+
+        // A source whose binding fails disposal folds the failure into the
+        // host's report.
+        let deferred =
+            define_service("test.phase.deferred").unwrap_or_else(|e| panic!("define: {e}"));
+        let source = ExternalSource {
+            accepts_unavailable: true,
+            fail_dispose: true,
+            offered: Vec::new(),
+            views: Rc::new(RefCell::new(Vec::new())),
+        };
+        let consumer = facet("deferred-consumer", {
+            let deferred = deferred.clone();
+            move |env| {
+                env.use_service(&deferred)
+                    .unwrap_or_else(|e| panic!("use: {e}"));
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer],
+            service_sources: vec![Rc::new(source)],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the deferred binding activates: {e}"));
+        let error = host
+            .dispose()
+            .await
+            .expect_err("the failing source disposal aggregates");
+        assert!(
+            error_message(&error).contains("external source disposal failed"),
+            "source disposal: {error}"
+        );
+
+        // Two deferred sources for one requirement reject the graph.
+        let consumer = facet("orphan-consumer", {
+            let deferred = deferred.clone();
+            move |env| {
+                env.use_service(&deferred)
+                    .unwrap_or_else(|e| panic!("use: {e}"));
+            }
+        });
+        let error = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer],
+            service_sources: vec![
+                Rc::new(ExternalSource {
+                    accepts_unavailable: true,
+                    fail_dispose: false,
+                    offered: Vec::new(),
+                    views: Rc::new(RefCell::new(Vec::new())),
+                }),
+                Rc::new(ExternalSource {
+                    accepts_unavailable: true,
+                    fail_dispose: false,
+                    offered: Vec::new(),
+                    views: Rc::new(RefCell::new(Vec::new())),
+                }),
+            ],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect_err("two deferred sources reject");
+        assert!(
+            error_message(&error).contains("more than one deferred source"),
+            "deferred fence: {error}"
+        );
+    });
+}
+
+/// An external service source whose catalogue and disposal the case
+/// controls. Its services interface serves local-backed views whose reads
+/// ride the host's access gate; the views it hands out are retained in
+/// `views` so a case can read one after the host dies.
+struct ExternalSource {
+    accepts_unavailable: bool,
+    fail_dispose: bool,
+    offered: Vec<ServiceCatalogueEntry>,
+    views: Rc<RefCell<Vec<ServiceView>>>,
+}
+
+impl RemoteServiceSource for ExternalSource {
+    fn accepts_unavailable_services(&self) -> bool {
+        self.accepts_unavailable
+    }
+
+    fn catalogue(
+        &self,
+        _context: Context,
+    ) -> LocalBoxFuture<Result<Vec<ServiceCatalogueEntry>, ChordError>> {
+        boxed(std::future::ready(Ok(self.offered.clone())))
+    }
+
+    fn open(&self, options: RemoteServiceSourceOpenOptions) -> Rc<dyn RemoteServices> {
+        Rc::new(ExternalServices {
+            assert: options.assert_access,
+            fail_dispose: self.fail_dispose,
+            views: self.views.clone(),
+        })
+    }
+}
+
+struct ExternalServices {
+    assert: pi_chord::handle::AssertAccess,
+    fail_dispose: bool,
+    views: Rc<RefCell<Vec<ServiceView>>>,
+}
+
+impl RemoteServices for ExternalServices {
+    fn use_service(&self, service: &Service) -> Result<ServiceView, ChordError> {
+        let slot = ServiceSlot::new(&service.id);
+        slot.bind(ServiceTarget::Local(Rc::new(read_implementation("A"))));
+        let view = slot.view(self.assert.clone());
+        self.views.borrow_mut().push(view.clone());
+        Ok(view)
+    }
+
+    fn observe(
+        &self,
+        _service: &Service,
+        _handler: KeyedViewHandler,
+    ) -> Result<Unsubscribe, ChordError> {
+        Ok(Box::new(|| ()))
+    }
+
+    fn ready(&self, _context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
+        boxed(std::future::ready(Ok(())))
+    }
+
+    fn dispose(&self, _context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
+        if self.fail_dispose {
+            boxed(std::future::ready(Err(ChordError::Message(
+                "external source disposal failed".to_string(),
+            ))))
+        } else {
+            boxed(std::future::ready(Ok(())))
+        }
+    }
+}
+
+#[test]
+fn facet_graphs_fence_duplicate_provisions_and_requirement_mismatches() {
+    rt().block_on(async {
+        let mixed = define_service("test.graph.mixed").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // One service provided as both singleton and keyed rejects.
+        let host_facet = facet("graph-singleton", {
+            let mixed = mixed.clone();
+            move |env| {
+                env.provide(&mixed, read_implementation("A"))
+                    .expect("provide lands");
+            }
+        });
+        let keyed_facet = facet("mixed-keyed", {
+            let mixed = mixed.clone();
+            move |env| {
+                env.provide_many(&mixed).expect("provide_many lands");
+            }
+        });
+        let error = create_facet_host(FacetKernelOptions {
+            facets: vec![host_facet, keyed_facet],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect_err("the mixed provision rejects");
+        assert!(
+            error_message(&error).contains("provided as both singleton and keyed"),
+            "mixed: {error}"
+        );
+
+        // A requirement whose mode mismatches the provision rejects.
+        // (An external entry cannot double-provide: requirements resolve to
+        // the external surface only for services no facet provides, so the
+        // host-and-facet provision arm stays unreachable by construction.)
+        let keyed_only =
+            define_service("test.graph.keyed-only").unwrap_or_else(|e| panic!("define: {e}"));
+        let consumer = facet("graph-consumer-2", {
+            let keyed_only = keyed_only.clone();
+            move |env| {
+                env.use_service(&keyed_only)
+                    .unwrap_or_else(|e| panic!("use: {e}"));
+            }
+        });
+        let provider = facet("graph-provider-2", {
+            let keyed_only = keyed_only.clone();
+            move |env| {
+                env.provide_many(&keyed_only).expect("provide_many lands");
+            }
+        });
+        let error = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer, provider],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect_err("the mode mismatch rejects");
+        assert!(
+            error_message(&error).contains("but"),
+            "mode mismatch: {error}"
+        );
+
+        // A facet requiring its own provision activates.
+        let self_served =
+            define_service("test.graph.self").unwrap_or_else(|e| panic!("define: {e}"));
+        let self_facet = facet("self-serving", {
+            let self_served = self_served.clone();
+            move |env| {
+                env.provide(&self_served, read_implementation("A"))
+                    .expect("provide lands");
+                env.use_service(&self_served)
+                    .unwrap_or_else(|e| panic!("use: {e}"));
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![self_facet],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("self-requirement activates: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+/// A loader whose loaded generation's teardown fails, the fixture the
+/// disposal-aggregation case rides on.
+struct OkFailingDisposalLoader;
+
+impl FacetLoader for OkFailingDisposalLoader {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
+        let failing: pi_chord::handle::Disposal = Box::new(|| {
+            boxed(async { Err(ChordError::Message("loader disposal failed".to_string())) })
+        });
+        boxed(std::future::ready(Ok(LoadedFacets {
+            facets: Vec::new(),
+            dispose: failing,
+        })))
+    }
+}
+
+/// A loader that fails its load with the message the case pins.
+struct MessageFailingLoader {
+    message: &'static str,
+}
+
+impl FacetLoader for MessageFailingLoader {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
+        boxed(std::future::ready(Err(ChordError::Message(
+            self.message.to_string(),
+        ))))
+    }
+}
+
+/// A loader whose loaded generation's teardown fails, the fixture the
+/// disposal-aggregation case rides on.
+struct LoadedWithFailingDisposal;
+
+impl FacetLoader for LoadedWithFailingDisposal {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
+        let failing: pi_chord::handle::Disposal = Box::new(|| {
+            boxed(async { Err(ChordError::Message("loaded disposal failed".to_string())) })
+        });
+        boxed(std::future::ready(Ok(LoadedFacets {
+            facets: Vec::new(),
+            dispose: failing,
+        })))
+    }
+}
+
+#[test]
+fn facet_reloads_aggregate_stage_and_activation_cleanup_failures() {
+    rt().block_on(async {
+        let svc = define_service("test.reload.svc").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // A staged reload whose setup registered a failing teardown folds
+        // the cleanup failure into the report.
+        let failing_teardown = facet("reloadable", {
+            let svc = svc.clone();
+            move |env| {
+                env.provide(&svc, read_implementation("A"))
+                    .expect("provide lands");
+                env.on_deactivate(Box::new(|| {
+                    boxed(async { Err(ChordError::Message("teardown failed".to_string())) })
+                }));
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![failing_teardown.clone()],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("host: {e}"));
+
+        // A staged replacement whose implementation is invalid fails
+        // staging; its teardown failure aggregates.
+        // A staged reload whose implementation is not remotely
+        // exposable fails staging; its teardown failure aggregates.
+        let invalid = facet("reloadable", {
+            let svc = svc.clone();
+            move |env| {
+                let mut non_exposable = ServiceImplementation::new();
+                non_exposable.method(
+                    "read",
+                    sync_method(|_args: Vec<JsonValue>, _context: &Context| Ok(Some(js("A")))),
+                );
+                non_exposable.value("payload", Rc::new(()));
+                env.provide(&svc, non_exposable).expect("provide lands");
+                env.on_deactivate(Box::new(|| {
+                    boxed(async { Err(ChordError::Message("staged teardown failed".to_string())) })
+                }));
+            }
+        });
+        let error = host
+            .reload(vec![invalid])
+            .await
+            .expect_err("the invalid stage rejects");
+        assert!(
+            error_message(&error).contains("Facet reload setup and cleanup failed")
+                && error_message(&error).contains("staged teardown failed"),
+            "stage aggregate: {error}"
+        );
+
+        // A failed cleanup aborts the host, so the activation-failure
+        // aggregate needs a fresh host.
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![failing_teardown],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("second host: {e}"));
+
+        // An activation failure with a failing teardown aggregates the
+        // abort.
+        let failing_activation = facet("reloadable", {
+            let svc = svc.clone();
+            move |env| {
+                env.provide(&svc, read_implementation("B"))
+                    .expect("provide lands");
+                env.on_activate(Box::new(|_env: &mut FacetEnvironment| {
+                    boxed(async { Err(ChordError::Message("activation failed".to_string())) })
+                }));
+                env.on_deactivate(Box::new(|| {
+                    boxed(async {
+                        Err(ChordError::Message(
+                            "activation teardown failed".to_string(),
+                        ))
+                    })
+                }));
+            }
+        });
+        let error = host
+            .reload(vec![failing_activation])
+            .await
+            .expect_err("the failed activation aggregates");
+        assert!(
+            error_message(&error).contains("Facet reload activation and cleanup failed")
+                && error_message(&error).contains("activation failed")
+                && error_message(&error).contains("teardown failed"),
+            "activation aggregate: {error}"
+        );
+
+        // The surviving generation still serves reads, and the host
+        // disposes cleanly.
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn facet_hosts_bind_external_keyed_sources() {
+    rt().block_on(async {
+        let external =
+            define_service("test.extkey.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+        let source = ExternalSource {
+            accepts_unavailable: false,
+            fail_dispose: false,
+            offered: vec![ServiceCatalogueEntry {
+                service_id: external.id.clone(),
+                mode: ServiceMode::Keyed,
+            }],
+            views: Rc::new(RefCell::new(Vec::new())),
+        };
+        let consumer = facet("external-keyed-consumer", {
+            let external = external.clone();
+            move |env| {
+                env.observe_service(
+                    &external,
+                    Rc::new(|_view: ServiceView, _context: Context| ()),
+                )
+                .expect("observe lands");
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer],
+            service_sources: vec![Rc::new(source)],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("the external keyed binding activates: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
     });
 }

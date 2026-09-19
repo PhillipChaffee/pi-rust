@@ -1126,3 +1126,354 @@ fn parses_every_update_arm_and_guards_control_calls() {
     let error = expect_err(parse_service_call(&bad_args));
     assert!(error.to_string().contains("Invalid service call"));
 }
+
+#[test]
+fn parses_every_update_arm_in_both_forms_and_fences_snapshot_shapes() {
+    let address = ServiceInstanceAddress {
+        key: "dialog".to_string(),
+        generation: 1,
+    };
+
+    // Every decoded update kind round-trips, with state and method members
+    // riding along.
+    let decoded_updates = [
+        ServiceProviderUpdate::Unavailable,
+        ServiceProviderUpdate::Replaced {
+            snapshot: ServiceInstanceSnapshot {
+                instance: None,
+                members: vec![
+                    ServiceMemberSnapshot::Method {
+                        name: "send".to_string(),
+                    },
+                    ServiceMemberSnapshot::State {
+                        name: "state".to_string(),
+                        sequence: 2,
+                        ops: vec![Op::Replace(js("value"))],
+                    },
+                ],
+            },
+        },
+        ServiceProviderUpdate::Spawned {
+            instance: ServiceInstanceSnapshot {
+                instance: Some(address.clone()),
+                members: vec![ServiceMemberSnapshot::State {
+                    name: "request".to_string(),
+                    sequence: 3,
+                    ops: vec![Op::Replace(js("First?"))],
+                }],
+            },
+        },
+        ServiceProviderUpdate::Closed {
+            instance: address.clone(),
+        },
+        ServiceProviderUpdate::State {
+            instance: Some(address.clone()),
+            member: "request".to_string(),
+            sequence: 1,
+            ops: vec![Op::Replace(js("Updated?"))],
+        },
+    ];
+    for update in &decoded_updates {
+        let json = update_to_json(update);
+        let parsed = expect_ok(parse_service_provider_update(&json));
+        assert_eq!(
+            update_to_json(&parsed).to_json_string(),
+            json.to_json_string()
+        );
+    }
+
+    // The wire form round-trips the same way through its own parser.
+    let wire_updates = [
+        pi_chord::services::wire::WireServiceProviderUpdate::Unavailable,
+        pi_chord::services::wire::WireServiceProviderUpdate::Replaced {
+            snapshot: WireServiceInstanceSnapshot {
+                instance: None,
+                members: vec![
+                    WireServiceMemberSnapshot::Method {
+                        name: "send".to_string(),
+                    },
+                    WireServiceMemberSnapshot::State {
+                        name: "state".to_string(),
+                        sequence: 2,
+                        ops: vec![WireOp::Replace(js("value"))],
+                    },
+                ],
+            },
+        },
+        pi_chord::services::wire::WireServiceProviderUpdate::Spawned {
+            instance: WireServiceInstanceSnapshot {
+                instance: Some(address.clone()),
+                members: vec![WireServiceMemberSnapshot::State {
+                    name: "request".to_string(),
+                    sequence: 1,
+                    ops: vec![WireOp::Replace(js("First?"))],
+                }],
+            },
+        },
+        pi_chord::services::wire::WireServiceProviderUpdate::Closed {
+            instance: address.clone(),
+        },
+        pi_chord::services::wire::WireServiceProviderUpdate::State {
+            instance: Some(address),
+            member: "request".to_string(),
+            sequence: 1,
+            ops: vec![WireOp::Replace(js("Updated?"))],
+        },
+    ];
+    for update in &wire_updates {
+        let json = wire_update_to_json(update);
+        let parsed = expect_ok(parse_wire_service_provider_update(&json));
+        assert_eq!(
+            wire_update_to_json(&parsed).to_json_string(),
+            json.to_json_string()
+        );
+    }
+
+    // Subscription snapshots with method members parse in both forms.
+    let decoded_snapshot = ServiceSubscriptionSnapshot {
+        service_id: "pi.models".to_string(),
+        mode: ServiceMode::Singleton,
+        instances: vec![ServiceInstanceSnapshot {
+            instance: None,
+            members: vec![ServiceMemberSnapshot::Method {
+                name: "select".to_string(),
+            }],
+        }],
+    };
+    let parsed = parse_snapshot(&snapshot_to_json(&decoded_snapshot));
+    assert!(matches!(
+        parsed.instances[0].members[0],
+        ServiceMemberSnapshot::Method { .. }
+    ));
+    let wire_snapshot = WireServiceSubscriptionSnapshot {
+        service_id: "pi.models".to_string(),
+        mode: ServiceMode::Singleton,
+        instances: vec![WireServiceInstanceSnapshot {
+            instance: None,
+            members: vec![WireServiceMemberSnapshot::Method {
+                name: "select".to_string(),
+            }],
+        }],
+    };
+    let parsed = parse_wire_snapshot(&wire_snapshot_to_json(&wire_snapshot));
+    assert!(matches!(
+        parsed.instances[0].members[0],
+        WireServiceMemberSnapshot::Method { .. }
+    ));
+
+    // A service call without an instance parses; the address stays absent.
+    let bare_call = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("member", js("select")),
+        ("args", JsonValue::Array(vec![])),
+    ]);
+    let parsed = expect_ok(parse_service_call(&bare_call));
+    assert_eq!(parsed.instance, None);
+
+    // Snapshot and instance shape violations reject.
+    let with_unknown_key = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        ("instances", JsonValue::Array(vec![])),
+        ("extra", JsonValue::Bool(true)),
+    ]);
+    let error = expect_err(parse_service_subscription_snapshot(&with_unknown_key));
+    assert!(
+        error
+            .to_string()
+            .contains("Invalid service subscription snapshot")
+    );
+
+    let instances_not_array = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        ("instances", js("not a list")),
+    ]);
+    assert!(parse_service_subscription_snapshot(&instances_not_array).is_err());
+
+    let instance_not_record = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        ("instances", JsonValue::Array(vec![js("not an object")])),
+    ]);
+    assert!(parse_service_subscription_snapshot(&instance_not_record).is_err());
+
+    let members_not_array = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        (
+            "instances",
+            JsonValue::Array(vec![jo(vec![("members", js("not a list"))])]),
+        ),
+    ]);
+    assert!(parse_service_subscription_snapshot(&instance_not_record).is_err());
+    assert!(parse_service_subscription_snapshot(&members_not_array).is_err());
+
+    let missing_required = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("instances", JsonValue::Array(vec![])),
+    ]);
+    assert!(parse_service_subscription_snapshot(&missing_required).is_err());
+
+    let bad_state_name = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        (
+            "instances",
+            JsonValue::Array(vec![jo(vec![(
+                "members",
+                JsonValue::Array(vec![jo(vec![
+                    ("name", number(7)),
+                    ("kind", js("state")),
+                    ("sequence", number(0)),
+                    ("ops", JsonValue::Array(vec![])),
+                ])]),
+            )])]),
+        ),
+    ]);
+    assert!(parse_service_subscription_snapshot(&bad_state_name).is_err());
+
+    let bad_ops = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        (
+            "instances",
+            JsonValue::Array(vec![jo(vec![(
+                "members",
+                JsonValue::Array(vec![jo(vec![
+                    ("name", js("state")),
+                    ("kind", js("state")),
+                    ("sequence", number(0)),
+                    ("ops", js("not a list")),
+                ])]),
+            )])]),
+        ),
+    ]);
+    assert!(parse_service_subscription_snapshot(&bad_ops).is_err());
+
+    let unknown_kind = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        (
+            "instances",
+            JsonValue::Array(vec![jo(vec![(
+                "members",
+                JsonValue::Array(vec![jo(vec![("name", js("x")), ("kind", js("weird"))])]),
+            )])]),
+        ),
+    ]);
+    assert!(parse_service_subscription_snapshot(&unknown_kind).is_err());
+
+    let address_extra = jo(vec![
+        ("key", js("dialog")),
+        ("generation", number(1)),
+        ("extra", JsonValue::Bool(true)),
+    ]);
+    let bad_address = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("keyed")),
+        (
+            "instances",
+            JsonValue::Array(vec![jo(vec![
+                ("instance", address_extra),
+                ("members", JsonValue::Array(vec![])),
+            ])]),
+        ),
+    ]);
+    assert!(parse_service_subscription_snapshot(&bad_address).is_err());
+
+    // Provider update shape violations reject: a non-string member, a
+    // non-array op list, and a state update with a malformed address.
+    let bad_member = jo(vec![
+        ("type", js("state")),
+        ("member", number(7)),
+        ("sequence", number(1)),
+        ("ops", JsonValue::Array(vec![])),
+    ]);
+    let error = expect_err(parse_service_provider_update(&bad_member));
+    assert!(error.to_string().contains("Invalid service state update"));
+    let bad_update_ops = jo(vec![
+        ("type", js("state")),
+        ("member", js("state")),
+        ("sequence", number(1)),
+        ("ops", js("not a list")),
+    ]);
+    assert!(parse_service_provider_update(&bad_update_ops).is_err());
+    let unknown_update = jo(vec![("type", js("weird"))]);
+    let error = expect_err(parse_service_provider_update(&unknown_update));
+    assert!(
+        error
+            .to_string()
+            .contains("Invalid service provider update")
+    );
+    let bad_closed = jo(vec![
+        ("type", js("closed")),
+        ("instance", js("not an address")),
+    ]);
+    assert!(parse_service_provider_update(&bad_closed).is_err());
+}
+
+#[test]
+fn endpoint_keyed_subscriptions_render_addressed_snapshots() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let dialogs = pi_chord::api::define_service("test.endpoint.keyed").expect("not reserved");
+        let provider = RemoteServiceProvider::new(vec![
+            pi_chord::services::provider::ServiceProviderDefinition {
+                service: dialogs.clone(),
+                mode: ServiceMode::Keyed,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("provider: {e}"));
+        let _close = provider
+            .spawn(&dialogs, "dialog", {
+                let mut implementation = ServiceImplementation::new();
+                implementation.method(
+                    "read",
+                    Rc::new(|_args: Vec<JsonValue>, _context: Context| {
+                        Box::pin(std::future::ready(Ok(None)))
+                    }),
+                );
+                implementation
+            })
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let endpoint = create_remote_service_endpoint(&provider);
+        let publish: pi_chord::types::ServiceUpdatePublisher = Rc::new(|_id, _update, _context| ());
+        let snapshot = endpoint
+            .invoke(
+                create_service_subscribe_call("keyed-1", &dialogs.id, ServiceMode::Keyed),
+                publish,
+                background_context(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("subscribe: {e}"))
+            .expect("the snapshot renders");
+        // The keyed instance renders its address.
+        let rendered = snapshot.to_json_string();
+        assert!(
+            rendered.contains("\"instance\""),
+            "keyed snapshot: {rendered}"
+        );
+        assert!(
+            rendered.contains("\"generation\""),
+            "keyed snapshot: {rendered}"
+        );
+        let parsed = parse_snapshot(&snapshot);
+        assert_eq!(
+            parsed.instances[0].instance,
+            Some(ServiceInstanceAddress {
+                key: "dialog".to_string(),
+                generation: 1,
+            })
+        );
+        let wire_parsed = parse_wire_snapshot(&snapshot);
+        assert!(wire_parsed.instances[0].instance.is_some());
+        endpoint.dispose();
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}

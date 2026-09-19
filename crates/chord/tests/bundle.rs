@@ -1640,3 +1640,143 @@ fn validates_manifests_and_artifacts_before_loading() {
         assert!(error_message(&error).contains("entry name must not be empty"));
     });
 }
+
+#[test]
+fn spells_the_loader_debug_surfaces_and_reports_missing_module_files() {
+    let output_directory = temp_dir();
+    let module_host = program_host(generation_service());
+    let result = runtime().block_on(async {
+        bundle_facets(BundleFacetsOptions {
+            plugin: FacetBundlePlugin {
+                id: "test.bundle.debug".to_string(),
+                version: Some("1.0.0".to_string()),
+            },
+            entries: vec![(
+                "generation".to_string(),
+                FacetEntrySource {
+                    text: generation_program("generation.svc", "one"),
+                    external_imports: Vec::new(),
+                    source_map: None,
+                },
+            )],
+            outdir: output_directory.path().join("out"),
+            working_directory: None,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("bundle: {e}"))
+    });
+    let manifest_path = result.manifest_path;
+
+    // The loader options and loader spell debug surfaces.
+    let options = FacetBundleLoaderOptions {
+        manifest_path: manifest_path.clone(),
+        entry: "generation".to_string(),
+        resolve_external: None,
+        module_host: host_rc(&module_host),
+    };
+    assert!(format!("{options:?}").contains("\"generation\""));
+    let loader = create_facet_bundle_loader(options);
+    assert!(format!("{loader:?}").contains("generation"));
+
+    // The artifact loader's options and loader spell debug surfaces.
+    let artifact = read_facet_bundle_artifact(&manifest_path, "generation")
+        .unwrap_or_else(|e| panic!("artifact: {e}"));
+    let artifact_options = FacetBundleArtifactLoaderOptions {
+        artifact,
+        resolve_external: None,
+        temporary_directory: Some(temp_dir().path().to_path_buf()),
+        module_host: host_rc(&module_host),
+    };
+    assert!(format!("{artifact_options:?}").contains("generation"));
+    let artifact_loader =
+        create_facet_bundle_artifact_loader(artifact_options).expect("the artifact validates");
+    assert!(format!("{artifact_loader:?}").starts_with("ArtifactFacetLoader"));
+
+    // A manifest whose entry file is missing fails the load with the read
+    // error.
+    let module_file = manifest_path
+        .parent()
+        .expect("the manifest has a parent")
+        .join(
+            read_facet_bundle_manifest(&manifest_path)
+                .expect("the manifest reads")
+                .entry("generation")
+                .expect("the entry exists")
+                .file
+                .clone(),
+        );
+    std::fs::remove_file(&module_file).expect("the module file removal lands");
+    let error = runtime()
+        .block_on(FacetLoader::load(&loader))
+        .expect_err("the missing module file rejects");
+    assert!(
+        error_message(&error).contains("Could not load facet bundle entry")
+            && error_message(&error).contains("Could not read facet bundle entry"),
+        "missing module: {error}"
+    );
+}
+
+#[test]
+fn package_metadata_fences_missing_and_escaping_configured_entries() {
+    let package = temp_dir();
+    let package_directory = package.path().join("pkg");
+    std::fs::create_dir_all(&package_directory).expect("the package directory creates");
+    std::fs::write(
+        package_directory.join("package.json"),
+        r#"{"name":"test.bundle","version":"1.0.0","chord":{"facets":{"generation":"./generation.js"}}}"#,
+    )
+    .expect("the package metadata writes");
+    let options_for = || BundleFacetPackageOptions {
+        package_path: package_directory.clone(),
+        outdir: package.path().join("build"),
+        default_facets: Vec::new(),
+    };
+
+    // A configured facet that points at a missing file rejects.
+    let error = runtime()
+        .block_on(bundle_facet_package(options_for()))
+        .expect_err("the missing configured facet rejects");
+    assert!(
+        error_message(&error).contains("Could not access configured facet entry"),
+        "missing entry file: {error}"
+    );
+
+    // A configured entry whose file is a symlink escaping the package
+    // directory rejects.
+    let outside = temp_dir();
+    let outside_file = outside.path().join("outside.js");
+    std::fs::write(&outside_file, "module.exports = {};\n").expect("the outside file writes");
+    std::os::unix::fs::symlink(&outside_file, package_directory.join("generation.js"))
+        .expect("the symlink creates");
+    let error = runtime()
+        .block_on(bundle_facet_package(options_for()))
+        .expect_err("the escaping symlink rejects");
+    assert!(
+        error_message(&error).contains("resolves outside the package directory"),
+        "symlink escape: {error}"
+    );
+}
+
+#[test]
+fn package_metadata_paths_fence_their_shapes() {
+    // An empty path and a nonexistent path reject with their messages.
+    let error = runtime()
+        .block_on(bundle_facet_package(BundleFacetPackageOptions {
+            package_path: PathBuf::from(""),
+            outdir: temp_dir().path().join("build"),
+            default_facets: Vec::new(),
+        }))
+        .expect_err("an empty path rejects");
+    assert!(error_message(&error).contains("path must not be empty"));
+    let error = runtime()
+        .block_on(bundle_facet_package(BundleFacetPackageOptions {
+            package_path: PathBuf::from("/nonexistent-facet-package-path"),
+            outdir: temp_dir().path().join("build"),
+            default_facets: Vec::new(),
+        }))
+        .expect_err("a missing path rejects");
+    assert!(
+        error_message(&error).contains("Could not access facet package"),
+        "missing path: {error}"
+    );
+}
