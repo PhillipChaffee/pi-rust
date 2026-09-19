@@ -20,11 +20,15 @@
 
 pub mod box_component;
 pub mod cancellable_loader;
+pub mod h_stack;
 pub mod loader;
 pub mod mouse_region;
+pub mod scroll_view;
 pub mod spacer;
+pub mod stack;
 pub mod text;
 pub mod truncated_text;
+pub mod v_stack;
 
 use std::sync::Arc;
 
@@ -34,8 +38,14 @@ pub type ColorFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 pub use box_component::Box;
 pub use cancellable_loader::CancellableLoader;
+pub use h_stack::HStack;
 pub use loader::{Loader, LoaderIndicatorOptions};
 pub use mouse_region::MouseRegion;
+pub use scroll_view::{
+    FollowMode, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollViewScrollbar,
+};
 pub use spacer::Spacer;
+pub use stack::{StackChild, StackEntry, StackEntryOptions, StackOptions, allocate_stack_sizes};
 pub use text::Text;
 pub use truncated_text::TruncatedText;
+pub use v_stack::VStack;

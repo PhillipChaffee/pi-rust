@@ -83,6 +83,8 @@ pub mod components;
 pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
+pub mod layout;
+pub mod layout_node;
 pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;

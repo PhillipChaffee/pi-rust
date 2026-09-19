@@ -324,6 +324,15 @@ pub trait Component: Any {
     fn as_focusable(&self) -> Option<&dyn Focusable> {
         None
     }
+
+    /// Upstream's `LAYOUT_NODE` capability
+    /// (`Symbol.for("@earendil-works/pi-tui/layout-node")`): `Some(node)`
+    /// when the component participates in the constrained layout engine
+    /// (stacks and scroll views), `None` for plain components (survey
+    /// flag 1).
+    fn layout_node(&self) -> Option<crate::layout_node::LayoutNode> {
+        None
+    }
 }
 
 /// Interface for components that can receive focus and display a hardware
