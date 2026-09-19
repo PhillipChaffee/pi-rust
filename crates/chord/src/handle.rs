@@ -332,8 +332,8 @@ impl ServiceView {
         let slot = self.slot.clone();
         let member = member.to_string();
         boxed(async move {
-            let target = resolve_target(&slot)?;
             (access)()?;
+            let target = resolve_target(&slot)?;
             match target {
                 ServiceTarget::Local(implementation) => {
                     invoke_local_member(&member, &implementation, args, context).await

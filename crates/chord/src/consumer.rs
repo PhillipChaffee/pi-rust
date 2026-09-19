@@ -1168,8 +1168,6 @@ impl KeyedBindingState {
                 background_context(),
             )
             .await?;
-        // The same await boundary for the keyed start.
-        crate::future::yield_once().await;
         if self.closed.get() || !self.bound.get() || self.revision.get() != revision {
             (subscription.close)(Some(background_context())).await?;
             return Ok(());

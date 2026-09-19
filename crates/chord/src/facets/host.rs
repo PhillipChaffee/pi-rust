@@ -90,7 +90,13 @@ type Observation = Box<dyn FnOnce() -> Result<Disposal, ChordError>>;
 
 /// One activation hook, upstream's `() => void | Promise<void>` with the
 /// failure the await propagates carried as the result.
-pub type ActivationCallback = Box<dyn Fn() -> LocalBoxFuture<Result<(), ChordError>>>;
+pub type ActivationCallback =
+    Box<dyn Fn(&mut FacetEnvironment) -> LocalBoxFuture<Result<(), ChordError>>>;
+
+/// One teardown hook, upstream's onDeactivate callback. Teardown runs
+/// after service access is revoked, so the hook is env-free: anything it
+/// needs is captured at setup.
+pub type TeardownCallback = Box<dyn Fn() -> LocalBoxFuture<Result<(), ChordError>>>;
 
 impl FacetLifecycle {
     fn assert_active(&self, operation: &str) -> Result<(), ChordError> {
@@ -175,7 +181,7 @@ impl FacetLifecycle {
         Ok(())
     }
 
-    async fn activate(&self) -> Result<(), ChordError> {
+    async fn activate(&self, environment: &mut FacetEnvironment) -> Result<(), ChordError> {
         if self.state.get() != LifecycleState::Prepared {
             return Err(ChordError::Message(format!(
                 "Facet {} is not prepared",
@@ -191,7 +197,7 @@ impl FacetLifecycle {
         let callbacks: Vec<ActivationCallback> =
             self.activate_callbacks.borrow_mut().drain(..).collect();
         for callback in callbacks {
-            callback().await?;
+            callback(environment).await?;
         }
         Ok(())
     }
@@ -412,10 +418,8 @@ impl FacetEnvironment {
     ///
     /// # Errors
     /// [`ChordError`] when the facet is no longer setting up.
-    pub fn on_deactivate(&mut self, callback: ActivationCallback) -> Result<(), ChordError> {
-        self.runtime
-            .lifecycle
-            .own(Box::new(move || boxed(async move { callback().await })))
+    pub fn on_deactivate(&mut self, callback: TeardownCallback) -> Result<(), ChordError> {
+        self.runtime.lifecycle.own(Box::new(move || callback()))
     }
 }
 
@@ -1056,7 +1060,11 @@ impl FacetKernel {
                 .find(|(facet_id, _)| *facet_id == id)
                 .map(|(_, record)| record.clone());
             if let Some(record) = record {
-                record.lifecycle.activate().await?;
+                let mut environment = FacetEnvironment {
+                    runtime: record.clone(),
+                    slots: self.core.slots.clone(),
+                };
+                record.lifecycle.activate(&mut environment).await?;
             }
         }
         self.core.phase.set(GenerationPhase::Active);
@@ -1251,7 +1259,11 @@ impl FacetKernel {
         candidate_order: &[Rc<RuntimeRecord>],
     ) -> Result<(), ChordError> {
         for candidate in candidate_order {
-            candidate.lifecycle.activate().await?;
+            let mut environment = FacetEnvironment {
+                runtime: candidate.clone(),
+                slots: self.core.slots.clone(),
+            };
+            candidate.lifecycle.activate(&mut environment).await?;
         }
         for candidate in candidate_order {
             self.validate_replacement_provisions(candidate)?;
