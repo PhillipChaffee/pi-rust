@@ -9,6 +9,8 @@
 //! field type); the diagnostics helpers port with the utils belt.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use pi_telemetry::TelemetryHandle;
 use serde::{Deserialize, Serialize};
@@ -2242,7 +2244,120 @@ pub struct ImagesModel {
     pub output: Vec<Modality>,
 }
 
+/// A boxed future, the port of the crate's promise-returning contracts.
+pub type BoxedFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The uniform stream contract of an API implementation module.
+///
+/// Every module under upstream's `src/api/` exports `stream` and
+/// `streamSimple`; capable modules may also export deferred-response methods.
+/// Lazy wrappers and provider factories pass these around as values. This is
+/// the untyped dispatch shape; per-API option typing lives on the
+/// implementation modules themselves and on `Provider.stream()` via
+/// `ApiStreamOptions`.
+///
+/// Contract: `stream` and `streamSimple` return the
+/// [`AssistantMessageEventStream`](crate::utils::event_stream::AssistantMessageEventStream) synchronously, matching upstream's
+/// lazy-stream contract — a direct call may fail synchronously when request
+/// auth is missing; once a stream is returned, request, model, and runtime
+/// failures are encoded in that stream. Error termination must produce an
+/// assistant message with stop reason `"error"` or `"aborted"` and
+/// `errorMessage`, emitted via the stream protocol.
+pub trait ProviderStreams: Send + Sync {
+    /// Stream an assistant response for the model and context.
+    fn stream(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> crate::utils::event_stream::AssistantMessageEventStream;
+
+    /// Stream a simple assistant response for the model and context.
+    fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: Option<&SimpleStreamOptions>,
+    ) -> crate::utils::event_stream::AssistantMessageEventStream;
+
+    /// Fetch a deferred response by its durable handle; only adapters that
+    /// support deferred responses implement it, upstream's optional method.
+    fn fetch_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        options: Option<&DeferredFetchOptions>,
+    ) -> Option<crate::utils::event_stream::AssistantMessageEventStream> {
+        let _ = (model, handle, options);
+        None
+    }
+
+    /// Cancel a deferred response; only adapters that support deferred
+    /// responses implement it, upstream's optional method.
+    ///
+    /// # Errors
+    /// The returned future resolves to the provider's failure.
+    fn cancel_deferred<'a>(
+        &'a self,
+        _model: &'a Model,
+        _handle: &'a DeferredHandle,
+        _options: Option<&'a DeferredCancelOptions>,
+    ) -> BoxedFuture<'a, Result<(), crate::utils::provider_retry::ProviderRequestError>> {
+        Box::pin(async { Err(crate::utils::provider_retry::ProviderRequestError::aborted()) })
+    }
+}
+
+/// The uniform contract of an image-generation API implementation module.
+///
+/// Every image API module under upstream's `src/api/` exports exactly
+/// `generateImages`, so the module itself satisfies this interface.
+pub trait ProviderImages: Send + Sync {
+    /// Generate images for the input context.
+    ///
+    /// # Errors
+    /// The boxed future resolves to the provider's failure; per-image
+    /// failures inside a completed run surface through
+    /// [`AssistantImages::stop_reason`] instead.
+    fn generate_images<'a>(
+        &'a self,
+        model: &'a ImagesModel,
+        context: &'a ImagesContext,
+        options: Option<&'a ImagesOptions>,
+    ) -> BoxedFuture<'a, Result<AssistantImages, crate::utils::provider_retry::ProviderRequestError>>;
+}
+
+/// A stream function, upstream's `StreamFunction`: the typed function shape
+/// lazy wrappers and provider factories pass around as values. See
+/// [`ProviderStreams`] for the stream contract.
+pub type StreamFunction = Box<
+    dyn Fn(
+            &Model,
+            &Context,
+            Option<&StreamOptions>,
+        ) -> crate::utils::event_stream::AssistantMessageEventStream
+        + Send
+        + Sync,
+>;
+
+/// An image-generation function, upstream's `ImagesFunction`. See
+/// [`ProviderImages`] for the contract.
+pub type ImagesFunction = Box<
+    dyn for<'a> Fn(
+            &'a ImagesModel,
+            &'a ImagesContext,
+            Option<&'a ImagesOptions>,
+        ) -> BoxedFuture<
+            'a,
+            Result<AssistantImages, crate::utils::provider_retry::ProviderRequestError>,
+        > + Send
+        + Sync,
+>;
+
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "the tests pin parse outcomes; an unexpected result panics the test by design"
+)]
 mod partition_tests {
     use super::deserialize_partition;
 

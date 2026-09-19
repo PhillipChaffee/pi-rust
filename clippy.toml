@@ -7,4 +7,5 @@
 # whole point is that prose may reference them bare.
 # House provider names carried bare in the types' wire docs (pi-ai port).
 doc-valid-idents = ["AcpClient", "OpenCode", "WKWebView", "OpenAI", "OpenRouter",
-    "MiniMax", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR", ".."]
+    "MiniMax", "MiMo", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR",
+    "AbortSignal", "UUIDv7", "HttpClient", "WeakMap", "serde_json", ".."]

@@ -32,10 +32,13 @@
 //!   field's shape by the model's `api` at the type level, the wire object
 //!   carries no discriminator, and the field sets never conflict — one struct
 //!   with per-field ownership documented round-trips the same JSON.
-//!
-//! [ADR 0004]: ../../docs/adr/0004-open-telemetry-seam.md
+//! - `sanitize-unicode.ts` is not ported: Rust strings are UTF-8 and cannot
+//!   hold the unpaired surrogates it strips, and `serde_json` rejects
+//!   lone-surrogate escapes when reading the wire, so the invariant it
+//!   enforces is statically upheld.
 
 #![forbid(unsafe_code)]
 
 pub mod session_resources;
 pub mod types;
+pub mod utils;
