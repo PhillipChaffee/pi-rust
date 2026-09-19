@@ -1048,8 +1048,15 @@ fn drain_input_waits_out_a_silent_channel() {
     terminal.set_input_handler(None);
 
     let start = Instant::now();
+    // A silent open channel exits through the idle window, which precedes
+    // the max bound here (upstream breaks on whichever fires first).
     terminal.drain_input(30, 20);
-    assert!(start.elapsed() >= Duration::from_millis(30));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(20),
+        "the idle window bounds the wait"
+    );
+    assert!(elapsed < Duration::from_millis(500));
     drop(input_tx);
 }
 
