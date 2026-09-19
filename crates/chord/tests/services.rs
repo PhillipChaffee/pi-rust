@@ -239,6 +239,133 @@ fn tracks_mutable_source_state_while_publishing_immutable_revisions() {
     assert_eq!(kinds, vec!["hydrate", "update"]);
     unsubscribe();
 }
+
+#[test]
+fn flushes_pending_mutations_before_hydrating_a_new_state_subscriber() {
+    let initial = jo(vec![(
+        "entries",
+        JsonValue::Array(vec![jo(vec![("id", js("one"))])]),
+    )]);
+    let state = replicated_state(initial);
+    let first = Rc::new(RefCell::new(Vec::<JsonValue>::new()));
+    let _unsubscribe_first = state
+        .subscribe({
+            let first = first.clone();
+            Rc::new(
+                move |value: &JsonValue,
+                      _context: &Context,
+                      _delivery: &pi_chord::types::ReplicatedStateDelivery| {
+                    first.borrow_mut().push(value.clone());
+                },
+            )
+        })
+        .unwrap_or_else(|e| panic!("subscribe: {e}"));
+
+    state.mutate(|tracker| {
+        tracker
+            .set(
+                &[key("entries"), Seg::Index(1)],
+                jo(vec![("id", js("two"))]),
+            )
+            .expect("the write lands");
+    });
+
+    let second = Rc::new(RefCell::new(Vec::<JsonValue>::new()));
+    let _unsubscribe_second = state
+        .subscribe({
+            let second = second.clone();
+            Rc::new(
+                move |value: &JsonValue,
+                      _context: &Context,
+                      _delivery: &pi_chord::types::ReplicatedStateDelivery| {
+                    second.borrow_mut().push(value.clone());
+                },
+            )
+        })
+        .unwrap_or_else(|e| panic!("subscribe: {e}"));
+
+    assert_eq!(
+        *first.borrow(),
+        vec![
+            jo(vec![(
+                "entries",
+                JsonValue::Array(vec![jo(vec![("id", js("one"))])])
+            )]),
+            jo(vec![(
+                "entries",
+                JsonValue::Array(vec![
+                    jo(vec![("id", js("one"))]),
+                    jo(vec![("id", js("two"))])
+                ])
+            )]),
+        ]
+    );
+    assert_eq!(
+        *second.borrow(),
+        vec![jo(vec![(
+            "entries",
+            JsonValue::Array(vec![
+                jo(vec![("id", js("one"))]),
+                jo(vec![("id", js("two"))])
+            ])
+        )])]
+    );
+}
+
+/// Upstream's `does not defensively clone method arguments or results`
+/// asserts `Object.is` identity on the argument the implementation receives
+/// and the result the caller receives; owned data has no identity to spell,
+/// so the port pins the loopback handing both sides their values unmodified.
+#[test]
+fn passes_method_arguments_and_results_through_the_loopback_unchanged() {
+    let rt = runtime();
+    rt.block_on(async {
+        let echo = define_service("test.echo").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = provider_for(&[&echo]);
+        let received = Rc::new(RefCell::new(None));
+        let mut implementation = ServiceImplementation::new();
+        implementation.method("echo", {
+            let received = received.clone();
+            Rc::new(move |args: Vec<JsonValue>, _context: Context| {
+                let received = received.clone();
+                let response = jo(vec![("value", js("response"))]);
+                boxed(async move {
+                    *received.borrow_mut() = args.first().cloned();
+                    Ok(Some(response))
+                })
+            })
+        });
+        provider
+            .provide(&echo, implementation)
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+
+        let binding = binding_for(vec![echo.clone()], &provider, None);
+        let echo_view = binding
+            .use_service(&echo)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+
+        let request = jo(vec![("value", js("request"))]);
+        let response = echo_view
+            .call("echo", vec![request.clone()], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("echo: {e}"));
+        assert_eq!(response, Some(jo(vec![("value", js("response"))])));
+        assert_eq!(*received.borrow(), Some(request));
+
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+    });
+}
+
 /// Builds the Models implementation: a `state` member plus a `select`
 /// method that records the model, bumps the revision, publishes with the
 /// invocation context, and captures the published value — the port of the
