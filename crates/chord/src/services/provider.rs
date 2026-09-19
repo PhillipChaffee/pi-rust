@@ -37,9 +37,13 @@ pub struct ServiceProviderDefinition {
     pub mode: ServiceMode,
 }
 
+/// The subscription close handle, upstream's `() => Promise<void>` as the
+/// boxed synchronous close the port hands back.
+pub(crate) type SubscriptionClose = Box<dyn Fn(Option<Context>) -> LocalBoxFuture<Result<(), ChordError>>>;
+
 /// A singleton definition, upstream's bare `{ id }` catalogue entry.
 #[must_use]
-pub fn singleton_definition(service: Service) -> ServiceProviderDefinition {
+pub const fn singleton_definition(service: Service) -> ServiceProviderDefinition {
     ServiceProviderDefinition {
         service,
         mode: ServiceMode::Singleton,
@@ -159,7 +163,7 @@ impl RemoteServiceProvider {
     /// remotely exposable.
     pub fn provide(&self, service: &Service, implementation: ServiceImplementation) -> Result<(), ChordError> {
         self.assert_active()?;
-        self.assert_remotable(service)?;
+        assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
         let registration = self.registration(&service.id, ServiceMode::Singleton)?;
         if registration.borrow().singleton.is_some() {
@@ -171,8 +175,8 @@ impl RemoteServiceProvider {
         validate_remote_implementation(&service.id, &implementation)?;
         let implementation = Rc::new(implementation);
         let shape = implementation.member_shape();
-        assert_singleton_shape(&registration.borrow(), shape.clone())?;
-        let instance = self.create_instance(&registration, implementation, None);
+        assert_singleton_shape(&registration.borrow(), &shape)?;
+        let instance = create_instance(&registration, implementation, None);
         registration.borrow_mut().singleton = Some(instance);
         Ok(())
     }
@@ -185,7 +189,7 @@ impl RemoteServiceProvider {
     /// not allowlisted, or the mode mismatches.
     pub fn withdraw(&self, service: &Service) -> Result<(), ChordError> {
         self.assert_active()?;
-        self.assert_remotable(service)?;
+        assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
         let registration = self.registration(&service.id, ServiceMode::Singleton)?;
         let previous = registration.borrow().singleton.clone();
@@ -200,7 +204,7 @@ impl RemoteServiceProvider {
             }
             registration.singleton = None;
         }
-        self.emit(&registration, ServiceProviderUpdate::Unavailable, None)
+        emit(&registration, &ServiceProviderUpdate::Unavailable, None)
     }
 
     /// Validates one singleton replacement without changing the active
@@ -215,11 +219,11 @@ impl RemoteServiceProvider {
         implementation: &ServiceImplementation,
     ) -> Result<(), ChordError> {
         self.assert_active()?;
-        self.assert_remotable(service)?;
+        assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
         let registration = self.registration(&service.id, ServiceMode::Singleton)?;
         validate_remote_implementation(&registration.borrow().service_id, implementation)?;
-        assert_singleton_shape(&registration.borrow(), implementation.member_shape())
+        assert_singleton_shape(&registration.borrow(), &implementation.member_shape())
     }
 
     /// Replaces one singleton without making its stable remote facade
@@ -230,14 +234,14 @@ impl RemoteServiceProvider {
     /// not allowlisted, or the replacement breaks the member shape.
     pub fn replace(&self, service: &Service, implementation: ServiceImplementation) -> Result<(), ChordError> {
         self.assert_active()?;
-        self.assert_remotable(service)?;
+        assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
         let registration = self.registration(&service.id, ServiceMode::Singleton)?;
         validate_remote_implementation(&service.id, &implementation)?;
         let implementation = Rc::new(implementation);
         let shape = implementation.member_shape();
-        assert_singleton_shape(&registration.borrow(), shape.clone())?;
-        let replacement = self.create_instance(&registration, implementation, None);
+        assert_singleton_shape(&registration.borrow(), &shape)?;
+        let replacement = create_instance(&registration, implementation, None);
         {
             let mut registration = registration.borrow_mut();
             if let Some(previous) = registration.singleton.take() {
@@ -249,10 +253,10 @@ impl RemoteServiceProvider {
             registration.singleton = Some(replacement.clone());
             registration.singleton_shape = Some(shape);
         }
-        self.emit(
+        emit(
             &registration,
-            ServiceProviderUpdate::Replaced {
-                snapshot: self.snapshot_instance(&replacement),
+            &ServiceProviderUpdate::Replaced {
+                snapshot: snapshot_instance(&replacement),
             },
             None,
         )
@@ -263,25 +267,25 @@ impl RemoteServiceProvider {
     /// # Errors
     /// [`ChordError`] when the provider is disposed, the service is local or
     /// not allowlisted, or no singleton is provided.
-    #[must_use]
     pub fn use_service(&self, service: &Service) -> Result<Rc<ServiceImplementation>, ChordError> {
         self.assert_active()?;
-        self.assert_remotable(service)?;
+        assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
         let registration = self.find_registration(&service.id)?;
         let registration = registration.borrow();
-        if registration.mode != ServiceMode::Singleton || registration.singleton.is_none() {
+        if registration.mode != ServiceMode::Singleton {
             return Err(remote_error(
                 RemoteServiceErrorCode::ServiceNotFound,
                 format!("Remote service {} has no local provider", service.id),
             ));
         }
-        Ok(registration
-            .singleton
-            .as_ref()
-            .expect("checked above")
-            .implementation
-            .clone())
+        let Some(instance) = registration.singleton.as_ref() else {
+            return Err(remote_error(
+                RemoteServiceErrorCode::ServiceNotFound,
+                format!("Remote service {} has no local provider", service.id),
+            ));
+        };
+        Ok(instance.implementation.clone())
     }
 
     /// Spawns one keyed instance and returns the closure that closes it.
@@ -290,6 +294,11 @@ impl RemoteServiceProvider {
     /// # Errors
     /// [`ChordError`] when the provider is disposed, the service is local or
     /// not allowlisted, the key is empty or live, or the mode mismatches.
+    ///
+    /// # Panics
+    /// Never for instances [`spawn`](Self::spawn) created: the close closure
+    /// reads back the address spawn attached; a panic would be a port bug,
+    /// not a runtime condition.
     pub fn spawn(
         &self,
         service: &Service,
@@ -297,7 +306,7 @@ impl RemoteServiceProvider {
         implementation: ServiceImplementation,
     ) -> Result<impl Fn() -> Result<(), ChordError> + 'static, ChordError> {
         self.assert_active()?;
-        self.assert_remotable(service)?;
+        assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
         if key.is_empty() {
             return Err(ChordError::Message(
@@ -319,19 +328,18 @@ impl RemoteServiceProvider {
         };
         validate_remote_implementation(&service.id, &implementation)?;
         let implementation = Rc::new(implementation);
-        let instance = self.create_instance(&registration, implementation, Some(address));
+        let instance = create_instance(&registration, implementation, Some(address));
         registration
             .borrow_mut()
             .instances
             .push((key.to_string(), instance.clone()));
-        self.emit(
+        emit(
             &registration,
-            ServiceProviderUpdate::Spawned {
-                instance: self.snapshot_instance(&instance),
+            &ServiceProviderUpdate::Spawned {
+                instance: snapshot_instance(&instance),
             },
             None,
         )?;
-        let provider = self.clone();
         let close_registration = registration;
         let close_instance = instance;
         Ok(move || {
@@ -348,9 +356,13 @@ impl RemoteServiceProvider {
                 remove();
             }
             registration.instances.retain(|(_, current)| !Rc::ptr_eq(current, &close_instance));
+            #[allow(
+                clippy::expect_used,
+                reason = "keyed instances always carry the address spawn attached; this closure only closes instances spawn created"
+            )]
             let address = close_instance.address.clone().expect("keyed instances carry addresses");
             drop(registration);
-            provider.emit(&close_registration, ServiceProviderUpdate::Closed { instance: address }, None)
+            emit(&close_registration, &ServiceProviderUpdate::Closed { instance: address }, None)
         })
     }
 
@@ -359,8 +371,9 @@ impl RemoteServiceProvider {
     /// # Errors
     /// [`ChordError`] when the provider is disposed, the service or member
     /// is unknown, the mode or member mismatches, or the member fails.
+    #[must_use]
     pub fn invoke(&self, call: ServiceCall, context: Context) -> LocalBoxFuture<Result<Option<JsonValue>, ChordError>> {
-        let resolved = self.resolve_method(&call);
+        let resolved = self.resolve_method(call);
         boxed(async move {
             let (method, args) = resolved?;
             method(args, context).await
@@ -391,7 +404,7 @@ impl RemoteServiceProvider {
                 format!("Remote service {service_id} has no provider"),
             ));
         }
-        self.publish_pending(&registration)?;
+        publish_pending(&registration)?;
         let subscriber = Rc::new(Subscriber {
             listener,
             buffer: RefCell::new(Vec::new()),
@@ -400,7 +413,7 @@ impl RemoteServiceProvider {
             closed: Cell::new(false),
         });
         registration.borrow_mut().subscribers.push(subscriber.clone());
-        let snapshot = self.snapshot(&registration.borrow());
+        let snapshot = snapshot(&registration.borrow());
         let activate_subscriber = subscriber.clone();
         let activate: Box<dyn Fn() -> Result<(), ChordError>> = Box::new(move || {
             if activate_subscriber.closed.get() || activate_subscriber.active.get() {
@@ -422,7 +435,7 @@ impl RemoteServiceProvider {
         });
         let close_subscriber = subscriber;
         let close_registration = registration;
-        let close: Box<dyn Fn(Option<Context>) -> LocalBoxFuture<Result<(), ChordError>>> = Box::new(move |_| {
+        let close: SubscriptionClose = Box::new(move |_| {
             if close_subscriber.closed.get() {
                 return boxed(std::future::ready(Ok(())));
             }
@@ -447,6 +460,11 @@ impl RemoteServiceProvider {
     ///
     /// # Errors
     /// [`ChordError`] aggregating the failures collected while emitting.
+    ///
+    /// # Panics
+    /// Never for instances [`spawn`](Self::spawn) created: dispose reads
+    /// back the address spawn attached; a panic would be a port bug, not a
+    /// runtime condition.
     pub fn dispose(&self) -> Result<(), ChordError> {
         if self.0.disposed.get() {
             return Ok(());
@@ -466,7 +484,7 @@ impl RemoteServiceProvider {
                     }
                     registration.singleton = None;
                 }
-                if let Err(error) = self.emit(&registration, ServiceProviderUpdate::Unavailable, None) {
+                if let Err(error) = emit(&registration, &ServiceProviderUpdate::Unavailable, None) {
                     errors.push(error);
                 }
             }
@@ -483,8 +501,12 @@ impl RemoteServiceProvider {
                         .instances
                         .retain(|(_, current)| !Rc::ptr_eq(current, &instance));
                 }
+                #[allow(
+                    clippy::expect_used,
+                    reason = "keyed instances always carry the address spawn attached; dispose only closes instances spawn created"
+                )]
                 let address = instance.address.clone().expect("keyed instances carry addresses");
-                if let Err(error) = self.emit(&registration, ServiceProviderUpdate::Closed { instance: address }, None) {
+                if let Err(error) = emit(&registration, &ServiceProviderUpdate::Closed { instance: address }, None) {
                     errors.push(error);
                 }
             }
@@ -534,227 +556,6 @@ impl RemoteServiceProvider {
         Ok(registration)
     }
 
-    fn create_instance(
-        &self,
-        registration: &Rc<RefCell<Registration>>,
-        implementation: Rc<ServiceImplementation>,
-        address: Option<ServiceInstanceAddress>,
-    ) -> Rc<ProviderInstance> {
-        let instance = Rc::new(ProviderInstance {
-            address,
-            implementation,
-            remove_member_listeners: RefCell::new(Vec::new()),
-            active: Cell::new(true),
-        });
-        let members: Vec<(String, ServiceMember)> = instance
-            .implementation
-            .members()
-            .map(|(name, member)| {
-                let member = match member {
-                    ServiceMember::Method(method) => ServiceMember::Method(method.clone()),
-                    ServiceMember::State(state) => ServiceMember::State(state.clone()),
-                    ServiceMember::Value(value) => ServiceMember::Value(value.clone()),
-                };
-                (name.clone(), member)
-            })
-            .collect();
-        for (name, member) in members {
-            let ServiceMember::State(state) = member else {
-                continue;
-            };
-            let listener = {
-                let registration = registration.clone();
-                let provider = self.clone();
-                let instance = instance.clone();
-                let address = instance.address.clone();
-                move |ops: &[Op], sequence: u64, context: &Context| -> Result<(), ChordError> {
-                    if !instance.active.get() {
-                        return Ok(());
-                    }
-                    provider.emit(
-                        &registration,
-                        ServiceProviderUpdate::State {
-                            instance: address.clone(),
-                            member: name.clone(),
-                            sequence,
-                            ops: ops.to_vec(),
-                        },
-                        Some(context),
-                    )
-                }
-            };
-            let unsubscribe = state.source_subscribe(Rc::new(listener));
-            instance.remove_member_listeners.borrow_mut().push(unsubscribe);
-        }
-        instance
-    }
-
-    fn resolve_instance(
-        &self,
-        registration: &Registration,
-        address: &Option<ServiceInstanceAddress>,
-    ) -> Result<Rc<ProviderInstance>, ChordError> {
-        if registration.mode == ServiceMode::Singleton {
-            if address.is_some() {
-                return Err(remote_error(
-                    RemoteServiceErrorCode::ServiceModeMismatch,
-                    format!("Remote service {} is singleton", registration.service_id),
-                ));
-            }
-            return registration.singleton.clone().ok_or_else(|| {
-                remote_error(
-                    RemoteServiceErrorCode::ServiceNotFound,
-                    format!("Remote service {} has no provider", registration.service_id),
-                )
-            });
-        }
-        let Some(address) = address else {
-            return Err(remote_error(
-                RemoteServiceErrorCode::ServiceModeMismatch,
-                format!("Remote service {} is keyed", registration.service_id),
-            ));
-        };
-        let instance = registration
-            .instances
-            .iter()
-            .find(|(key, _)| key == &address.key)
-            .map(|(_, instance)| instance.clone())
-            .ok_or_else(|| {
-                remote_error(
-                    RemoteServiceErrorCode::ServiceInstanceNotFound,
-                    format!(
-                        "Remote service {} has no instance {}",
-                        registration.service_id, address.key
-                    ),
-                )
-            })?;
-        if instance.address.as_ref().map(|stored| stored.generation) != Some(address.generation) {
-            return Err(remote_error(
-                RemoteServiceErrorCode::ServiceStaleInstance,
-                format!(
-                    "Remote service {} instance {} is stale",
-                    registration.service_id, address.key
-                ),
-            ));
-        }
-        Ok(instance)
-    }
-
-    fn publish_pending(&self, registration: &Rc<RefCell<Registration>>) -> Result<(), ChordError> {
-        let context = service_delivery_context();
-        let instances: Vec<Rc<ProviderInstance>> = match registration.borrow().mode {
-            ServiceMode::Singleton => registration.borrow().singleton.clone().into_iter().collect(),
-            ServiceMode::Keyed => registration
-                .borrow()
-                .instances
-                .iter()
-                .map(|(_, instance)| instance.clone())
-                .collect(),
-        };
-        for instance in instances {
-            for (_, member) in instance.implementation.members() {
-                if let ServiceMember::State(state) = member {
-                    state.publish(&context)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn snapshot(&self, registration: &Registration) -> crate::types::ServiceSubscriptionSnapshot {
-        let instances = match registration.mode {
-            ServiceMode::Singleton => registration
-                .singleton
-                .as_ref()
-                .map(|singleton| vec![self.snapshot_instance(singleton)])
-                .unwrap_or_default(),
-            ServiceMode::Keyed => {
-                let mut instances: Vec<Rc<ProviderInstance>> =
-                    registration.instances.iter().map(|(_, i)| i.clone()).collect();
-                instances.sort_by_key(|instance| {
-                    instance
-                        .address
-                        .as_ref()
-                        .map(|address| address.key.clone())
-                        .unwrap_or_default()
-                });
-                instances.iter().map(|instance| self.snapshot_instance(instance)).collect()
-            }
-        };
-        crate::types::ServiceSubscriptionSnapshot {
-            service_id: registration.service_id.clone(),
-            mode: registration.mode,
-            instances,
-        }
-    }
-
-    fn snapshot_instance(&self, instance: &ProviderInstance) -> crate::types::ServiceInstanceSnapshot {
-        let members = instance
-            .implementation
-            .members()
-            .map(|(name, member)| match member {
-                ServiceMember::Method(_) => crate::types::ServiceMemberSnapshot::Method { name: name.clone() },
-                ServiceMember::State(state) => crate::types::ServiceMemberSnapshot::State {
-                    name: name.clone(),
-                    sequence: state.sequence(),
-                    ops: vec![Op::Replace(state.value())],
-                },
-                ServiceMember::Value(_) => unreachable!(),
-            })
-            .collect();
-        crate::types::ServiceInstanceSnapshot {
-            instance: instance.address.clone(),
-            members,
-        }
-    }
-
-    fn emit(
-        &self,
-        registration: &Rc<RefCell<Registration>>,
-        update: ServiceProviderUpdate,
-        context: Option<&Context>,
-    ) -> Result<(), ChordError> {
-        let (subscribers, service_id): (Vec<Rc<Subscriber>>, String) = {
-            let registration = registration.borrow();
-            (registration.subscribers.clone(), registration.service_id.clone())
-        };
-        if subscribers.is_empty() {
-            return Ok(());
-        }
-        let delivery_context = context.map_or_else(service_delivery_context, Clone::clone);
-        let mut errors = Vec::new();
-        for subscriber in subscribers {
-            if subscriber.closed.get() {
-                continue;
-            }
-            if !subscriber.active.get() {
-                subscriber
-                    .buffer
-                    .borrow_mut()
-                    .push((update.clone(), delivery_context.clone()));
-                continue;
-            }
-            if let Err(error) = call_listener(&subscriber.listener, &update, &delivery_context) {
-                errors.push(error);
-            }
-        }
-        collect_errors(
-            errors,
-            format!("Failed to publish remote service {service_id} update", service_id = registration.borrow().service_id),
-        )
-        .map_or(Ok(()), Err)
-    }
-
-    fn assert_remotable(&self, service: &Service) -> Result<(), ChordError> {
-        if service.local {
-            return Err(remote_error(
-                RemoteServiceErrorCode::ServiceNotAllowed,
-                format!("Service {} is process-local", service.id),
-            ));
-        }
-        Ok(())
-    }
-
     fn assert_allowed(&self, service_id: &str) -> Result<(), ChordError> {
         if !self.0.registrations.borrow().iter().any(|(id, _)| id == service_id) {
             return Err(remote_error(
@@ -774,13 +575,13 @@ impl RemoteServiceProvider {
 
     fn resolve_method(
         &self,
-        call: &ServiceCall,
+        call: ServiceCall,
     ) -> Result<(RemoteMethod, Vec<JsonValue>), ChordError> {
         self.assert_active()?;
         self.assert_allowed(&call.service_id)?;
         let registration = self.find_registration(&call.service_id)?;
         let registration = registration.borrow();
-        let instance = self.resolve_instance(&registration, &call.instance)?;
+        let instance = resolve_instance(&registration, call.instance.as_ref())?;
         let member = instance.implementation.member(&call.member).ok_or_else(|| {
             remote_error(
                 RemoteServiceErrorCode::ServiceMemberNotFound,
@@ -796,8 +597,251 @@ impl RemoteServiceProvider {
                 ),
             ));
         };
-        Ok((method.clone(), call.args.clone()))
+        Ok((method.clone(), call.args))
     }
+}
+
+/// Resolves the live instance one call addresses, keyed instances by
+/// address and singletons by absence of one.
+///
+/// # Errors
+/// [`ChordError`] when the mode mismatches the address, the singleton is
+/// missing, the instance is unknown, or the generation is stale.
+fn resolve_instance(
+    registration: &Registration,
+    address: Option<&ServiceInstanceAddress>,
+) -> Result<Rc<ProviderInstance>, ChordError> {
+    if registration.mode == ServiceMode::Singleton {
+        if address.is_some() {
+            return Err(remote_error(
+                RemoteServiceErrorCode::ServiceModeMismatch,
+                format!("Remote service {} is singleton", registration.service_id),
+            ));
+        }
+        return registration.singleton.clone().ok_or_else(|| {
+            remote_error(
+                RemoteServiceErrorCode::ServiceNotFound,
+                format!("Remote service {} has no provider", registration.service_id),
+            )
+        });
+    }
+    let Some(address) = address else {
+        return Err(remote_error(
+            RemoteServiceErrorCode::ServiceModeMismatch,
+            format!("Remote service {} is keyed", registration.service_id),
+        ));
+    };
+    let instance = registration
+        .instances
+        .iter()
+        .find(|(key, _)| key == &address.key)
+        .map(|(_, instance)| instance.clone())
+        .ok_or_else(|| {
+            remote_error(
+                RemoteServiceErrorCode::ServiceInstanceNotFound,
+                format!(
+                    "Remote service {} has no instance {}",
+                    registration.service_id, address.key
+                ),
+            )
+        })?;
+    if instance.address.as_ref().map(|stored| stored.generation) != Some(address.generation) {
+        return Err(remote_error(
+            RemoteServiceErrorCode::ServiceStaleInstance,
+            format!(
+                "Remote service {} instance {} is stale",
+                registration.service_id, address.key
+            ),
+        ));
+    }
+    Ok(instance)
+}
+
+/// Flushes the tracked surface of every provided state before a
+/// subscription registers, upstream's `#publishPending`.
+///
+/// # Errors
+/// [`ChordError`] when one of the states fails to publish.
+fn publish_pending(registration: &Rc<RefCell<Registration>>) -> Result<(), ChordError> {
+    let context = service_delivery_context();
+    let instances: Vec<Rc<ProviderInstance>> = match registration.borrow().mode {
+        ServiceMode::Singleton => registration.borrow().singleton.clone().into_iter().collect(),
+        ServiceMode::Keyed => registration
+            .borrow()
+            .instances
+            .iter()
+            .map(|(_, instance)| instance.clone())
+            .collect(),
+    };
+    for instance in instances {
+        for (_, member) in instance.implementation.members() {
+            if let ServiceMember::State(state) = member {
+                state.publish(&context)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Builds the snapshot a subscription starts from, keyed instances sorted
+/// by key.
+fn snapshot(registration: &Registration) -> crate::types::ServiceSubscriptionSnapshot {
+    let instances = match registration.mode {
+        ServiceMode::Singleton => registration
+            .singleton
+            .as_ref()
+            .map(|singleton| vec![snapshot_instance(singleton)])
+            .unwrap_or_default(),
+        ServiceMode::Keyed => {
+            let mut instances: Vec<Rc<ProviderInstance>> =
+                registration.instances.iter().map(|(_, i)| i.clone()).collect();
+            instances.sort_by_key(|instance| {
+                instance
+                    .address
+                    .as_ref()
+                    .map(|address| address.key.clone())
+                    .unwrap_or_default()
+            });
+            instances.iter().map(|instance| snapshot_instance(instance)).collect()
+        }
+    };
+    crate::types::ServiceSubscriptionSnapshot {
+        service_id: registration.service_id.clone(),
+        mode: registration.mode,
+        instances,
+    }
+}
+
+/// Builds one instance's member snapshot, upstream's `snapshotInstance`.
+fn snapshot_instance(instance: &ProviderInstance) -> crate::types::ServiceInstanceSnapshot {
+    let members = instance
+        .implementation
+        .members()
+        .map(|(name, member)| match member {
+            ServiceMember::Method(_) => crate::types::ServiceMemberSnapshot::Method { name: name.clone() },
+            ServiceMember::State(state) => crate::types::ServiceMemberSnapshot::State {
+                name: name.clone(),
+                sequence: state.sequence(),
+                ops: vec![Op::Replace(state.value())],
+            },
+            ServiceMember::Value(_) => unreachable!(),
+        })
+        .collect();
+    crate::types::ServiceInstanceSnapshot {
+        instance: instance.address.clone(),
+        members,
+    }
+}
+
+/// Fans one update out to a registration's subscribers: buffering inactive
+/// ones and collecting delivery failures, upstream's `#deliver`.
+///
+/// # Errors
+/// [`ChordError`] aggregating the listener failures, or the first listener
+/// panic carried as a [`ChordError`].
+fn emit(
+    registration: &Rc<RefCell<Registration>>,
+    update: &ServiceProviderUpdate,
+    context: Option<&Context>,
+) -> Result<(), ChordError> {
+    let subscribers: Vec<Rc<Subscriber>> = {
+        let registration = registration.borrow();
+        registration.subscribers.clone()
+    };
+    if subscribers.is_empty() {
+        return Ok(());
+    }
+    let delivery_context = context.map_or_else(service_delivery_context, Clone::clone);
+    let mut errors = Vec::new();
+    for subscriber in subscribers {
+        if subscriber.closed.get() {
+            continue;
+        }
+        if !subscriber.active.get() {
+            subscriber
+                .buffer
+                .borrow_mut()
+                .push((update.clone(), delivery_context.clone()));
+            continue;
+        }
+        if let Err(error) = call_listener(&subscriber.listener, update, &delivery_context) {
+            errors.push(error);
+        }
+    }
+    collect_errors(
+        errors,
+        format!("Failed to publish remote service {service_id} update", service_id = registration.borrow().service_id),
+    )
+    .map_or(Ok(()), Err)
+}
+
+/// Validates that a service may be published remotely.
+///
+/// # Errors
+/// [`ChordError`] when the service is process-local.
+fn assert_remotable(service: &Service) -> Result<(), ChordError> {
+    if service.local {
+        return Err(remote_error(
+            RemoteServiceErrorCode::ServiceNotAllowed,
+            format!("Service {} is process-local", service.id),
+        ));
+    }
+    Ok(())
+}
+
+/// Builds one instance and subscribes its state members to the
+/// registration's fan-out, upstream's `#createInstance`.
+fn create_instance(
+    registration: &Rc<RefCell<Registration>>,
+    implementation: Rc<ServiceImplementation>,
+    address: Option<ServiceInstanceAddress>,
+) -> Rc<ProviderInstance> {
+    let instance = Rc::new(ProviderInstance {
+        address,
+        implementation,
+        remove_member_listeners: RefCell::new(Vec::new()),
+        active: Cell::new(true),
+    });
+    let members: Vec<(String, ServiceMember)> = instance
+        .implementation
+        .members()
+        .map(|(name, member)| {
+            let member = match member {
+                ServiceMember::Method(method) => ServiceMember::Method(method.clone()),
+                ServiceMember::State(state) => ServiceMember::State(state.clone()),
+                ServiceMember::Value(value) => ServiceMember::Value(value.clone()),
+            };
+            (name.clone(), member)
+        })
+        .collect();
+    for (name, member) in members {
+        let ServiceMember::State(state) = member else {
+            continue;
+        };
+        let listener = {
+            let registration = registration.clone();
+            let instance = instance.clone();
+            let address = instance.address.clone();
+            move |ops: &[Op], sequence: u64, context: &Context| -> Result<(), ChordError> {
+                if !instance.active.get() {
+                    return Ok(());
+                }
+                emit(
+                    &registration,
+                    &ServiceProviderUpdate::State {
+                        instance: address.clone(),
+                        member: name.clone(),
+                        sequence,
+                        ops: ops.to_vec(),
+                    },
+                    Some(context),
+                )
+            }
+        };
+        let unsubscribe = state.source_subscribe(Rc::new(listener));
+        instance.remove_member_listeners.borrow_mut().push(unsubscribe);
+    }
+    instance
 }
 
 /// Runs one listener, upstream's try/catch around every delivery: a panic
@@ -808,7 +852,7 @@ fn call_listener(
     context: &Context,
 ) -> Result<(), ChordError> {
     std::panic::catch_unwind(AssertUnwindSafe(|| listener(update, context)))
-        .map_err(|panic| ChordError::Message(crate::services::state::panic_message(&panic)))
+        .map_err(|panic| ChordError::Message(crate::services::state::panic_message(&*panic)))
 }
 
 fn remote_error(code: RemoteServiceErrorCode, message: impl Into<String>) -> ChordError {
@@ -817,11 +861,11 @@ fn remote_error(code: RemoteServiceErrorCode, message: impl Into<String>) -> Cho
 
 fn assert_singleton_shape(
     registration: &Registration,
-    replacement: Vec<(String, ServiceMemberKind)>,
+    replacement: &[(String, ServiceMemberKind)],
 ) -> Result<(), ChordError> {
     match &registration.singleton_shape {
         None => Ok(()),
-        Some(current) if *current == replacement => Ok(()),
+        Some(current) if current.as_slice() == replacement => Ok(()),
         Some(_) => Err(remote_error(
             RemoteServiceErrorCode::ServiceMemberMismatch,
             format!(
@@ -832,13 +876,12 @@ fn assert_singleton_shape(
     }
 }
 
+/// Hosts one provider for one remote consumer and owns that consumer's
+/// subscriptions, upstream's `RemoteServiceEndpoint`.
+///
 /// The publisher an endpoint hands subscription updates to, upstream's
 /// `ServiceUpdatePublisher` with the promise arm dropped: publishing is
 /// synchronous, and a failure propagates like upstream's sync throw.
-
-
-/// Hosts one provider for one remote consumer and owns that consumer's
-/// subscriptions, upstream's `RemoteServiceEndpoint`.
 #[derive(Clone)]
 pub struct RemoteServiceEndpoint {
     provider: RemoteServiceProvider,
@@ -846,7 +889,11 @@ pub struct RemoteServiceEndpoint {
     disposed: Rc<Cell<bool>>,
 }
 
-
+impl std::fmt::Debug for RemoteServiceEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteServiceEndpoint").finish_non_exhaustive()
+    }
+}
 
 impl RemoteServiceEndpoint {
     /// Invokes one call, decoding `$chord.service` control calls first.
@@ -887,7 +934,6 @@ impl RemoteServiceEndpoint {
                     ))));
                 }
                 let listener: ServiceProviderListener = {
-                    let publish = publish.clone();
                     let subscription_id = subscription_id.clone();
                     Rc::new(move |update: &ServiceProviderUpdate, update_context: &Context| {
                         publish(&subscription_id, update, update_context);
@@ -914,15 +960,19 @@ impl RemoteServiceEndpoint {
                         .position(|(id, _)| *id == subscription_id)
                         .map(|at| subscriptions.remove(at).1)
                 };
-                match found {
-                    Some(subscription) => boxed(async move {
-                        (subscription.close)(None).await?;
-                        Ok(None)
-                    }),
-                    None => boxed(std::future::ready(Err(ChordError::Message(
-                        "Service subscription was not found".to_string(),
-                    )))),
-                }
+                found.map_or_else(
+                    || {
+                        boxed(std::future::ready(Err(ChordError::Message(
+                            "Service subscription was not found".to_string(),
+                        ))))
+                    },
+                    |subscription| {
+                        boxed(async move {
+                            (subscription.close)(None).await?;
+                            Ok(None)
+                        })
+                    },
+                )
             }
             None => self.provider.invoke(call, context),
         }
@@ -938,7 +988,7 @@ impl RemoteServiceEndpoint {
         let subscriptions: Vec<ServiceSubscription> =
             self.subscriptions.borrow_mut().drain(..).map(|(_, s)| s).collect();
         for subscription in subscriptions {
-            (subscription.close)(None);
+            drop((subscription.close)(None));
         }
     }
 }

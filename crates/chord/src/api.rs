@@ -14,15 +14,20 @@ use crate::errors::ChordError;
 use crate::facets::host::{FacetKernel, FacetKernelOptions};
 use crate::future::{LocalBoxFuture, boxed};
 use crate::handle::{Disposal, ErrorReporter};
-use crate::services::provider::RemoteServiceProvider;
 use crate::services::state::MutableReplicatedState;
-use crate::types::{FacetDef, FacetLoader, LoadedFacets, Service};
+use crate::types::{FacetDef, FacetLoader, LoadedFacets};
 
 /// A facet host over one complete active generation, upstream's
 /// `FacetHost`.
 #[derive(Clone)]
 pub struct FacetHost {
     kernel: Rc<FacetKernel>,
+}
+
+impl std::fmt::Debug for FacetHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetHost").finish_non_exhaustive()
+    }
 }
 
 /// Creates an active host for one complete set of facets.
@@ -70,7 +75,7 @@ impl FacetHost {
 /// the port's constructor adds nothing because the setup closure is
 /// synchronous by type.
 #[must_use]
-pub fn define_facet(facet: FacetDef) -> FacetDef {
+pub const fn define_facet(facet: FacetDef) -> FacetDef {
     facet
 }
 

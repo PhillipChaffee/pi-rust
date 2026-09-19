@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::context::{await_with_context, background_context};
+use crate::context::background_context;
 use crate::consumer::{RemoteServiceBinding, RemoteServiceBindingOptions};
 use crate::errors::{ChordError, collect_errors};
 use crate::future::{LocalBoxFuture, boxed, join_all};
@@ -50,7 +50,7 @@ enum Provision {
 }
 
 impl Provision {
-    fn service(&self) -> &Service {
+    const fn service(&self) -> &Service {
         match self {
             Self::Singleton { service, .. } | Self::Keyed { service, .. } => service,
         }
@@ -82,9 +82,13 @@ struct FacetLifecycle {
     state: Cell<LifecycleState>,
     service_access: Cell<bool>,
     effects: RefCell<Vec<Disposal>>,
-    observations: RefCell<Vec<Box<dyn FnOnce() -> Result<Disposal, ChordError>>>>,
+    observations: RefCell<Vec<Observation>>,
     activate_callbacks: RefCell<Vec<ActivationCallback>>,
 }
+
+/// One deferred keyed-observation start, upstream's observation thunk whose
+/// result is the disposal that stops it.
+type Observation = Box<dyn FnOnce() -> Result<Disposal, ChordError>>;
 
 /// One activation hook, upstream's `() => void | Promise<void>` with the
 /// failure the await propagates carried as the result.
@@ -155,7 +159,7 @@ impl FacetLifecycle {
         Ok(())
     }
 
-    fn observe(&self, start: Box<dyn FnOnce() -> Result<Disposal, ChordError>>) -> Result<(), ChordError> {
+    fn observe(&self, start: Observation) -> Result<(), ChordError> {
         self.assert_setting_up("observe services")?;
         self.observations.borrow_mut().push(start);
         Ok(())
@@ -179,7 +183,7 @@ impl FacetLifecycle {
         }
         self.state.set(LifecycleState::Active);
         self.service_access.set(true);
-        let starts: Vec<Box<dyn FnOnce() -> Result<Disposal, ChordError>>> =
+        let starts: Vec<Observation> =
             self.observations.borrow_mut().drain(..).collect();
         for start in starts {
             self.effects.borrow_mut().push(start()?);
@@ -211,7 +215,7 @@ impl FacetLifecycle {
     }
 }
 
-fn state_str(state: LifecycleState) -> &'static str {
+const fn state_str(state: LifecycleState) -> &'static str {
     match state {
         LifecycleState::SettingUp => "setting_up",
         LifecycleState::Prepared => "prepared",
@@ -227,6 +231,12 @@ fn state_str(state: LifecycleState) -> &'static str {
 pub struct FacetEnvironment {
     runtime: Rc<RuntimeRecord>,
     slots: Rc<HostServiceSlots>,
+}
+
+impl std::fmt::Debug for FacetEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetEnvironment").finish_non_exhaustive()
+    }
 }
 
 impl FacetEnvironment {
@@ -322,44 +332,11 @@ impl FacetEnvironment {
         let slots = self.slots.clone();
         let lifecycle = self.runtime.lifecycle.clone();
         let service = service.clone();
-        let observe: Box<dyn FnOnce() -> Result<Disposal, ChordError>> = Box::new(move || {
+        let observe: Observation = Box::new(move || {
             let stopped = Rc::new(Cell::new(false));
             let base_access: AssertAccess = {
                 let lifecycle = lifecycle.clone();
                 Rc::new(move || lifecycle.assert_service_access())
-            };
-            let service_id = Rc::new(service.id.clone());
-            let wrapped: KeyedServiceHandler = {
-                let service_id = service_id.clone();
-                let base = base_access.clone();
-                let handler = handler.clone();
-                let stopped = stopped.clone();
-                Box::new(move |target, context| {
-                    let slot = ServiceSlot::new(service_id.as_str());
-                    slot.bind(target);
-                    let assert: AssertAccess = {
-                        let base = base.clone();
-                        let stopped = stopped.clone();
-                        let service_id = service_id.clone();
-                        let context = context.clone();
-                        Rc::new(move || {
-                            (base.clone())()?;
-                            if stopped.get()
-                                || context
-                                    .abort_signal()
-                                    .is_some_and(|signal| signal.aborted())
-                            {
-                                return Err(ChordError::Message(format!(
-                                    "Keyed service {} observation is closed",
-                                    service_id
-                                )));
-                            }
-                            Ok(())
-                        })
-                    };
-                    let view = slot.view(assert);
-                    (handler)(view, context);
-                })
             };
             let stop = slots.observe(&service, base_access, handler)?;
             Ok(sync_disposal(move || {
@@ -367,7 +344,7 @@ impl FacetEnvironment {
                     return Ok(());
                 }
                 stopped.set(true);
-                stop();
+                drop(stop());
                 Ok(())
             }))
         });
@@ -419,16 +396,27 @@ pub struct StagedServiceSpawner {
     lifecycle: Rc<FacetLifecycle>,
     service: Service,
     instances: Rc<RefCell<Vec<StagedInstance>>>,
-    installer: Rc<RefCell<Option<Box<dyn Fn(&str, Rc<ServiceImplementation>) -> Result<CloseInstance, ChordError>>>>>,
+    installer: Rc<RefCell<Option<Installer>>>,
     connected: Cell<bool>,
 }
 
 type CloseInstance = Rc<dyn Fn() -> Result<(), ChordError>>;
 
-struct SpawnedInstance {
-    key: String,
-    implementation: Rc<ServiceImplementation>,
-    release: RefCell<Option<CloseInstance>>,
+/// The provider's per-instance install hook, upstream's installer closure:
+/// key and implementation in, the close path out.
+type Installer = Box<dyn Fn(&str, Rc<ServiceImplementation>) -> Result<CloseInstance, ChordError>>;
+
+/// A staged reload generation, or the staged records to dispose when
+/// staging fails.
+type StagedGeneration = Result<Vec<Rc<RuntimeRecord>>, (ChordError, Vec<Rc<RuntimeRecord>>)>;
+
+impl std::fmt::Debug for StagedServiceSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedServiceSpawner")
+            .field("service", &self.service)
+            .field("connected", &self.connected.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl StagedServiceSpawner {
@@ -446,7 +434,7 @@ impl StagedServiceSpawner {
         }
         self.connected.set(true);
         let installer = Rc::new(installer);
-        let boxed_installer: Box<dyn Fn(&str, Rc<ServiceImplementation>) -> Result<CloseInstance, ChordError>> = {
+        let boxed_installer: Installer = {
             let installer = installer.clone();
             Box::new(move |key, implementation| installer(key, implementation))
         };
@@ -543,15 +531,6 @@ struct StagedInstance {
     release: RefCell<Option<CloseInstance>>,
 }
 
-impl StagedInstance {
-    fn release(&self) -> Result<(), ChordError> {
-        if let Some(release) = self.release.borrow_mut().take() {
-            release()?;
-        }
-        Ok(())
-    }
-}
-
 /// The keyed-instance source the host binds observation to, upstream's
 /// `KeyedServiceSource`.
 pub trait KeyedSource {
@@ -569,13 +548,21 @@ pub struct LocalKeyedServiceRegistry {
     disposed: Cell<bool>,
 }
 
+impl std::fmt::Debug for LocalKeyedServiceRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalKeyedServiceRegistry")
+            .field("disposed", &self.disposed.get())
+            .finish_non_exhaustive()
+    }
+}
+
 struct LocalKeyedRegistration {
     generations: HashMap<String, u64>,
     directory: InstanceDirectory,
 }
 
 impl LocalKeyedServiceRegistry {
-    fn new(services: Vec<Service>, on_error: ErrorReporter) -> Self {
+    fn new(services: Vec<Service>, on_error: &ErrorReporter) -> Self {
         Self {
             registrations: RefCell::new(
                 services
@@ -676,6 +663,12 @@ pub struct HostServiceSlots {
     keyed_sources: RefCell<HashMap<String, Rc<dyn KeyedSource>>>,
 }
 
+impl std::fmt::Debug for HostServiceSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostServiceSlots").finish_non_exhaustive()
+    }
+}
+
 impl HostServiceSlots {
     fn new() -> Self {
         Self {
@@ -727,8 +720,6 @@ impl HostServiceSlots {
         let stopped = Rc::new(Cell::new(false));
         let wrapped: KeyedServiceHandler = {
             let service_id = Rc::new(service.id.clone());
-            let assert_access = assert_access.clone();
-            let handler = handler.clone();
             let stopped = stopped.clone();
             Box::new(move |target, context| {
                 let slot = ServiceSlot::new(service_id.as_str());
@@ -746,8 +737,7 @@ impl HostServiceSlots {
                                 .is_some_and(|signal| signal.aborted())
                         {
                             return Err(ChordError::Message(format!(
-                                "Keyed service {} observation is closed",
-                                service_id
+                                "Keyed service {service_id} observation is closed"
                             )));
                         }
                         Ok(())
@@ -769,7 +759,7 @@ impl HostServiceSlots {
     }
 
     fn dispose(&self) {
-        for (_, (slot, _)) in self.singletons.borrow().iter() {
+        for (slot, _) in self.singletons.borrow().values() {
             slot.unbind();
         }
         self.singletons.borrow_mut().clear();
@@ -805,7 +795,7 @@ pub enum GenerationPhase {
 /// The spelling a phase carries in host error messages, upstream's string
 /// interpolation over `GenerationPhase`.
 #[must_use]
-pub fn phase_str(phase: GenerationPhase) -> &'static str {
+pub const fn phase_str(phase: GenerationPhase) -> &'static str {
     match phase {
         GenerationPhase::Setup => "setup",
         GenerationPhase::Assembling => "assembling",
@@ -829,10 +819,24 @@ pub struct FacetKernelOptions {
     pub on_error: ErrorReporter,
 }
 
+impl std::fmt::Debug for FacetKernelOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetKernelOptions")
+            .field("facets", &self.facets)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Private lifecycle and dependency kernel behind the atomic host entry
 /// point, upstream's `FacetKernel`.
 pub struct FacetKernel {
     core: Rc<KernelCore>,
+}
+
+impl std::fmt::Debug for FacetKernel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetKernel").finish_non_exhaustive()
+    }
 }
 
 /// One external service a source offers to the host.
@@ -843,7 +847,7 @@ struct ExternalService {
 }
 
 struct KernelCore {
-    initial_facets: std::cell::RefCell<Vec<FacetDef>>,
+    initial_facets: RefCell<Vec<FacetDef>>,
     service_sources: Vec<Rc<dyn RemoteServiceSource>>,
     on_error: ErrorReporter,
     slots: Rc<HostServiceSlots>,
@@ -876,7 +880,7 @@ impl FacetKernel {
         }
         Ok(Self {
             core: Rc::new(KernelCore {
-                initial_facets: std::cell::RefCell::new(options.facets),
+                initial_facets: RefCell::new(options.facets),
                 service_sources: options.service_sources,
                 on_error: options.on_error,
                 slots: Rc::new(HostServiceSlots::new()),
@@ -891,7 +895,7 @@ impl FacetKernel {
         })
     }
 
-    fn create_runtime(core: &Rc<KernelCore>, facet_id: &str) -> Rc<RuntimeRecord> {
+    fn create_runtime(_core: &Rc<KernelCore>, facet_id: &str) -> Rc<RuntimeRecord> {
         Rc::new(RuntimeRecord {
             facet_id: facet_id.to_string(),
             requires: RefCell::new(Vec::new()),
@@ -902,7 +906,7 @@ impl FacetKernel {
         })
     }
 
-    fn setup_facet(core: &Rc<KernelCore>, facet: FacetDef, record: &Rc<RuntimeRecord>) -> Result<(), ChordError> {
+    fn setup_facet(core: &Rc<KernelCore>, facet: &FacetDef, record: &Rc<RuntimeRecord>) -> Result<(), ChordError> {
         let mut environment = FacetEnvironment {
             runtime: record.clone(),
             slots: core.slots.clone(),
@@ -930,6 +934,10 @@ impl FacetKernel {
     /// snapshots, and facets activate in dependency order. Any failure
     /// terminates the host and aggregates the cleanup failures into the
     /// report.
+    ///
+    /// # Errors
+    /// [`ChordError`] when any activation stage fails; cleanup failures
+    /// aggregate into the report.
     pub async fn activate(&self) -> Result<(), ChordError> {
         match self.activate_inner().await {
             Ok(()) => Ok(()),
@@ -951,7 +959,7 @@ impl FacetKernel {
         for facet in facets {
             let record = Self::create_runtime(&self.core, &facet.id);
             self.core.facets.borrow_mut().push((facet.id.clone(), record.clone()));
-Self::setup_facet(&self.core, facet, &record)?;
+Self::setup_facet(&self.core, &facet, &record)?;
         }
         self.core.phase.set(GenerationPhase::Assembling);
         let external = self.resolve_external_services().await?;
@@ -991,9 +999,16 @@ Self::setup_facet(&self.core, facet, &record)?;
     }
 
     /// Activates and replaces facets with matching IDs without disconnecting
-    /// consumer service handles. The replacement stages and validates
-    /// before cutover; a failure before cutover keeps the old generation
-    /// live, and a failure after cutover aborts the host.
+    /// consumer service handles.
+    ///
+    /// The replacement stages and validates before cutover; a failure before
+    /// cutover keeps the old generation live, and a failure after cutover
+    /// aborts the host.
+    ///
+    /// # Errors
+    /// [`ChordError`] when a facet is unknown, staging or activation fails,
+    /// or cutover aborts the host; cleanup failures aggregate into the
+    /// report.
     pub async fn reload(&self, facets: Vec<FacetDef>) -> Result<(), ChordError> {
         if self.core.phase.get() != GenerationPhase::Active {
             return Err(ChordError::Message(format!(
@@ -1017,21 +1032,10 @@ Self::setup_facet(&self.core, facet, &record)?;
         }
         self.core.phase.set(GenerationPhase::Reloading);
 
-        let staged = match self.stage_generation(facets).await {
+        let staged = match self.stage_generation(facets) {
             Ok(staged) => staged,
             Err((error, staged)) => {
-                let mut reversed = staged;
-                reversed.reverse();
-                let cleanup_errors = dispose_records(&reversed).await;
-                if cleanup_errors.is_empty() {
-                    self.core.phase.set(GenerationPhase::Active);
-                    return Err(error);
-                }
-                let abort_errors = self.abort(&[]).await;
-                return Err(ChordError::Aggregate(
-                    std::iter::once(error).chain(cleanup_errors).chain(abort_errors).collect(),
-                    "Facet reload setup and cleanup failed".to_string(),
-                ));
+                return self.dispose_failed_stage(error, staged, "Facet reload setup and cleanup failed").await;
             }
         };
 
@@ -1126,17 +1130,43 @@ Self::setup_facet(&self.core, facet, &record)?;
         collect_errors(errors, "Failed to dispose facet generation").map_or(Ok(()), Err)
     }
 
-    async fn stage_generation(
+/// Disposes a failed reload stage in reverse order and folds the cleanup
+/// failures into the reported error.
+async fn dispose_failed_stage(
+        &self,
+        error: ChordError,
+        staged: Vec<Rc<RuntimeRecord>>,
+        label: &str,
+    ) -> Result<(), ChordError> {
+        let mut reversed = staged;
+        reversed.reverse();
+        let cleanup_errors = dispose_records(&reversed).await;
+        if cleanup_errors.is_empty() {
+            self.core.phase.set(GenerationPhase::Active);
+            return Err(error);
+        }
+        let abort_errors = self.abort(&[]).await;
+        Err(ChordError::Aggregate(
+            std::iter::once(error).chain(cleanup_errors).chain(abort_errors).collect(),
+            label.to_string(),
+        ))
+    }
+
+    fn stage_generation(
         &self,
         facets: Vec<FacetDef>,
-    ) -> Result<Vec<Rc<RuntimeRecord>>, (ChordError, Vec<Rc<RuntimeRecord>>)> {
+    ) -> StagedGeneration {
         let mut staged: Vec<Rc<RuntimeRecord>> = Vec::new();
         for facet in facets {
             let record = Self::create_runtime(&self.core, &facet.id);
             staged.push(record.clone());
-if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
+            if let Err(error) = Self::setup_facet(&self.core, &facet, &record) {
                 return Err((error, staged));
             }
+            #[allow(
+                clippy::expect_used,
+                reason = "reload checks every facet is active before staging"
+            )]
             let previous = self
                 .core
                 .facets
@@ -1216,7 +1246,7 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
                             Ok(Rc::new(move || {
                                 close();
                                 Ok(())
-                            }) as CloseInstance)
+                            }))
                         }
                     })?;
                 } else {
@@ -1226,7 +1256,7 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
                         let service = service.clone();
                         move |key, implementation| {
                             let close = provider.spawn(&service, key, (*implementation).clone())?;
-                            Ok(Rc::new(move || close()))
+                            Ok(Rc::new(close))
                         }
                     })?;
                 }
@@ -1265,7 +1295,7 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
             )
             .await;
         let mut offered: Vec<(String, ServiceMode, usize)> = Vec::new();
-        for result in catalogues.into_iter() {
+        for result in catalogues {
             let (index, entries) = result?;
             for entry in entries {
                 if offered.iter().any(|(id, _, _)| *id == entry.service_id) {
@@ -1305,29 +1335,7 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
                     .enumerate()
                     .find(|(_, (service_id, _, _))| *service_id == requirement.service_id)
                     .map(|(_, (service_id, mode, index))| (service_id.clone(), *mode, *index));
-                let found = match found {
-                    Some(found) => Some(found),
-                    None => {
-                        let deferred: Vec<usize> = self
-                            .core
-                            .service_sources
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, source)| source.accepts_unavailable_services())
-                            .map(|(index, _)| index)
-                            .collect();
-                        match deferred.len() {
-                            0 => None,
-                            1 => Some((requirement.service_id.clone(), requirement.mode, deferred[0])),
-                            _ => {
-                                return Err(ChordError::Message(format!(
-                                    "Facet host service {} has more than one deferred source",
-                                    requirement.service_id
-                                )));
-                            }
-                        }
-                    }
-                };
+                let found = requirement_source(&self.core, requirement, found)?;
                 if let Some((service_id, mode, source_index)) = found {
                     external.insert(
                         service_id.clone(),
@@ -1407,9 +1415,9 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
                     _ => None,
                 })
                 .collect(),
-            self.core.on_error.clone(),
+            &self.core.on_error,
         ));
-        for provision in provisions.iter() {
+        for provision in &provisions {
             match provision {
                 Provision::Singleton { service, implementation } => {
                     if !service.local {
@@ -1440,7 +1448,7 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
                         let service = service.clone();
                         spawner.connect(move |key, implementation| {
                             let close = provider.spawn(&service, key, (*implementation).clone())?;
-                            Ok(Rc::new(move || close()))
+                            Ok(Rc::new(close))
                         })?;
                     }
                 }
@@ -1522,10 +1530,6 @@ if let Err(error) = Self::setup_facet(&self.core, facet, &record) {
             .iter()
             .flat_map(|(_, record)| record.provisions.borrow().clone())
             .collect()
-    }
-
-    fn assert_service_target_access(&self) -> Result<(), ChordError> {
-        assert_service_target_access(&self.core)
     }
 
     async fn abort(&self, extra_records: &[Rc<RuntimeRecord>]) -> Vec<ChordError> {
@@ -1655,7 +1659,7 @@ impl KeyedSource for SourceKeyedSource {
     fn observe(&self, service: &Service, handler: KeyedServiceHandler) -> Result<Unsubscribe, ChordError> {
         let handler = Rc::new(handler);
         let wrapped: crate::types::KeyedViewHandler =
-            Rc::new(move |view, context| handler(ServiceTarget::View(view.clone()), context));
+            Rc::new(move |view, context| handler(ServiceTarget::View(view), context));
         self.0.observe(service, wrapped)
     }
 }
@@ -1671,6 +1675,34 @@ fn assert_service_target_access(core: &KernelCore) -> Result<(), ChordError> {
         )));
     }
     Ok(())
+}
+
+/// Resolves one requirement's provider: the source that offers it, or the
+/// single source that defers availability, or an error when several sources
+/// would defer the same service.
+fn requirement_source(
+    core: &KernelCore,
+    requirement: &FacetServiceReference,
+    found: Option<(String, ServiceMode, usize)>,
+) -> Result<Option<(String, ServiceMode, usize)>, ChordError> {
+    if let Some(found) = found {
+        return Ok(Some(found));
+    }
+    let deferred: Vec<usize> = core
+        .service_sources
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| source.accepts_unavailable_services())
+        .map(|(index, _)| index)
+        .collect();
+    match deferred.len() {
+        0 => Ok(None),
+        1 => Ok(Some((requirement.service_id.clone(), requirement.mode, deferred[0]))),
+        _ => Err(ChordError::Message(format!(
+            "Facet host service {} has more than one deferred source",
+            requirement.service_id
+        ))),
+    }
 }
 
 fn validate_facets(
@@ -1697,13 +1729,11 @@ fn validate_facets(
                 }
                 if provider_facet.is_none() {
                     return Err(ChordError::Message(format!(
-                        "Service {} is provided by both the host and {}",
-                        service_id, facet_id
+                        "Service {service_id} is provided by both the host and {facet_id}"
                     )));
                 }
                 return Err(ChordError::Message(format!(
-                    "Service {} is provided by both {:?} and {}",
-                    service_id, provider_facet, facet_id
+                    "Service {service_id} is provided by both {provider_facet:?} and {facet_id}"
                 )));
             }
             providers.push((provision.service_id.clone(), Some(facet_id.clone()), Some(provision.mode)));
@@ -1745,8 +1775,17 @@ fn validate_facets(
             if provider_facet == facet_id {
                 continue;
             }
-            dependencies.get_mut(facet_id).expect("seeded").insert(provider_facet.clone());
-            dependents.get_mut(provider_facet).expect("registered when staged").insert(facet_id.clone());
+            #[allow(
+                clippy::expect_used,
+                reason = "every facet id was seeded into both maps before this loop"
+            )]
+            {
+                dependencies.get_mut(facet_id).expect("seeded").insert(provider_facet.clone());
+                dependents
+                    .get_mut(provider_facet)
+                    .expect("registered when staged")
+                    .insert(facet_id.clone());
+            }
         }
     }
     topological_order(records, &dependencies, &dependents)
@@ -1774,7 +1813,7 @@ fn topological_order(
     }) {
         order.push(id.to_string());
         if let Some(dependent_ids) = dependents.get(id) {
-            for dependent in dependent_ids.iter() {
+            for dependent in dependent_ids {
                 let count = remaining[dependent.as_str()] - 1;
                 remaining.insert(dependent.as_str(), count);
                 if count == 0 {
@@ -1795,15 +1834,4 @@ fn topological_order(
         )));
     }
     Ok(order)
-}
-
-fn cycle_names(
-    records: &[(String, Rc<RuntimeRecord>)],
-    remaining: &HashMap<&str, usize>,
-) -> Vec<String> {
-    records
-        .iter()
-        .map(|(facet_id, _)| facet_id.clone())
-        .filter(|id| remaining[id.as_str()] > 0)
-        .collect()
 }

@@ -398,9 +398,10 @@ impl fmt::Display for ServiceMode {
     }
 }
 
-/// Stable identity for one service contract, upstream's `Service<T>` with
-/// the compile-time `SERVICE_TYPE` brand dropped: runtime identity is the
-/// ID alone, and the member registry carries what the type parameter
+/// Stable identity for one service contract, upstream's `Service<T>`.
+///
+/// The compile-time `SERVICE_TYPE` brand is dropped: runtime identity is
+/// the ID alone, and the member registry carries what the type parameter
 /// described.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
@@ -442,7 +443,7 @@ pub enum ServiceMemberKind {
 
 /// One member's description in a snapshot: a method, or state with its
 /// sequence and the operation batch that carries the current value.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceMemberSnapshot {
     /// A method member.
     Method {
@@ -481,7 +482,7 @@ impl ServiceMemberSnapshot {
 }
 
 /// One live instance's members, optionally addressed when keyed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceInstanceSnapshot {
     /// The address, present for keyed instances.
     pub instance: Option<ServiceInstanceAddress>,
@@ -491,7 +492,7 @@ pub struct ServiceInstanceSnapshot {
 
 /// The initial snapshot of one subscription: which service, its mode, and
 /// every live instance.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceSubscriptionSnapshot {
     /// The subscribed service.
     pub service_id: String,
@@ -502,7 +503,7 @@ pub struct ServiceSubscriptionSnapshot {
 }
 
 /// One update a provider pushes to its subscribers.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceProviderUpdate {
     /// State changed on one member of one instance.
     State {
@@ -591,12 +592,17 @@ pub struct ReplicatedStateDelivery {
 /// are no-ops (upstream's returned `() => void`).
 pub type Unsubscribe = Box<dyn Fn()>;
 
+/// The close path of one live [`ServiceSubscription`].
+pub(crate) type SubscriptionClose =
+    Box<dyn Fn(Option<crate::context::Context>) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>>;
+
 /// A keyed-service observer, upstream's `(service, context) => void |
-/// Promise<void>` with the promise arm dropped. The directory starts the
-/// handler synchronously with the raw bound target; the wrapping caller
-/// builds the guarded view over it, and cancellation is cooperative
-/// through the context, so an async continuation would have nothing to
-/// drive it.
+/// Promise<void>` with the promise arm dropped.
+///
+/// The directory starts the handler synchronously with the raw bound
+/// target; the wrapping caller builds the guarded view over it, and
+/// cancellation is cooperative through the context, so an async
+/// continuation would have nothing to drive it.
 pub type KeyedServiceHandler = Box<dyn Fn(crate::handle::ServiceTarget, crate::context::Context)>;
 
 /// The view-level keyed observer: the wrapping layer converts the raw
@@ -613,21 +619,23 @@ pub struct ServiceSubscription {
     pub activate: Box<dyn Fn() -> Result<(), crate::errors::ChordError>>,
     /// Closes the subscription, dropping buffered updates. Never rejects
     /// for in-process transports; remote transports may.
-    pub close: Box<dyn Fn(Option<crate::context::Context>) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>>,
+    pub close: SubscriptionClose,
 }
 
-impl std::fmt::Debug for ServiceSubscription {
+impl fmt::Debug for ServiceSubscription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServiceSubscription")
             .field("snapshot", &self.snapshot)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
-/// The pluggable wire boundary a remote service binding consumes, upstream's
-/// `RemoteServiceTransport`. Implementations choose transport, framing,
-/// routing, and envelope encoding; values crossing the boundary stay strict
-/// JSON, and adapters own serialization and any isolation copies.
+/// The pluggable wire boundary a remote service binding consumes,
+/// upstream's `RemoteServiceTransport`.
+///
+/// Implementations choose transport, framing, routing, and envelope
+/// encoding; values crossing the boundary stay strict JSON, and adapters
+/// own serialization and any isolation copies.
 pub trait RemoteServiceTransport {
     /// Invokes one remote method.
     fn invoke(
@@ -650,10 +658,11 @@ pub trait RemoteServiceTransport {
 pub type ServiceProviderListener = Rc<dyn Fn(&ServiceProviderUpdate, &crate::context::Context)>;
 
 /// The publisher one remote endpoint hands subscription updates to,
-/// upstream's `ServiceUpdatePublisher` with the promise arm dropped:
-/// publishing is synchronous, and a failure propagates like upstream's
+/// upstream's `ServiceUpdatePublisher` with the promise arm dropped.
+///
+/// Publishing is synchronous, and a failure propagates like upstream's
 /// sync throw before the `Promise.resolve` wrapper.
-pub type ServiceUpdatePublisher = std::rc::Rc<dyn Fn(&str, &ServiceProviderUpdate, &crate::context::Context)>;
+pub type ServiceUpdatePublisher = Rc<dyn Fn(&str, &ServiceProviderUpdate, &crate::context::Context)>;
 
 /// The service surface a facet or binding consumes, upstream's
 /// `RemoteServices`. Handles returned here stay stable across provider
@@ -666,6 +675,9 @@ pub trait RemoteServices {
     fn use_service(&self, service: &Service) -> Result<crate::handle::ServiceView, crate::errors::ChordError>;
 
     /// Observe every live instance of one keyed service.
+    ///
+    /// # Errors
+    /// The crate's error model; upstream throws.
     fn observe(&self, service: &Service, handler: KeyedViewHandler) -> Result<Unsubscribe, crate::errors::ChordError>;
 
     /// Wait until every currently acquired service has installed its initial
@@ -701,7 +713,7 @@ pub trait RemoteServiceSource {
     fn open(
         &self,
         options: RemoteServiceSourceOpenOptions,
-    ) -> std::rc::Rc<dyn RemoteServices>;
+    ) -> Rc<dyn RemoteServices>;
 }
 
 /// The options [`RemoteServiceSource::open`] receives.
@@ -714,10 +726,20 @@ pub struct RemoteServiceSourceOpenOptions {
     pub on_error: crate::handle::ErrorReporter,
 }
 
+impl fmt::Debug for RemoteServiceSourceOpenOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteServiceSourceOpenOptions")
+            .field("services", &self.services)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One facet: a synchronous setup that declares requirements and
-/// provisions through the environment. The setup is synchronous by
-/// construction — the closure receives `&mut FacetEnvironment` and returns
-/// nothing, which restates upstream's "setup must be synchronous" contract.
+/// provisions through the environment.
+///
+/// The setup is synchronous by construction — the closure receives
+/// `&mut FacetEnvironment` and returns nothing, which restates upstream's
+/// "setup must be synchronous" contract.
 pub struct FacetDef {
     /// The facet ID, unique within one generation.
     pub id: String,
@@ -728,7 +750,7 @@ pub struct FacetDef {
 
 impl fmt::Debug for FacetDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FacetDef").field("id", &self.id).finish()
+        f.debug_struct("FacetDef").field("id", &self.id).finish_non_exhaustive()
     }
 }
 
@@ -754,7 +776,7 @@ impl fmt::Debug for LoadedFacets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoadedFacets")
             .field("facets", &self.facets.iter().map(|facet| facet.id.as_str()).collect::<Vec<_>>())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

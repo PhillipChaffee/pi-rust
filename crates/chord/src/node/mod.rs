@@ -1,7 +1,8 @@
-//! The Node-side bundle surface, ported from upstream `src/node.ts` and
-//! `bundler.ts`: manifest and artifact contracts with integrity
-//! verification, the packaging pipeline over built sources, and the loader
-//! seam the Rust-native extension mechanism implements.
+//! The Node-side bundle surface, ported from upstream `src/node.ts` and `bundler.ts`.
+//!
+//! Manifest and artifact contracts with integrity verification, the
+//! packaging pipeline over built sources, and the loader seam the
+//! Rust-native extension mechanism implements.
 
 pub mod bundle;
 pub mod bundle_loader;

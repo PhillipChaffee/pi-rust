@@ -23,13 +23,15 @@ use crate::services::state::{ReplicatedStateReplica, ValueListener, panic_messag
 use crate::types::{
     JsonValue, KeyedServiceHandler, RemoteServiceTransport, Service, ServiceCall,
     ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberKind, ServiceMode,
-    ServiceProviderListener, ServiceProviderUpdate, ServiceSubscription, ServiceSubscriptionSnapshot,
-    Unsubscribe,
+    ServiceProviderListener, ServiceProviderUpdate, ServiceSubscription, Unsubscribe,
 };
 
 /// The transport handle a binding consumes, held by shared reference the
 /// single-threaded runtime keeps alive.
 pub type SharedTransport = Rc<dyn RemoteServiceTransport>;
+
+/// A stored start/transition future, the reusable-promise cell.
+pub(crate) type StoredStart = Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>;
 
 fn remote_error(code: RemoteServiceErrorCode, message: impl Into<String>) -> ChordError {
     ChordError::Remote(RemoteServiceError::new(code, message))
@@ -49,6 +51,15 @@ pub struct RemoteServiceBindingOptions {
     pub on_error: ErrorReporter,
     /// The gate every handle access passes.
     pub assert_access: Option<AssertAccess>,
+}
+
+impl std::fmt::Debug for RemoteServiceBindingOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteServiceBindingOptions")
+            .field("services", &self.services)
+            .field("bound", &self.bound)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Builds the binding from its options, upstream's
@@ -85,19 +96,19 @@ pub fn create_remote_service_binding(
 /// Takes a stored start/transition future, awaits it once, and leaves a
 /// settled copy in its place: every later await sees the same result, the
 /// reusable-promise contract.
-fn settle_stored(
-    cell: &Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>,
-) -> LocalBoxFuture<Result<(), ChordError>> {
+fn settle_stored(cell: &StoredStart) -> LocalBoxFuture<Result<(), ChordError>> {
     let cell = cell.clone();
     let existing = cell.borrow_mut().take();
-    match existing {
-        Some(future) => boxed(async move {
-            let result = future.await;
-            *cell.borrow_mut() = Some(boxed(ready_with(result.clone())));
-            result
-        }),
-        None => boxed(ready_with(Ok(()))),
-    }
+    existing.map_or_else(
+        || boxed(ready_with(Ok(()))),
+        |future| {
+            boxed(async move {
+                let result = future.await;
+                *cell.borrow_mut() = Some(boxed(ready_with(result.clone())));
+                result
+            })
+        },
+    )
 }
 
 /// The per-member consumer slot, upstream's `MemberSlot`: a replicated
@@ -119,7 +130,7 @@ impl std::fmt::Debug for MemberSlot {
         f.debug_struct("MemberSlot")
             .field("service_id", &self.service_id)
             .field("member", &self.member)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -261,7 +272,7 @@ impl MemberSlot {
     }
 }
 
-fn kind_str(kind: ServiceMemberKind) -> &'static str {
+const fn kind_str(kind: ServiceMemberKind) -> &'static str {
     match kind {
         ServiceMemberKind::Method => "method",
         ServiceMemberKind::State => "state",
@@ -378,8 +389,8 @@ impl RemoteFacade {
     }
 
     /// The member slot for `member`, applying any known description kind.
-    pub(crate) fn member_slot(self: &Rc<Self>, member: &str) -> Result<Rc<MemberSlot>, ChordError> {
-        Ok(self.slot(member))
+    pub(crate) fn member_slot(self: &Rc<Self>, member: &str) -> Rc<MemberSlot> {
+        self.slot(member)
     }
 
     /// Invokes one method member through its slot.
@@ -394,7 +405,7 @@ impl RemoteFacade {
     }
 
     fn install(self: &Rc<Self>, snapshot: &ServiceInstanceSnapshot, context: &Context) -> Result<(), ChordError> {
-        if !same_address(&snapshot.instance, &self.0.address) {
+        if !same_address(snapshot.instance.as_ref(), self.0.address.as_ref()) {
             return Err(ChordError::Message("Remote service snapshot has the wrong address".to_string()));
         }
         validate_members(&snapshot.members)?;
@@ -471,7 +482,7 @@ fn validate_members(members: &[crate::types::ServiceMemberSnapshot]) -> Result<(
     Ok(())
 }
 
-fn same_address(left: &Option<ServiceInstanceAddress>, right: &Option<ServiceInstanceAddress>) -> bool {
+fn same_address(left: Option<&ServiceInstanceAddress>, right: Option<&ServiceInstanceAddress>) -> bool {
     match (left, right) {
         (None, None) => true,
         (Some(left), Some(right)) => left.key == right.key && left.generation == right.generation,
@@ -484,7 +495,7 @@ struct SingletonBindingState {
     facade: Rc<RemoteFacade>,
     view: RefCell<Option<crate::handle::ServiceView>>,
     subscription: RefCell<Option<ServiceSubscription>>,
-    starting: Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>,
+    starting: StoredStart,
     slot_view_access: AssertAccess,
     active: Rc<Cell<bool>>,
     revision: Cell<u64>,
@@ -503,7 +514,7 @@ struct KeyedBindingState {
     service_id: String,
     instances: InstanceDirectory,
     subscription: RefCell<Option<ServiceSubscription>>,
-    starting: Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>,
+    starting: StoredStart,
     closed: Cell<bool>,
     bound: Cell<bool>,
     revision: Cell<u64>,
@@ -519,7 +530,7 @@ struct BindingCore {
     keyed: RefCell<Vec<(String, Rc<KeyedBindingState>)>>,
     bound: Cell<bool>,
     readiness_revision: Cell<u64>,
-    binding_transition: Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>,
+    binding_transition: StoredStart,
     disposed: Rc<Cell<bool>>,
 }
 
@@ -546,7 +557,7 @@ impl RemoteServiceBinding {
     /// [`ChordError`] when the binding is disposed, the service is local,
     /// not allowlisted, or already used as keyed.
     pub fn use_service(&self, service: &Service) -> Result<crate::handle::ServiceView, ChordError> {
-        self.assert_remotable(service)?;
+        Self::assert_remotable(service)?;
         self.assert_available(&service.id, ServiceMode::Singleton)?;
         if let Some((_, binding)) = self.0.singletons.borrow().iter().find(|(id, _)| id == &service.id) {
             return Ok(binding.view());
@@ -599,7 +610,7 @@ impl RemoteServiceBinding {
     /// [`ChordError`] when the binding is disposed, the service is local,
     /// not allowlisted, or already used as singleton.
     pub fn observe(&self, service: &Service, handler: crate::types::KeyedViewHandler) -> Result<Unsubscribe, ChordError> {
-        self.assert_remotable(service)?;
+        Self::assert_remotable(service)?;
         self.assert_available(&service.id, ServiceMode::Keyed)?;
         let core = self.0.clone();
         let existing = self
@@ -609,30 +620,26 @@ impl RemoteServiceBinding {
             .iter()
             .find(|(id, _)| id == &service.id)
             .map(|(_, binding)| binding.clone());
-        let binding = match existing {
-            Some(binding) => binding,
-            None => {
-                let core = core.clone();
-                let binding = Rc::new(KeyedBindingState {
-                    service_id: service.id.clone(),
-                    instances: InstanceDirectory::new(
-                        false,
-                        Rc::new({
-                            let report = core.report_error.clone();
-                            move |error| report(error)
-                        }),
-                    ),
-                    subscription: RefCell::new(None),
-                    starting: Rc::new(RefCell::new(None)),
-                    closed: Cell::new(false),
-                    bound: Cell::new(core.bound.get()),
-                    revision: Cell::new(0),
-                });
-                core.keyed.borrow_mut().push((service.id.clone(), binding.clone()));
-                core.readiness_revision.set(core.readiness_revision.get() + 1);
-                binding
-            }
-        };
+        let binding = existing.unwrap_or_else(|| {
+            let binding = Rc::new(KeyedBindingState {
+                service_id: service.id.clone(),
+                instances: InstanceDirectory::new(
+                    false,
+                    Rc::new({
+                        let report = core.report_error.clone();
+                        move |error| report(error)
+                    }),
+                ),
+                subscription: RefCell::new(None),
+                starting: Rc::new(RefCell::new(None)),
+                closed: Cell::new(false),
+                bound: Cell::new(core.bound.get()),
+                revision: Cell::new(0),
+            });
+            core.keyed.borrow_mut().push((service.id.clone(), binding.clone()));
+            core.readiness_revision.set(core.readiness_revision.get() + 1);
+            binding
+        });
         let stopped = Rc::new(Cell::new(false));
         let observe_handler: KeyedServiceHandler = {
             let service_id = Rc::new(service.id.clone());
@@ -640,9 +647,7 @@ impl RemoteServiceBinding {
                 let core = core.clone();
                 Rc::new(move || core.assert_handle_access())
             };
-            let handler = handler.clone();
             let stopped = stopped.clone();
-            let service_id = service_id.clone();
             Box::new(move |target, context| {
                 let slot = ServiceSlot::new(service_id.as_str());
                 slot.bind(target);
@@ -660,7 +665,7 @@ impl RemoteServiceBinding {
                         {
                             return Err(remote_error(
                                 RemoteServiceErrorCode::ServiceStaleInstance,
-                                format!("Remote service {} observation is closed", service_id),
+                                format!("Remote service {service_id} observation is closed"),
                             ));
                         }
                         Ok(())
@@ -690,6 +695,7 @@ impl RemoteServiceBinding {
 
     /// Waits until every currently acquired service has installed its
     /// initial snapshot, retrying while readiness revisions keep changing.
+    #[must_use]
     pub fn ready(&self, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
         let core = self.0.clone();
         boxed(async move {
@@ -733,6 +739,7 @@ impl RemoteServiceBinding {
     /// Rebinds every acquired service: subscriptions close and restart, or
     /// close without restart when `bound` is `false`. Collected transition
     /// failures aggregate.
+    #[must_use]
     pub fn rebind(&self, bound: bool, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
         let core = self.0.clone();
         boxed(async move {
@@ -757,7 +764,7 @@ impl RemoteServiceBinding {
                             (subscription.close)(Some(context.clone())).await?;
                         }
                         if bound {
-                            RemoteServiceBinding::start_singleton(&core, &service_id, &binding, revision).await?;
+                            Self::start_singleton(&core, &service_id, &binding, revision).await?;
                         }
                         Ok(())
                     })
@@ -783,6 +790,7 @@ impl RemoteServiceBinding {
     }
 
     /// Tears down every subscription and facade this binding owns.
+    #[must_use]
     pub fn dispose(&self, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
         let core = self.0.clone();
         boxed(async move {
@@ -827,7 +835,7 @@ impl RemoteServiceBinding {
     ) -> LocalBoxFuture<Result<(), ChordError>> {
         let core = self.0.clone();
         boxed(async move {
-            let result = RemoteServiceBinding::start_singleton(&core, &service_id, &binding, revision).await;
+            let result = Self::start_singleton(&core, &service_id, &binding, revision).await;
             if let Err(error) = &result
                 && binding.active.get()
                 && binding.revision.get() == revision
@@ -855,7 +863,7 @@ impl RemoteServiceBinding {
         })
     }
 
-    fn assert_remotable(&self, service: &Service) -> Result<(), ChordError> {
+    fn assert_remotable(service: &Service) -> Result<(), ChordError> {
         if service.local {
             return Err(remote_error(
                 RemoteServiceErrorCode::ServiceNotAllowed,
@@ -908,6 +916,11 @@ impl BindingCore {
 impl RemoteServiceBinding {
     /// Starts one singleton's subscription and installs its initial
     /// snapshot, upstream's `#startSingleton`.
+    ///
+    /// # Panics
+    /// Only if the subscription stored above disappears between the store
+    /// and this read, which nothing between can make happen; a panic here is
+    /// a port bug, not a runtime condition.
     async fn start_singleton(
         core: &Rc<BindingCore>,
         service_id: &str,
@@ -943,8 +956,9 @@ impl RemoteServiceBinding {
                             sequence,
                             ops,
                         } => facade.update(member, *sequence, ops, context),
-                        ServiceProviderUpdate::State { .. } => Ok(()),
-                        ServiceProviderUpdate::Spawned { .. } | ServiceProviderUpdate::Closed { .. } => Ok(()),
+                        ServiceProviderUpdate::State { .. }
+                        | ServiceProviderUpdate::Spawned { .. }
+                        | ServiceProviderUpdate::Closed { .. } => Ok(()),
                     };
                     if let Err(error) = result {
                         (core_report)(&error);
@@ -979,13 +993,19 @@ impl RemoteServiceBinding {
         binding
             .facade
             .install(&snapshot.instances[0], &service_delivery_context())?;
-        let stored = binding
-            .subscription
-            .borrow_mut()
-            .take()
-            .expect("subscription stored above");
-        (stored.activate)()?;
-        *binding.subscription.borrow_mut() = Some(stored);
+        #[allow(
+            clippy::expect_used,
+            reason = "the subscription was stored above and nothing between can remove it"
+        )]
+        {
+            let stored = binding
+                .subscription
+                .borrow_mut()
+                .take()
+                .expect("subscription stored above");
+            (stored.activate)()?;
+            *binding.subscription.borrow_mut() = Some(stored);
+        }
         Ok(())
     }
 }
@@ -1013,6 +1033,13 @@ impl KeyedBindingState {
         }
     }
 
+    /// Starts one keyed service's subscription, spawns every instance in the
+    /// initial snapshot, and marks the directory ready.
+    ///
+    /// # Panics
+    /// Only if the subscription stored above disappears between the store
+    /// and this read, which nothing between can make happen; a panic here is
+    /// a port bug, not a runtime condition.
     async fn start(self: &Rc<Self>, core: &Rc<BindingCore>, revision: u64) -> Result<(), ChordError> {
         let listener = keyed_listener(core, self, revision);
         let subscription = core
@@ -1034,13 +1061,19 @@ impl KeyedBindingState {
         for instance in &snapshot.instances {
             self.spawn(core, instance, &service_delivery_context())?;
         }
-        let stored = self
-            .subscription
-            .borrow_mut()
-            .take()
-            .expect("subscription stored above");
-        (stored.activate)()?;
-        *self.subscription.borrow_mut() = Some(stored);
+        #[allow(
+            clippy::expect_used,
+            reason = "the subscription was stored above and nothing between can remove it"
+        )]
+        {
+            let stored = self
+                .subscription
+                .borrow_mut()
+                .take()
+                .expect("subscription stored above");
+            (stored.activate)()?;
+            *self.subscription.borrow_mut() = Some(stored);
+        }
         self.instances.ready()?;
         Ok(())
     }
@@ -1060,7 +1093,6 @@ impl KeyedBindingState {
         let closed = Rc::new(Cell::new(false));
         let is_active: Rc<dyn Fn() -> bool> = {
             let active = active.clone();
-            let closed = closed.clone();
             Rc::new(move || active.get() && !closed.get())
         };
         let assert_access: AssertAccess = {
@@ -1153,7 +1185,7 @@ impl KeyedBindingState {
 
     async fn reset(
         &self,
-        core: &Rc<BindingCore>,
+        _core: &Rc<BindingCore>,
         context: &Context,
         wait_for_starting: bool,
     ) -> Result<(), ChordError> {

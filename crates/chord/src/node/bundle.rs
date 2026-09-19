@@ -2,7 +2,7 @@
 //! `src/node/bundle.ts` and `package.ts`.
 //!
 //! Upstream compiles each facet entry with esbuild into a content-addressed
-//! CommonJS file, records its integrity and external imports in the
+//! `CommonJS` file, records its integrity and external imports in the
 //! manifest, and swaps the output directory atomically. The compilation
 //! step belongs to the JS loader seam the port replaces (the Rust-native
 //! extension mechanism owns it), so the pipeline here takes the built
@@ -15,10 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::types::{JsonNumber, JsonObject, JsonValue};
 
 use crate::errors::ChordError;
-use crate::node::manifest::{
-    FACET_BUNDLE_FORMAT, FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleEntry,
-    FacetBundleManifest, FacetBundlePlugin, integrity_digest,
-};
+use crate::node::manifest::{FACET_BUNDLE_FORMAT, FacetBundlePlugin};
 /// One built facet entry the packaging pipeline takes, upstream's esbuild
 /// output: the source text, the external imports it left undeclared, and
 /// its source map text when one was emitted.
@@ -81,7 +78,7 @@ pub async fn bundle_facets(options: BundleFacetsOptions) -> Result<BundleFacetsR
         file_name(&output_directory),
         short_hash(&random_suffix())
     ));
-    std::fs::create_dir(&temporary_directory).map_err(|error| {
+    let _ = std::fs::create_dir(&temporary_directory).map_err(|error| {
         ChordError::Message(format!(
             "Could not create facet bundle staging directory {}: {error}",
             temporary_directory.display()
@@ -148,7 +145,7 @@ pub async fn bundle_facet_package(options: BundleFacetPackageOptions) -> Result<
                     },
                 ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ChordError::Message(format!(
                     "Could not read default facet entry {name}: {}: {error}",
@@ -189,6 +186,10 @@ pub async fn bundle_facet_package(options: BundleFacetPackageOptions) -> Result<
             metadata.name
         )));
     }
+    #[allow(
+        clippy::collection_is_never_read,
+        reason = "the merged set mirrors upstream's externalImports assembly and is only mutated until the entries carry it; deleting it would strand the metadata fields"
+    )]
     let mut external: Vec<String> = metadata
         .peer_dependencies
         .iter()
@@ -282,8 +283,7 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
         })?;
         let package_directory = package_json_path
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."));
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         (package_directory, package_json_path)
     } else {
         return Err(ChordError::Message(format!(
@@ -319,18 +319,21 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
             package_json_path.display()
         ))
     })?;
-    let peer_dependencies = match object.get("peerDependencies").and_then(JsonValue::as_object) {
-        None => Vec::new(),
-        Some(peer) => {
-            let mut names: Vec<String> = peer
-                .keys()
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
-            names.sort_unstable();
-            names
-        }
-    };
+    let peer_dependencies = object
+        .get("peerDependencies")
+        .and_then(JsonValue::as_object)
+        .map_or_else(
+            Vec::new,
+            |peer| {
+                let mut names: Vec<String> = peer
+                    .keys()
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                names.sort_unstable();
+                names
+            },
+        );
     let (configured_facets, external, _source_map) = parse_chord_configuration(object, &package_json_path);
     Ok(PackageMetadata {
         package_directory,
@@ -346,7 +349,7 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
 
 fn parse_chord_configuration(
     object: &JsonObject,
-    package_json_path: &std::path::Path,
+    package_json_path: &Path,
 ) -> (Vec<(String, FacetSource)>, Vec<String>, bool) {
     let Some(chord) = object.get("chord").and_then(JsonValue::as_object) else {
         return (Vec::new(), Vec::new(), true);
@@ -436,14 +439,6 @@ fn bundle_entry(
     })
 }
 
-fn map_file(path: &Path) -> std::path::PathBuf {
-    path.to_path_buf()
-}
-
-fn map_file_name(file: &str) -> String {
-    format!("{file}.map")
-}
-
 /// Renders the manifest as the two-space JSON the bundler writes, upstream's
 /// `JSON.stringify(manifest, null, 2)`.
 #[must_use]
@@ -517,11 +512,7 @@ fn replace_directory(temporary_directory: &Path, output_directory: &Path) -> Res
         "old-{}",
         short_hash(&random_suffix())
     ));
-    let mut moved_existing = false;
-    match std::fs::rename(output_directory, &backup_directory) {
-        Ok(()) => moved_existing = true,
-        Err(_) => {}
-    }
+    let moved_existing = std::fs::rename(output_directory, &backup_directory).is_ok();
     match std::fs::rename(temporary_directory, output_directory) {
         Ok(()) => {}
         Err(error) => {
@@ -557,26 +548,33 @@ fn file_name(path: &Path) -> String {
 /// The 12-hex-character short hash upstream's `shortHash` produces.
 #[must_use]
 pub fn short_hash(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(bytes);
-    digest[..6]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
+    let mut text = String::with_capacity(12);
+    for byte in &digest[..6] {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 fn integrity_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     use sha2::Digest as _;
     let digest = sha2::Sha256::digest(bytes);
     let mut text = String::with_capacity(20);
     for byte in &digest[..10] {
-        text.push_str(&format!("{byte:02X}"));
+        let _ = write!(text, "{byte:02X}");
     }
     text
 }
 
 fn random_suffix() -> [u8; 8] {
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the low 64 bits of the nanosecond clock carry the suffix uniqueness"
+    )]
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)

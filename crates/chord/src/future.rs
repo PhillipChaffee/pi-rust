@@ -24,7 +24,6 @@ pub fn boxed<T, F: Future<Output = T> + 'static>(future: F) -> LocalBoxFuture<T>
 ///
 /// Upstream spells this `async () => value`; the helper keeps closures that
 /// produce a value without an await point off async blocks.
-#[must_use]
 pub fn ready_with<T>(value: T) -> std::future::Ready<T> {
     std::future::ready(value)
 }
@@ -83,6 +82,7 @@ impl<T> Future for JoinAll<T> {
 /// no ambient executor, so callers poll once and drop anything still
 /// pending, which is the documented restatement of the fire-and-forget
 /// shape for futures that settle without yielding.
+#[must_use]
 pub fn settle_now<T>(mut future: LocalBoxFuture<T>) -> Option<T> {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);

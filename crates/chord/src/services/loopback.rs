@@ -12,8 +12,7 @@ use crate::context::Context;
 use crate::future::{LocalBoxFuture, boxed};
 use crate::services::provider::RemoteServiceProvider;
 use crate::types::{
-    JsonValue, RemoteServiceTransport, ServiceCall, ServiceMode, ServiceProviderListener,
-    ServiceSubscription,
+    JsonValue, RemoteServiceTransport, ServiceMode, ServiceProviderListener, ServiceSubscription,
 };
 
 /// Connects a provider to a binding without changing remote service

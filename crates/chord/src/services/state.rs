@@ -11,7 +11,7 @@
 
 use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::context::{Context, background_context};
 use crate::delta::{Op, Tracker, apply_immutable, is_base};
@@ -40,7 +40,7 @@ struct ListenerList<T> {
 }
 
 impl<T> ListenerList<T> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             next_id: 1,
             entries: Vec::new(),
@@ -54,9 +54,19 @@ impl<T> ListenerList<T> {
         id
     }
 
-fn remove(&mut self, id: u64) {
+    fn remove(&mut self, id: u64) {
         self.entries.retain(|(stored, _)| *stored != id);
     }
+}
+
+/// Locks one of the state mutexes, panicking with the lock's label when the
+/// lock is poisoned.
+#[allow(
+    clippy::expect_used,
+    reason = "a poisoned state lock panics with its label, the port's single-threaded contract; recovering differently would change the observable panic"
+)]
+fn lock_state<'a, T>(mutex: &'a Mutex<T>, label: &'static str) -> MutexGuard<'a, T> {
+    mutex.lock().expect(label)
 }
 
 struct MutableStateInner {
@@ -67,16 +77,17 @@ struct MutableStateInner {
     source_listeners: ListenerList<SourceListener>,
 }
 
-/// Initialized mutable state a producer exposes through a service
-/// implementation: reads see the last published value, writes go through
-/// the tracked surface, and [`publish`](Self::publish) emits the flushed
-/// operation batch to every consumer.
+/// Initialized mutable state a producer exposes through a service implementation.
+///
+/// Reads see the last published value, writes go through the tracked
+/// surface, and [`publish`](Self::publish) emits the flushed operation
+/// batch to every consumer.
 #[derive(Clone)]
-pub struct MutableReplicatedState(Arc<Mutex<MutableStateInner>>);
+pub struct MutableReplicatedState(Rc<Mutex<MutableStateInner>>);
 
 impl std::fmt::Debug for MutableReplicatedState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.0.lock().expect("state lock");
+        let inner = lock_state(&self.0, "state lock");
         f.debug_struct("MutableReplicatedState")
             .field("sequence", &inner.sequence)
             .field("published", &inner.published)
@@ -86,6 +97,11 @@ impl std::fmt::Debug for MutableReplicatedState {
 
 impl MutableReplicatedState {
     /// Tracks `initial`; the first publication is a base batch.
+    ///
+    /// # Panics
+    /// Only if the tracker's own base flush fails to apply, which its
+    /// emitted vocabulary cannot make happen; a panic here is a port bug,
+    /// not a runtime condition.
     #[must_use]
     pub fn new(initial: JsonValue) -> Self {
         let mut tracker = Tracker::new(initial);
@@ -95,7 +111,7 @@ impl MutableReplicatedState {
         )]
         let published = apply_immutable(None, &tracker.flush())
             .expect("the tracker's base flush applies to an empty value");
-        Self(Arc::new(Mutex::new(MutableStateInner {
+        Self(Rc::new(Mutex::new(MutableStateInner {
             tracker,
             published,
             sequence: 0,
@@ -113,20 +129,20 @@ impl MutableReplicatedState {
     /// is uncontended.
     #[must_use]
     pub fn value(&self) -> JsonValue {
-        self.0.lock().expect("state lock").published.clone()
+        lock_state(&self.0, "state lock").published.clone()
     }
 
     /// The publication sequence, `0` before the first publication.
     #[must_use]
     pub fn sequence(&self) -> u64 {
-        self.0.lock().expect("state lock").sequence
+        lock_state(&self.0, "state lock").sequence
     }
 
     /// Accesses the tracked surface, the `state.` proxy writes upstream
     /// producers make: every mutation records an intent, and the next
     /// [`publish`](Self::publish) flushes it.
     pub fn mutate<R>(&self, mutate: impl FnOnce(&mut Tracker) -> R) -> R {
-        let mut inner = self.0.lock().expect("state lock");
+        let mut inner = lock_state(&self.0, "state lock");
         mutate(&mut inner.tracker)
     }
 
@@ -136,9 +152,18 @@ impl MutableReplicatedState {
     /// listeners (the provider's replication plumbing) hear the batch
     /// before the value listeners, upstream's delivery order, and both run
     /// with the state lock released so listener bodies may read state.
+    ///
+    /// # Errors
+    /// [`ChordError`] when a source listener rejects the flushed batch,
+    /// propagated before any value listener runs.
+    ///
+    /// # Panics
+    /// Only if the tracker's own flush fails to apply, which its emitted
+    /// vocabulary cannot make happen; a panic here is a port bug, not a
+    /// runtime condition.
     pub fn publish(&self, context: &Context) -> Result<(), ChordError> {
         let (ops, sequence, published, sources, listeners) = {
-            let mut inner = self.0.lock().expect("state lock");
+            let mut inner = lock_state(&self.0, "state lock");
             let ops = inner.tracker.flush();
             if ops.is_empty() {
                 return Ok(());
@@ -178,19 +203,24 @@ impl MutableReplicatedState {
     ///
     /// # Errors
     /// [`ChordError`] when the flush-before-hydrate publication fails.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the listener is registered and then invoked for the hydrate delivery; the by-value signature is the ported public surface"
+    )]
     pub fn subscribe(&self, listener: ValueListener) -> Result<Unsubscribe, ChordError> {
         let context = service_delivery_context();
         self.publish(&context)?;
-        let mut inner = self.0.lock().expect("state lock");
+        let mut inner = lock_state(&self.0, "state lock");
         let id = inner.listeners.add(listener.clone());
         let delivery = ReplicatedStateDelivery {
             kind: ReplicatedStateDeliveryKind::Hydrate,
             sequence: inner.sequence,
         };
         listener(&inner.published, &context, &delivery);
+        drop(inner);
         let state = self.clone();
         Ok(Box::new(move || {
-            state.0.lock().expect("state lock").listeners.remove(id);
+            lock_state(&state.0, "state lock").listeners.remove(id);
         }))
     }
 
@@ -198,11 +228,10 @@ impl MutableReplicatedState {
     /// plumbing publishes through it.
     #[must_use]
     pub(crate) fn source_subscribe(&self, listener: SourceListener) -> Unsubscribe {
-        let mut inner = self.0.lock().expect("state lock");
-        let id = inner.source_listeners.add(listener);
+        let id = lock_state(&self.0, "state lock").source_listeners.add(listener);
         let state = self.clone();
         Box::new(move || {
-            state.0.lock().expect("state lock").source_listeners.remove(id);
+            lock_state(&state.0, "state lock").source_listeners.remove(id);
         })
     }
 }
@@ -214,17 +243,18 @@ struct ReplicaInner {
     report_error: ErrorReporter,
 }
 
-/// A cold read-only state used by service consumers until a complete
-/// snapshot arrives, upstream's `ReplicatedStateReplica`. Sequence fencing
-/// is strict: an update that skips a sequence clears the replica before the
-/// error propagates. Listener failures are reported to the constructor's
-/// reporter, the try/catch shape upstream wraps every delivery in.
+/// A cold read-only state used by service consumers until a complete snapshot arrives, upstream's `ReplicatedStateReplica`.
+///
+/// Sequence fencing is strict: an update that skips a sequence clears the
+/// replica before the error propagates. Listener failures are reported to
+/// the constructor's reporter, the try/catch shape upstream wraps every
+/// delivery in.
 #[derive(Clone)]
-pub struct ReplicatedStateReplica(Arc<Mutex<ReplicaInner>>);
+pub struct ReplicatedStateReplica(Rc<Mutex<ReplicaInner>>);
 
 impl std::fmt::Debug for ReplicatedStateReplica {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.0.lock().expect("replica lock");
+        let inner = lock_state(&self.0, "replica lock");
         f.debug_struct("ReplicatedStateReplica")
             .field("sequence", &inner.sequence)
             .field("value", &inner.value)
@@ -236,7 +266,7 @@ impl ReplicatedStateReplica {
     /// A replica that reports listener failures to `report_error`.
     #[must_use]
     pub fn new(report_error: ErrorReporter) -> Self {
-        Self(Arc::new(Mutex::new(ReplicaInner {
+        Self(Rc::new(Mutex::new(ReplicaInner {
             value: None,
             sequence: None,
             listeners: ListenerList::new(),
@@ -248,15 +278,18 @@ impl ReplicatedStateReplica {
     /// reports [`None`] again.
     #[must_use]
     pub fn value(&self) -> Option<JsonValue> {
-        self.0.lock().expect("replica lock").value.clone()
+        lock_state(&self.0, "replica lock").value.clone()
     }
 
     /// Subscribes; an already-hydrated replica delivers one hydrate
     /// immediately.
     #[must_use]
-    #[must_use]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the listener is registered and then invoked for a possible hydrate delivery; the by-value signature is the ported public surface"
+    )]
     pub fn subscribe(&self, listener: ValueListener) -> Unsubscribe {
-        let mut inner = self.0.lock().expect("replica lock");
+        let mut inner = lock_state(&self.0, "replica lock");
         let id = inner.listeners.add(listener.clone());
         if let Some(value) = inner.value.clone()
             && let Some(sequence) = inner.sequence
@@ -267,9 +300,10 @@ impl ReplicatedStateReplica {
             };
             listener(&value, &service_delivery_context(), &delivery);
         }
+        drop(inner);
         let replica = self.clone();
         Box::new(move || {
-            replica.0.lock().expect("replica lock").listeners.remove(id);
+            lock_state(&replica.0, "replica lock").listeners.remove(id);
         })
     }
 
@@ -284,14 +318,15 @@ impl ReplicatedStateReplica {
             ));
         }
         let value = apply_immutable(None, ops)?;
-        let mut inner = self.0.lock().expect("replica lock");
+        let mut inner = lock_state(&self.0, "replica lock");
         inner.sequence = Some(sequence);
         inner.value = Some(value);
         let delivery = ReplicatedStateDelivery {
             kind: ReplicatedStateDeliveryKind::Hydrate,
             sequence,
         };
-        deliver_all(&mut inner, context, &delivery);
+        deliver_all(&inner, context, &delivery);
+        drop(inner);
         Ok(())
     }
 
@@ -302,7 +337,7 @@ impl ReplicatedStateReplica {
     /// sequence is not exactly one past the applied one — the gap clears the
     /// replica before the error surfaces.
     pub fn update(&self, sequence: u64, ops: &[Op], context: &Context) -> Result<(), ChordError> {
-        let mut inner = self.0.lock().expect("replica lock");
+        let mut inner = lock_state(&self.0, "replica lock");
         let (Some(applied_sequence), Some(applied_value)) = (inner.sequence, inner.value.clone()) else {
             return Err(ChordError::Message(
                 "Replicated state received an update before hydration".to_string(),
@@ -322,20 +357,21 @@ impl ReplicatedStateReplica {
             kind: ReplicatedStateDeliveryKind::Update,
             sequence,
         };
-        deliver_all(&mut inner, context, &delivery);
+        deliver_all(&inner, context, &delivery);
+        drop(inner);
         Ok(())
     }
 
     /// Drops the retained value and sequence, the cold state a consumer
     /// restarts from.
     pub fn clear(&self) {
-        let mut inner = self.0.lock().expect("replica lock");
+        let mut inner = lock_state(&self.0, "replica lock");
         inner.value = None;
         inner.sequence = None;
     }
 }
 
-fn deliver_all(inner: &mut ReplicaInner, context: &Context, delivery: &ReplicatedStateDelivery) {
+fn deliver_all(inner: &ReplicaInner, context: &Context, delivery: &ReplicatedStateDelivery) {
     let Some(value) = inner.value.clone() else {
         return;
     };
@@ -343,7 +379,7 @@ fn deliver_all(inner: &mut ReplicaInner, context: &Context, delivery: &Replicate
     for listener in listeners {
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| listener(&value, context, delivery)));
         if let Err(panic) = result {
-            (inner.report_error)(&ChordError::Message(panic_message(&panic)));
+            (inner.report_error)(&ChordError::Message(panic_message(&*panic)));
         }
     }
 }

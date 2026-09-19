@@ -29,6 +29,15 @@ pub struct InstanceDirectoryEntry {
     pub deactivate: Rc<dyn Fn()>,
 }
 
+impl std::fmt::Debug for InstanceDirectoryEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceDirectoryEntry")
+            .field("key", &self.key)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
 struct Observer {
     handler: KeyedServiceHandler,
     tasks: RefCell<Vec<(Rc<InstanceDirectoryEntry>, crate::context::AbortController)>>,
@@ -49,7 +58,7 @@ impl std::fmt::Debug for InstanceDirectory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstanceDirectory")
             .field("ready", &self.ready.get())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -87,6 +96,10 @@ impl InstanceDirectory {
     ///
     /// # Errors
     /// [`ChordError`] when the directory is disposed or the key is live.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the entry is registered and observed; the by-value signature is the ported public surface"
+    )]
     pub fn insert(&self, entry: Rc<InstanceDirectoryEntry>) -> Result<(), ChordError> {
         self.assert_active()?;
         if self.entries.borrow().iter().any(|(key, _)| *key == entry.key) {
@@ -107,6 +120,10 @@ impl InstanceDirectory {
     /// # Errors
     /// [`ChordError`] when the directory is disposed or the live generation
     /// repeats.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the entry is registered and observed; the by-value signature is the ported public surface"
+    )]
     pub fn replace(&self, entry: Rc<InstanceDirectoryEntry>) -> Result<(), ChordError> {
         self.assert_active()?;
         let previous = self.get(&entry.key);
@@ -271,7 +288,7 @@ impl InstanceDirectory {
             (observer.handler)(target, context.clone());
         }));
         if let Err(panic) = result {
-            report(ChordError::Message(crate::services::state::panic_message(&panic)));
+            report(ChordError::Message(crate::services::state::panic_message(&*panic)));
         }
     }
 

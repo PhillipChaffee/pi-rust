@@ -110,7 +110,12 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
         return Err(manifest_error(path, "Invalid facet bundle manifest format"));
     }
     let version = manifest.get("formatVersion").and_then(JsonValue::as_number);
-    if version != Some(FACET_BUNDLE_FORMAT_VERSION as f64) {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "the format version is a small constant, exact inside f64's integer range"
+    )]
+    let expected_version = FACET_BUNDLE_FORMAT_VERSION as f64;
+    if version != Some(expected_version) {
         return Err(ChordError::Message(format!(
             "Unsupported facet bundle manifest version in {path}: {version:?}"
         )));
@@ -147,66 +152,7 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
     }
     let mut entries = Vec::with_capacity(entries_value.len());
     for (name, candidate) in entries_value.iter() {
-        if name.is_empty() {
-            return Err(manifest_error(path, "Facet bundle manifest has an invalid entry"));
-        }
-        let entry = candidate
-            .as_object()
-            .ok_or_else(|| manifest_error(path, "Facet bundle manifest has an invalid entry"))?;
-        let file = entry
-            .get("file")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| manifest_error(path, &format!("Facet bundle entry {name} has no file")))?;
-        resolve_bundle_file(file)?;
-        let integrity = entry
-            .get("integrity")
-            .and_then(JsonValue::as_str)
-            .ok_or_else(|| manifest_error(path, &format!("Facet bundle entry {name} has no integrity")))?;
-        parse_integrity(integrity)?;
-        let declared_imports = entry
-            .get("externalImports")
-            .and_then(JsonValue::as_array)
-            .ok_or_else(|| {
-                manifest_error(path, &format!("Facet bundle entry {name} has invalid external imports"))
-            })?;
-        let mut external_imports: Vec<&str> = Vec::with_capacity(declared_imports.len());
-        for item in declared_imports {
-            let Some(item) = item.as_str() else {
-                return Err(manifest_error(
-                    path,
-                    &format!("Facet bundle entry {name} has invalid external imports"),
-                ));
-            };
-            external_imports.push(item);
-        }
-        let mut unique = external_imports.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        if unique.len() != external_imports.len() {
-            return Err(manifest_error(
-                path,
-                &format!("Facet bundle entry {name} has duplicate external imports"),
-            ));
-        }
-        let source_map = match entry.get("sourceMap") {
-            None => None,
-            Some(source_map) => {
-                let source_map = source_map.as_str().ok_or_else(|| {
-                    manifest_error(path, &format!("Facet bundle entry {name} has an invalid source map"))
-                })?;
-                resolve_bundle_file(source_map)?;
-                Some(source_map.to_string())
-            }
-        };
-        entries.push((
-            name.to_string(),
-            FacetBundleEntry {
-                file: file.to_string(),
-                integrity: integrity.to_string(),
-                external_imports: external_imports.into_iter().map(str::to_string).collect(),
-                source_map,
-            },
-        ));
+        entries.push((name.to_string(), validate_entry(name, candidate, path)?));
     }
     Ok(FacetBundleManifest {
         format: FACET_BUNDLE_FORMAT.to_string(),
@@ -216,6 +162,72 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
             version,
         },
         entries,
+    })
+}
+
+/// Validates one manifest entry, the per-entry half of
+/// [`validate_manifest`].
+///
+/// # Errors
+/// [`ChordError`] describing the first violation, with the reader's path
+/// label and the entry name.
+fn validate_entry(name: &str, candidate: &JsonValue, path: &str) -> Result<FacetBundleEntry, ChordError> {
+    if name.is_empty() {
+        return Err(manifest_error(path, "Facet bundle manifest has an invalid entry"));
+    }
+    let entry = candidate
+        .as_object()
+        .ok_or_else(|| manifest_error(path, "Facet bundle manifest has an invalid entry"))?;
+    let file = entry
+        .get("file")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| manifest_error(path, &format!("Facet bundle entry {name} has no file")))?;
+    resolve_bundle_file(file)?;
+    let integrity = entry
+        .get("integrity")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| manifest_error(path, &format!("Facet bundle entry {name} has no integrity")))?;
+    parse_integrity(integrity)?;
+    let declared_imports = entry
+        .get("externalImports")
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| {
+            manifest_error(path, &format!("Facet bundle entry {name} has invalid external imports"))
+        })?;
+    let mut external_imports: Vec<&str> = Vec::with_capacity(declared_imports.len());
+    for item in declared_imports {
+        let Some(item) = item.as_str() else {
+            return Err(manifest_error(
+                path,
+                &format!("Facet bundle entry {name} has invalid external imports"),
+            ));
+        };
+        external_imports.push(item);
+    }
+    let mut unique = external_imports.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != external_imports.len() {
+        return Err(manifest_error(
+            path,
+            &format!("Facet bundle entry {name} has duplicate external imports"),
+        ));
+    }
+    let source_map = match entry.get("sourceMap") {
+        None => None,
+        Some(source_map) => {
+            let source_map = source_map.as_str().ok_or_else(|| {
+                manifest_error(path, &format!("Facet bundle entry {name} has an invalid source map"))
+            })?;
+            resolve_bundle_file(source_map)?;
+            Some(source_map.to_string())
+        }
+    };
+    Ok(FacetBundleEntry {
+        file: file.to_string(),
+        integrity: integrity.to_string(),
+        external_imports: external_imports.into_iter().map(str::to_string).collect(),
+        source_map,
     })
 }
 
@@ -294,6 +306,10 @@ pub fn read_facet_bundle_manifest(path: &std::path::Path) -> Result<FacetBundleM
 ///
 /// # Errors
 /// [`ChordError`] when the text is not valid JSON.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "the context is an owned error label by contract; the by-value signature is the ported public surface"
+)]
 pub fn parse_json(text: &str, context: String) -> Result<JsonValue, ChordError> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|error| ChordError::Message(format!("{context}: {error}")))?;
@@ -306,7 +322,12 @@ fn json_from_serde(value: &serde_json::Value) -> JsonValue {
         serde_json::Value::Bool(flag) => JsonValue::Bool(*flag),
         serde_json::Value::Number(number) => {
             let number = number.as_f64().unwrap_or_default();
-            JsonValue::Number(JsonNumber::new(number).unwrap_or(JsonNumber::new(0.0).expect("zero is finite")))
+            #[allow(
+                clippy::expect_used,
+                reason = "zero is finite, so the fallback cannot fail; a panic here is a JsonNumber contract bug"
+            )]
+            let zero = JsonNumber::new(0.0).expect("zero is finite");
+            JsonValue::Number(JsonNumber::new(number).unwrap_or(zero))
         }
         serde_json::Value::String(text) => JsonValue::Str(text.clone()),
         serde_json::Value::Array(items) => JsonValue::Array(items.iter().map(json_from_serde).collect()),

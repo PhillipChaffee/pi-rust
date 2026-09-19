@@ -159,6 +159,11 @@ pub fn create_service_unsubscribe_call(subscription_id: &str) -> ServiceCall {
 /// Decodes one call as a control call, or [`None`] when it is a plain
 /// member invocation. The reserved service ID without a control shape falls
 /// through too: upstream returns `undefined`.
+///
+/// # Panics
+/// Never: the `"subscribe"` guard checks `ServiceMode::parse` succeeds, so
+/// the second parse inside the arm cannot fail; a panic would be a port
+/// bug.
 #[must_use]
 pub fn decode_service_control_call(call: &ServiceCall) -> Option<ServiceControlCall> {
     if call.service_id != SERVICE_CONTROL_ID || call.instance.is_some() {
@@ -171,11 +176,17 @@ pub fn decode_service_control_call(call: &ServiceCall) -> Option<ServiceControlC
             && is_id(&call.args[1])
             && ServiceMode::parse(call.args[2].as_str()?).is_some() =>
         {
-            Some(ServiceControlCall::Subscribe {
-                subscription_id: call.args[0].as_str()?.to_string(),
-                service_id: call.args[1].as_str()?.to_string(),
-                mode: ServiceMode::parse(call.args[2].as_str()?).expect("mode parsed above"),
-            })
+            #[allow(
+                clippy::expect_used,
+                reason = "the match guard checked that the mode parses; a failure is a port bug"
+            )]
+            {
+                Some(ServiceControlCall::Subscribe {
+                    subscription_id: call.args[0].as_str()?.to_string(),
+                    service_id: call.args[1].as_str()?.to_string(),
+                    mode: ServiceMode::parse(call.args[2].as_str()?).expect("mode parsed above"),
+                })
+            }
         }
         "unsubscribe" if call.args.len() == 1 && is_id(&call.args[0]) => {
             Some(ServiceControlCall::Unsubscribe {
@@ -628,11 +639,17 @@ fn mode_field(value: &JsonObject) -> Option<ServiceMode> {
 
 fn integer_field(value: &JsonObject, key: &str, minimum: u64) -> Option<u64> {
     let number = value.get(key)?.as_number()?;
-    if number.fract() != 0.0 || number < minimum as f64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "minimum values are small constants, exact inside f64's integer range"
+    )]
+    let minimum = minimum as f64;
+    if number.fract() != 0.0 || number < minimum {
         return None;
     }
     #[allow(
         clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
         reason = "the integer check above rules out fractions and negatives, so the cast is exact"
     )]
     Some(number as u64)
@@ -728,7 +745,7 @@ fn address_to_json(address: &ServiceInstanceAddress) -> JsonValue {
 /// Builds a JSON object from `(key, value)` pairs in order.
 #[must_use]
 pub fn object(entries: Vec<(&str, JsonValue)>) -> JsonValue {
-    JsonValue::Object(crate::types::JsonObject::from_entries(
+    JsonValue::Object(JsonObject::from_entries(
         entries
             .into_iter()
             .map(|(key, value)| (key.to_string(), value))

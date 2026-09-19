@@ -2,7 +2,7 @@
 //! `src/node/bundle-loader.ts` with the module execution designed open.
 //!
 //! Upstream verifies the entry's SHA-256 integrity and then compiles the
-//! CommonJS module with `node:vm.compileFunction`, resolving host externals
+//! `CommonJS` module with `node:vm.compileFunction`, resolving host externals
 //! through `require`. Rust has no JS runtime, and the ticket leaves the
 //! loader seam deliberately open: the Rust-native extension mechanism (the
 //! map's fogged destination) owns what a facet bundle artifact contains.
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::errors::ChordError;
-use crate::future::{LocalBoxFuture, boxed, ready_with};
+use crate::future::{LocalBoxFuture, boxed};
 use crate::node::manifest::{
     FACET_BUNDLE_ARTIFACT_FORMAT, FACET_BUNDLE_ARTIFACT_FORMAT_VERSION, FACET_BUNDLE_FORMAT,
     FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact, FacetBundleManifest,
@@ -28,10 +28,10 @@ use crate::types::{FacetDef, FacetLoader, LoadedFacets};
 /// resolution.
 pub type FacetBundleExternalResolver = Rc<dyn Fn(&str) -> Option<PathBuf>>;
 
-/// Executes one loaded facet module, the seam the Rust-native extension
-/// mechanism implements. Upstream's CommonJS `module.exports` contract is
-/// the JavaScript side of this seam; the native counterpart decides the
-/// artifact form itself.
+/// Executes one loaded facet module, the seam the Rust-native extension mechanism implements.
+///
+/// Upstream's `CommonJS` `module.exports` contract is the JavaScript side of
+/// this seam; the native counterpart decides the artifact form itself.
 pub trait FacetModuleHost {
     /// Executes the verified source and returns the facets it exports.
     ///
@@ -99,6 +99,16 @@ pub struct FacetBundleLoaderOptions {
     pub module_host: Rc<dyn FacetModuleHost>,
 }
 
+impl std::fmt::Debug for FacetBundleLoaderOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetBundleLoaderOptions")
+            .field("manifest_path", &self.manifest_path)
+            .field("entry", &self.entry)
+            .field("verify_integrity", &self.verify_integrity)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The options `create_facet_bundle_artifact_loader` takes, upstream's
 /// `FacetBundleArtifactLoaderOptions`.
 pub struct FacetBundleArtifactLoaderOptions {
@@ -112,6 +122,15 @@ pub struct FacetBundleArtifactLoaderOptions {
     pub temporary_directory: Option<PathBuf>,
     /// The module host the materialized source rides to.
     pub module_host: Rc<dyn FacetModuleHost>,
+}
+
+impl std::fmt::Debug for FacetBundleArtifactLoaderOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetBundleArtifactLoaderOptions")
+            .field("artifact", &self.artifact)
+            .field("temporary_directory", &self.temporary_directory)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Reads and verifies one transportable entry from a facet bundle on disk,
@@ -134,7 +153,7 @@ pub fn read_facet_bundle_artifact(
             manifest.plugin.id
         )));
     };
-    let module_path = manifest_path.parent().unwrap_or(Path::new(".")).join(&entry.file);
+    let module_path = manifest_path.parent().unwrap_or_else(|| Path::new(".")).join(&entry.file);
     let source = std::fs::read_to_string(&module_path).map_err(|error| {
         ChordError::Message(format!("Could not read facet bundle entry {}: {error}", module_path.display()))
     })?;
@@ -143,7 +162,7 @@ pub fn read_facet_bundle_artifact(
         .source_map
         .as_ref()
         .map(|source_map| {
-            std::fs::read_to_string(manifest_path.parent().unwrap_or(Path::new(".")).join(source_map))
+            std::fs::read_to_string(manifest_path.parent().unwrap_or_else(|| Path::new(".")).join(source_map))
                 .map_err(|error| {
                     ChordError::Message(format!("Could not read facet bundle source map: {error}"))
                 })
@@ -157,7 +176,7 @@ pub fn read_facet_bundle_artifact(
         entry_name: entry_name.to_string(),
         entry: entry.clone(),
         source,
-        source_map_contents: source_map_contents,
+        source_map_contents,
     })
 }
 
@@ -187,6 +206,16 @@ pub struct FacetBundleLoader {
     module_host: Rc<dyn FacetModuleHost>,
 }
 
+impl std::fmt::Debug for FacetBundleLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FacetBundleLoader")
+            .field("manifest_path", &self.manifest_path)
+            .field("entry", &self.entry)
+            .field("verify_integrity", &self.verify_integrity)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FacetLoader for FacetBundleLoader {
     fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
         let manifest_path = self.manifest_path.clone();
@@ -207,7 +236,7 @@ impl FacetLoader for FacetBundleLoader {
             };
             let module_path = manifest_path
                 .parent()
-                .unwrap_or(Path::new("."))
+                .unwrap_or_else(|| Path::new("."))
                 .join(&bundle_entry.file);
             let result = (|| {
                 let source = std::fs::read_to_string(&module_path).map_err(|error| {
@@ -261,6 +290,15 @@ pub struct ArtifactFacetLoader {
     module_host: Rc<dyn FacetModuleHost>,
 }
 
+impl std::fmt::Debug for ArtifactFacetLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArtifactFacetLoader")
+            .field("artifact", &self.artifact)
+            .field("temporary_parent", &self.temporary_parent)
+            .finish_non_exhaustive()
+    }
+}
+
 impl ArtifactFacetLoader {
     /// Loads one fresh materialized generation.
     fn load_sync(&self) -> Result<LoadedFacets, ChordError> {
@@ -278,7 +316,7 @@ impl ArtifactFacetLoader {
             std::fs::write(directory.join(&self.artifact.entry.file), &self.artifact.source).map_err(|error| {
                 ChordError::Message(format!("Could not materialize facet artifact: {error}"))
             })?;
-            let manifest = crate::node::bundle::manifest_to_json_text(&crate::node::manifest::FacetBundleManifest {
+            let manifest = crate::node::bundle::manifest_to_json_text(&FacetBundleManifest {
                 format: FACET_BUNDLE_FORMAT.to_string(),
                 format_version: FACET_BUNDLE_FORMAT_VERSION,
                 plugin: self.artifact.plugin.clone(),
@@ -330,20 +368,23 @@ impl FacetLoader for ArtifactFacetLoader {
 }
 
 fn settle(loaded: LocalBoxFuture<Result<LoadedFacets, ChordError>>) -> Result<LoadedFacets, ChordError> {
-    match crate::future::settle_now(loaded) {
-        Some(result) => result,
-        None => Err(ChordError::Message(
+    crate::future::settle_now(loaded).unwrap_or_else(|| {
+        Err(ChordError::Message(
             "Facet bundle loading must settle without awaiting; module hosts that yield are not materializable synchronously"
                 .to_string(),
-        )),
-    }
+        ))
+    })
 }
 
 fn short_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the low 64 bits of the nanosecond clock carry the suffix uniqueness"
+    )]
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or_default();
-    format!("{:016x}", nanos)
+    format!("{nanos:016x}")
 }

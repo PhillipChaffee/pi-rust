@@ -10,11 +10,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::delta::{Decoder, Encoder, Op, WireOp};
+use crate::delta::{Decoder, Encoder};
 use crate::errors::ChordError;
 use crate::types::{
-    ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceMode,
-    ServiceProviderUpdate, ServiceSubscriptionSnapshot,
+    ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceProviderUpdate,
+    ServiceSubscriptionSnapshot,
 };
 use crate::services::wire::{
     WireServiceInstanceSnapshot, WireServiceMemberSnapshot, WireServiceProviderUpdate,
@@ -25,6 +25,12 @@ use crate::services::wire::{
 /// subscription, upstream's `ServiceStateEncoder`.
 pub struct ServiceStateEncoder {
     codecs: CodecRegistry<Encoder>,
+}
+
+impl std::fmt::Debug for ServiceStateEncoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceStateEncoder").finish_non_exhaustive()
+    }
 }
 
 impl ServiceStateEncoder {
@@ -128,6 +134,12 @@ impl ServiceStateEncoder {
 /// subscription, upstream's `ServiceStateDecoder`.
 pub struct ServiceStateDecoder {
     codecs: CodecRegistry<Decoder>,
+}
+
+impl std::fmt::Debug for ServiceStateDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceStateDecoder").finish_non_exhaustive()
+    }
 }
 
 impl ServiceStateDecoder {
@@ -348,8 +360,8 @@ fn state_key(instance: Option<&ServiceInstanceAddress>, member: &str) -> StateKe
 }
 
 fn describe_state(instance: Option<&ServiceInstanceAddress>, member: &str) -> String {
-    match instance {
-        None => member.to_string(),
-        Some(address) => format!("{}@{}.{}", address.key, address.generation, member),
-    }
+    instance.map_or_else(
+        || member.to_string(),
+        |address| format!("{}@{}.{}", address.key, address.generation, member),
+    )
 }

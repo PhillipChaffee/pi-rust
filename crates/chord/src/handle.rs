@@ -22,7 +22,7 @@ use crate::context::Context;
 use crate::errors::ChordError;
 use crate::future::{LocalBoxFuture, boxed};
 use crate::services::state::MutableReplicatedState;
-use crate::types::{JsonValue, ServiceMemberKind, ReplicatedStateDelivery, Unsubscribe};
+use crate::types::{JsonValue, ServiceMemberKind, Unsubscribe};
 
 /// The gate every handle access passes before touching a service target.
 /// Upstream threads an `assertAccess: () => void` closure that throws;
@@ -59,10 +59,11 @@ pub fn sync_disposal(
 }
 
 /// A remote method member: arguments in wire order, then the invocation
-/// context. Upstream spells the return a `Promise` of JSON or void; the
-/// boxed future is that promise, driven by the caller's runtime. Shared
-/// ownership ([`Rc`]) lets providers clone a member into the future that
-/// awaits it.
+/// context.
+///
+/// Upstream spells the return a `Promise` of JSON or void; the boxed future
+/// is that promise, driven by the caller's runtime. Shared ownership
+/// ([`Rc`]) lets providers clone a member into the future that awaits it.
 pub type RemoteMethod = Rc<dyn Fn(Vec<JsonValue>, Context) -> LocalBoxFuture<Result<Option<JsonValue>, ChordError>>>;
 
 /// Builds a [`RemoteMethod`] from a synchronous body, for methods that
@@ -101,9 +102,10 @@ impl std::fmt::Debug for ServiceMember {
 }
 
 /// A service implementation as an explicit member registry, the owned-data
-/// restatement of the object upstream classifies by reflection. Member
-/// order is sorted by name, matching the classification order upstream's
-/// snapshots and shape checks observe.
+/// restatement of the object upstream classifies by reflection.
+///
+/// Member order is sorted by name, matching the classification order
+/// upstream's snapshots and shape checks observe.
 #[derive(Clone, Debug, Default)]
 pub struct ServiceImplementation {
     members: std::collections::BTreeMap<String, ServiceMember>,
@@ -136,7 +138,6 @@ impl ServiceImplementation {
     }
 
     /// The members in registration (sorted-name) order.
-    #[must_use]
     pub fn members(&self) -> impl Iterator<Item = (&String, &ServiceMember)> {
         self.members.iter()
     }
@@ -193,13 +194,12 @@ pub fn validate_remote_implementation(
     Ok(())
 }
 
-/// The target a [`ServiceSlot`] resolves member access against: a local
-/// implementation registry, or a consumer facade over a transport.
-/// The target a [`ServiceSlot`] resolves member access against: a local
-/// implementation registry, a consumer facade over a transport, or a view
-/// another source already guards (the layering upstream's proxy chain
-/// restates).
-#[derive(Clone)]
+/// The target a [`ServiceSlot`] resolves member access against.
+///
+/// Targets are a local implementation registry, a consumer facade over a
+/// transport, or a view another source already guards (the layering
+/// upstream's proxy chain restates).
+#[derive(Clone, Debug)]
 pub enum ServiceTarget {
     /// A host-provided implementation.
     Local(Rc<ServiceImplementation>),
@@ -233,12 +233,6 @@ impl std::fmt::Debug for ServiceSlot {
             .field("service_id", &self.0.service_id)
             .field("bound", &self.0.target.borrow().is_some())
             .finish()
-    }
-}
-
-impl SlotCore {
-    fn service_id(&self) -> &str {
-        &self.service_id
     }
 }
 
@@ -321,6 +315,7 @@ impl ServiceView {
     /// # Errors
     /// [`ChordError`] when the access gate or the member dispatch rejects,
     /// or the member is not a method.
+    #[must_use]
     pub fn call(
         &self,
         member: &str,
@@ -363,7 +358,7 @@ impl ServiceView {
                 ))),
             },
             ServiceTarget::Facade(facade) => {
-                let slot = facade.member_slot(member)?;
+                let slot = facade.member_slot(member);
                 Ok(StateMemberView {
                     access: self.assert_access.clone(),
                     inner: StateMemberInner::Replica(slot),
@@ -397,12 +392,20 @@ impl ServiceView {
     }
 }
 
-/// One replicated-state member as a consumer sees it: a source state when
-/// the target is local, a replica when the target is a facade. Every read
-/// re-passes the view's access gate, the per-property proxy trap.
+/// One replicated-state member as a consumer sees it.
+///
+/// The target is a source state when local, a replica when the target is a
+/// facade. Every read re-passes the view's access gate, the per-property
+/// proxy trap.
 pub struct StateMemberView {
     access: AssertAccess,
     inner: StateMemberInner,
+}
+
+impl std::fmt::Debug for StateMemberView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StateMemberView").finish_non_exhaustive()
+    }
 }
 
 enum StateMemberInner {
