@@ -1,0 +1,20 @@
+[package]
+name = "pi-evals"
+version = "0.1.0"
+edition = "2024"
+description = "Pure experiment logic for pi behavioral evals: case planning, paired comparison, and report reading, ported from @earendil-works/pi-evals"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["evals", "evaluation", "benchmark", "coding-agent", "testing"]
+categories = ["development-tools"]
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

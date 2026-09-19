@@ -1,0 +1,18 @@
+[package]
+name = "pi-telemetry"
+version = "0.1.0"
+edition = "2024"
+description = "Vendor-neutral callback-span telemetry contract, ported from @earendil-works/pi-telemetry"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["telemetry", "spans", "tracing", "observability", "coding-agent"]
+categories = ["development-tools", "development-tools::profiling"]
+
+[dependencies]
+
+[dev-dependencies]
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "sync"] }
+
+[lints]
+workspace = true
