@@ -1418,7 +1418,7 @@ const fn parse_event_type(event_type: Option<i64>) -> KeyEventType {
 /// digit is present. Upstream's `parseInt` yields an out-of-range float for
 /// absurdly long runs; the saturating value lands in the same "never matches a
 /// real key" bucket.
-fn scan_digits(bytes: &[u8], pos: &mut usize) -> Option<i64> {
+pub(crate) fn scan_digits(bytes: &[u8], pos: &mut usize) -> Option<i64> {
     let mut value: i64 = 0;
     let mut any = false;
     while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
