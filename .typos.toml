@@ -8,3 +8,7 @@ calender = "calender"
 ratatui = "ratatui"
 # evn is the macro variable binding an event's name.
 evn = "evn"
+# JSON fragments the utils suites pin verbatim from the upstream tests.
+[default.extend-words]
+tru = "tru"
+Hel = "Hel"
