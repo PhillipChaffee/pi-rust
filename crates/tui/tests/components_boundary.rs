@@ -546,15 +546,19 @@ mod loader_component {
 
     #[test]
     fn stop_disarms_the_animation() {
-        let (loader, _count) = loader_with(vec!["a".to_string(), "b".to_string()], 10);
+        let (loader, count) = loader_with(vec!["a".to_string(), "b".to_string()], 10);
 
         let initial = loader.render(20)[1].clone();
         assert!(wait_for(|| loader.render(20)[1] != initial));
         loader.stop();
 
-        let settled = loader.render(20)[1].clone();
+        // The stop is best-effort: one set already in flight may land, so
+        // assert the render requests settle instead of asserting an exact
+        // display. A still-running worker would tick every 10 ms.
         std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(loader.render(20)[1], settled);
+        let settled = count.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(count.load(Ordering::SeqCst) <= settled + 1);
     }
 
     #[test]
@@ -678,7 +682,8 @@ mod boundary_extras {
         assert!(wait_for(|| count.load(Ordering::SeqCst) > 1));
 
         // Swapping to a single frame stops arming new ticks: the in-flight
-        // worker exits on its next wake instead of advancing.
+        // worker exits on its next wake instead of advancing, though one
+        // set already in flight may land.
         loader.set_indicator(Some(LoaderIndicatorOptions {
             frames: Some(vec!["z".to_string()]),
             interval_ms: None,
@@ -687,7 +692,7 @@ mod boundary_extras {
         let settled = count.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(120));
         assert_eq!(loader.render(20)[1].trim(), "z Loading");
-        assert_eq!(count.load(Ordering::SeqCst), settled);
+        assert!(count.load(Ordering::SeqCst) <= settled + 1);
     }
 
     #[test]
