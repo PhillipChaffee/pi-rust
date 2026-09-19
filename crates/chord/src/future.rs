@@ -89,14 +89,17 @@ pub fn settle_now<T>(mut future: LocalBoxFuture<T>) -> Option<T> {
     }
 }
 
-/// Polls a boxed future once, returning its value when the first poll
-/// settles it, or the future back when it stays pending.
+/// Polls a boxed future once.
 ///
 /// Upstream starts promises the moment they are created; the event loop
 /// runs them before any later statement observes them. In-process
 /// transports settle inside one poll, so the eager-start restatement is
-/// "drive the stored future once at creation"; a future that needs more
-/// turns goes back where it came from.
+/// "drive the stored future once at creation".
+///
+/// # Errors
+/// Never returns `Err` as a failure; the `Err` arm carries the still
+/// pending future back to the caller, the put-back half of the eager-start
+/// contract.
 pub fn drive_once<T>(mut future: LocalBoxFuture<T>) -> Result<T, LocalBoxFuture<T>> {
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
@@ -106,10 +109,12 @@ pub fn drive_once<T>(mut future: LocalBoxFuture<T>) -> Result<T, LocalBoxFuture<
     }
 }
 
-/// The one-poll boundary an upstream `await` creates even when the awaited
-/// promise is already resolved: the first poll issues the call, the
-/// continuation runs on the next one, which is the microtask boundary the
-/// event loop inserted between subscribing and installing.
+/// The one-poll boundary an upstream `await` creates.
+///
+/// Even when the awaited promise is already resolved, the first poll
+/// issues the call and the continuation runs on the next one — the
+/// microtask boundary the event loop inserted between subscribing and
+/// installing.
 #[derive(Debug)]
 pub struct Yield {
     yielded: bool,
@@ -117,7 +122,7 @@ pub struct Yield {
 
 /// The future [`yield_once`] returns.
 #[must_use]
-pub fn yield_once() -> Yield {
+pub const fn yield_once() -> Yield {
     Yield { yielded: false }
 }
 

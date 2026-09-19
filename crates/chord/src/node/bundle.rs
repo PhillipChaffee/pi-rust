@@ -384,7 +384,7 @@ fn parse_chord_configuration(
             }
             match source {
                 JsonValue::Bool(false) => {
-                    configured_facets.push((name.to_string(), FacetSource::Removed))
+                    configured_facets.push((name.to_string(), FacetSource::Removed));
                 }
                 JsonValue::Str(source) => {
                     configured_facets.push((name.to_string(), FacetSource::File(source.clone())));

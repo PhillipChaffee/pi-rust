@@ -15,6 +15,10 @@
     clippy::expect_used,
     reason = "test helpers settle results the case's own assertions would reject"
 )]
+#![allow(
+    clippy::too_many_lines,
+    reason = "the case bodies are the upstream suite ported 1:1; splitting them would obscure the mapping"
+)]
 
 use std::cell::RefCell;
 use std::rc::Rc;

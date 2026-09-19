@@ -1074,15 +1074,33 @@ impl FacetKernel {
     /// [`ChordError`] when a facet is unknown, staging or activation fails,
     /// or cutover aborts the host; cleanup failures aggregate into the
     /// report.
-    pub async fn reload(&self, facets: Vec<FacetDef>) -> Result<(), ChordError> {
-        if self.core.phase.get() != GenerationPhase::Active {
-            return Err(ChordError::Message(format!(
-                "Facet host cannot reload while {}",
-                phase_str(self.core.phase.get())
-            )));
+    /// Swaps the staged candidates into the facet map and returns the
+    /// records they replace, upstream's cutover prelude.
+    fn install_candidates(&self, candidate_order: &[Rc<RuntimeRecord>]) -> Vec<Rc<RuntimeRecord>> {
+        let previous: Vec<Rc<RuntimeRecord>> = candidate_order
+            .iter()
+            .filter_map(|candidate| {
+                self.core
+                    .facets
+                    .borrow()
+                    .iter()
+                    .find(|(id, _)| id == &candidate.facet_id)
+                    .map(|(_, record)| record.clone())
+            })
+            .collect();
+        for candidate in candidate_order {
+            let mut facets = self.core.facets.borrow_mut();
+            if let Some(slot) = facets.iter_mut().find(|(id, _)| id == &candidate.facet_id) {
+                slot.1 = candidate.clone();
+            }
         }
+        previous
+    }
+
+    /// Validates a reload's preconditions, upstream's reload prelude.
+    fn check_reload_requirements(&self, facets: &[FacetDef]) -> Result<(), ChordError> {
         let mut ids = std::collections::HashSet::new();
-        for facet in &facets {
+        for facet in facets {
             if facet.id.is_empty() {
                 return Err(ChordError::Message(
                     "Facet ID must not be empty".to_string(),
@@ -1094,7 +1112,7 @@ impl FacetKernel {
                 ));
             }
         }
-        for facet in &facets {
+        for facet in facets {
             if !self
                 .core
                 .facets
@@ -1108,6 +1126,24 @@ impl FacetKernel {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Activates and replaces facets with matching IDs without disconnecting
+    /// consumer service handles.
+    ///
+    /// # Errors
+    /// [`ChordError`] when the host is not active, a reloaded facet is
+    /// unknown, shapes change, or any stage of the reload fails; cleanup
+    /// failures aggregate into the report.
+    pub async fn reload(&self, facets: Vec<FacetDef>) -> Result<(), ChordError> {
+        if self.core.phase.get() != GenerationPhase::Active {
+            return Err(ChordError::Message(format!(
+                "Facet host cannot reload while {}",
+                phase_str(self.core.phase.get())
+            )));
+        }
+        self.check_reload_requirements(&facets)?;
         self.core.phase.set(GenerationPhase::Reloading);
 
         let staged = match self.stage_generation(facets) {
@@ -1131,16 +1167,7 @@ impl FacetKernel {
             .filter_map(|id| replacements.get(id).cloned())
             .collect();
 
-        let activation_result: Result<(), ChordError> = async {
-            for candidate in &candidate_order {
-                candidate.lifecycle.activate().await?;
-            }
-            for candidate in &candidate_order {
-                self.validate_replacement_provisions(candidate)?;
-            }
-            Ok(())
-        }
-        .await;
+        let activation_result = self.activate_candidates(&candidate_order).await;
         if let Err(error) = activation_result {
             let cleanup_errors =
                 dispose_records(&candidate_order.iter().rev().cloned().collect::<Vec<_>>()).await;
@@ -1158,23 +1185,7 @@ impl FacetKernel {
             ));
         }
 
-        let previous: Vec<Rc<RuntimeRecord>> = candidate_order
-            .iter()
-            .filter_map(|candidate| {
-                self.core
-                    .facets
-                    .borrow()
-                    .iter()
-                    .find(|(id, _)| id == &candidate.facet_id)
-                    .map(|(_, record)| record.clone())
-            })
-            .collect();
-        for candidate in &candidate_order {
-            let mut facets = self.core.facets.borrow_mut();
-            if let Some(slot) = facets.iter_mut().find(|(id, _)| id == &candidate.facet_id) {
-                slot.1 = candidate.clone();
-            }
-        }
+        let previous = self.install_candidates(&candidate_order);
         match self.cut_over(&candidate_order).await {
             Ok(()) => {}
             Err(error) => {
@@ -1231,6 +1242,21 @@ impl FacetKernel {
                 .collect(),
             label.to_string(),
         ))
+    }
+
+    /// Activates the staged candidates in dependency order and re-validates
+    /// their provisions, upstream's reload activation phase.
+    async fn activate_candidates(
+        &self,
+        candidate_order: &[Rc<RuntimeRecord>],
+    ) -> Result<(), ChordError> {
+        for candidate in candidate_order {
+            candidate.lifecycle.activate().await?;
+        }
+        for candidate in candidate_order {
+            self.validate_replacement_provisions(candidate)?;
+        }
+        Ok(())
     }
 
     fn stage_generation(&self, facets: Vec<FacetDef>) -> StagedGeneration {
@@ -1373,33 +1399,7 @@ impl FacetKernel {
         &self,
     ) -> Result<HashMap<String, ExternalService>, ChordError> {
         let sources = self.core.service_sources.clone();
-        let catalogues: Vec<Result<(usize, Vec<ServiceCatalogueEntry>), ChordError>> = join_all(
-            sources
-                .into_iter()
-                .enumerate()
-                .map(|(index, source)| {
-                    boxed(async move {
-                        let entries = source.catalogue(background_context()).await?;
-                        Ok((index, entries))
-                    })
-                })
-                .collect(),
-        )
-        .await;
-        let mut offered: Vec<(String, ServiceMode, usize)> = Vec::new();
-        for result in catalogues {
-            let (index, entries) = result?;
-            for entry in entries {
-                if offered.iter().any(|(id, _, _)| *id == entry.service_id) {
-                    return Err(ChordError::Message(format!(
-                        "Facet host service {} is offered by more than one source",
-                        entry.service_id
-                    )));
-                }
-                offered.push((entry.service_id, entry.mode, index));
-            }
-        }
-
+        let offered: Vec<(String, ServiceMode, usize)> = collect_offerings(&sources).await?;
         let local: std::collections::HashSet<String> = self
             .core
             .facets
@@ -1801,6 +1801,43 @@ impl KeyedSource for SourceKeyedSource {
             Rc::new(move |view, context| handler(ServiceTarget::View(view), context));
         self.0.observe(service, wrapped)
     }
+}
+
+/// Joins every source's catalogue into the offerings list, upstream's
+/// catalogue `Promise.all`. Indexes track the source each entry came from.
+async fn collect_offerings(
+    sources: &[Rc<dyn RemoteServiceSource>],
+) -> Result<Vec<(String, ServiceMode, usize)>, ChordError> {
+    let mut indexed: Vec<(usize, Rc<dyn RemoteServiceSource>)> = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        indexed.push((index, source.clone()));
+    }
+    let catalogues: Vec<Result<(usize, Vec<ServiceCatalogueEntry>), ChordError>> = join_all(
+        indexed
+            .into_iter()
+            .map(|(index, source)| {
+                boxed(async move {
+                    let entries = source.catalogue(background_context()).await?;
+                    Ok((index, entries))
+                })
+            })
+            .collect(),
+    )
+    .await;
+    let mut offered: Vec<(String, ServiceMode, usize)> = Vec::new();
+    for result in catalogues {
+        let (index, entries) = result?;
+        for entry in entries {
+            if offered.iter().any(|(id, _, _)| *id == entry.service_id) {
+                return Err(ChordError::Message(format!(
+                    "Facet host service {} is offered by more than one source",
+                    entry.service_id
+                )));
+            }
+            offered.push((entry.service_id, entry.mode, index));
+        }
+    }
+    Ok(offered)
 }
 
 fn assert_service_target_access(core: &KernelCore) -> Result<(), ChordError> {

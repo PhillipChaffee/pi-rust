@@ -104,7 +104,7 @@ pub fn create_remote_service_binding(
 /// scheduling performs: an in-process transport's subscription settles in
 /// one poll, and a future needing more turns stays stored for
 /// [`RemoteServiceBinding::ready`].
-fn drive_start_now(cell: &Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>) {
+fn drive_start_now(cell: &StoredStart) {
     let taken = cell.borrow_mut().take();
     if let Some(future) = taken {
         match crate::future::drive_once(future) {
