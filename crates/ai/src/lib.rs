@@ -20,8 +20,11 @@
 //!   [`types::KnownApi`]/[`types::KnownProvider`] enums with lookups; no
 //!   nominal type parameter survives.
 //! - `ProviderRequestOptions`' transport fields — `fetch`, `signal`, the
-//!   `onPayload`/`onResponse` callbacks — land with the HttpClient-seam child;
-//!   the options structs here carry pure data.
+//!   `onPayload`/`onResponse` callbacks — group into one
+//!   [`types::TransportOptions`] bundle carried by the options structs; the
+//!   `fetch` field is the [`http::HttpClient`] seam with the reqwest 0.12 +
+//!   rustls process default, and `signal` is the
+//!   [`tokio_util::sync::CancellationToken`] port of `AbortSignal`.
 //! - `ApiOptionsMap`/`ApiStreamOptions` land with the wire-API children; the
 //!   stream-contract interfaces (`ProviderStreams`, `ProviderImages`,
 //!   `StreamFunction`, `ImagesFunction`) land with the utils child, which owns
@@ -39,6 +42,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod http;
 pub mod session_resources;
 pub mod types;
 pub mod utils;
