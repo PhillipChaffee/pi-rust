@@ -7,3 +7,9 @@
 max_retries = 2
 timeout = 20
 exclude_path = ["./coverage"]
+exclude = [
+  # The Coveralls repo page sits behind Cloudflare bot protection and 403s
+  # non-browser agents, so the README badge's link target always fails the
+  # check while the badge SVG itself passes (it redirects to a static asset).
+  "^https://coveralls\\.io/github/PhillipChaffee/pi-rust.*",
+]
