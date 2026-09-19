@@ -27,8 +27,8 @@ impl TelemetryContext for NoopTelemetryContext {
 
     async fn start_span<T, E, Fut, F>(&self, _options: SpanOptions, body: F) -> Result<T, E>
     where
-        F: FnOnce(NoopSpan) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        F: FnOnce(NoopSpan) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
     {
         body(NoopSpan).await
     }
@@ -39,8 +39,8 @@ impl TelemetryContext for NoopSpan {
 
     async fn start_span<T, E, Fut, F>(&self, _options: SpanOptions, body: F) -> Result<T, E>
     where
-        F: FnOnce(Self) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        F: FnOnce(Self) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
     {
         body(Self).await
     }
