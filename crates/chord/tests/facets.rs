@@ -22,6 +22,10 @@
     reason = "the case bodies are the upstream suite ported 1:1; splitting them would obscure the mapping"
 )]
 #![allow(
+    unused_must_use,
+    reason = "setup-side registrations whose failure is a fixture bug; the cases assert the outcomes they pin"
+)]
+#![allow(
     clippy::type_complexity,
     reason = "the ported cases spell their fixture types inline, as the upstream suite does"
 )]
@@ -576,8 +580,6 @@ fn scopes_singleton_service_views_to_each_facet_lifecycle() {
          -> FacetDef {
             facet("scoped-consumer", {
                 let source = source.clone();
-                let consumer_handles = consumer_handles.clone();
-                let cleanup_values = cleanup_values.clone();
                 move |env| {
                     let first = env.use_service(&source).expect("use lands");
                     let second = env.use_service(&source).expect("the view is cached");
@@ -591,7 +593,7 @@ fn scopes_singleton_service_views_to_each_facet_lifecycle() {
                     )) {
                         assert!(error_message(&error).contains("cannot be used while setting_up"));
                     }
-                    let retained = first.clone();
+                    let retained = first;
                     env.on_deactivate({
                         let cleanup_values = cleanup_values.clone();
                         Box::new(move || {
@@ -691,7 +693,8 @@ fn scopes_singleton_service_views_to_each_facet_lifecycle() {
             *cleanup_values.borrow(),
             vec!["A:value".to_string(), "B:value".to_string()]
         );
-        for handle in consumer_handles.borrow().iter() {
+        let retained_handles: Vec<ServiceView> = consumer_handles.borrow().clone();
+        for handle in retained_handles {
             let error = handle
                 .call("read", vec![], background_context())
                 .await
@@ -711,4 +714,162 @@ fn rt() -> tokio::runtime::Runtime {
         .enable_all()
         .build()
         .expect("runtime")
+}
+
+#[test]
+fn combines_loaded_facets_in_loader_order_and_disposes_generations_in_reverse() {
+    rt().block_on(async {
+        let trace = Rc::new(RefCell::new(Vec::<String>::new()));
+        let loader = |name: &'static str| -> Rc<dyn pi_chord::types::FacetLoader> {
+            Rc::new(TraceLoader {
+                trace: trace.clone(),
+                name,
+            })
+        };
+
+        let generations: Vec<Rc<dyn pi_chord::types::FacetLoader>> =
+            vec![loader("first"), loader("second")];
+        let combined: Rc<dyn pi_chord::types::FacetLoader> =
+            Rc::new(pi_chord::api::combine_facet_loaders(generations));
+        let loaded = pi_chord::future::drive_once(combined.load())
+            .map_err(|_pending| ())
+            .expect("load settles")
+            .expect("the combined load carries no error");
+        assert_eq!(
+            loaded
+                .facets
+                .iter()
+                .map(|facet| facet.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        // Upstream calls dispose twice; the port's Disposal is FnOnce, so
+        // the no-op-repeat contract rides the guard inside the combined
+        // disposal (the second upstream call would be a no-op).
+        let first_dispose = loaded.dispose;
+        (first_dispose)()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert_eq!(
+            *trace.borrow(),
+            vec![
+                "load first",
+                "load second",
+                "dispose second",
+                "dispose first"
+            ]
+        );
+    });
+}
+
+struct DisposeCountingLoader {
+    dispose_calls: Rc<std::cell::Cell<u32>>,
+}
+
+impl pi_chord::types::FacetLoader for DisposeCountingLoader {
+    fn load(
+        &self,
+    ) -> pi_chord::future::LocalBoxFuture<Result<pi_chord::types::LoadedFacets, ChordError>> {
+        let dispose_calls = self.dispose_calls.clone();
+        boxed(async move {
+            Ok(pi_chord::types::LoadedFacets {
+                facets: Vec::new(),
+                dispose: Box::new(move || {
+                    boxed(async move {
+                        dispose_calls.set(dispose_calls.get() + 1);
+                        Ok(())
+                    })
+                }),
+            })
+        })
+    }
+}
+
+struct FailingLoader {
+    failure: ChordError,
+}
+
+impl pi_chord::types::FacetLoader for FailingLoader {
+    fn load(
+        &self,
+    ) -> pi_chord::future::LocalBoxFuture<Result<pi_chord::types::LoadedFacets, ChordError>> {
+        let failure = self.failure.clone();
+        boxed(async move { Err(failure) })
+    }
+}
+
+struct TraceLoader {
+    trace: Rc<RefCell<Vec<String>>>,
+    name: &'static str,
+}
+
+impl pi_chord::types::FacetLoader for TraceLoader {
+    fn load(
+        &self,
+    ) -> pi_chord::future::LocalBoxFuture<Result<pi_chord::types::LoadedFacets, ChordError>> {
+        let trace = self.trace.clone();
+        let name = self.name;
+        boxed(async move {
+            trace.borrow_mut().push(format!("load {name}"));
+            let dispose_trace = trace.clone();
+            Ok(pi_chord::types::LoadedFacets {
+                facets: vec![facet(name, |_| {})],
+                dispose: Box::new(move || {
+                    let dispose_trace = dispose_trace.clone();
+                    boxed(async move {
+                        dispose_trace.borrow_mut().push(format!("dispose {name}"));
+                        Ok(())
+                    })
+                }),
+            })
+        })
+    }
+}
+
+#[test]
+fn cleans_up_loaded_facets_when_a_later_loader_fails() {
+    rt().block_on(async {
+        let failure = ChordError::Message("load failed".to_string());
+        let dispose_calls = Rc::new(std::cell::Cell::new(0u32));
+        let first = Rc::new(DisposeCountingLoader {
+            dispose_calls: dispose_calls.clone(),
+        });
+
+        let second = Rc::new(FailingLoader { failure });
+
+        let combined: Rc<dyn pi_chord::types::FacetLoader> =
+            Rc::new(pi_chord::api::combine_facet_loaders(vec![first, second]));
+        let error = pi_chord::future::drive_once(combined.load())
+            .map_err(|_pending| ())
+            .ok()
+            .and_then(Result::err)
+            .expect("the later loader's failure surfaces");
+        assert!(error_message(&error).contains("load failed"));
+        assert_eq!(dispose_calls.get(), 1);
+    });
+}
+
+#[test]
+fn creates_a_reusable_static_loader() {
+    rt().block_on(async {
+        let facets = vec![facet("first", |_| {})];
+        let loader: Rc<dyn pi_chord::types::FacetLoader> =
+            Rc::new(pi_chord::api::create_static_facet_loader(facets));
+        let first = pi_chord::future::drive_once(loader.load())
+            .ok()
+            .expect("the static load settles")
+            .expect("the static load carries no error");
+        let second = pi_chord::future::drive_once(loader.load())
+            .ok()
+            .expect("the static load repeats")
+            .expect("the repeat carries no error");
+        assert_eq!(first.facets[0].id, "first");
+        assert_eq!(second.facets[0].id, "first");
+        (first.dispose)()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        (second.dispose)()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
 }
