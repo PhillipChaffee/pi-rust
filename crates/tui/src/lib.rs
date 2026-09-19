@@ -12,10 +12,10 @@
 //! input parsing layer ([#40](https://github.com/PhillipChaffee/pi-rust/issues/40)),
 //! the terminal I/O layer ([#41](https://github.com/PhillipChaffee/pi-rust/issues/41)),
 //! the fuzzy matcher and the leaf components
-//! ([#42](https://github.com/PhillipChaffee/pi-rust/issues/42)), and the
-//! component contract from `tui.ts` that the leaf components implement; the
-//! renderers, the TUI core, and the layout engine land with their own port
-//! tickets.
+//! ([#42](https://github.com/PhillipChaffee/pi-rust/issues/42)), and the TUI
+//! core — the component contract, the overlay stack, the mouse routing, and
+//! the render scheduler ([#43](https://github.com/PhillipChaffee/pi-rust/issues/43)); the renderers and
+//! the layout engine land with their own port tickets.
 //!
 //! - [`utils`] — ANSI-aware width measurement and manipulation.
 //! - [`fuzzy`] — [`fuzzy::fuzzy_match`] and [`fuzzy::fuzzy_filter`], the
@@ -38,8 +38,13 @@
 //!   `drainInput`.
 //! - [`terminal_colors`] — the OSC 11 background-color response parser and
 //!   the `CSI ? 997 ; n` color-scheme report parser.
-//! - [`tui`] — the [`tui::Component`] contract and the mouse event types and
-//!   dispatch helper; the TUI machinery around them lands with #43.
+//! - [`tui`] — the [`tui::Component`] contract and mouse event types, the
+//!   [`tui::Container`], the overlay stack and [`tui::OverlayHandle`], the
+//!   focus-restore machinery, [`tui::composite_tui_line`], the
+//!   [`tui::CURSOR_MARKER`], and the [`tui::Tui`] core with its render
+//!   scheduler; the concrete renderers land with #45 and #46.
+//! - [`terminal_image`] — the cell-dimension store and [`terminal_image::is_image_line`]
+//!   the TUI core consumes; the rest of terminal-image lands with #51.
 //! - [`components`] — the leaf components ([`components::Box`],
 //!   [`components::Text`], [`components::TruncatedText`],
 //!   [`components::Spacer`], [`components::Loader`],
@@ -81,5 +86,6 @@ pub mod keys;
 pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;
+pub mod terminal_image;
 pub mod tui;
 pub mod utils;

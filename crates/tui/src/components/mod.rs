@@ -21,6 +21,7 @@
 pub mod box_component;
 pub mod cancellable_loader;
 pub mod loader;
+pub mod mouse_region;
 pub mod spacer;
 pub mod text;
 pub mod truncated_text;
@@ -34,6 +35,7 @@ pub type ColorFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 pub use box_component::Box;
 pub use cancellable_loader::CancellableLoader;
 pub use loader::{Loader, LoaderIndicatorOptions};
+pub use mouse_region::MouseRegion;
 pub use spacer::Spacer;
 pub use text::Text;
 pub use truncated_text::TruncatedText;
