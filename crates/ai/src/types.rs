@@ -11,9 +11,13 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use pi_telemetry::TelemetryHandle;
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+
+use crate::http::client::HttpClient;
 
 /// A JSON value; upstream's recursive [`JsonValue`] type alias.
 pub type JsonValue = serde_json::Value;
@@ -675,15 +679,128 @@ pub struct ProviderResponse {
     pub headers: BTreeMap<String, String>,
 }
 
+/// The request-payload hook, upstream's `onPayload`
+/// (`packages/ai/src/types.ts:145`).
+///
+/// Receives the payload an adapter is about to send and the model it is for;
+/// `Some` replaces the payload, `None` keeps it unchanged. Adapters that
+/// cannot re-bind a payload reject it instead of silently bypassing it.
+#[derive(Clone)]
+pub struct OnPayload(
+    Arc<dyn Fn(JsonValue, Model) -> BoxedFuture<'static, Option<JsonValue>> + Send + Sync>,
+);
+
+impl OnPayload {
+    /// Wrap a hook.
+    pub fn new(
+        hook: impl Fn(JsonValue, Model) -> BoxedFuture<'static, Option<JsonValue>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    /// Invoke the hook.
+    #[must_use]
+    pub fn call(
+        &self,
+        payload: JsonValue,
+        model: Model,
+    ) -> BoxedFuture<'static, Option<JsonValue>> {
+        self.0(payload, model)
+    }
+}
+
+impl std::fmt::Debug for OnPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnPayload(..)")
+    }
+}
+
+/// The response hook, upstream's `onResponse`
+/// (`packages/ai/src/types.ts:149`): invoked after an HTTP response is
+/// received, before its body is consumed.
+#[derive(Clone)]
+pub struct OnResponse(
+    Arc<dyn Fn(ProviderResponse, Model) -> BoxedFuture<'static, ()> + Send + Sync>,
+);
+
+impl OnResponse {
+    /// Wrap a hook.
+    pub fn new(
+        hook: impl Fn(ProviderResponse, Model) -> BoxedFuture<'static, ()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(hook))
+    }
+
+    /// Invoke the hook.
+    #[must_use]
+    pub fn call(&self, response: ProviderResponse, model: Model) -> BoxedFuture<'static, ()> {
+        self.0(response, model)
+    }
+}
+
+impl std::fmt::Debug for OnResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnResponse(..)")
+    }
+}
+
+/// The transport fields of the request options, grouped because Rust has no
+/// interface extension and the option structs spell their base's fields out.
+///
+/// Upstream's `fetch`, `signal`, `onPayload`, and `onResponse` of
+/// `ProviderRequestOptions` (`packages/ai/src/types.ts:124`). Never
+/// serialized: request plumbing.
+#[derive(Clone, Debug, Default)]
+pub struct TransportOptions {
+    /// The HTTP client for provider requests, upstream's `fetch`
+    /// (`packages/ai/src/types.ts:115`). `None` uses the process default,
+    /// the reqwest 0.12 + rustls client the stack decision pins behind the
+    /// `HttpClient` seam; adapters that cannot take a custom client reject
+    /// it instead of bypassing it. This does not affect WebSocket transports.
+    pub http_client: Option<Arc<dyn HttpClient>>,
+    /// Cancellation for the request and its streamed body, upstream's
+    /// `signal: AbortSignal`.
+    pub signal: Option<CancellationToken>,
+    /// The request-payload hook, upstream's `onPayload`.
+    pub on_payload: Option<OnPayload>,
+    /// The response hook, upstream's `onResponse`.
+    pub on_response: Option<OnResponse>,
+}
+
+impl TransportOptions {
+    /// The client to send on: the injected one, else the process default.
+    #[must_use]
+    pub fn client(&self) -> Arc<dyn HttpClient> {
+        self.http_client
+            .clone()
+            .unwrap_or_else(crate::http::default_http_client)
+    }
+
+    /// The operation-local cancellation token: the caller's token when
+    /// supplied, a fresh uncancelled one otherwise.
+    #[must_use]
+    pub fn signal(&self) -> CancellationToken {
+        crate::utils::abort::operation_signal(self.signal.as_ref())
+    }
+}
+
 /// Authentication, environment, and lifecycle options shared by provider
 /// requests, upstream's `ProviderRequestOptions<TModel>`.
 ///
 /// The generic parameter's only use upstream is typing the `onPayload` and
-/// `onResponse` callbacks; those callbacks and the transport fields (`fetch`,
-/// `signal`) land with the HttpClient-seam child, so this struct carries pure
-/// data at this layer. Options are request plumbing, never serialized.
+/// `onResponse` callbacks; Rust passes the [`Model`] by value into the hooks.
+/// The transport fields — `fetch`, `signal`, and the two callbacks — ride the
+/// [`TransportOptions`] bundle. Options are request plumbing, never
+/// serialized.
 #[derive(Clone, Debug, Default)]
 pub struct ProviderRequestOptions {
+    /// The transport seam: the request's HTTP client, cancellation token,
+    /// and lifecycle callbacks, upstream's `fetch`, `signal`, `onPayload`,
+    /// and `onResponse`.
+    pub transport_options: TransportOptions,
     /// The API key, overriding credential resolution.
     pub api_key: Option<String>,
     /// Explicit parent context for telemetry produced by this logical request.
@@ -718,6 +835,9 @@ pub struct ProviderRequestOptions {
 /// spelled out because Rust has no interface extension.
 #[derive(Clone, Debug, Default)]
 pub struct StreamOptions {
+    /// The transport seam: the request's HTTP client, cancellation token,
+    /// and lifecycle callbacks.
+    pub transport_options: TransportOptions,
     /// The API key, overriding credential resolution.
     pub api_key: Option<String>,
     /// Explicit parent context for telemetry produced by this logical request.
@@ -783,6 +903,9 @@ pub type ProviderStreamOptions = StreamOptions;
 /// `DeferredFetchOptions extends ProviderRequestOptions`.
 #[derive(Clone, Debug, Default)]
 pub struct DeferredFetchOptions {
+    /// The transport seam: the request's HTTP client, cancellation token,
+    /// and lifecycle callbacks.
+    pub transport_options: TransportOptions,
     /// The API key, overriding credential resolution.
     pub api_key: Option<String>,
     /// Explicit parent context for telemetry produced by this logical request.
@@ -842,6 +965,9 @@ pub enum DeferredRequest {
 /// `SimpleStreamOptions extends StreamOptions`.
 #[derive(Clone, Debug, Default)]
 pub struct SimpleStreamOptions {
+    /// The transport seam: the request's HTTP client, cancellation token,
+    /// and lifecycle callbacks.
+    pub transport_options: TransportOptions,
     /// The API key, overriding credential resolution.
     pub api_key: Option<String>,
     /// Explicit parent context for telemetry produced by this logical request.

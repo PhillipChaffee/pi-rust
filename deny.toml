@@ -57,6 +57,9 @@ allow = [
     "Unicode-3.0",
     # miniz_oxide and friends ship under Zlib.
     "Zlib",
+    # CDLA-Permissive-2.0: webpki-roots ships Mozilla's root store data under
+    # it — a permissive data license, BSD-flavored in effect.
+    "CDLA-Permissive-2.0",
     # Public-domain-equivalent; a few small utility crates use it.
     "CC0-1.0",
 ]

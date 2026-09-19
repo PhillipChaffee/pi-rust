@@ -58,6 +58,14 @@ cargo = { level = "warn", priority = -1 }     # lints the manifest itself (wildc
 
 # --- group exceptions carry reasons; start empty and add them as they fire
 # future_not_send = "allow"             # e.g. template: single-threaded UI executor
+# The TLS and WebSocket stacks pin the duplicates: rustls' ring backend holds
+# getrandom 0.2 beside tokio-util's 0.4 and the uuidv7 tail's 0.3 (with their
+# r-efi and windows-sys transports), and tokio-tungstenite 0.30 pins the
+# webpki-roots 0.26 compat shim beside hyper-rustls' 1.0.9 — one bundle copy
+# of root data behind two package versions. The pins belong to the TLS and
+# WebSocket stacks the stack decision chose, not to drift this workspace can
+# heal; revisit when those crates re-pin.
+multiple_crate_versions = { level = "allow", priority = 0 }
 
 # --- restriction picks: not enabled by default; pick the ones your codebase
 # has real failure modes for, one reason each
