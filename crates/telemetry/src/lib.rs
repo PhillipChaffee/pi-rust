@@ -31,6 +31,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod dispatch;
 pub mod memory;
 pub mod noop;
 pub mod schema;
@@ -39,6 +40,10 @@ pub mod typed;
 
 // Upstream's `index.ts` re-exports the noop context and the in-memory
 // adapter beside the contract; the crate root keeps that single import point.
+pub use crate::dispatch::{
+    BoxedSpanBody, DynSpanHandle, DynTelemetryContext, DynTelemetrySpan, ErasedSpanFuture,
+    SpanBodyError, SpanBodyFailure, TelemetryHandle,
+};
 pub use crate::memory::{InMemoryTelemetryContext, RecordedTelemetryEvent, RecordedTelemetrySpan};
 pub use crate::noop::{NOOP_TELEMETRY_CONTEXT, NoopSpan, NoopTelemetryContext};
 
@@ -197,16 +202,20 @@ pub trait TelemetryContext {
     /// Registers a span synchronously and returns a future that runs `body`
     /// with it on first poll and settles the span on completion.
     ///
+    /// Bodies are `Send` because the dispatch handle ([`TelemetryHandle`],
+    /// [ADR 0004]) drives them across threads; a future owned by one thread
+    /// cannot cross the erased layer.
+    ///
     /// # Errors
     /// Propagates the body's `Err` value unchanged, after settling the span.
     fn start_span<T, E, Fut, F>(
         &self,
         options: SpanOptions,
         body: F,
-    ) -> impl Future<Output = Result<T, E>>
+    ) -> impl Future<Output = Result<T, E>> + Send
     where
-        F: FnOnce(Self::Span) -> Fut,
-        Fut: Future<Output = Result<T, E>>;
+        F: FnOnce(Self::Span) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send;
 }
 
 /// A live span handle: records events, attributes, and status, and starts

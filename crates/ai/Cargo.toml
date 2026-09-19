@@ -1,0 +1,40 @@
+[package]
+name = "pi-ai"
+version = "0.1.0"
+edition = "2024"
+description = "Unified LLM layer with provider collections, OAuth resolution, token and cost tracking, ported from @earendil-works/pi-ai"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["llm", "ai", "providers", "streaming", "coding-agent"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+pi-telemetry = { path = "../telemetry" }
+serde = { version = "1.0.219", features = ["derive"] }
+# preserve_order: JSON objects keep their insertion order like JS objects do,
+# which the wire payloads and the serialized-arguments comparisons rely on.
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+
+# regex: the overflow and retry classifiers are provider error-message
+# grammars upstream expresses as case-insensitive RegExp lists.
+regex = "1.11"
+# tokio + tokio-util: the async substrate the stack decision pins —
+# cancellable sleeps, the CancellationToken port of AbortSignal, and the
+# oneshot waiters behind EventStream.
+tokio = { version = "1.47", default-features = false, features = ["sync", "time", "macros", "rt"] }
+tokio-util = { version = "0.7", default-features = false }
+# url: WHATWG URL parsing for proxy resolution, matching node's URL.
+url = "2.5"
+# getrandom: crypto.getRandomValues for the uuidv7 tail.
+getrandom = "0.3"
+# rustix: the kernel release for the pi user agent, through a safe API.
+rustix = { version = "1.1", default-features = false, features = ["std", "system"] }
+
+[dev-dependencies]
+# test-util: the paused clock the provider-retry tests drive, the fake-timer
+# port per the stack decision.
+tokio = { version = "1.47", features = ["test-util"] }
+
+[lints]
+workspace = true

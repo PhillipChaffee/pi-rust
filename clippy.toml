@@ -6,5 +6,8 @@
 # doc comments actually carry — spelled verbatim from the code, since the
 # whole point is that prose may reference them bare. The tui slice #41 adds
 # the upstream attribution and terminal names its doc comments carry bare
-# (OpenTUI, XTVersion, WezTerm), spelled verbatim from the code they name.
-doc-valid-idents = ["AcpClient", "OpenTUI", "OpenCode", "WKWebView", "XTVersion", "WezTerm", ".."]
+# (OpenTUI, XTVersion, WezTerm); the pi-ai port adds the provider names its
+# wire docs carry bare.
+doc-valid-idents = ["AcpClient", "OpenTUI", "OpenCode", "WKWebView", "XTVersion", "WezTerm", "OpenAI", "OpenRouter",
+    "MiniMax", "MiMo", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR",
+    "AbortSignal", "UUIDv7", "HttpClient", "WeakMap", "serde_json", ".."]
