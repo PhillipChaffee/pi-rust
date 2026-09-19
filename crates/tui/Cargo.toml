@@ -1,0 +1,19 @@
+[package]
+name = "pi-tui"
+version = "0.1.0"
+edition = "2024"
+description = "Terminal UI library with differential line-diff rendering, ported from @earendil-works/pi-tui"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["tui", "terminal", "ansi", "text", "coding-agent"]
+categories = ["command-line-interface", "development-tools"]
+
+[dependencies]
+emojis = "0.6"
+regex = "1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+[lints]
+workspace = true

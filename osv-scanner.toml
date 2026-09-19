@@ -14,3 +14,7 @@ reason = "unpublished workspace crate; license declared in crates/telemetry/Carg
 name = "pi-evals"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/evals/Cargo.toml"
+[[PackageOverrides]]
+name = "pi-tui"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/tui/Cargo.toml"
