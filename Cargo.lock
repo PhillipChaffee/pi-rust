@@ -976,6 +976,7 @@ dependencies = [
  "nix",
  "regex",
  "signal-hook",
+ "tokio-util",
  "unicode-segmentation",
  "unicode-width",
 ]
