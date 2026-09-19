@@ -1,7 +1,10 @@
-//! Facet hosting, ported from upstream `src/facets/*`.
-//!
-//! The kernel that validates the dependency graph, binds service handles,
-//! activates providers before consumers, and disposes in reverse order; the
-//! lifecycle state machine gating handle use; the staged-candidate reload
-//! cutover; and the loader combination surface upstream places in
-//! `facets/loader.ts`.
+//! The facet host: the kernel that validates the facet graph, binds
+//! service handles, and drives activation, disposal, and reload, ported
+//! from upstream `src/facets/`.
+
+pub mod host;
+
+pub use host::{
+    FacetEnvironment, FacetKernel, FacetKernelOptions, GenerationPhase, KeyedSource,
+    LocalKeyedServiceRegistry, StagedServiceSpawner,
+};

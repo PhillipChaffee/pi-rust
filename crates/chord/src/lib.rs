@@ -33,10 +33,13 @@
 
 pub mod api;
 pub mod bundler;
+pub mod consumer;
 pub mod context;
 pub mod delta;
 pub mod errors;
 pub mod facets;
+pub mod future;
+pub mod handle;
 pub mod json;
 pub mod node;
 pub mod services;
