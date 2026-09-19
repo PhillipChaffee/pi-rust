@@ -561,3 +561,154 @@ fn keyed_value_implementation(value: &'static str) -> ServiceImplementation {
     );
     implementation
 }
+
+#[test]
+fn scopes_singleton_service_views_to_each_facet_lifecycle() {
+    rt().block_on(async {
+        let source = source_service();
+        let consumer_handles = Rc::new(RefCell::new(Vec::<ServiceView>::new()));
+        let cleanup_values = Rc::new(RefCell::new(Vec::<String>::new()));
+        let peer_handle = Rc::new(RefCell::new(None::<ServiceView>));
+
+        let consumer_for = |generation: &'static str,
+                            consumer_handles: Rc<RefCell<Vec<ServiceView>>>,
+                            cleanup_values: Rc<RefCell<Vec<String>>>|
+         -> FacetDef {
+            facet("scoped-consumer", {
+                let source = source.clone();
+                let consumer_handles = consumer_handles.clone();
+                let cleanup_values = cleanup_values.clone();
+                move |env| {
+                    let first = env.use_service(&source).expect("use lands");
+                    let second = env.use_service(&source).expect("the view is cached");
+                    assert!(first.same_handle(&second));
+                    consumer_handles.borrow_mut().push(first.clone());
+                    // Handles are unusable during setup, upstream's gate.
+                    if let Ok(Err(error)) = pi_chord::future::drive_once(first.call(
+                        "read",
+                        vec![],
+                        background_context(),
+                    )) {
+                        assert!(error_message(&error).contains("cannot be used while setting_up"));
+                    }
+                    let retained = first.clone();
+                    env.on_deactivate({
+                        let cleanup_values = cleanup_values.clone();
+                        Box::new(move || {
+                            let retained = retained.clone();
+                            let cleanup_values = cleanup_values.clone();
+                            boxed(async move {
+                                // The lifecycle keeps service access through
+                                // teardown effects, upstream's dispose order.
+                                let read = retained
+                                    .call("read", vec![], background_context())
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|value| value.as_str().map(str::to_string))
+                                    .unwrap_or_default();
+                                cleanup_values
+                                    .borrow_mut()
+                                    .push(format!("{generation}:{read}"));
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("teardown lands");
+                    let _ = second;
+                }
+            })
+        };
+
+        let peer = facet("peer-consumer", {
+            let source = source.clone();
+            let peer_handle = peer_handle.clone();
+            move |env| {
+                peer_handle
+                    .borrow_mut()
+                    .replace(env.use_service(&source).expect("use lands"));
+            }
+        });
+        let provider = facet("scoped-provider", {
+            let source = source.clone();
+            move |env| {
+                env.provide(&source, read_implementation("value"))
+                    .expect("provide lands");
+            }
+        });
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![
+                consumer_for("A", consumer_handles.clone(), cleanup_values.clone()),
+                peer,
+                provider,
+            ],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let handles: Vec<ServiceView> = consumer_handles.borrow().clone();
+        let peer = peer_handle.borrow().clone().expect("peer handle");
+        assert!(
+            !handles[0].same_handle(&peer),
+            "each facet scopes its own view"
+        );
+
+        host.reload(vec![consumer_for(
+            "B",
+            consumer_handles.clone(),
+            cleanup_values.clone(),
+        )])
+        .await
+        .unwrap_or_else(|e| panic!("reload: {e}"));
+        assert_eq!(*cleanup_values.borrow(), vec!["A:value".to_string()]);
+        let generation_b = consumer_handles.borrow().clone();
+        assert!(generation_b.len() >= 2);
+        assert!(!handles[0].same_handle(&generation_b[1]));
+        // The old generation's handle is dead after retirement.
+        let error = handles[0]
+            .call("read", vec![], background_context())
+            .await
+            .expect_err("the retired facet's handle is dead");
+        assert!(error_message(&error).contains("cannot be used while dead"));
+
+        let read = generation_b[1]
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(JsonValue::Str("value".to_string())));
+        let read = peer
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("peer read: {e}"));
+        assert_eq!(read, Some(JsonValue::Str("value".to_string())));
+
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert_eq!(
+            *cleanup_values.borrow(),
+            vec!["A:value".to_string(), "B:value".to_string()]
+        );
+        for handle in consumer_handles.borrow().iter() {
+            let error = handle
+                .call("read", vec![], background_context())
+                .await
+                .expect_err("dead handles reject");
+            assert!(error_message(&error).contains("cannot be used while dead"));
+        }
+        let error = peer
+            .call("read", vec![], background_context())
+            .await
+            .expect_err("dead handles reject");
+        assert!(error_message(&error).contains("cannot be used while dead"));
+    });
+}
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+}

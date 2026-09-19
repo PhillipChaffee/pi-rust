@@ -1193,11 +1193,11 @@ impl FacetKernel {
             ));
         }
 
-        let previous = self.install_candidates(&candidate_order);
-        match self.cut_over(&candidate_order).await {
+        let replaced = self.install_candidates(&candidate_order);
+        match self.cut_over(&candidate_order, &replaced).await {
             Ok(()) => {}
             Err(error) => {
-                let abort_errors = self.abort(&previous).await;
+                let abort_errors = self.abort(&replaced).await;
                 return Err(ChordError::Aggregate(
                     std::iter::once(error).chain(abort_errors).collect(),
                     "Facet reload failed after cutover".to_string(),
@@ -1307,7 +1307,11 @@ impl FacetKernel {
         Ok(staged)
     }
 
-    async fn cut_over(&self, candidate_order: &[Rc<RuntimeRecord>]) -> Result<(), ChordError> {
+    async fn cut_over(
+        &self,
+        candidate_order: &[Rc<RuntimeRecord>],
+        replaced: &[Rc<RuntimeRecord>],
+    ) -> Result<(), ChordError> {
         for candidate in candidate_order {
             for provision in candidate.provisions.borrow().iter() {
                 let Provision::Singleton {
@@ -1327,18 +1331,7 @@ impl FacetKernel {
                 }
             }
         }
-        let previous: Vec<Rc<RuntimeRecord>> = candidate_order
-            .iter()
-            .filter_map(|candidate| {
-                self.core
-                    .facets
-                    .borrow()
-                    .iter()
-                    .find(|(id, _)| id == &candidate.facet_id)
-                    .map(|(_, record)| record.clone())
-            })
-            .collect();
-        let retirement_errors = dispose_records(&previous).await;
+        let retirement_errors = dispose_records(replaced).await;
         if let Some(error) = collect_errors(retirement_errors, "Failed to retire replaced facets") {
             return Err(error);
         }

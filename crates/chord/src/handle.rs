@@ -265,12 +265,14 @@ impl ServiceSlot {
         self.0.target.borrow().is_some()
     }
 
-    /// A guarded view over this slot.
+    /// A guarded view over this slot; each call mints a fresh handle, so
+    /// callers that need stable identity cache the view.
     #[must_use]
     pub fn view(&self, assert_access: AssertAccess) -> ServiceView {
         ServiceView {
             slot: self.clone(),
             assert_access,
+            identity: Rc::new(()),
         }
     }
 }
@@ -281,6 +283,10 @@ impl ServiceSlot {
 pub struct ServiceView {
     slot: ServiceSlot,
     assert_access: AssertAccess,
+    /// Per-view identity, minted at view creation: two views over one slot
+    /// are still distinct handles, the proxy-object identity upstream's
+    /// `Object.is` assertions observe across facets.
+    identity: Rc<()>,
 }
 
 impl std::fmt::Debug for ServiceView {
@@ -292,13 +298,14 @@ impl std::fmt::Debug for ServiceView {
 }
 
 impl ServiceView {
-    /// Whether two views resolve through the same slot, the restatement of
+    /// Whether two views are the same handle, the restatement of
     /// upstream's proxy identity (`Object.is` on handles). Hosts and
-    /// bindings cache one view per service, which is what makes identity
-    /// stable, exactly as upstream's proxy caches do.
+    /// bindings cache one view per service per facet, which is what makes
+    /// identity stable across replacement, exactly as upstream's proxy
+    /// caches do.
     #[must_use]
     pub fn same_handle(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.slot.0, &other.slot.0)
+        Rc::ptr_eq(&self.identity, &other.identity)
     }
 
     /// The service ID this view addresses.
