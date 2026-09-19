@@ -166,8 +166,8 @@ async fn run_body<T, E, Fut, F>(
     body: F,
 ) -> Result<T, E>
 where
-    F: FnOnce(InMemorySpan) -> Fut,
-    Fut: Future<Output = Result<T, E>>,
+    F: FnOnce(InMemorySpan) -> Fut + Send,
+    Fut: Future<Output = Result<T, E>> + Send,
 {
     let span = InMemorySpan {
         state: Arc::clone(&state),
@@ -216,10 +216,10 @@ impl TelemetryContext for InMemoryTelemetryContext {
         &self,
         options: SpanOptions,
         body: F,
-    ) -> impl Future<Output = Result<T, E>>
+    ) -> impl Future<Output = Result<T, E>> + Send
     where
-        F: FnOnce(Self::Span) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        F: FnOnce(Self::Span) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
     {
         let state = Arc::clone(&self.state);
         let id = register_span(&self.state, None, &options);
@@ -282,10 +282,10 @@ impl TelemetryContext for InMemorySpan {
         &self,
         options: SpanOptions,
         body: F,
-    ) -> impl Future<Output = Result<T, E>>
+    ) -> impl Future<Output = Result<T, E>> + Send
     where
-        F: FnOnce(Self) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        F: FnOnce(Self) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
     {
         let parent_settled = lock(&self.state).spans[span_index(self.id)].settled;
         // Children of settled spans record nowhere reachable, matching

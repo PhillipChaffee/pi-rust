@@ -109,6 +109,7 @@ pub fn create_telemetry_adapter_conformance<F, C>(
 where
     F: Fn() -> TelemetryAdapterFixture<C> + Clone + 'static,
     C: TelemetryContext + 'static,
+    C::Span: Send,
 {
     vec![
         case(
@@ -475,6 +476,7 @@ fn case<C, F, B>(
 where
     F: Fn() -> TelemetryAdapterFixture<C> + 'static,
     C: TelemetryContext + 'static,
+    C::Span: Send,
     B: Fn(TelemetryAdapterFixture<C>) -> Pin<Box<dyn Future<Output = ()>>> + 'static,
 {
     TelemetryAdapterConformanceCase {

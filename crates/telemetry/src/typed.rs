@@ -193,11 +193,11 @@ impl<C: TelemetryContext> TypedSpanStarter<C> {
         _span: N,
         attributes: N::Start,
         body: F,
-    ) -> impl Future<Output = Result<T, E>>
+    ) -> impl Future<Output = Result<T, E>> + Send
     where
         N: SpanDefinition,
-        F: FnOnce(SchemaSpan<N, C::Span>, TypedSpanStarter<C::Span>) -> Fut,
-        Fut: Future<Output = Result<T, E>>,
+        F: FnOnce(SchemaSpan<N, C::Span>, TypedSpanStarter<C::Span>) -> Fut + Send,
+        Fut: Future<Output = Result<T, E>> + Send,
     {
         let options = SpanOptions::new(N::NAME).with_attributes(attributes.into_span_attributes());
         TelemetryContext::start_span(&self.parent, options, move |raw| {

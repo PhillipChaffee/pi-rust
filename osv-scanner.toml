@@ -9,3 +9,8 @@
 name = "pi-telemetry"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/telemetry/Cargo.toml"
+
+[[PackageOverrides]]
+name = "pi-ai"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/ai/Cargo.toml"
