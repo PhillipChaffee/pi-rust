@@ -5,4 +5,6 @@
 # appears, so the sentinel stays and the list holds only the house names the
 # doc comments actually carry — spelled verbatim from the code, since the
 # whole point is that prose may reference them bare.
-doc-valid-idents = ["AcpClient", "OpenCode", "WKWebView", ".."]
+# House provider names carried bare in the types' wire docs (pi-ai port).
+doc-valid-idents = ["AcpClient", "OpenCode", "WKWebView", "OpenAI", "OpenRouter",
+    "MiniMax", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR", ".."]
