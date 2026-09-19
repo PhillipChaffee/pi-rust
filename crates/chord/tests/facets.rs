@@ -272,6 +272,10 @@ fn projection_implementation(source: ServiceView) -> ServiceImplementation {
     implementation
 }
 
+/// Upstream's third arm rejects an `async setup` (`Facet asynchronous setup
+/// must be synchronous`); the port's `FacetDef::setup` is a synchronous
+/// closure by type, so that rejection has no Rust-reachable shape and the
+/// case ports the two arms the graph validator owns.
 #[test]
 fn rejects_missing_dependencies_cycles_and_multiple_sources() {
     let rt = tokio::runtime::Builder::new_current_thread()
