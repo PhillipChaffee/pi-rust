@@ -142,14 +142,18 @@ fn is_keyboard_protocol_negotiation_sequence_prefix(sequence: &str) -> bool {
 /// Terminal identifies itself through `TERM_PROGRAM` on darwin.
 #[must_use]
 pub fn is_apple_terminal_session() -> bool {
+    // The probe reads the process environment on every platform, so the
+    // function is genuinely effectful everywhere and stays non-const; only
+    // the comparison is darwin's.
+    let term_program = std::env::var("TERM_PROGRAM").ok();
     #[cfg(target_os = "macos")]
-    {
-        std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "Apple_Terminal")
-    }
+    let apple_terminal = term_program.as_deref() == Some("Apple_Terminal");
     #[cfg(not(target_os = "macos"))]
-    {
+    let apple_terminal = {
+        let _ = &term_program;
         false
-    }
+    };
+    apple_terminal
 }
 
 /// Refresh terminal dimensions on POSIX platforms by sending SIGWINCH to
