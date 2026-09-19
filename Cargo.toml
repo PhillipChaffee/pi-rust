@@ -1,6 +1,6 @@
 [workspace]
 # One crate per upstream TS package, per the map: crates/<pkg> mirrors packages/<pkg>.
-members = ["crates/telemetry", "crates/ai"]
+members = ["crates/telemetry", "crates/ai", "crates/evals", "crates/tui"]
 # Edition 2024's default resolver, made explicit so the workspace table is self-describing.
 resolver = "3"
 
