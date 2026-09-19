@@ -1,6 +1,8 @@
 //! Delta path vocabulary, path-safety rejection, and the string-overlap
 //! scan, ported from upstream `src/delta/index.ts`.
 //!
+
+//
 //! A delta operation addresses one value through a [`Path`] of object keys
 //! and array indices. Reserved segments stay rejected wherever a path is
 //! data: the applier performs `parent[key] = value` writes, so
@@ -26,8 +28,8 @@ pub enum Seg {
 impl fmt::Display for Seg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Seg::Key(key) => f.write_str(key),
-            Seg::Index(index) => write!(f, "{index}"),
+            Self::Key(key) => f.write_str(key),
+            Self::Index(index) => write!(f, "{index}"),
         }
     }
 }
@@ -68,15 +70,14 @@ impl std::error::Error for UnsafePathError {}
 /// # Errors
 /// Returns [`UnsafePathError`] when a key segment is one of
 /// [`RESERVED_SEGMENTS`].
-#[must_use]
 pub fn assert_safe_path(path: &[Seg]) -> Result<(), UnsafePathError> {
     for segment in path {
-        if let Seg::Key(key) = segment {
-            if RESERVED_SEGMENTS.contains(&key.as_str()) {
-                return Err(UnsafePathError {
-                    segment: segment.clone(),
-                });
-            }
+        if let Seg::Key(key) = segment
+            && RESERVED_SEGMENTS.contains(&key.as_str())
+        {
+            return Err(UnsafePathError {
+                segment: segment.clone(),
+            });
         }
     }
     Ok(())

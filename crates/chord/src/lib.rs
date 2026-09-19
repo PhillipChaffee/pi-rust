@@ -43,4 +43,8 @@ pub mod services;
 pub mod types;
 
 #[cfg(test)]
-mod test_support;
+#[allow(
+    clippy::redundant_pub_crate,
+    reason = "the helpers are crate-visible in test builds; the lint reads the cfg(test) module as private"
+)]
+pub(crate) mod test_support;

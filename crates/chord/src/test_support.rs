@@ -17,6 +17,7 @@ use std::cell::Cell;
 
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use sha2::{Digest, Sha256};
 
 /// Seed for the hand-rolled LCG property test in the delta suite, pinned
 /// from upstream `delta.test.ts` (`0x5eed1234`).
@@ -76,10 +77,14 @@ pub(crate) fn parse_json(text: &str) -> serde_json::Value {
 /// `sha256-` integrity prefix carries in bundle manifests.
 #[must_use]
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    let mut text = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 /// Creates the temporary directory for real-fs tests, deleted on drop.
@@ -109,7 +114,3 @@ pub(crate) fn current_thread_runtime() -> tokio::runtime::Runtime {
             .expect("current-thread runtime build must succeed")
     }
 }
-
-/// The cancellation primitive the context fixtures wire, re-exported so
-/// ported suites share one import site.
-pub(crate) use tokio_util::sync::CancellationToken;
