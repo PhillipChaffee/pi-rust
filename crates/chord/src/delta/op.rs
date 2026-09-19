@@ -731,3 +731,54 @@ impl JsonValue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{ja, jn, jo, js};
+
+    #[test]
+    fn parses_decoded_ops_and_rejects_wire_forms() {
+        // Validating Op against the wire grammar would be laxer than the
+        // type: a two-element `["s", value]` would pass, and apply would read
+        // the value as a path. Each vocabulary gets the validator that
+        // matches it.
+        for op in [
+            ja(vec![js("r"), jo(vec![("a", jn(1.0))])]),
+            ja(vec![js("s"), ja(vec![js("a")]), jn(1.0)]),
+            ja(vec![js("d"), ja(vec![js("a")])]),
+            ja(vec![js("a"), ja(vec![js("a")]), js("x")]),
+            ja(vec![js("t"), ja(vec![js("a")]), jn(2.0)]),
+            ja(vec![
+                js("p"),
+                ja(vec![js("a")]),
+                jn(0.0),
+                jn(0.0),
+                ja(Vec::new()),
+            ]),
+        ] {
+            assert!(Op::from_json(&op).is_ok());
+        }
+        for wire_only in [
+            ja(vec![js("s"), jn(1.0)]),
+            ja(vec![js("d")]),
+            ja(vec![js("a"), js("x")]),
+            ja(vec![js("t"), jn(2.0)]),
+            ja(vec![js("p"), jn(0.0), jn(0.0), ja(Vec::new())]),
+            ja(vec![js("#"), jn(0.0), ja(vec![js("a")])]),
+            ja(vec![js("s"), jn(0.0), jn(1.0)]),
+        ] {
+            assert!(Op::from_json(&wire_only).is_err());
+            assert!(WireOp::from_json(&wire_only).is_ok());
+        }
+    }
+
+    // Upstream validates only the tuple shape, never the payload's contents;
+    // owned data restates this: a payload is JsonValue by construction, so a
+    // recursive inspection cannot exist.
+    #[test]
+    fn does_not_recursively_inspect_operation_payloads() {
+        assert!(Op::from_json(&ja(vec![js("s"), ja(vec![js("value")]), jo(Vec::new())])).is_ok());
+        assert!(WireOp::from_json(&ja(vec![js("r"), jo(Vec::new())])).is_ok());
+    }
+}

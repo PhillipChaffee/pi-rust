@@ -185,6 +185,24 @@ impl JsonValue {
         Self::Str(value.into())
     }
 
+    /// The string content, or [`None`] when this is not a string.
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The number as a plain float, or [`None`] when this is not a number.
+    #[must_use]
+    pub const fn as_number(&self) -> Option<f64> {
+        match self {
+            Self::Number(number) => Some(number.get()),
+            _ => None,
+        }
+    }
+
     /// Whether the value is a container: an array or an object.
     ///
     /// Upstream spells this `isObj`; every walk, diff, and resolve branches on
