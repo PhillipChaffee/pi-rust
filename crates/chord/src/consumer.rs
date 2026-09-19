@@ -90,7 +90,10 @@ pub fn create_remote_service_binding(
         assert_access: options.assert_access.unwrap_or_else(allow_access),
         singletons: RefCell::new(Vec::new()),
         keyed: RefCell::new(Vec::new()),
-        bound: Cell::new(options.bound),
+        // A shared cell: the facades' is-active closures read this flag
+        // live, so a rebind flips every handle at once, upstream's live
+        // `binding.bound` read.
+        bound: Rc::new(Cell::new(options.bound)),
         readiness_revision: Cell::new(0),
         binding_transition: Rc::new(RefCell::new(None)),
         disposed: Rc::new(Cell::new(false)),
@@ -572,7 +575,7 @@ struct BindingCore {
     assert_access: AssertAccess,
     singletons: RefCell<Vec<(String, Rc<SingletonBindingState>)>>,
     keyed: RefCell<Vec<(String, Rc<KeyedBindingState>)>>,
-    bound: Cell<bool>,
+    bound: Rc<Cell<bool>>,
     readiness_revision: Cell<u64>,
     binding_transition: StoredStart,
     disposed: Rc<Cell<bool>>,

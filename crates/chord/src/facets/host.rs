@@ -1522,6 +1522,11 @@ impl FacetKernel {
                 .collect(),
             &self.core.on_error,
         ));
+        // The assembled surfaces register before the connects run, upstream's
+        // assignment order: the connects read them back.
+        *self.core.provider.borrow_mut() = Some(provider.clone());
+        *self.core.internal_services.borrow_mut() = Some(internal_services);
+        *self.core.local_keyed_services.borrow_mut() = Some(local_keyed_services);
         for provision in &provisions {
             match provision {
                 Provision::Singleton {
@@ -1567,9 +1572,6 @@ impl FacetKernel {
                 }
             }
         }
-        *self.core.provider.borrow_mut() = Some(provider);
-        *self.core.internal_services.borrow_mut() = Some(internal_services);
-        *self.core.local_keyed_services.borrow_mut() = Some(local_keyed_services);
         Ok(())
     }
 

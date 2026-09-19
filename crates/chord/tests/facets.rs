@@ -1,13 +1,20 @@
-//! The facet-host suite, ported from upstream `test/facets.test.ts` at pin
-//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
+//! The facet-host suite, ported from upstream `test/facets.test.ts`, and
+//! the facet-loader cases upstream keeps in `test/facet-loader.test.ts`,
+//! both at pin `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
 //! The port's synchronous event-loop restatement removes the races
 //! upstream's `vi.waitFor` covered: keyed observations start inside the
-//! call that spawns them, so cases assert directly. The compile-time-only
-//! contract case (JSON checks never throw at runtime) restates as a
-//! behavior check on the member registry, and "asynchronous setup" is
-//! unrepresentable — the setup closure returns nothing, so the case pins
-//! the sync-by-type contract in this comment instead of a runtime throw.
+//! call that spawns them, so cases assert directly. Two ordering deltas
+//! ride that restatement: an observation's delivery lands during the
+//! observing facet's activation, before its `onActivate` callbacks
+//! (upstream's subscribe chain resolves a microtask after them), and the
+//! loader case that parks a reload mid-activation runs the reload and the
+//! gate window concurrently on `tokio::join!`, upstream's
+//! `await replacementStarted` window. The compile-time-only contract case (JSON
+//! checks never throw at runtime) restates as a behavior check on the
+//! member registry, and "asynchronous setup" is unrepresentable — the
+//! setup closure returns nothing, so the case pins the sync-by-type
+//! contract in this comment instead of a runtime throw.
 
 #![allow(
     clippy::panic,
@@ -30,19 +37,29 @@
     reason = "the ported cases spell their fixture types inline, as the upstream suite does"
 )]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use pi_chord::api::{
     create_facet_host, create_remote_service_binding, define_local_service, define_service,
 };
 use pi_chord::context::{Context, background_context};
+use pi_chord::delta::Seg;
 use pi_chord::errors::ChordError;
 use pi_chord::facets::host::{ActivationCallback, FacetEnvironment, FacetKernelOptions};
-use pi_chord::future::boxed;
-use pi_chord::handle::{ServiceImplementation, ServiceView, sync_method};
+use pi_chord::future::{LocalBoxFuture, boxed};
+use pi_chord::handle::{
+    ServiceImplementation, ServiceSlot, ServiceTarget, ServiceView, allow_access, sync_disposal,
+    sync_method,
+};
 use pi_chord::services::loopback::create_loopback_service_transport;
-use pi_chord::types::{FacetDef, JsonValue, KeyedViewHandler, Service, ServiceMode};
+use pi_chord::services::provider::{RemoteServiceProvider, singleton_definition};
+use pi_chord::services::state::MutableReplicatedState;
+use pi_chord::types::{
+    FacetDef, FacetLoader, JsonValue, KeyedViewHandler, LoadedFacets, RemoteServiceSource,
+    RemoteServiceSourceOpenOptions, RemoteServices, Service, ServiceCatalogueEntry, ServiceMode,
+    ServiceProviderUpdate, Unsubscribe,
+};
 
 fn source_service() -> Service {
     define_service("test.experimental.source").expect("not reserved")
@@ -60,18 +77,10 @@ fn watched_service() -> Service {
     define_service("test.experimental.watched").expect("not reserved")
 }
 
-#[allow(
-    dead_code,
-    reason = "the local-service cases land with the remaining ports"
-)]
 fn host_values_service() -> Service {
     define_local_service("test.experimental.host-values").expect("not reserved")
 }
 
-#[allow(
-    dead_code,
-    reason = "the local-keyed cases land with the remaining ported cases"
-)]
 fn local_keyed_service() -> Service {
     define_local_service("test.experimental.local-keyed-value").expect("not reserved")
 }
@@ -107,29 +116,6 @@ fn read_implementation(value: &'static str) -> ServiceImplementation {
 
 fn error_message(error: &ChordError) -> String {
     error.to_string()
-}
-
-fn error_sink() -> (
-    Rc<RefCell<Vec<ChordError>>>,
-    pi_chord::handle::ErrorReporter,
-) {
-    let errors = Rc::new(RefCell::new(Vec::new()));
-    let reporter: pi_chord::handle::ErrorReporter = {
-        let errors = errors.clone();
-        Rc::new(move |error| errors.borrow_mut().push(error.clone()))
-    };
-    (errors, reporter)
-}
-
-#[allow(
-    dead_code,
-    reason = "the remaining ported cases share this runtime builder"
-)]
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime build must succeed")
 }
 
 fn activate_hook(trace: &Rc<RefCell<Vec<String>>>, message: &'static str) -> ActivationCallback {
@@ -378,7 +364,7 @@ fn owns_resources_registered_during_activation() {
     rt.block_on(async {
         let _source = source_service();
         let watched = watched_service();
-        let deliveries = Rc::new(std::cell::Cell::new(0u32));
+        let deliveries = Rc::new(Cell::new(0u32));
 
         let consumer = facet("consumer", {
             let watched = watched.clone();
@@ -399,7 +385,7 @@ fn owns_resources_registered_during_activation() {
                                 deliveries.set(deliveries.get() + 1);
                             },
                         )) {
-                            env.own(pi_chord::handle::sync_disposal(move || {
+                            env.own(sync_disposal(move || {
                                 subscription();
                                 Ok(())
                             }))
@@ -445,7 +431,7 @@ fn rejects_a_service_offered_by_multiple_sources() {
     rt.block_on(async {
         struct DuplicateSource;
 
-        impl pi_chord::types::RemoteServiceSource for DuplicateSource {
+        impl RemoteServiceSource for DuplicateSource {
             fn accepts_unavailable_services(&self) -> bool {
                 false
             }
@@ -453,21 +439,16 @@ fn rejects_a_service_offered_by_multiple_sources() {
             fn catalogue(
                 &self,
                 _context: Context,
-            ) -> pi_chord::future::LocalBoxFuture<
-                Result<Vec<pi_chord::types::ServiceCatalogueEntry>, ChordError>,
-            > {
+            ) -> LocalBoxFuture<Result<Vec<ServiceCatalogueEntry>, ChordError>> {
                 boxed(async {
-                    Ok(vec![pi_chord::types::ServiceCatalogueEntry {
+                    Ok(vec![ServiceCatalogueEntry {
                         service_id: source_service().id,
                         mode: ServiceMode::Singleton,
                     }])
                 })
             }
 
-            fn open(
-                &self,
-                _options: pi_chord::types::RemoteServiceSourceOpenOptions,
-            ) -> Rc<dyn pi_chord::types::RemoteServices> {
+            fn open(&self, _options: RemoteServiceSourceOpenOptions) -> Rc<dyn RemoteServices> {
                 panic!("ambiguous sources must not open")
             }
         }
@@ -499,49 +480,30 @@ fn rejects_invalid_service_ids() {
 }
 
 #[test]
-fn connects_keyed_observations_through_the_host_provider() {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    rt.block_on(async {
+fn routes_remotely_exposable_keyed_services_through_the_host_provider() {
+    rt().block_on(async {
         let keyed = keyed_service();
-        let observed = Rc::new(RefCell::new(Vec::<String>::new()));
+        let observed: Rc<RefCell<Vec<(ServiceView, Context)>>> = Rc::new(RefCell::new(Vec::new()));
 
-        let observer_facet = facet("observer", {
+        let consumer = facet("remote-keyed-consumer", {
             let keyed = keyed.clone();
             let observed = observed.clone();
             move |env| {
                 let handler: KeyedViewHandler = {
                     let observed = observed.clone();
-                    Rc::new(move |view: ServiceView, _context: Context| {
-                        if let Ok(state) = view.state("value")
-                            && let Ok(Some(value)) = state.value()
-                        {
-                            observed.borrow_mut().push(format!("observe {value:?}"));
-                        }
+                    Rc::new(move |view: ServiceView, context: Context| {
+                        observed.borrow_mut().push((view, context));
                     })
                 };
                 env.observe_service(&keyed, handler).expect("observe lands");
             }
         });
-        let provider_facet = facet("provider", {
-            let keyed = keyed.clone();
-            move |env| {
-                let values = env.provide_many(&keyed).expect("provide_many lands");
-                env.on_activate({
-                    Box::new(move |_env: &mut FacetEnvironment| {
-                        values
-                            .spawn("one", keyed_value_implementation("one"))
-                            .expect("spawn lands");
-                        boxed(async { Ok(()) })
-                    })
-                });
-            }
-        });
 
         let host = create_facet_host(FacetKernelOptions {
-            facets: vec![observer_facet, provider_facet],
+            facets: vec![
+                consumer,
+                keyed_spawner_facet("remote-keyed-provider", &keyed, "A"),
+            ],
             service_sources: Vec::new(),
             on_error: pi_chord::handle::no_error_reporter(),
         })
@@ -550,20 +512,73 @@ fn connects_keyed_observations_through_the_host_provider() {
         // The keyed observation started inside the spawn's publication; the
         // synchronous restatement delivers it before any assertion.
         assert_eq!(observed.borrow().len(), 1);
+        let (first_view, first_context) = observed.borrow()[0].clone();
+        let read = first_view
+            .call("read", vec![], first_context.clone())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+
+        host.reload(vec![keyed_spawner_facet(
+            "remote-keyed-provider",
+            &keyed,
+            "B",
+        )])
+        .await
+        .unwrap_or_else(|e| panic!("reload: {e}"));
+        assert_eq!(observed.borrow().len(), 2);
+        assert!(
+            first_context
+                .abort_signal()
+                .is_some_and(|signal| signal.aborted()),
+            "the replaced generation's observation context is aborted"
+        );
+        let error = first_view
+            .call("read", vec![], first_context.clone())
+            .await
+            .expect_err("the replaced generation's view is closed");
+        assert!(error_message(&error).contains("observation is closed"));
+        let (second_view, second_context) = observed.borrow()[1].clone();
+        let read = second_view
+            .call("read", vec![], second_context.clone())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("B")));
 
         host.dispose()
             .await
             .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert!(
+            second_context
+                .abort_signal()
+                .is_some_and(|signal| signal.aborted()),
+            "the surviving observation closes on host disposal"
+        );
     });
 }
 
-fn keyed_value_implementation(value: &'static str) -> ServiceImplementation {
-    let mut implementation = ServiceImplementation::new();
-    implementation.state(
-        "value",
-        pi_chord::api::replicated_state(jo(vec![("value", js(value))])),
-    );
-    implementation
+/// A keyed provider facet whose activation spawns one instance under
+/// `current`, upstream's `provider(value)` builder.
+fn keyed_spawner_facet(id: &'static str, service: &Service, value: &'static str) -> FacetDef {
+    let service = service.clone();
+    facet(id, move |env| {
+        let values = env.provide_many(&service).expect("provide_many lands");
+        env.on_activate({
+            Box::new(move |_env: &mut FacetEnvironment| {
+                values
+                    .spawn("current", read_implementation(value))
+                    .expect("spawn lands");
+                boxed(async { Ok(()) })
+            })
+        });
+    })
+}
+
+fn rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
 }
 
 #[test]
@@ -709,34 +724,26 @@ fn scopes_singleton_service_views_to_each_facet_lifecycle() {
     });
 }
 
-fn rt() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime")
-}
-
 #[test]
 fn combines_loaded_facets_in_loader_order_and_disposes_generations_in_reverse() {
     rt().block_on(async {
         let trace = Rc::new(RefCell::new(Vec::<String>::new()));
-        let loader = |name: &'static str| -> Rc<dyn pi_chord::types::FacetLoader> {
+        let loader = |name: &'static str| -> Rc<dyn FacetLoader> {
             Rc::new(TraceLoader {
                 trace: trace.clone(),
                 name,
             })
         };
 
-        let generations: Vec<Rc<dyn pi_chord::types::FacetLoader>> =
-            vec![loader("first"), loader("second")];
-        let combined: Rc<dyn pi_chord::types::FacetLoader> =
+        let generations: Vec<Rc<dyn FacetLoader>> = vec![loader("first"), loader("second")];
+        let combined: Rc<dyn FacetLoader> =
             Rc::new(pi_chord::api::combine_facet_loaders(generations));
-        let loaded = pi_chord::future::drive_once(combined.load())
+        let loaded_facets = pi_chord::future::drive_once(combined.load())
             .map_err(|_pending| ())
             .expect("load settles")
             .expect("the combined load carries no error");
         assert_eq!(
-            loaded
+            loaded_facets
                 .facets
                 .iter()
                 .map(|facet| facet.id.as_str())
@@ -746,7 +753,7 @@ fn combines_loaded_facets_in_loader_order_and_disposes_generations_in_reverse() 
         // Upstream calls dispose twice; the port's Disposal is FnOnce, so
         // the no-op-repeat contract rides the guard inside the combined
         // disposal (the second upstream call would be a no-op).
-        let first_dispose = loaded.dispose;
+        let first_dispose = loaded_facets.dispose;
         (first_dispose)()
             .await
             .unwrap_or_else(|e| panic!("dispose: {e}"));
@@ -763,16 +770,14 @@ fn combines_loaded_facets_in_loader_order_and_disposes_generations_in_reverse() 
 }
 
 struct DisposeCountingLoader {
-    dispose_calls: Rc<std::cell::Cell<u32>>,
+    dispose_calls: Rc<Cell<u32>>,
 }
 
-impl pi_chord::types::FacetLoader for DisposeCountingLoader {
-    fn load(
-        &self,
-    ) -> pi_chord::future::LocalBoxFuture<Result<pi_chord::types::LoadedFacets, ChordError>> {
+impl FacetLoader for DisposeCountingLoader {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
         let dispose_calls = self.dispose_calls.clone();
         boxed(async move {
-            Ok(pi_chord::types::LoadedFacets {
+            Ok(LoadedFacets {
                 facets: Vec::new(),
                 dispose: Box::new(move || {
                     boxed(async move {
@@ -789,10 +794,8 @@ struct FailingLoader {
     failure: ChordError,
 }
 
-impl pi_chord::types::FacetLoader for FailingLoader {
-    fn load(
-        &self,
-    ) -> pi_chord::future::LocalBoxFuture<Result<pi_chord::types::LoadedFacets, ChordError>> {
+impl FacetLoader for FailingLoader {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
         let failure = self.failure.clone();
         boxed(async move { Err(failure) })
     }
@@ -803,16 +806,14 @@ struct TraceLoader {
     name: &'static str,
 }
 
-impl pi_chord::types::FacetLoader for TraceLoader {
-    fn load(
-        &self,
-    ) -> pi_chord::future::LocalBoxFuture<Result<pi_chord::types::LoadedFacets, ChordError>> {
+impl FacetLoader for TraceLoader {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
         let trace = self.trace.clone();
         let name = self.name;
         boxed(async move {
             trace.borrow_mut().push(format!("load {name}"));
             let dispose_trace = trace.clone();
-            Ok(pi_chord::types::LoadedFacets {
+            Ok(LoadedFacets {
                 facets: vec![facet(name, |_| {})],
                 dispose: Box::new(move || {
                     let dispose_trace = dispose_trace.clone();
@@ -830,14 +831,14 @@ impl pi_chord::types::FacetLoader for TraceLoader {
 fn cleans_up_loaded_facets_when_a_later_loader_fails() {
     rt().block_on(async {
         let failure = ChordError::Message("load failed".to_string());
-        let dispose_calls = Rc::new(std::cell::Cell::new(0u32));
+        let dispose_calls = Rc::new(Cell::new(0u32));
         let first = Rc::new(DisposeCountingLoader {
             dispose_calls: dispose_calls.clone(),
         });
 
         let second = Rc::new(FailingLoader { failure });
 
-        let combined: Rc<dyn pi_chord::types::FacetLoader> =
+        let combined: Rc<dyn FacetLoader> =
             Rc::new(pi_chord::api::combine_facet_loaders(vec![first, second]));
         let error = pi_chord::future::drive_once(combined.load())
             .map_err(|_pending| ())
@@ -853,7 +854,7 @@ fn cleans_up_loaded_facets_when_a_later_loader_fails() {
 fn creates_a_reusable_static_loader() {
     rt().block_on(async {
         let facets = vec![facet("first", |_| {})];
-        let loader: Rc<dyn pi_chord::types::FacetLoader> =
+        let loader: Rc<dyn FacetLoader> =
             Rc::new(pi_chord::api::create_static_facet_loader(facets));
         let first = pi_chord::future::drive_once(loader.load())
             .ok()
@@ -871,5 +872,1550 @@ fn creates_a_reusable_static_loader() {
         (second.dispose)()
             .await
             .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+fn read_text(read: Option<JsonValue>) -> String {
+    read.and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+#[test]
+fn connects_keyed_observations_only_when_the_observing_facet_activates() {
+    rt().block_on(async {
+        let keyed = keyed_service();
+        let trace = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        let observer_facet = facet("observer", {
+            let keyed = keyed.clone();
+            let trace = trace.clone();
+            move |env| {
+                let handler: KeyedViewHandler = {
+                    let trace = trace.clone();
+                    Rc::new(move |view: ServiceView, context: Context| {
+                        // Upstream awaits the read inside the handler; the
+                        // sync handler drives the settled call inline.
+                        if let Ok(Ok(Some(value))) =
+                            pi_chord::future::drive_once(view.call("read", vec![], context))
+                        {
+                            trace
+                                .borrow_mut()
+                                .push(format!("observe {}", read_text(Some(value))));
+                        }
+                    })
+                };
+                env.observe_service(&keyed, handler).expect("observe lands");
+                env.on_activate(activate_hook(&trace, "activate observer"))
+                    .expect("onActivate lands");
+            }
+        });
+        let provider_facet = facet("provider", {
+            let keyed = keyed.clone();
+            let trace = trace.clone();
+            move |env| {
+                let values = env.provide_many(&keyed).expect("provide_many lands");
+                env.on_activate({
+                    let trace = trace.clone();
+                    Box::new(move |_env: &mut FacetEnvironment| {
+                        trace.borrow_mut().push("activate provider".to_string());
+                        values
+                            .spawn("one", read_implementation("one"))
+                            .expect("spawn lands");
+                        boxed(async { Ok(()) })
+                    })
+                });
+            }
+        });
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![observer_facet, provider_facet],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        // Upstream's trace pins the gate: the observation connects when the
+        // observing facet activates, never at setup or at the provider's
+        // spawn. The port's eager keyed start delivers inside that
+        // activation, before the onActivate callbacks — upstream's subscribe
+        // chain resolves after them — so the port's trace swaps the last
+        // two entries.
+        assert_eq!(
+            *trace.borrow(),
+            vec!["activate provider", "observe one", "activate observer"]
+        );
+
+        let services = host.services().expect("assembled");
+        let remote =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![keyed.clone()],
+                transport: create_loopback_service_transport(&services),
+                bound: true,
+                on_error: pi_chord::handle::no_error_reporter(),
+                assert_access: None,
+            })
+            .expect("binding");
+        let remote_values = Rc::new(RefCell::new(Vec::<String>::new()));
+        remote
+            .observe(&keyed, {
+                let remote_values = remote_values.clone();
+                Rc::new(move |view: ServiceView, context: Context| {
+                    if let Ok(Ok(Some(value))) =
+                        pi_chord::future::drive_once(view.call("read", vec![], context))
+                    {
+                        remote_values.borrow_mut().push(read_text(Some(value)));
+                    }
+                })
+            })
+            .expect("observe lands");
+        remote
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        assert_eq!(*remote_values.borrow(), vec!["one".to_string()]);
+
+        remote
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn terminates_the_host_when_keyed_replacement_publication_fails() {
+    rt().block_on(async {
+        let keyed = keyed_service();
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![keyed_spawner_facet("failing-keyed-provider", &keyed, "A")],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let services = host.services().expect("assembled");
+        let subscription = services
+            .subscribe(
+                keyed.id.as_str(),
+                ServiceMode::Keyed,
+                Rc::new(|update: &ServiceProviderUpdate, _context: &Context| {
+                    if matches!(update, ServiceProviderUpdate::Spawned { .. }) {
+                        panic!("spawn publication failed");
+                    }
+                }),
+            )
+            .expect("subscribe lands");
+        (subscription.activate)().expect("activate lands");
+
+        let error = host
+            .reload(vec![keyed_spawner_facet(
+                "failing-keyed-provider",
+                &keyed,
+                "B",
+            )])
+            .await
+            .expect_err("the publication failure terminates the host");
+        assert!(error_message(&error).contains("Facet reload failed after cutover"));
+        let error = host
+            .reload(vec![])
+            .await
+            .expect_err("the dead host rejects reloads");
+        assert!(error_message(&error).contains("cannot reload while dead"));
+        let error = services
+            .use_service(&keyed)
+            .expect_err("the disposed provider rejects use");
+        assert!(error_message(&error).contains("Remote service provider is disposed"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn terminates_the_host_when_keyed_retirement_publication_fails() {
+    rt().block_on(async {
+        let keyed = keyed_service();
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![keyed_spawner_facet(
+                "failing-keyed-retirement-provider",
+                &keyed,
+                "A",
+            )],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let services = host.services().expect("assembled");
+        let subscription = services
+            .subscribe(
+                keyed.id.as_str(),
+                ServiceMode::Keyed,
+                Rc::new(|update: &ServiceProviderUpdate, _context: &Context| {
+                    if matches!(update, ServiceProviderUpdate::Closed { .. }) {
+                        panic!("close publication failed");
+                    }
+                }),
+            )
+            .expect("subscribe lands");
+        (subscription.activate)().expect("activate lands");
+
+        let error = host
+            .reload(vec![keyed_spawner_facet(
+                "failing-keyed-retirement-provider",
+                &keyed,
+                "B",
+            )])
+            .await
+            .expect_err("the publication failure terminates the host");
+        assert!(error_message(&error).contains("Facet reload failed after cutover"));
+        let error = host
+            .reload(vec![])
+            .await
+            .expect_err("the dead host rejects reloads");
+        assert!(error_message(&error).contains("cannot reload while dead"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+/// A process-local keyed implementation: a `read` method plus the
+/// `metadata` map as a local value member, upstream's object literal.
+fn local_keyed_implementation(value: &'static str) -> ServiceImplementation {
+    let mut implementation = ServiceImplementation::new();
+    implementation.method(
+        "read",
+        sync_method(move |_args: Vec<JsonValue>, _context: &Context| Ok(Some(js(value)))),
+    );
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("value".to_string(), value.to_string());
+    implementation.value("metadata", Rc::new(metadata));
+    implementation
+}
+
+#[test]
+fn keeps_unrestricted_local_keyed_services_process_local_across_provider_reloads() {
+    rt().block_on(async {
+        let local_keyed = local_keyed_service();
+        let observed: Rc<RefCell<Vec<(ServiceView, Context)>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let consumer = facet("local-keyed-consumer", {
+            let local_keyed = local_keyed.clone();
+            let observed = observed.clone();
+            move |env| {
+                let handler: KeyedViewHandler = {
+                    let observed = observed.clone();
+                    Rc::new(move |view: ServiceView, context: Context| {
+                        observed.borrow_mut().push((view, context));
+                    })
+                };
+                env.observe_service(&local_keyed, handler)
+                    .expect("observe lands");
+            }
+        });
+        let provider_for = |value: &'static str| -> FacetDef {
+            facet("local-keyed-provider", {
+                let local_keyed = local_keyed.clone();
+                move |env| {
+                    let values = env.provide_many(&local_keyed).expect("provide_many lands");
+                    env.on_activate({
+                        Box::new(move |_env: &mut FacetEnvironment| {
+                            values
+                                .spawn("current", local_keyed_implementation(value))
+                                .expect("spawn lands");
+                            boxed(async { Ok(()) })
+                        })
+                    });
+                }
+            })
+        };
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer, provider_for("A")],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        assert_eq!(observed.borrow().len(), 1);
+        let (first_view, first_context) = observed.borrow()[0].clone();
+        let read = first_view
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+        let metadata = metadata_value(&first_view);
+        assert_eq!(metadata.as_deref(), Some("A"));
+
+        let services = host.services().expect("assembled");
+        assert!(
+            !services
+                .catalogue()
+                .iter()
+                .any(|entry| entry.service_id == local_keyed.id),
+            "the process-local keyed service stays out of the catalogue"
+        );
+        let error = services
+            .use_service(&local_keyed)
+            .expect_err("process-local services reject use");
+        assert!(error_message(&error).contains("process-local"));
+
+        host.reload(vec![provider_for("B")])
+            .await
+            .unwrap_or_else(|e| panic!("reload: {e}"));
+        assert_eq!(observed.borrow().len(), 2);
+        assert!(
+            first_context
+                .abort_signal()
+                .is_some_and(|signal| signal.aborted()),
+            "the replaced generation's observation context is aborted"
+        );
+        let error = first_view
+            .call("read", vec![], background_context())
+            .await
+            .expect_err("the closed observation rejects");
+        assert!(error_message(&error).contains("observation is closed"));
+        let (second_view, second_context) = observed.borrow()[1].clone();
+        let read = second_view
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("B")));
+        let metadata = metadata_value(&second_view);
+        assert_eq!(metadata.as_deref(), Some("B"));
+
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert!(
+            second_context
+                .abort_signal()
+                .is_some_and(|signal| signal.aborted()),
+            "the surviving observation closes on host disposal"
+        );
+    });
+}
+
+fn metadata_value(view: &ServiceView) -> Option<String> {
+    view.with_value("metadata", |data| {
+        data.downcast_ref::<std::collections::HashMap<String, String>>()
+            .expect("the metadata map")
+            .get("value")
+            .cloned()
+    })
+    .expect("the value member is reachable")
+}
+
+#[test]
+fn keeps_remotely_exposable_local_state_replicas_stable_across_provider_reloads() {
+    rt().block_on(async {
+        let watched = watched_service();
+        let sources: Rc<RefCell<Vec<MutableReplicatedState>>> = Rc::new(RefCell::new(Vec::new()));
+        let revisions = Rc::new(RefCell::new(Vec::<JsonValue>::new()));
+        let retained_handle = Rc::new(RefCell::new(None::<ServiceView>));
+
+        let consumer = facet("state-consumer", {
+            let watched = watched.clone();
+            let revisions = revisions.clone();
+            let retained_handle = retained_handle.clone();
+            move |env| {
+                let handle = env.use_service(&watched).expect("use lands");
+                *retained_handle.borrow_mut() = Some(handle.clone());
+                env.on_activate({
+                    let revisions = revisions.clone();
+                    Box::new(move |env: &mut FacetEnvironment| {
+                        let state = handle.state("state").expect("the member is state");
+                        if let Ok(unsubscribe) = state.subscribe({
+                            let revisions = revisions.clone();
+                            Rc::new(
+                                move |value: &JsonValue,
+                                      _context: &Context,
+                                      _delivery: &pi_chord::types::ReplicatedStateDelivery| {
+                                    if let JsonValue::Object(object) = value
+                                        && let Some(field) = object.get("value")
+                                    {
+                                        revisions.borrow_mut().push(field.clone());
+                                    }
+                                },
+                            )
+                        }) {
+                            env.own(sync_disposal(move || {
+                                unsubscribe();
+                                Ok(())
+                            }))
+                            .expect("own lands");
+                        }
+                        boxed(async { Ok(()) })
+                    })
+                });
+            }
+        });
+        let provider_for = |value: u64| -> FacetDef {
+            facet("state-provider", {
+                let watched = watched.clone();
+                let sources = sources.clone();
+                move |env| {
+                    let state = env
+                        .replicated_state(jo(vec![("value", number(value))]))
+                        .expect("state lands");
+                    sources.borrow_mut().push(state.clone());
+                    let mut implementation = ServiceImplementation::new();
+                    implementation.state("state", state);
+                    env.provide(&watched, implementation)
+                        .expect("provide lands");
+                }
+            })
+        };
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer, provider_for(1)],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let retained = retained_handle
+            .borrow()
+            .clone()
+            .expect("the consumer's handle")
+            .state("state")
+            .expect("the member is state");
+        let value = retained.value().unwrap_or_else(|e| panic!("state: {e}"));
+        assert_eq!(value, Some(jo(vec![("value", number(1))])));
+        assert_eq!(*revisions.borrow(), vec![number(1)]);
+
+        host.reload(vec![provider_for(2)])
+            .await
+            .unwrap_or_else(|e| panic!("reload: {e}"));
+        // The replica rides the facade's per-name member slot, and the
+        // facade never changes across a reload, so the retained view is the
+        // same handle upstream's `Object.is` pins; it hydrates the
+        // replacement's state.
+        let value = retained.value().unwrap_or_else(|e| panic!("state: {e}"));
+        assert_eq!(value, Some(jo(vec![("value", number(2))])));
+        assert_eq!(*revisions.borrow(), vec![number(1), number(2)]);
+
+        // The retired source still publishes, upstream's direct state write;
+        // its deactivated provider instance drops the batch.
+        sources.borrow()[0].mutate(|tracker| {
+            tracker
+                .set(&[Seg::Key("value".to_string())], number(3))
+                .expect("the write lands");
+        });
+        sources.borrow()[0]
+            .publish(&background_context())
+            .unwrap_or_else(|e| panic!("publish: {e}"));
+        let value = retained.value().unwrap_or_else(|e| panic!("state: {e}"));
+        assert_eq!(value, Some(jo(vec![("value", number(2))])));
+        assert_eq!(revisions.borrow().len(), 2);
+
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let error = retained
+            .value()
+            .expect_err("the dead facet's replica rejects");
+        assert!(error_message(&error).contains("cannot be used while dead"));
+    });
+}
+
+#[test]
+fn provides_arbitrary_host_services_through_the_facet_graph() {
+    rt().block_on(async {
+        let host_values = host_values_service();
+        let consumer = facet("host-service-consumer", {
+            let host_values = host_values.clone();
+            move |env| {
+                let handle = env.use_service(&host_values).expect("use lands");
+                // Upstream touches the implementation's `use` property during
+                // setup; the value-member read hits the lifecycle gate.
+                let error = handle
+                    .with_value("use", |_data: &dyn std::any::Any| ())
+                    .expect_err("setup-time access is gated");
+                assert!(error_message(&error).contains("cannot be used while setting_up"));
+                env.on_activate(Box::new(move |_env: &mut FacetEnvironment| {
+                    // The handle is the port's view over the slot, not
+                    // the implementation value itself, upstream's proxy
+                    // identity check.
+                    assert_eq!(read_string_member(&handle, "name"), "session");
+                    assert_eq!(read_string_member(&handle, "use"), "host value");
+                    boxed(async { Ok(()) })
+                }));
+            }
+        });
+        let provider = facet("host-service-provider", {
+            let host_values = host_values.clone();
+            move |env| {
+                let mut implementation = ServiceImplementation::new();
+                implementation.value("name", Rc::new("session".to_string()));
+                implementation.value("use", Rc::new("host value".to_string()));
+                env.provide(&host_values, implementation)
+                    .expect("provide lands");
+            }
+        });
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer, provider],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let services = host.services().expect("assembled");
+        let error = services
+            .use_service(&host_values)
+            .expect_err("process-local services reject use");
+        assert!(
+            error_message(&error)
+                .contains("Service test.experimental.host-values is process-local")
+        );
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+fn read_string_member(handle: &ServiceView, member: &str) -> String {
+    handle
+        .with_value(member, |data| {
+            data.downcast_ref::<String>()
+                .expect("the value member carries a string")
+                .clone()
+        })
+        .unwrap_or_default()
+}
+
+/// The pre-built namespace a source hands back on every open, carrying the
+/// ready override upstream's `Object.assign(namespace, { ready })` makes:
+/// the binding is unbound, so readiness rebinds first.
+struct RebindingNamespace {
+    binding: pi_chord::consumer::RemoteServiceBinding,
+}
+
+impl RemoteServices for RebindingNamespace {
+    fn use_service(&self, service: &Service) -> Result<ServiceView, ChordError> {
+        self.binding.use_service(service)
+    }
+
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedViewHandler,
+    ) -> Result<Unsubscribe, ChordError> {
+        self.binding.observe(service, handler)
+    }
+
+    fn ready(&self, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
+        let binding = self.binding.clone();
+        boxed(async move {
+            binding.rebind(true, context.clone()).await?;
+            binding.ready(context).await
+        })
+    }
+
+    fn dispose(&self, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
+        self.binding.dispose(context)
+    }
+}
+
+/// The service source over one pre-built namespace, upstream's mapped
+/// `{ namespace, provider }` source objects.
+struct NamespaceSource {
+    provider: RemoteServiceProvider,
+    namespace: pi_chord::consumer::RemoteServiceBinding,
+}
+
+impl RemoteServiceSource for NamespaceSource {
+    fn accepts_unavailable_services(&self) -> bool {
+        false
+    }
+
+    fn catalogue(
+        &self,
+        _context: Context,
+    ) -> LocalBoxFuture<Result<Vec<ServiceCatalogueEntry>, ChordError>> {
+        let entries = self.provider.catalogue().to_vec();
+        boxed(std::future::ready(Ok(entries)))
+    }
+
+    fn open(&self, _options: RemoteServiceSourceOpenOptions) -> Rc<dyn RemoteServices> {
+        Rc::new(RebindingNamespace {
+            binding: self.namespace.clone(),
+        })
+    }
+}
+
+#[test]
+fn combines_connected_services_and_facet_provided_services_in_one_host() {
+    rt().block_on(async {
+        let left = define_service("test.experimental.left-value").expect("not reserved");
+        let right = define_service("test.experimental.right-value").expect("not reserved");
+        let combined = define_service("test.experimental.combined-value").expect("not reserved");
+
+        let left_provider =
+            RemoteServiceProvider::new(vec![singleton_definition(left.clone())]).expect("provider");
+        left_provider
+            .provide(&left, read_implementation("left"))
+            .expect("provide lands");
+        let right_provider = RemoteServiceProvider::new(vec![singleton_definition(right.clone())])
+            .expect("provider");
+        right_provider
+            .provide(&right, read_implementation("right"))
+            .expect("provide lands");
+
+        let left_namespace =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![left.clone()],
+                transport: create_loopback_service_transport(&left_provider),
+                bound: false,
+                on_error: pi_chord::handle::no_error_reporter(),
+                assert_access: None,
+            })
+            .expect("binding");
+        let right_namespace =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![right.clone()],
+                transport: create_loopback_service_transport(&right_provider),
+                bound: false,
+                on_error: pi_chord::handle::no_error_reporter(),
+                assert_access: None,
+            })
+            .expect("binding");
+
+        let combined_facet = facet("combined", {
+            let left = left.clone();
+            let right = right.clone();
+            let combined = combined.clone();
+            move |env| {
+                let left_handle = env.use_service(&left).expect("use lands");
+                let right_handle = env.use_service(&right).expect("use lands");
+                let mut implementation = ServiceImplementation::new();
+                implementation.method(
+                    "read",
+                    Rc::new(move |_args: Vec<JsonValue>, context: Context| {
+                        let left_handle = left_handle.clone();
+                        let right_handle = right_handle.clone();
+                        boxed(async move {
+                            let left_read =
+                                left_handle.call("read", vec![], context.clone()).await?;
+                            let right_read = right_handle.call("read", vec![], context).await?;
+                            Ok(Some(js(&format!(
+                                "{} {}",
+                                read_text(left_read),
+                                read_text(right_read)
+                            ))))
+                        })
+                    }),
+                );
+                env.provide(&combined, implementation)
+                    .expect("provide lands");
+            }
+        });
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![combined_facet],
+            service_sources: vec![
+                Rc::new(NamespaceSource {
+                    provider: left_provider.clone(),
+                    namespace: left_namespace.clone(),
+                }),
+                Rc::new(NamespaceSource {
+                    provider: right_provider.clone(),
+                    namespace: right_namespace.clone(),
+                }),
+            ],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the host assembles");
+
+        let services = host.services().expect("assembled");
+        let implementation = services.use_service(&combined).expect("use lands");
+        let slot = ServiceSlot::new(combined.id.as_str());
+        slot.bind(ServiceTarget::Local(implementation.clone()));
+        let view = slot.view(allow_access());
+        let read = view
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("left right")));
+
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        left_namespace
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        right_namespace
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        left_provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        right_provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+/// The per-generation namespace one source open builds: readiness rebinds
+/// the unbound binding first, and disposal counts the generations that
+/// tear down, upstream's open-time wrapper.
+struct GenerationNamespace {
+    binding: pi_chord::consumer::RemoteServiceBinding,
+    disposed: Rc<Cell<u32>>,
+}
+
+impl RemoteServices for GenerationNamespace {
+    fn use_service(&self, service: &Service) -> Result<ServiceView, ChordError> {
+        self.binding.use_service(service)
+    }
+
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedViewHandler,
+    ) -> Result<Unsubscribe, ChordError> {
+        self.binding.observe(service, handler)
+    }
+
+    fn ready(&self, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
+        let binding = self.binding.clone();
+        boxed(async move {
+            binding.rebind(true, context.clone()).await?;
+            binding.ready(context).await
+        })
+    }
+
+    fn dispose(&self, context: Context) -> LocalBoxFuture<Result<(), ChordError>> {
+        let binding = self.binding.clone();
+        let disposed = self.disposed.clone();
+        boxed(async move {
+            disposed.set(disposed.get() + 1);
+            binding.dispose(context).await
+        })
+    }
+}
+
+/// The catalogue-following source, upstream's `source` object whose open
+/// builds one binding per host generation over the current provider.
+struct GenerationSource {
+    current: Rc<RefCell<RemoteServiceProvider>>,
+    opened: Rc<Cell<u32>>,
+    disposed: Rc<Cell<u32>>,
+}
+
+impl RemoteServiceSource for GenerationSource {
+    fn accepts_unavailable_services(&self) -> bool {
+        false
+    }
+
+    fn catalogue(
+        &self,
+        _context: Context,
+    ) -> LocalBoxFuture<Result<Vec<ServiceCatalogueEntry>, ChordError>> {
+        let entries = self.current.borrow().catalogue().to_vec();
+        boxed(std::future::ready(Ok(entries)))
+    }
+
+    fn open(&self, options: RemoteServiceSourceOpenOptions) -> Rc<dyn RemoteServices> {
+        self.opened.set(self.opened.get() + 1);
+        let binding =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: options.services,
+                transport: create_loopback_service_transport(&self.current.borrow()),
+                bound: false,
+                on_error: options.on_error,
+                assert_access: Some(options.assert_access),
+            })
+            .expect("the source opens its binding");
+        Rc::new(GenerationNamespace {
+            binding,
+            disposed: self.disposed.clone(),
+        })
+    }
+}
+
+#[test]
+fn reopens_source_bindings_from_changed_catalogues_for_a_replacement_generation() {
+    rt().block_on(async {
+        let left = define_service("test.experimental.left-value").expect("not reserved");
+        let right = define_service("test.experimental.right-value").expect("not reserved");
+
+        let left_provider =
+            RemoteServiceProvider::new(vec![singleton_definition(left.clone())]).expect("provider");
+        left_provider
+            .provide(&left, read_implementation("left"))
+            .expect("provide lands");
+        let right_provider = RemoteServiceProvider::new(vec![singleton_definition(right.clone())])
+            .expect("provider");
+        right_provider
+            .provide(&right, read_implementation("right"))
+            .expect("provide lands");
+
+        let current = Rc::new(RefCell::new(left_provider.clone()));
+        let opened = Rc::new(Cell::new(0u32));
+        let disposed = Rc::new(Cell::new(0u32));
+        let source = Rc::new(GenerationSource {
+            current: current.clone(),
+            opened: opened.clone(),
+            disposed: disposed.clone(),
+        });
+
+        let values = Rc::new(RefCell::new(Vec::<String>::new()));
+        let consumer_for = |facet_id: &'static str, service: &Service| -> FacetDef {
+            let service = service.clone();
+            let values = values.clone();
+            facet(facet_id, move |env| {
+                let handle = env.use_service(&service).expect("use lands");
+                env.on_activate({
+                    let values = values.clone();
+                    Box::new(move |_env: &mut FacetEnvironment| {
+                        let handle = handle.clone();
+                        let values = values.clone();
+                        boxed(async move {
+                            let read = handle
+                                .call("read", vec![], background_context())
+                                .await
+                                .unwrap_or_else(|e| panic!("read: {e}"));
+                            values.borrow_mut().push(read_text(read));
+                            Ok(())
+                        })
+                    })
+                });
+            })
+        };
+
+        let first = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer_for("left-consumer", &left)],
+            service_sources: vec![source.clone()],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the first generation assembles");
+        first
+            .dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        *current.borrow_mut() = right_provider.clone();
+        let second = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer_for("right-consumer", &right)],
+            service_sources: vec![source.clone()],
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the second generation assembles");
+        second
+            .dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        assert_eq!(
+            *values.borrow(),
+            vec!["left".to_string(), "right".to_string()]
+        );
+        assert_eq!(opened.get(), 2);
+        assert_eq!(disposed.get(), 2);
+        left_provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        right_provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+/// The generation loader upstream's `loader` object spells: each load
+/// produces one provider facet generation named A then B, and the B
+/// generation parks mid-activation until the case opens the gate.
+struct GenerationLoader {
+    trace: Rc<RefCell<Vec<String>>>,
+    local_service: Service,
+    remote_service: Service,
+    generation: Rc<Cell<u32>>,
+    gate: Rc<
+        RefCell<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                tokio::sync::oneshot::Receiver<()>,
+            )>,
+        >,
+    >,
+}
+
+impl FacetLoader for GenerationLoader {
+    fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
+        let trace = self.trace.clone();
+        let local = self.local_service.clone();
+        let remote = self.remote_service.clone();
+        let generation = self.generation.get();
+        self.generation.set(generation + 1);
+        let name = if generation == 0 { "A" } else { "B" };
+        let gate = self.gate.clone();
+        boxed(async move {
+            trace.borrow_mut().push(format!("load {name}"));
+            let provider = facet("provider", {
+                let trace = trace.clone();
+                let local = local.clone();
+                let remote = remote.clone();
+                let gate = gate.clone();
+                move |env| {
+                    trace.borrow_mut().push(format!("setup provider {name}"));
+                    let implementation = read_implementation(name);
+                    env.provide(&local, implementation.clone())
+                        .expect("provide lands");
+                    env.provide(&remote, implementation).expect("provide lands");
+                    env.on_activate({
+                        let trace = trace.clone();
+                        let gate = gate.clone();
+                        Box::new(move |_env: &mut FacetEnvironment| {
+                            let trace = trace.clone();
+                            let gate = gate.clone();
+                            boxed(async move {
+                                trace.borrow_mut().push(format!("activate provider {name}"));
+                                if name == "B" {
+                                    let gate = gate.borrow_mut().take();
+                                    if let Some((started, can_continue)) = gate {
+                                        let _ = started.send(());
+                                        let _ = can_continue.await;
+                                    }
+                                }
+                                Ok(())
+                            })
+                        })
+                    });
+                    env.on_deactivate({
+                        let trace = trace.clone();
+                        Box::new(move || {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace
+                                    .borrow_mut()
+                                    .push(format!("deactivate provider {name}"));
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("teardown lands");
+                }
+            });
+            Ok(LoadedFacets {
+                facets: vec![provider],
+                dispose: {
+                    let trace = trace.clone();
+                    Box::new(move || {
+                        let trace = trace.clone();
+                        boxed(async move {
+                            trace.borrow_mut().push(format!("unload {name}"));
+                            Ok(())
+                        })
+                    })
+                },
+            })
+        })
+    }
+}
+
+#[test]
+fn keeps_local_and_rpc_service_handles_stable_when_their_provider_facet_reloads() {
+    rt().block_on(async {
+        let local_service =
+            define_local_service("test.experimental.local-generation-value").expect("not reserved");
+        let remote_service =
+            define_service("test.experimental.remote-generation-value").expect("not reserved");
+        let trace = Rc::new(RefCell::new(Vec::<String>::new()));
+        let local_handle = Rc::new(RefCell::new(None::<ServiceView>));
+
+        let consumer = facet("consumer", {
+            let local_service = local_service.clone();
+            let trace = trace.clone();
+            let local_handle = local_handle.clone();
+            move |env| {
+                trace.borrow_mut().push("setup consumer".to_string());
+                let handle = env.use_service(&local_service).expect("use lands");
+                *local_handle.borrow_mut() = Some(handle.clone());
+                env.on_activate({
+                    let trace = trace.clone();
+                    Box::new(move |_env: &mut FacetEnvironment| {
+                        let handle = handle.clone();
+                        let trace = trace.clone();
+                        boxed(async move {
+                            let read = handle
+                                .call("read", vec![], background_context())
+                                .await
+                                .unwrap_or_else(|e| panic!("read: {e}"));
+                            trace
+                                .borrow_mut()
+                                .push(format!("activate consumer:{}", read_text(read)));
+                            Ok(())
+                        })
+                    })
+                });
+                env.on_deactivate({
+                    let trace = trace.clone();
+                    Box::new(move || {
+                        let trace = trace.clone();
+                        boxed(async move {
+                            trace.borrow_mut().push("deactivate consumer".to_string());
+                            Ok(())
+                        })
+                    })
+                })
+                .expect("teardown lands");
+            }
+        });
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (open_tx, open_rx) = tokio::sync::oneshot::channel::<()>();
+        let generation_loader = Rc::new(GenerationLoader {
+            trace: trace.clone(),
+            local_service: local_service.clone(),
+            remote_service: remote_service.clone(),
+            generation: Rc::new(Cell::new(0u32)),
+            gate: Rc::new(RefCell::new(Some((started_tx, open_rx)))),
+        });
+
+        let loaded_a = generation_loader.load().await.expect("load lands");
+        let mut initial = vec![consumer];
+        initial.extend(loaded_a.facets);
+        let host = create_facet_host(FacetKernelOptions {
+            facets: initial,
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let original_local = local_handle.borrow().clone().expect("handle");
+        let services = host.services().expect("assembled");
+        let remote_services =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![remote_service.clone()],
+                transport: create_loopback_service_transport(&services),
+                bound: true,
+                on_error: pi_chord::handle::no_error_reporter(),
+                assert_access: None,
+            })
+            .expect("binding");
+        let original_remote = remote_services
+            .use_service(&remote_service)
+            .expect("use lands");
+        remote_services
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("ready: {e}"));
+        let read = original_local
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+        let read = original_remote
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+
+        // A replacement that drops the remote provision fails its shape
+        // check before cutover, and the old generation keeps serving.
+        let invalid = facet("provider", {
+            let local = local_service.clone();
+            move |env| {
+                env.provide(&local, read_implementation("invalid"))
+                    .expect("provide lands");
+            }
+        });
+        let error = host
+            .reload(vec![invalid])
+            .await
+            .expect_err("the shape change rejects");
+        assert!(error_message(&error).contains(
+            "Reloaded facet provider must preserve its service requirements and provisions"
+        ));
+        let read = original_local
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+        let read = original_remote
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+
+        let loaded_b = generation_loader.load().await.expect("load lands");
+        let gate_window = async {
+            started_rx.await.expect("the replacement starts");
+            // The parked replacement keeps the old generation live, upstream's
+            // window between `replacementStarted` and the gate opening.
+            let read = original_local
+                .call("read", vec![], background_context())
+                .await
+                .unwrap_or_else(|e| panic!("read: {e}"));
+            assert_eq!(read, Some(js("A")));
+            let read = original_remote
+                .call("read", vec![], background_context())
+                .await
+                .unwrap_or_else(|e| panic!("read: {e}"));
+            assert_eq!(read, Some(js("A")));
+            let _ = open_tx.send(());
+        };
+        let (reload_result, ()) = tokio::join!(host.reload(loaded_b.facets), gate_window);
+        reload_result.unwrap_or_else(|e| panic!("reload: {e}"));
+        (loaded_a.dispose)()
+            .await
+            .unwrap_or_else(|e| panic!("unload: {e}"));
+
+        assert!(
+            local_handle
+                .borrow()
+                .as_ref()
+                .expect("handle")
+                .same_handle(&original_local),
+            "the local handle survives the reload"
+        );
+        assert!(
+            remote_services
+                .use_service(&remote_service)
+                .expect("use lands")
+                .same_handle(&original_remote),
+            "the RPC handle survives the reload"
+        );
+        let read = original_local
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("B")));
+        let read = original_remote
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("B")));
+
+        remote_services
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        (loaded_b.dispose)()
+            .await
+            .unwrap_or_else(|e| panic!("unload: {e}"));
+        assert_eq!(
+            *trace.borrow(),
+            vec![
+                "load A",
+                "setup consumer",
+                "setup provider A",
+                "activate provider A",
+                "activate consumer:A",
+                "load B",
+                "setup provider B",
+                "activate provider B",
+                "deactivate provider A",
+                "unload A",
+                "deactivate consumer",
+                "deactivate provider B",
+                "unload B"
+            ]
+        );
+    });
+}
+
+#[test]
+fn rejects_remote_singleton_member_shape_changes_before_reload_cutover() {
+    rt().block_on(async {
+        let remote =
+            define_service("test.experimental.remote-generation-value").expect("not reserved");
+        let provider_disposed = Rc::new(Cell::new(false));
+        let retained_handle = Rc::new(RefCell::new(None::<ServiceView>));
+
+        let consumer = facet("shape-consumer", {
+            let remote = remote.clone();
+            let retained_handle = retained_handle.clone();
+            move |env| {
+                let handle = env.use_service(&remote).expect("use lands");
+                *retained_handle.borrow_mut() = Some(handle);
+            }
+        });
+        let provider = facet("shape-provider", {
+            let remote = remote.clone();
+            let provider_disposed = provider_disposed.clone();
+            move |env| {
+                env.provide(&remote, read_implementation("A"))
+                    .expect("provide lands");
+                env.on_deactivate({
+                    let provider_disposed = provider_disposed.clone();
+                    Box::new(move || {
+                        provider_disposed.set(true);
+                        boxed(async { Ok(()) })
+                    })
+                })
+                .expect("teardown lands");
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer, provider],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+
+        let replacement = facet("shape-provider", {
+            let remote = remote.clone();
+            move |env| {
+                let mut implementation = ServiceImplementation::new();
+                implementation.method(
+                    "renamed",
+                    sync_method(|_args: Vec<JsonValue>, _context: &Context| Ok(Some(js("B")))),
+                );
+                env.provide(&remote, implementation).expect("provide lands");
+            }
+        });
+        let error = host
+            .reload(vec![replacement])
+            .await
+            .expect_err("the member shape change rejects");
+        assert!(error_message(&error).contains("replacement must preserve its member shape"));
+        assert!(!provider_disposed.get(), "cutover never ran");
+        let retained = retained_handle.borrow().clone().expect("handle");
+        let read = retained
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert!(
+            provider_disposed.get(),
+            "the live provider retires on disposal"
+        );
+    });
+}
+
+#[test]
+fn terminates_the_host_when_old_cleanup_fails_after_cutover() {
+    rt().block_on(async {
+        let remote =
+            define_service("test.experimental.remote-generation-value").expect("not reserved");
+        let provider_for = |name: &'static str, fail_cleanup: bool| -> FacetDef {
+            facet("cleanup-provider", {
+                let remote = remote.clone();
+                move |env| {
+                    env.provide(&remote, read_implementation(name))
+                        .expect("provide lands");
+                    if fail_cleanup {
+                        env.on_deactivate(Box::new(|| {
+                            boxed(async { Err(ChordError::Message("cleanup failed".to_string())) })
+                        }))
+                        .expect("teardown lands");
+                    }
+                }
+            })
+        };
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![provider_for("A", true)],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+
+        let error = host
+            .reload(vec![provider_for("B", false)])
+            .await
+            .expect_err("the cleanup failure terminates the host");
+        assert!(error_message(&error).contains("Facet reload failed after cutover"));
+        let error = host
+            .reload(vec![])
+            .await
+            .expect_err("the dead host rejects reloads");
+        assert!(error_message(&error).contains("cannot reload while dead"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn cleans_failed_candidate_activation_in_reverse_dependency_order() {
+    rt().block_on(async {
+        let remote =
+            define_service("test.experimental.remote-generation-value").expect("not reserved");
+        let trace = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        let provider_for = |name: &'static str| -> FacetDef {
+            facet("ordered-provider", {
+                let remote = remote.clone();
+                let trace = trace.clone();
+                move |env| {
+                    env.provide(&remote, read_implementation(name))
+                        .expect("provide lands");
+                    env.on_activate({
+                        let trace = trace.clone();
+                        Box::new(move |_env: &mut FacetEnvironment| {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace.borrow_mut().push(format!("activate provider {name}"));
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("onActivate lands");
+                    env.on_deactivate({
+                        let trace = trace.clone();
+                        Box::new(move || {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace
+                                    .borrow_mut()
+                                    .push(format!("deactivate provider {name}"));
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("teardown lands");
+                }
+            })
+        };
+        let consumer_for = |name: &'static str, fail: bool| -> FacetDef {
+            facet("ordered-consumer", {
+                let remote = remote.clone();
+                let trace = trace.clone();
+                move |env| {
+                    env.use_service(&remote).expect("use lands");
+                    env.on_activate({
+                        let trace = trace.clone();
+                        Box::new(move |_env: &mut FacetEnvironment| {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace.borrow_mut().push(format!("activate consumer {name}"));
+                                if fail {
+                                    return Err(ChordError::Message(
+                                        "consumer activation failed".to_string(),
+                                    ));
+                                }
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("onActivate lands");
+                    env.on_deactivate({
+                        let trace = trace.clone();
+                        Box::new(move || {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace
+                                    .borrow_mut()
+                                    .push(format!("deactivate consumer {name}"));
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("teardown lands");
+                }
+            })
+        };
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer_for("A", false), provider_for("A")],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        trace.borrow_mut().clear();
+
+        let error = host
+            .reload(vec![consumer_for("B", true), provider_for("B")])
+            .await
+            .expect_err("the activation failure rejects");
+        assert!(error_message(&error).contains("consumer activation failed"));
+        assert_eq!(
+            *trace.borrow(),
+            vec![
+                "activate provider B",
+                "activate consumer B",
+                "deactivate consumer B",
+                "deactivate provider B"
+            ]
+        );
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn terminates_the_host_when_replacement_publication_fails_after_cutover() {
+    rt().block_on(async {
+        let remote =
+            define_service("test.experimental.remote-generation-value").expect("not reserved");
+        let provider_for = |name: &'static str| -> FacetDef {
+            facet("publication-provider", {
+                let remote = remote.clone();
+                move |env| {
+                    env.provide(&remote, read_implementation(name))
+                        .expect("provide lands");
+                }
+            })
+        };
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![provider_for("A")],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let services = host.services().expect("assembled");
+        let subscription = services
+            .subscribe(
+                remote.id.as_str(),
+                ServiceMode::Singleton,
+                Rc::new(|_update: &ServiceProviderUpdate, _context: &Context| {
+                    panic!("publication failed");
+                }),
+            )
+            .expect("subscribe lands");
+        (subscription.activate)().expect("activate lands");
+
+        let error = host
+            .reload(vec![provider_for("B")])
+            .await
+            .expect_err("the publication failure terminates the host");
+        assert!(error_message(&error).contains("Facet reload failed after cutover"));
+        let error = host
+            .reload(vec![])
+            .await
+            .expect_err("the dead host rejects reloads");
+        assert!(error_message(&error).contains("cannot reload while dead"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn keeps_the_old_generation_active_when_replacement_activation_fails_before_cutover() {
+    rt().block_on(async {
+        let remote =
+            define_service("test.experimental.remote-generation-value").expect("not reserved");
+        let trace = Rc::new(RefCell::new(Vec::<String>::new()));
+        let retained_handle = Rc::new(RefCell::new(None::<ServiceView>));
+
+        let consumer = facet("terminal-consumer", {
+            let remote = remote.clone();
+            let retained_handle = retained_handle.clone();
+            let trace = trace.clone();
+            move |env| {
+                let handle = env.use_service(&remote).expect("use lands");
+                *retained_handle.borrow_mut() = Some(handle);
+                env.on_deactivate({
+                    let trace = trace.clone();
+                    Box::new(move || {
+                        let trace = trace.clone();
+                        boxed(async move {
+                            trace.borrow_mut().push("deactivate consumer".to_string());
+                            Ok(())
+                        })
+                    })
+                })
+                .expect("teardown lands");
+            }
+        });
+        let provider_for = |name: &'static str, fail: bool| -> FacetDef {
+            facet("terminal-provider", {
+                let remote = remote.clone();
+                let trace = trace.clone();
+                move |env| {
+                    env.provide(&remote, read_implementation(name))
+                        .expect("provide lands");
+                    env.on_activate({
+                        let trace = trace.clone();
+                        Box::new(move |_env: &mut FacetEnvironment| {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace.borrow_mut().push(format!("activate {name}"));
+                                if fail {
+                                    return Err(ChordError::Message(
+                                        "replacement activation failed".to_string(),
+                                    ));
+                                }
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("onActivate lands");
+                    env.on_deactivate({
+                        let trace = trace.clone();
+                        Box::new(move || {
+                            let trace = trace.clone();
+                            boxed(async move {
+                                trace.borrow_mut().push(format!("deactivate {name}"));
+                                Ok(())
+                            })
+                        })
+                    })
+                    .expect("teardown lands");
+                }
+            })
+        };
+
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![consumer, provider_for("A", false)],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect("the graph is valid");
+        let retained = retained_handle.borrow().clone().expect("handle");
+        let read = retained
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+
+        let error = host
+            .reload(vec![provider_for("B", true)])
+            .await
+            .expect_err("the activation failure rejects");
+        assert!(error_message(&error).contains("replacement activation failed"));
+        assert_eq!(
+            *trace.borrow(),
+            vec!["activate A", "activate B", "deactivate B"]
+        );
+        let read = retained
+            .call("read", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert_eq!(read, Some(js("A")));
+        host.reload(vec![])
+            .await
+            .unwrap_or_else(|e| panic!("reload: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert_eq!(
+            *trace.borrow(),
+            vec![
+                "activate A",
+                "activate B",
+                "deactivate B",
+                "deactivate consumer",
+                "deactivate A"
+            ]
+        );
     });
 }

@@ -188,7 +188,11 @@ impl RemoteServiceProvider {
         let shape = implementation.member_shape();
         assert_singleton_shape(&registration.borrow(), &shape)?;
         let instance = create_instance(&registration, implementation, None);
-        registration.borrow_mut().singleton = Some(instance);
+        {
+            let mut registration = registration.borrow_mut();
+            registration.singleton = Some(instance);
+            registration.singleton_shape = Some(shape);
+        }
         Ok(())
     }
 

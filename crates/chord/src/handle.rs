@@ -379,7 +379,16 @@ impl ServiceView {
                     inner: StateMemberInner::Replica(slot),
                 })
             }
-            ServiceTarget::View(view) => view.state(member),
+            ServiceTarget::View(view) => {
+                // The outer gate stays on the member view: every later read
+                // passes the facet's lifecycle gate and then the inner view's
+                // own gate, upstream's facet-then-binding gate chain on a
+                // retained state member.
+                Ok(StateMemberView {
+                    access: self.assert_access.clone(),
+                    inner: view.state(member)?.inner,
+                })
+            }
         }
     }
 
