@@ -4,5 +4,7 @@
 # doc-valid-idents REPLACES clippy's default list unless the `..` sentinel
 # appears, so the sentinel stays and the list holds only the house names the
 # doc comments actually carry — spelled verbatim from the code, since the
-# whole point is that prose may reference them bare.
-doc-valid-idents = ["AcpClient", "OpenCode", "WKWebView", ".."]
+# whole point is that prose may reference them bare. The tui slice #41 adds
+# the upstream attribution and terminal names its doc comments carry bare
+# (OpenTUI, XTVersion, WezTerm), spelled verbatim from the code they name.
+doc-valid-idents = ["AcpClient", "OpenTUI", "OpenCode", "WKWebView", "XTVersion", "WezTerm", ".."]
