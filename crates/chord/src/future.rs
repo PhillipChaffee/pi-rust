@@ -88,3 +88,53 @@ pub fn settle_now<T>(mut future: LocalBoxFuture<T>) -> Option<T> {
         Poll::Pending => None,
     }
 }
+
+/// Polls a boxed future once, returning its value when the first poll
+/// settles it, or the future back when it stays pending.
+///
+/// Upstream starts promises the moment they are created; the event loop
+/// runs them before any later statement observes them. In-process
+/// transports settle inside one poll, so the eager-start restatement is
+/// "drive the stored future once at creation"; a future that needs more
+/// turns goes back where it came from.
+pub fn drive_once<T>(mut future: LocalBoxFuture<T>) -> Result<T, LocalBoxFuture<T>> {
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
+    match future.as_mut().poll(&mut cx) {
+        Poll::Ready(value) => Ok(value),
+        Poll::Pending => Err(future),
+    }
+}
+
+/// The one-poll boundary an upstream `await` creates even when the awaited
+/// promise is already resolved: the first poll issues the call, the
+/// continuation runs on the next one, which is the microtask boundary the
+/// event loop inserted between subscribing and installing.
+#[derive(Debug)]
+pub struct Yield {
+    yielded: bool,
+}
+
+/// The future [`yield_once`] returns.
+#[must_use]
+pub fn yield_once() -> Yield {
+    Yield { yielded: false }
+}
+
+impl Future for Yield {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        if this.yielded {
+            Poll::Ready(())
+        } else {
+            this.yielded = true;
+            // A pended yield must reschedule itself, exactly as
+            // `tokio::task::yield_now` does: the caller polls again on the
+            // next turn without an external wakeup.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}

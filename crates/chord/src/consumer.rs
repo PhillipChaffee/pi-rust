@@ -100,6 +100,20 @@ pub fn create_remote_service_binding(
 /// Takes a stored start/transition future, awaits it once, and leaves a
 /// settled copy in its place: every later await sees the same result, the
 /// reusable-promise contract.
+/// Drives a stored start once, the eager start upstream's microtask
+/// scheduling performs: an in-process transport's subscription settles in
+/// one poll, and a future needing more turns stays stored for
+/// [`RemoteServiceBinding::ready`].
+fn drive_start_now(cell: &Rc<RefCell<Option<LocalBoxFuture<Result<(), ChordError>>>>>) {
+    let taken = cell.borrow_mut().take();
+    if let Some(future) = taken {
+        match crate::future::drive_once(future) {
+            Ok(result) => *cell.borrow_mut() = Some(boxed(ready_with(result))),
+            Err(still_pending) => *cell.borrow_mut() = Some(still_pending),
+        }
+    }
+}
+
 fn settle_stored(cell: &StoredStart) -> LocalBoxFuture<Result<(), ChordError>> {
     let cell = cell.clone();
     let existing = cell.borrow_mut().take();
@@ -642,6 +656,7 @@ impl RemoteServiceBinding {
             let starting =
                 self.start_singleton_wrapped(service.id.clone(), binding.clone(), revision);
             *binding.starting.borrow_mut() = Some(starting);
+            drive_start_now(&binding.starting);
         }
         Ok(binding.view())
     }
@@ -729,6 +744,7 @@ impl RemoteServiceBinding {
             let revision = binding.revision.get();
             let starting = self.start_keyed_wrapped(binding.clone(), revision);
             *binding.starting.borrow_mut() = Some(starting);
+            drive_start_now(&binding.starting);
         }
         Ok(Box::new(move || {
             if stopped.get() {
@@ -870,8 +886,15 @@ impl RemoteServiceBinding {
             for binding in singletons {
                 binding.active.set(false);
                 binding.facade.clear();
+                // Upstream swallows start failures on the disposal path
+                // (`binding.starting.catch(() => {})`); readiness reports
+                // them, disposal collects only close failures.
                 if binding.starting.borrow().is_some() {
-                    closes.push(settle_stored(&binding.starting));
+                    let starting = settle_stored(&binding.starting);
+                    closes.push(boxed(async move {
+                        let _ = starting.await;
+                        Ok(())
+                    }));
                 }
                 let subscription = binding.subscription.borrow_mut().take();
                 if let Some(subscription) = subscription {
@@ -1057,6 +1080,10 @@ impl RemoteServiceBinding {
                 background_context(),
             )
             .await?;
+        // The await boundary upstream's resolved promise still inserts: the
+        // subscribe call issues eagerly, and the installation continuation
+        // runs when the awaiting task polls again.
+        crate::future::yield_once().await;
         if !binding.active.get()
             || core.disposed.get()
             || !core.bound.get()
@@ -1141,6 +1168,8 @@ impl KeyedBindingState {
                 background_context(),
             )
             .await?;
+        // The same await boundary for the keyed start.
+        crate::future::yield_once().await;
         if self.closed.get() || !self.bound.get() || self.revision.get() != revision {
             (subscription.close)(Some(background_context())).await?;
             return Ok(());
