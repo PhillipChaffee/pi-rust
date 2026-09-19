@@ -52,9 +52,7 @@ pub type Disposal = Box<dyn FnOnce() -> LocalBoxFuture<Result<(), ChordError>>>;
 
 /// Builds a [`Disposal`] from a synchronous body.
 #[must_use]
-pub fn sync_disposal(
-    disposal: impl FnOnce() -> Result<(), ChordError> + 'static,
-) -> Disposal {
+pub fn sync_disposal(disposal: impl FnOnce() -> Result<(), ChordError> + 'static) -> Disposal {
     Box::new(move || boxed(async move { disposal() }))
 }
 
@@ -64,7 +62,8 @@ pub fn sync_disposal(
 /// Upstream spells the return a `Promise` of JSON or void; the boxed future
 /// is that promise, driven by the caller's runtime. Shared ownership
 /// ([`Rc`]) lets providers clone a member into the future that awaits it.
-pub type RemoteMethod = Rc<dyn Fn(Vec<JsonValue>, Context) -> LocalBoxFuture<Result<Option<JsonValue>, ChordError>>>;
+pub type RemoteMethod =
+    Rc<dyn Fn(Vec<JsonValue>, Context) -> LocalBoxFuture<Result<Option<JsonValue>, ChordError>>>;
 
 /// Builds a [`RemoteMethod`] from a synchronous body, for methods that
 /// produce their result without an await point.
@@ -82,7 +81,7 @@ pub fn sync_method(
 /// One member of a [`ServiceImplementation`].
 #[derive(Clone)]
 pub enum ServiceMember {
-    /// An invokable method.
+    /// An invocable method.
     Method(RemoteMethod),
     /// Replicated state the provider publishes and consumers subscribe to.
     State(MutableReplicatedState),
@@ -120,13 +119,15 @@ impl ServiceImplementation {
 
     /// Adds a method member, replacing any previous one under `name`.
     pub fn method(&mut self, name: impl Into<String>, method: RemoteMethod) -> &mut Self {
-        self.members.insert(name.into(), ServiceMember::Method(method));
+        self.members
+            .insert(name.into(), ServiceMember::Method(method));
         self
     }
 
     /// Adds a replicated-state member.
     pub fn state(&mut self, name: impl Into<String>, state: MutableReplicatedState) -> &mut Self {
-        self.members.insert(name.into(), ServiceMember::State(state));
+        self.members
+            .insert(name.into(), ServiceMember::State(state));
         self
     }
 
@@ -182,7 +183,9 @@ pub fn validate_remote_implementation(
     implementation: &ServiceImplementation,
 ) -> Result<(), ChordError> {
     if implementation.is_empty() {
-        return Err(ChordError::Message(format!("Remote service {service_id} has no members")));
+        return Err(ChordError::Message(format!(
+            "Remote service {service_id} has no members"
+        )));
     }
     for (name, member) in &implementation.members {
         if matches!(member, ServiceMember::Value(_)) {
@@ -306,7 +309,10 @@ impl ServiceView {
 
     fn target(&self) -> Result<ServiceTarget, ChordError> {
         self.slot.0.target.borrow().clone().ok_or_else(|| {
-            ChordError::Message(format!("Service {} is disconnected", self.slot.0.service_id))
+            ChordError::Message(format!(
+                "Service {} is disconnected",
+                self.slot.0.service_id
+            ))
         })
     }
 
@@ -351,7 +357,9 @@ impl ServiceView {
                     access: self.assert_access.clone(),
                     inner: StateMemberInner::Source(state.clone()),
                 }),
-                Some(_) => Err(ChordError::Message("Service member is not replicated state".to_string())),
+                Some(_) => Err(ChordError::Message(
+                    "Service member is not replicated state".to_string(),
+                )),
                 None => Err(ChordError::Message(format!(
                     "Service {} is disconnected",
                     self.slot.0.service_id
@@ -373,12 +381,18 @@ impl ServiceView {
     ///
     /// # Errors
     /// [`ChordError`] when the access gate or the member dispatch rejects.
-    pub fn with_value<R>(&self, member: &str, read: impl FnOnce(&dyn Any) -> R) -> Result<R, ChordError> {
+    pub fn with_value<R>(
+        &self,
+        member: &str,
+        read: impl FnOnce(&dyn Any) -> R,
+    ) -> Result<R, ChordError> {
         (self.assert_access.clone())()?;
         match self.target()? {
             ServiceTarget::Local(implementation) => match implementation.member(member) {
                 Some(ServiceMember::Value(data)) => Ok(read(data.as_ref())),
-                Some(_) => Err(ChordError::Message("Service member is not a value".to_string())),
+                Some(_) => Err(ChordError::Message(
+                    "Service member is not a value".to_string(),
+                )),
                 None => Err(ChordError::Message(format!(
                     "Service {} is disconnected",
                     self.slot.0.service_id

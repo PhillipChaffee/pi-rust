@@ -102,13 +102,20 @@ impl InstanceDirectory {
     )]
     pub fn insert(&self, entry: Rc<InstanceDirectoryEntry>) -> Result<(), ChordError> {
         self.assert_active()?;
-        if self.entries.borrow().iter().any(|(key, _)| *key == entry.key) {
+        if self
+            .entries
+            .borrow()
+            .iter()
+            .any(|(key, _)| *key == entry.key)
+        {
             return Err(ChordError::Message(format!(
                 "Keyed service already has a live instance with key {}",
                 entry.key
             )));
         }
-        self.entries.borrow_mut().push((entry.key.clone(), entry.clone()));
+        self.entries
+            .borrow_mut()
+            .push((entry.key.clone(), entry.clone()));
         if self.ready.get() {
             self.start_all(&entry);
         }
@@ -129,11 +136,15 @@ impl InstanceDirectory {
         let previous = self.get(&entry.key);
         if let Some(previous) = previous {
             if previous.generation == entry.generation {
-                return Err(ChordError::Message("Keyed service repeated a live generation".to_string()));
+                return Err(ChordError::Message(
+                    "Keyed service repeated a live generation".to_string(),
+                ));
             }
             self.remove(&previous);
         }
-        self.entries.borrow_mut().push((entry.key.clone(), entry.clone()));
+        self.entries
+            .borrow_mut()
+            .push((entry.key.clone(), entry.clone()));
         if self.ready.get() {
             self.start_all(&entry);
         }
@@ -164,8 +175,12 @@ impl InstanceDirectory {
             return Ok(());
         }
         self.ready.set(true);
-        let entries: Vec<Rc<InstanceDirectoryEntry>> =
-            self.entries.borrow().iter().map(|(_, e)| e.clone()).collect();
+        let entries: Vec<Rc<InstanceDirectoryEntry>> = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect();
         for entry in entries {
             self.start_all(&entry);
         }
@@ -180,8 +195,12 @@ impl InstanceDirectory {
             return;
         }
         self.ready.set(false);
-        let entries: Vec<Rc<InstanceDirectoryEntry>> =
-            self.entries.borrow().iter().map(|(_, e)| e.clone()).collect();
+        let entries: Vec<Rc<InstanceDirectoryEntry>> = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect();
         for entry in entries {
             self.remove_internal(&entry);
         }
@@ -201,8 +220,12 @@ impl InstanceDirectory {
         });
         self.observers.borrow_mut().push(observer.clone());
         if self.ready.get() {
-            let entries: Vec<Rc<InstanceDirectoryEntry>> =
-                self.entries.borrow().iter().map(|(_, e)| e.clone()).collect();
+            let entries: Vec<Rc<InstanceDirectoryEntry>> = self
+                .entries
+                .borrow()
+                .iter()
+                .map(|(_, e)| e.clone())
+                .collect();
             for entry in entries {
                 self.start(&observer, &entry);
             }
@@ -216,7 +239,9 @@ impl InstanceDirectory {
             for (_, controller) in observer.tasks.borrow_mut().drain(..) {
                 controller.abort_without_reason();
             }
-            observers.borrow_mut().retain(|current| !Rc::ptr_eq(current, &observer));
+            observers
+                .borrow_mut()
+                .retain(|current| !Rc::ptr_eq(current, &observer));
         }))
     }
 
@@ -234,8 +259,12 @@ impl InstanceDirectory {
             }
         }
         self.observers.borrow_mut().clear();
-        let entries: Vec<Rc<InstanceDirectoryEntry>> =
-            self.entries.borrow().iter().map(|(_, e)| e.clone()).collect();
+        let entries: Vec<Rc<InstanceDirectoryEntry>> = self
+            .entries
+            .borrow()
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect();
         for entry in entries {
             (entry.deactivate)();
         }
@@ -277,9 +306,15 @@ impl InstanceDirectory {
             return;
         }
         let (context, controller) = with_cancel(&crate::context::background_context());
-        observer.tasks.borrow_mut().push((entry.clone(), controller));
+        observer
+            .tasks
+            .borrow_mut()
+            .push((entry.clone(), controller));
         let report = |error: ChordError| {
-            if !context.abort_signal().is_some_and(|signal| signal.aborted()) {
+            if !context
+                .abort_signal()
+                .is_some_and(|signal| signal.aborted())
+            {
                 (self.report_error)(&error);
             }
         };
@@ -288,13 +323,17 @@ impl InstanceDirectory {
             (observer.handler)(target, context.clone());
         }));
         if let Err(panic) = result {
-            report(ChordError::Message(crate::services::state::panic_message(&*panic)));
+            report(ChordError::Message(crate::services::state::panic_message(
+                &*panic,
+            )));
         }
     }
 
     fn assert_active(&self) -> Result<(), ChordError> {
         if self.disposed.get() {
-            return Err(ChordError::Message("Keyed service directory is disposed".to_string()));
+            return Err(ChordError::Message(
+                "Keyed service directory is disposed".to_string(),
+            ));
         }
         Ok(())
     }

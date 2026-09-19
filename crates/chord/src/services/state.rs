@@ -180,8 +180,18 @@ impl MutableReplicatedState {
                 ops,
                 inner.sequence,
                 published,
-                inner.source_listeners.entries.iter().map(|(_, l)| l.clone()).collect::<Vec<SourceListener>>(),
-                inner.listeners.entries.iter().map(|(_, l)| l.clone()).collect::<Vec<ValueListener>>(),
+                inner
+                    .source_listeners
+                    .entries
+                    .iter()
+                    .map(|(_, l)| l.clone())
+                    .collect::<Vec<SourceListener>>(),
+                inner
+                    .listeners
+                    .entries
+                    .iter()
+                    .map(|(_, l)| l.clone())
+                    .collect::<Vec<ValueListener>>(),
             )
         };
         for source in &sources {
@@ -228,10 +238,14 @@ impl MutableReplicatedState {
     /// plumbing publishes through it.
     #[must_use]
     pub(crate) fn source_subscribe(&self, listener: SourceListener) -> Unsubscribe {
-        let id = lock_state(&self.0, "state lock").source_listeners.add(listener);
+        let id = lock_state(&self.0, "state lock")
+            .source_listeners
+            .add(listener);
         let state = self.clone();
         Box::new(move || {
-            lock_state(&state.0, "state lock").source_listeners.remove(id);
+            lock_state(&state.0, "state lock")
+                .source_listeners
+                .remove(id);
         })
     }
 }
@@ -338,7 +352,8 @@ impl ReplicatedStateReplica {
     /// replica before the error surfaces.
     pub fn update(&self, sequence: u64, ops: &[Op], context: &Context) -> Result<(), ChordError> {
         let mut inner = lock_state(&self.0, "replica lock");
-        let (Some(applied_sequence), Some(applied_value)) = (inner.sequence, inner.value.clone()) else {
+        let (Some(applied_sequence), Some(applied_value)) = (inner.sequence, inner.value.clone())
+        else {
             return Err(ChordError::Message(
                 "Replicated state received an update before hydration".to_string(),
             ));
@@ -375,9 +390,15 @@ fn deliver_all(inner: &ReplicaInner, context: &Context, delivery: &ReplicatedSta
     let Some(value) = inner.value.clone() else {
         return;
     };
-    let listeners: Vec<ValueListener> = inner.listeners.entries.iter().map(|(_, l)| l.clone()).collect();
+    let listeners: Vec<ValueListener> = inner
+        .listeners
+        .entries
+        .iter()
+        .map(|(_, l)| l.clone())
+        .collect();
     for listener in listeners {
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| listener(&value, context, delivery)));
+        let result =
+            std::panic::catch_unwind(AssertUnwindSafe(|| listener(&value, context, delivery)));
         if let Err(panic) = result {
             (inner.report_error)(&ChordError::Message(panic_message(&*panic)));
         }

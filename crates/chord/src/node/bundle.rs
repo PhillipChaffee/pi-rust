@@ -69,7 +69,9 @@ pub async fn bundle_facets(options: BundleFacetsOptions) -> Result<BundleFacetsR
     let output_directory = resolve(&working_directory, &options.outdir);
     let output_parent = output_directory
         .parent()
-        .ok_or_else(|| ChordError::Message("Facet bundle output directory has no parent".to_string()))?
+        .ok_or_else(|| {
+            ChordError::Message("Facet bundle output directory has no parent".to_string())
+        })?
         .to_path_buf();
     std::fs::create_dir_all(&output_parent)
         .map_err(|error| ChordError::Message(format!("Could not create output parent: {error}")))?;
@@ -102,10 +104,13 @@ pub async fn bundle_facets(options: BundleFacetsOptions) -> Result<BundleFacetsR
             entries,
         };
         let manifest_text = format!("{}\n", manifest_to_json_text(&manifest));
-        std::fs::write(temporary_directory.join(crate::node::manifest::FACET_BUNDLE_MANIFEST_FILE), manifest_text)
-            .map_err(|error| {
-                ChordError::Message(format!("Could not write facet bundle manifest: {error}"))
-            })?;
+        std::fs::write(
+            temporary_directory.join(crate::node::manifest::FACET_BUNDLE_MANIFEST_FILE),
+            manifest_text,
+        )
+        .map_err(|error| {
+            ChordError::Message(format!("Could not write facet bundle manifest: {error}"))
+        })?;
         replace_directory(&temporary_directory, &output_directory)?;
         Ok::<BundleFacetsResult, ChordError>(BundleFacetsResult {
             manifest_path: output_directory.join(crate::node::manifest::FACET_BUNDLE_MANIFEST_FILE),
@@ -129,7 +134,9 @@ pub async fn bundle_facets(options: BundleFacetsOptions) -> Result<BundleFacetsR
 /// # Errors
 /// [`ChordError`] when the package metadata is unreadable or invalid, no
 /// facet entry resolves, or an entry escapes the package directory.
-pub async fn bundle_facet_package(options: BundleFacetPackageOptions) -> Result<BundleFacetPackageResult, ChordError> {
+pub async fn bundle_facet_package(
+    options: BundleFacetPackageOptions,
+) -> Result<BundleFacetPackageResult, ChordError> {
     let metadata = read_facet_package_metadata(&options.package_path)?;
     let mut entries: Vec<(String, FacetEntrySource)> = Vec::new();
     for (name, source) in &options.default_facets {
@@ -260,24 +267,38 @@ struct PackageMetadata {
     peer_dependencies: Vec<String>,
     configured_facets: Vec<(String, FacetSource)>,
     external: Vec<String>,
-    #[allow(dead_code, reason = "the source map flag rides the metadata the builder seam consumes")]
+    #[allow(
+        dead_code,
+        reason = "the source map flag rides the metadata the builder seam consumes"
+    )]
     source_map: bool,
 }
 
 fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, ChordError> {
     if package_path.as_os_str().is_empty() {
-        return Err(ChordError::Message("Facet package path must not be empty".to_string()));
+        return Err(ChordError::Message(
+            "Facet package path must not be empty".to_string(),
+        ));
     }
     let candidate = package_path.to_path_buf();
     let metadata = std::fs::metadata(&candidate).map_err(|error| {
-        ChordError::Message(format!("Could not access facet package {}: {error}", candidate.display()))
+        ChordError::Message(format!(
+            "Could not access facet package {}: {error}",
+            candidate.display()
+        ))
     })?;
     let (package_directory, package_json_path) = if metadata.is_dir() {
         let directory = std::fs::canonicalize(&candidate).map_err(|error| {
-            ChordError::Message(format!("Could not resolve facet package {}: {error}", candidate.display()))
+            ChordError::Message(format!(
+                "Could not resolve facet package {}: {error}",
+                candidate.display()
+            ))
         })?;
         (directory.clone(), directory.join("package.json"))
-    } else if candidate.file_name().is_some_and(|name| name == "package.json") {
+    } else if candidate
+        .file_name()
+        .is_some_and(|name| name == "package.json")
+    {
         let package_json_path = std::fs::canonicalize(&candidate).map_err(|error| {
             ChordError::Message(format!("Could not resolve facet package metadata: {error}"))
         })?;
@@ -299,7 +320,10 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
     })?;
     let parsed = crate::node::manifest::parse_json(
         &text,
-        format!("Could not read facet package metadata {}", package_json_path.display()),
+        format!(
+            "Could not read facet package metadata {}",
+            package_json_path.display()
+        ),
     )?;
     let Some(object) = parsed.as_object() else {
         return Err(ChordError::Message(format!(
@@ -322,19 +346,17 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
     let peer_dependencies = object
         .get("peerDependencies")
         .and_then(JsonValue::as_object)
-        .map_or_else(
-            Vec::new,
-            |peer| {
-                let mut names: Vec<String> = peer
-                    .keys()
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                names.sort_unstable();
-                names
-            },
-        );
-    let (configured_facets, external, _source_map) = parse_chord_configuration(object, &package_json_path);
+        .map_or_else(Vec::new, |peer| {
+            let mut names: Vec<String> = peer
+                .keys()
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect();
+            names.sort_unstable();
+            names
+        });
+    let (configured_facets, external, _source_map) =
+        parse_chord_configuration(object, &package_json_path);
     Ok(PackageMetadata {
         package_directory,
         package_json_path,
@@ -361,7 +383,9 @@ fn parse_chord_configuration(
                 continue;
             }
             match source {
-                JsonValue::Bool(false) => configured_facets.push((name.to_string(), FacetSource::Removed)),
+                JsonValue::Bool(false) => {
+                    configured_facets.push((name.to_string(), FacetSource::Removed))
+                }
                 JsonValue::Str(source) => {
                     configured_facets.push((name.to_string(), FacetSource::File(source.clone())));
                 }
@@ -389,17 +413,30 @@ fn parse_chord_configuration(
 
 fn validate_options(options: &BundleFacetsOptions) -> Result<(), ChordError> {
     if options.plugin.id.is_empty() {
-        return Err(ChordError::Message("Facet bundle plugin ID must not be empty".to_string()));
+        return Err(ChordError::Message(
+            "Facet bundle plugin ID must not be empty".to_string(),
+        ));
     }
-    if options.plugin.version.as_ref().is_some_and(String::is_empty) {
-        return Err(ChordError::Message("Facet bundle plugin version must not be empty".to_string()));
+    if options
+        .plugin
+        .version
+        .as_ref()
+        .is_some_and(String::is_empty)
+    {
+        return Err(ChordError::Message(
+            "Facet bundle plugin version must not be empty".to_string(),
+        ));
     }
     if options.entries.is_empty() {
-        return Err(ChordError::Message("Facet bundle must contain at least one entry".to_string()));
+        return Err(ChordError::Message(
+            "Facet bundle must contain at least one entry".to_string(),
+        ));
     }
     for (name, source) in &options.entries {
         if name.is_empty() {
-            return Err(ChordError::Message("Facet bundle entry name must not be empty".to_string()));
+            return Err(ChordError::Message(
+                "Facet bundle entry name must not be empty".to_string(),
+            ));
         }
         if source.text.is_empty() {
             return Err(ChordError::Message(format!(
@@ -416,7 +453,10 @@ fn bundle_entry(
     temporary_directory: &Path,
 ) -> Result<crate::node::manifest::FacetBundleEntry, ChordError> {
     let content_digest = integrity_hex(source.text.as_bytes());
-    let file = format!("facet-{}-{content_digest}.cjs", short_hash(entry_name.as_bytes()));
+    let file = format!(
+        "facet-{}-{content_digest}.cjs",
+        short_hash(entry_name.as_bytes())
+    );
     let path = temporary_directory.join(&file);
     std::fs::write(&path, &source.text).map_err(|error| {
         ChordError::Message(format!("Could not write facet entry {entry_name}: {error}"))
@@ -424,10 +464,15 @@ fn bundle_entry(
     if let Some(contents) = &source.source_map {
         let map_file = format!("{file}.map");
         std::fs::write(temporary_directory.join(&map_file), contents).map_err(|error| {
-            ChordError::Message(format!("Could not write facet entry {entry_name} source map: {error}"))
+            ChordError::Message(format!(
+                "Could not write facet entry {entry_name} source map: {error}"
+            ))
         })?;
     }
-    let integrity = format!("sha256-{}", crate::node::manifest::integrity_digest(source.text.as_bytes()));
+    let integrity = format!(
+        "sha256-{}",
+        crate::node::manifest::integrity_digest(source.text.as_bytes())
+    );
     let mut external_imports = source.external_imports.clone();
     external_imports.sort_unstable();
     external_imports.dedup();
@@ -450,7 +495,10 @@ pub fn manifest_to_json_text(manifest: &crate::node::manifest::FacetBundleManife
             .map(|(name, entry)| {
                 let mut fields: Vec<(String, JsonValue)> = vec![
                     ("file".to_string(), JsonValue::Str(entry.file.clone())),
-                    ("integrity".to_string(), JsonValue::Str(entry.integrity.clone())),
+                    (
+                        "integrity".to_string(),
+                        JsonValue::Str(entry.integrity.clone()),
+                    ),
                     (
                         "externalImports".to_string(),
                         JsonValue::Array(
@@ -465,7 +513,10 @@ pub fn manifest_to_json_text(manifest: &crate::node::manifest::FacetBundleManife
                 if let Some(source_map) = &entry.source_map {
                     fields.push(("sourceMap".to_string(), JsonValue::Str(source_map.clone())));
                 }
-                (name.clone(), JsonValue::Object(JsonObject::from_entries(fields)))
+                (
+                    name.clone(),
+                    JsonValue::Object(JsonObject::from_entries(fields)),
+                )
             })
             .collect(),
     );
@@ -477,7 +528,10 @@ pub fn manifest_to_json_text(manifest: &crate::node::manifest::FacetBundleManife
         fields
     });
     let root = JsonObject::from_entries(vec![
-        ("format".to_string(), JsonValue::Str(manifest.format.clone())),
+        (
+            "format".to_string(),
+            JsonValue::Str(manifest.format.clone()),
+        ),
         (
             "formatVersion".to_string(),
             JsonValue::Number(JsonNumber::from(manifest.format_version)),
@@ -495,10 +549,16 @@ fn string_field<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
     }
 }
 
-fn validate_package_entry(package_directory: &Path, path: &Path, name: &str) -> Result<(), ChordError> {
-    let relative = path
-        .strip_prefix(package_directory)
-        .map_err(|_| ChordError::Message(format!("Facet package entry {name} resolves outside the package directory")))?;
+fn validate_package_entry(
+    package_directory: &Path,
+    path: &Path,
+    name: &str,
+) -> Result<(), ChordError> {
+    let relative = path.strip_prefix(package_directory).map_err(|_| {
+        ChordError::Message(format!(
+            "Facet package entry {name} resolves outside the package directory"
+        ))
+    })?;
     if relative.as_os_str().is_empty() {
         return Err(ChordError::Message(format!(
             "Facet package entry {name} escapes the package directory"
@@ -507,11 +567,12 @@ fn validate_package_entry(package_directory: &Path, path: &Path, name: &str) -> 
     Ok(())
 }
 
-fn replace_directory(temporary_directory: &Path, output_directory: &Path) -> Result<(), ChordError> {
-    let backup_directory = output_directory.with_extension(format!(
-        "old-{}",
-        short_hash(&random_suffix())
-    ));
+fn replace_directory(
+    temporary_directory: &Path,
+    output_directory: &Path,
+) -> Result<(), ChordError> {
+    let backup_directory =
+        output_directory.with_extension(format!("old-{}", short_hash(&random_suffix())));
     let moved_existing = std::fs::rename(output_directory, &backup_directory).is_ok();
     match std::fs::rename(temporary_directory, output_directory) {
         Ok(()) => {}
@@ -548,8 +609,8 @@ fn file_name(path: &Path) -> String {
 /// The 12-hex-character short hash upstream's `shortHash` produces.
 #[must_use]
 pub fn short_hash(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
     use sha2::Digest as _;
+    use std::fmt::Write as _;
     let digest = sha2::Sha256::digest(bytes);
     let mut text = String::with_capacity(12);
     for byte in &digest[..6] {
@@ -559,8 +620,8 @@ pub fn short_hash(bytes: &[u8]) -> String {
 }
 
 fn integrity_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
     use sha2::Digest as _;
+    use std::fmt::Write as _;
     let digest = sha2::Sha256::digest(bytes);
     let mut text = String::with_capacity(20);
     for byte in &digest[..10] {

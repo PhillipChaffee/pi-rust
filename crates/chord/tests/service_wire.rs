@@ -16,28 +16,26 @@
     reason = "test helpers settle results the case's own assertions would reject"
 )]
 
-
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use pi_chord::context::{Context, background_context};
 use pi_chord::delta::{Op, PathRef, Seg, WireOp};
 use pi_chord::handle::ServiceImplementation;
-use pi_chord::services::provider::{
-    RemoteServiceProvider, create_remote_service_endpoint,
-};
+use pi_chord::services::provider::{RemoteServiceProvider, create_remote_service_endpoint};
 use pi_chord::services::state::MutableReplicatedState;
 use pi_chord::services::state_codec::{create_service_state_decoder, create_service_state_encoder};
 use pi_chord::services::wire::{
-    ServiceControlCall, WireServiceInstanceSnapshot, WireServiceMemberSnapshot, WireServiceSubscriptionSnapshot,
-    catalogue_to_json, create_service_catalogue_call, create_service_subscribe_call,
-    create_service_unsubscribe_call, decode_service_control_call, object, parse_service_call,
-    parse_service_catalogue, parse_service_provider_update, parse_service_subscription_snapshot,
-    parse_wire_service_provider_update, parse_wire_service_subscription_snapshot, snapshot_to_json,
+    ServiceControlCall, WireServiceInstanceSnapshot, WireServiceMemberSnapshot,
+    WireServiceSubscriptionSnapshot, catalogue_to_json, create_service_catalogue_call,
+    create_service_subscribe_call, create_service_unsubscribe_call, decode_service_control_call,
+    object, parse_service_call, parse_service_catalogue, parse_service_provider_update,
+    parse_service_subscription_snapshot, parse_wire_service_provider_update,
+    parse_wire_service_subscription_snapshot, snapshot_to_json,
 };
 use pi_chord::types::{
     JsonValue, ServiceCatalogueEntry, ServiceInstanceAddress, ServiceInstanceSnapshot,
-    ServiceMemberSnapshot, ServiceMode, ServiceSubscriptionSnapshot, ServiceProviderUpdate,
+    ServiceMemberSnapshot, ServiceMode, ServiceProviderUpdate, ServiceSubscriptionSnapshot,
 };
 
 fn key(text: &str) -> Seg {
@@ -69,7 +67,8 @@ fn encodes_control_calls_and_validates_service_values() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].service_id, "pi.models");
     assert_eq!(entries[1].mode, ServiceMode::Keyed);
-    let subscribe = create_service_subscribe_call("subscription-1", "pi.models", ServiceMode::Singleton);
+    let subscribe =
+        create_service_subscribe_call("subscription-1", "pi.models", ServiceMode::Singleton);
     assert_eq!(
         decode_service_control_call(&subscribe),
         Some(ServiceControlCall::Subscribe {
@@ -86,11 +85,17 @@ fn encodes_control_calls_and_validates_service_values() {
     );
     let call = jo(vec![
         ("serviceId", js("pi.question-dialog")),
-        ("instance", jo(vec![("key", js("invocation-1")), ("generation", number(2))])),
+        (
+            "instance",
+            jo(vec![("key", js("invocation-1")), ("generation", number(2))]),
+        ),
         ("member", js("submit")),
         (
             "args",
-            JsonValue::Array(vec![jo(vec![("outcome", js("selected")), ("index", number(0))])]),
+            JsonValue::Array(vec![jo(vec![
+                ("outcome", js("selected")),
+                ("index", number(0)),
+            ])]),
         ),
     ]);
     let parsed = expect_ok(parse_service_call(&call));
@@ -115,7 +120,10 @@ fn rejects_malformed_service_values() {
     let error = expect_err(parse_service_call(&extra));
     assert!(error.to_string().contains("Invalid service call"));
 
-    let bad_mode = JsonValue::Array(vec![jo(vec![("serviceId", js("pi.models")), ("mode", js("unknown"))])]);
+    let bad_mode = JsonValue::Array(vec![jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("unknown")),
+    ])]);
     let error = expect_err(parse_service_catalogue(&bad_mode));
     assert!(error.to_string().contains("Invalid service catalogue"));
 
@@ -170,7 +178,11 @@ fn keeps_one_operation_codec_pair_for_one_subscription_state() {
     let snapshot = singleton_snapshot(jo(vec![("revision", number(0))]));
     let mut batch_decoder = decoder();
     let decoded = batch_decoder
-        .decode_snapshot(&encoder.encode_snapshot(&snapshot).unwrap_or_else(|e| panic!("snapshot: {e}")))
+        .decode_snapshot(
+            &encoder
+                .encode_snapshot(&snapshot)
+                .unwrap_or_else(|e| panic!("snapshot: {e}")),
+        )
         .unwrap_or_else(|e| panic!("decode snapshot: {e}"));
     assert_eq!(decoded.service_id, snapshot.service_id);
 
@@ -223,11 +235,19 @@ fn isolates_operation_dictionaries_between_states_and_subscriptions() {
     let mut second_encoder = encoder();
     let mut first_decoder = decoder();
     let _ = first_decoder
-        .decode_snapshot(&first_encoder.encode_snapshot(&snapshot).unwrap_or_else(|e| panic!("first: {e}")))
+        .decode_snapshot(
+            &first_encoder
+                .encode_snapshot(&snapshot)
+                .unwrap_or_else(|e| panic!("first: {e}")),
+        )
         .unwrap_or_else(|e| panic!("first decode: {e}"));
     let mut second_decoder = decoder();
     let _ = second_decoder
-        .decode_snapshot(&second_encoder.encode_snapshot(&snapshot).unwrap_or_else(|e| panic!("second: {e}")))
+        .decode_snapshot(
+            &second_encoder
+                .encode_snapshot(&snapshot)
+                .unwrap_or_else(|e| panic!("second: {e}")),
+        )
         .unwrap_or_else(|e| panic!("decode second: {e}"));
 
     let update = |member: &str, sequence: u64, revision: u64| ServiceProviderUpdate::State {
@@ -257,8 +277,18 @@ fn isolates_operation_dictionaries_between_states_and_subscriptions() {
     for wire in [&second_left, &second_right] {
         assert_sets(wire, true, &number(2));
     }
-    assert_eq!(first_decoder.decode_update(&first_left).unwrap_or_else(|e| panic!("dfl: {e}")), update("left", 1, 1));
-    assert_eq!(first_decoder.decode_update(&first_right).unwrap_or_else(|e| panic!("dfr: {e}")), update("right", 1, 1));
+    assert_eq!(
+        first_decoder
+            .decode_update(&first_left)
+            .unwrap_or_else(|e| panic!("dfl: {e}")),
+        update("left", 1, 1)
+    );
+    assert_eq!(
+        first_decoder
+            .decode_update(&first_right)
+            .unwrap_or_else(|e| panic!("dfr: {e}")),
+        update("right", 1, 1)
+    );
     assert_eq!(
         first_decoder
             .decode_update(&second_left)
@@ -309,7 +339,11 @@ fn isolates_operation_dictionaries_between_states_and_subscriptions() {
     );
 }
 
-fn assert_sets(wire: &pi_chord::services::wire::WireServiceProviderUpdate, interned: bool, value: &JsonValue) {
+fn assert_sets(
+    wire: &pi_chord::services::wire::WireServiceProviderUpdate,
+    interned: bool,
+    value: &JsonValue,
+) {
     let pi_chord::services::wire::WireServiceProviderUpdate::State { ops, .. } = wire else {
         panic!("state update");
     };
@@ -371,7 +405,10 @@ fn creates_and_removes_keyed_instance_codecs_with_their_lifecycle() {
         instances: vec![],
     };
     let decoded = dec
-        .decode_snapshot(&enc.encode_snapshot(&empty).unwrap_or_else(|e| panic!("encode: {e}")))
+        .decode_snapshot(
+            &enc.encode_snapshot(&empty)
+                .unwrap_or_else(|e| panic!("encode: {e}")),
+        )
         .unwrap_or_else(|e| panic!("decode: {e}"));
     assert_eq!(decoded.instances.len(), 0);
     let address = ServiceInstanceAddress {
@@ -398,23 +435,33 @@ fn creates_and_removes_keyed_instance_codecs_with_their_lifecycle() {
     );
     let update = keyed_update(&address, 1, 1);
     assert_eq!(
-        dec.decode_update(&enc.encode_update(&update).unwrap_or_else(|e| panic!("update: {e}")))
-            .unwrap_or_else(|e| panic!("update decode: {e}")),
+        dec.decode_update(
+            &enc.encode_update(&update)
+                .unwrap_or_else(|e| panic!("update: {e}"))
+        )
+        .unwrap_or_else(|e| panic!("update decode: {e}")),
         update
     );
     let closed = ServiceProviderUpdate::Closed {
         instance: address.clone(),
     };
     assert_eq!(
-        dec.decode_update(&enc.encode_update(&closed).unwrap_or_else(|e| panic!("close: {e}")))
-            .unwrap_or_else(|e| panic!("close decode: {e}")),
+        dec.decode_update(
+            &enc.encode_update(&closed)
+                .unwrap_or_else(|e| panic!("close: {e}"))
+        )
+        .unwrap_or_else(|e| panic!("close decode: {e}")),
         closed
     );
     let error = expect_err(enc.encode_update(&keyed_update(&address, 2, 2)));
     assert!(error.to_string().contains("Unknown service state"));
 }
 
-fn keyed_update(address: &ServiceInstanceAddress, sequence: u64, value: u64) -> ServiceProviderUpdate {
+fn keyed_update(
+    address: &ServiceInstanceAddress,
+    sequence: u64,
+    value: u64,
+) -> ServiceProviderUpdate {
     ServiceProviderUpdate::State {
         instance: Some(address.clone()),
         member: "request".to_string(),
@@ -433,11 +480,13 @@ fn remote_service_endpoints_publish_and_clean_up_provider_subscriptions() {
         .build()
         .unwrap_or_else(|error| panic!("runtime: {error}"));
     runtime.block_on(async {
-        let service = pi_chord::api::define_service("test.counter").unwrap_or_else(|e| panic!("define: {e}"));
-        let provider = RemoteServiceProvider::new(vec![pi_chord::services::provider::singleton_definition(
-            service.clone(),
-        )])
-        .unwrap_or_else(|e| panic!("provider: {e}"));
+        let service =
+            pi_chord::api::define_service("test.counter").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider =
+            RemoteServiceProvider::new(vec![pi_chord::services::provider::singleton_definition(
+                service.clone(),
+            )])
+            .unwrap_or_else(|e| panic!("provider: {e}"));
         let state = MutableReplicatedState::new(jo(vec![("value", number(0))]));
         let mut implementation = ServiceImplementation::new();
         implementation.state("state", state.clone());
@@ -448,22 +497,35 @@ fn remote_service_endpoints_publish_and_clean_up_provider_subscriptions() {
         let updates = Rc::new(RefCell::new(Vec::<ServiceProviderUpdate>::new()));
         let publisher: pi_chord::types::ServiceUpdatePublisher = {
             let updates = updates.clone();
-            Rc::new(move |_id: &str, update: &ServiceProviderUpdate, _context: &Context| {
-                updates.borrow_mut().push(update.clone());
-            })
+            Rc::new(
+                move |_id: &str, update: &ServiceProviderUpdate, _context: &Context| {
+                    updates.borrow_mut().push(update.clone());
+                },
+            )
         };
 
         let catalogue = endpoint
-            .invoke(create_service_catalogue_call(), publisher.clone(), background_context())
+            .invoke(
+                create_service_catalogue_call(),
+                publisher.clone(),
+                background_context(),
+            )
             .await
             .unwrap_or_else(|e| panic!("catalogue: {e}"));
         assert_eq!(
             catalogue,
-            Some(catalogue_to_json(&[catalogue_entry(service.id.as_str(), ServiceMode::Singleton)]))
+            Some(catalogue_to_json(&[catalogue_entry(
+                service.id.as_str(),
+                ServiceMode::Singleton
+            )]))
         );
         let snapshot = endpoint
             .invoke(
-                create_service_subscribe_call("subscription-1", service.id.as_str(), ServiceMode::Singleton),
+                create_service_subscribe_call(
+                    "subscription-1",
+                    service.id.as_str(),
+                    ServiceMode::Singleton,
+                ),
                 publisher.clone(),
                 background_context(),
             )
@@ -476,23 +538,21 @@ fn remote_service_endpoints_publish_and_clean_up_provider_subscriptions() {
         assert_eq!(reparsed.service_id, service.id);
         assert_eq!(reparsed.mode, ServiceMode::Singleton);
 
-        state
-            .mutate(|tracker| {
-                tracker
-                    .set(&[key("value")], number(1))
-                    .unwrap_or_else(|e| panic!("set: {e}"));
-            });
+        state.mutate(|tracker| {
+            tracker
+                .set(&[key("value")], number(1))
+                .unwrap_or_else(|e| panic!("set: {e}"));
+        });
         state
             .publish(&background_context())
             .unwrap_or_else(|e| panic!("publish: {e}"));
         assert_eq!(updates.borrow().len(), 1);
         endpoint.dispose();
-        state
-            .mutate(|tracker| {
-                tracker
-                    .set(&[key("value")], number(2))
-                    .unwrap_or_else(|e| panic!("set: {e}"));
-            });
+        state.mutate(|tracker| {
+            tracker
+                .set(&[key("value")], number(2))
+                .unwrap_or_else(|e| panic!("set: {e}"));
+        });
         state
             .publish(&background_context())
             .unwrap_or_else(|e| panic!("publish: {e}"));
@@ -523,15 +583,19 @@ fn catalogue_entry(service_id: &str, mode: ServiceMode) -> ServiceCatalogueEntry
 }
 
 fn parse_catalogue(value: &JsonValue) -> Vec<ServiceCatalogueEntry> {
-    parse_service_catalogue(value).map_err(|error| std::format!("{error}")).unwrap_or_default()
+    parse_service_catalogue(value)
+        .map_err(|error| std::format!("{error}"))
+        .unwrap_or_default()
 }
 
 fn parse_snapshot(value: &JsonValue) -> ServiceSubscriptionSnapshot {
-    parse_service_subscription_snapshot(value).unwrap_or_else(|error| panic!("snapshot parses: {error}"))
+    parse_service_subscription_snapshot(value)
+        .unwrap_or_else(|error| panic!("snapshot parses: {error}"))
 }
 
 fn parse_wire_snapshot(value: &JsonValue) -> WireServiceSubscriptionSnapshot {
-    parse_wire_service_subscription_snapshot(value).unwrap_or_else(|error| panic!("wire snapshot parses: {error}"))
+    parse_wire_service_subscription_snapshot(value)
+        .unwrap_or_else(|error| panic!("wire snapshot parses: {error}"))
 }
 
 fn encoder() -> pi_chord::services::state_codec::ServiceStateEncoder {
@@ -606,7 +670,10 @@ fn wire_snapshot_to_json(snapshot: &WireServiceSubscriptionSnapshot) -> JsonValu
                         if let Some(address) = &instance.instance {
                             fields.push((
                                 "instance",
-                                jo(vec![("key", js(address.key.as_str())), ("generation", number(address.generation))]),
+                                jo(vec![
+                                    ("key", js(address.key.as_str())),
+                                    ("generation", number(address.generation)),
+                                ]),
                             ));
                         }
                         fields.push((
@@ -616,16 +683,23 @@ fn wire_snapshot_to_json(snapshot: &WireServiceSubscriptionSnapshot) -> JsonValu
                                     .members
                                     .iter()
                                     .map(|member| match member {
-                                        WireServiceMemberSnapshot::Method { name } => {
-                                            jo(vec![("name", js(name.as_str())), ("kind", js("method"))])
-                                        }
-                                        WireServiceMemberSnapshot::State { name, sequence, ops } => jo(vec![
+                                        WireServiceMemberSnapshot::Method { name } => jo(vec![
+                                            ("name", js(name.as_str())),
+                                            ("kind", js("method")),
+                                        ]),
+                                        WireServiceMemberSnapshot::State {
+                                            name,
+                                            sequence,
+                                            ops,
+                                        } => jo(vec![
                                             ("name", js(name.as_str())),
                                             ("kind", js("state")),
                                             ("sequence", number(*sequence)),
                                             (
                                                 "ops",
-                                                JsonValue::Array(ops.iter().map(WireOp::to_json).collect()),
+                                                JsonValue::Array(
+                                                    ops.iter().map(WireOp::to_json).collect(),
+                                                ),
                                             ),
                                         ]),
                                     })
@@ -653,25 +727,36 @@ fn wire_update_to_json(update: &pi_chord::services::wire::WireServiceProviderUpd
             if let Some(address) = instance {
                 fields.push((
                     "instance",
-                    jo(vec![("key", js(address.key.as_str())), ("generation", number(address.generation))]),
+                    jo(vec![
+                        ("key", js(address.key.as_str())),
+                        ("generation", number(address.generation)),
+                    ]),
                 ));
             }
             fields.push(("sequence", number(*sequence)));
-            fields.push(("ops", JsonValue::Array(ops.iter().map(WireOp::to_json).collect())));
+            fields.push((
+                "ops",
+                JsonValue::Array(ops.iter().map(WireOp::to_json).collect()),
+            ));
             object(fields)
         }
         Wire::Unavailable => jo(vec![("type", js("unavailable"))]),
-        Wire::Replaced { snapshot } => {
-            jo(vec![("type", js("replaced")), ("snapshot", wire_instance_to_json(snapshot))])
-        }
-        Wire::Spawned { instance } => {
-            jo(vec![("type", js("spawned")), ("instance", wire_instance_to_json(instance))])
-        }
+        Wire::Replaced { snapshot } => jo(vec![
+            ("type", js("replaced")),
+            ("snapshot", wire_instance_to_json(snapshot)),
+        ]),
+        Wire::Spawned { instance } => jo(vec![
+            ("type", js("spawned")),
+            ("instance", wire_instance_to_json(instance)),
+        ]),
         Wire::Closed { instance } => jo(vec![
             ("type", js("closed")),
             (
                 "instance",
-                jo(vec![("key", js(instance.key.as_str())), ("generation", number(instance.generation))]),
+                jo(vec![
+                    ("key", js(instance.key.as_str())),
+                    ("generation", number(instance.generation)),
+                ]),
             ),
         ]),
     }
@@ -682,7 +767,10 @@ fn wire_instance_to_json(instance: &WireServiceInstanceSnapshot) -> JsonValue {
     if let Some(address) = &instance.instance {
         fields.push((
             "instance",
-            jo(vec![("key", js(address.key.as_str())), ("generation", number(address.generation))]),
+            jo(vec![
+                ("key", js(address.key.as_str())),
+                ("generation", number(address.generation)),
+            ]),
         ));
     }
     fields.push((
@@ -695,11 +783,18 @@ fn wire_instance_to_json(instance: &WireServiceInstanceSnapshot) -> JsonValue {
                     WireServiceMemberSnapshot::Method { name } => {
                         jo(vec![("name", js(name.as_str())), ("kind", js("method"))])
                     }
-                    WireServiceMemberSnapshot::State { name, sequence, ops } => jo(vec![
+                    WireServiceMemberSnapshot::State {
+                        name,
+                        sequence,
+                        ops,
+                    } => jo(vec![
                         ("name", js(name.as_str())),
                         ("kind", js("state")),
                         ("sequence", number(*sequence)),
-                        ("ops", JsonValue::Array(ops.iter().map(WireOp::to_json).collect())),
+                        (
+                            "ops",
+                            JsonValue::Array(ops.iter().map(WireOp::to_json).collect()),
+                        ),
                     ]),
                 })
                 .collect(),
@@ -720,25 +815,36 @@ fn update_to_json(update: &ServiceProviderUpdate) -> JsonValue {
             if let Some(address) = instance {
                 fields.push((
                     "instance",
-                    jo(vec![("key", js(address.key.as_str())), ("generation", number(address.generation))]),
+                    jo(vec![
+                        ("key", js(address.key.as_str())),
+                        ("generation", number(address.generation)),
+                    ]),
                 ));
             }
             fields.push(("sequence", number(*sequence)));
-            fields.push(("ops", JsonValue::Array(ops.iter().map(Op::to_json).collect())));
+            fields.push((
+                "ops",
+                JsonValue::Array(ops.iter().map(Op::to_json).collect()),
+            ));
             object(fields)
         }
         ServiceProviderUpdate::Unavailable => jo(vec![("type", js("unavailable"))]),
-        ServiceProviderUpdate::Replaced { snapshot } => {
-            jo(vec![("type", js("replaced")), ("snapshot", decoded_instance_to_json(snapshot))])
-        }
-        ServiceProviderUpdate::Spawned { instance } => {
-            jo(vec![("type", js("spawned")), ("instance", decoded_instance_to_json(instance))])
-        }
+        ServiceProviderUpdate::Replaced { snapshot } => jo(vec![
+            ("type", js("replaced")),
+            ("snapshot", decoded_instance_to_json(snapshot)),
+        ]),
+        ServiceProviderUpdate::Spawned { instance } => jo(vec![
+            ("type", js("spawned")),
+            ("instance", decoded_instance_to_json(instance)),
+        ]),
         ServiceProviderUpdate::Closed { instance } => jo(vec![
             ("type", js("closed")),
             (
                 "instance",
-                jo(vec![("key", js(instance.key.as_str())), ("generation", number(instance.generation))]),
+                jo(vec![
+                    ("key", js(instance.key.as_str())),
+                    ("generation", number(instance.generation)),
+                ]),
             ),
         ]),
     }
@@ -749,7 +855,10 @@ fn decoded_instance_to_json(instance: &ServiceInstanceSnapshot) -> JsonValue {
     if let Some(address) = &instance.instance {
         fields.push((
             "instance",
-            jo(vec![("key", js(address.key.as_str())), ("generation", number(address.generation))]),
+            jo(vec![
+                ("key", js(address.key.as_str())),
+                ("generation", number(address.generation)),
+            ]),
         ));
     }
     fields.push((
@@ -762,11 +871,18 @@ fn decoded_instance_to_json(instance: &ServiceInstanceSnapshot) -> JsonValue {
                     ServiceMemberSnapshot::Method { name } => {
                         jo(vec![("name", js(name.as_str())), ("kind", js("method"))])
                     }
-                    ServiceMemberSnapshot::State { name, sequence, ops } => jo(vec![
+                    ServiceMemberSnapshot::State {
+                        name,
+                        sequence,
+                        ops,
+                    } => jo(vec![
                         ("name", js(name.as_str())),
                         ("kind", js("state")),
                         ("sequence", number(*sequence)),
-                        ("ops", JsonValue::Array(ops.iter().map(Op::to_json).collect())),
+                        (
+                            "ops",
+                            JsonValue::Array(ops.iter().map(Op::to_json).collect()),
+                        ),
                     ]),
                 })
                 .collect(),

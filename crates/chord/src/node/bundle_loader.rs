@@ -18,8 +18,8 @@ use crate::errors::ChordError;
 use crate::future::{LocalBoxFuture, boxed};
 use crate::node::manifest::{
     FACET_BUNDLE_ARTIFACT_FORMAT, FACET_BUNDLE_ARTIFACT_FORMAT_VERSION, FACET_BUNDLE_FORMAT,
-    FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact, FacetBundleManifest,
-    read_facet_bundle_manifest, verify_source,
+    FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact,
+    FacetBundleManifest, read_facet_bundle_manifest, verify_source,
 };
 use crate::types::{FacetDef, FacetLoader, LoadedFacets};
 
@@ -144,7 +144,9 @@ pub fn read_facet_bundle_artifact(
     entry_name: &str,
 ) -> Result<FacetBundleArtifact, ChordError> {
     if entry_name.is_empty() {
-        return Err(ChordError::Message("Facet bundle entry name must not be empty".to_string()));
+        return Err(ChordError::Message(
+            "Facet bundle entry name must not be empty".to_string(),
+        ));
     }
     let manifest = read_facet_bundle_manifest(manifest_path)?;
     let Some(entry) = manifest.entry(entry_name) else {
@@ -153,19 +155,30 @@ pub fn read_facet_bundle_artifact(
             manifest.plugin.id
         )));
     };
-    let module_path = manifest_path.parent().unwrap_or_else(|| Path::new(".")).join(&entry.file);
+    let module_path = manifest_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(&entry.file);
     let source = std::fs::read_to_string(&module_path).map_err(|error| {
-        ChordError::Message(format!("Could not read facet bundle entry {}: {error}", module_path.display()))
+        ChordError::Message(format!(
+            "Could not read facet bundle entry {}: {error}",
+            module_path.display()
+        ))
     })?;
     verify_source(&source, entry)?;
     let source_map_contents = entry
         .source_map
         .as_ref()
         .map(|source_map| {
-            std::fs::read_to_string(manifest_path.parent().unwrap_or_else(|| Path::new(".")).join(source_map))
-                .map_err(|error| {
-                    ChordError::Message(format!("Could not read facet bundle source map: {error}"))
-                })
+            std::fs::read_to_string(
+                manifest_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(source_map),
+            )
+            .map_err(|error| {
+                ChordError::Message(format!("Could not read facet bundle source map: {error}"))
+            })
         })
         .transpose()?;
     let plugin = manifest.plugin.clone();
@@ -225,7 +238,9 @@ impl FacetLoader for FacetBundleLoader {
         let host = self.module_host.clone();
         boxed(async move {
             if entry.is_empty() {
-                return Err(ChordError::Message("Facet bundle entry name must not be empty".to_string()));
+                return Err(ChordError::Message(
+                    "Facet bundle entry name must not be empty".to_string(),
+                ));
             }
             let manifest = read_facet_bundle_manifest(&manifest_path)?;
             let Some(bundle_entry) = manifest.entry(&entry) else {
@@ -248,7 +263,12 @@ impl FacetLoader for FacetBundleLoader {
                 if verify {
                     verify_source(&source, bundle_entry)?;
                 }
-                let facets = host.load(&source, &module_path, &bundle_entry.external_imports, resolver.as_ref())?;
+                let facets = host.load(
+                    &source,
+                    &module_path,
+                    &bundle_entry.external_imports,
+                    resolver.as_ref(),
+                )?;
                 facets_from_module(facets, &manifest.plugin.id, &entry)
             })();
             match result {
@@ -270,7 +290,9 @@ impl FacetLoader for FacetBundleLoader {
 ///
 /// # Errors
 /// [`ChordError`] when the artifact is invalid.
-pub fn create_facet_bundle_artifact_loader(options: FacetBundleArtifactLoaderOptions) -> ArtifactFacetLoader {
+pub fn create_facet_bundle_artifact_loader(
+    options: FacetBundleArtifactLoaderOptions,
+) -> ArtifactFacetLoader {
     ArtifactFacetLoader {
         artifact: options.artifact,
         temporary_parent: options
@@ -308,25 +330,38 @@ impl ArtifactFacetLoader {
                 self.temporary_parent.display()
             ))
         })?;
-        let directory = self.temporary_parent.join(format!("chord-facet-{}", short_suffix()));
+        let directory = self
+            .temporary_parent
+            .join(format!("chord-facet-{}", short_suffix()));
         std::fs::create_dir(&directory).map_err(|error| {
-            ChordError::Message(format!("Could not create facet artifact generation: {error}"))
+            ChordError::Message(format!(
+                "Could not create facet artifact generation: {error}"
+            ))
         })?;
         let result = (|| {
-            std::fs::write(directory.join(&self.artifact.entry.file), &self.artifact.source).map_err(|error| {
+            std::fs::write(
+                directory.join(&self.artifact.entry.file),
+                &self.artifact.source,
+            )
+            .map_err(|error| {
                 ChordError::Message(format!("Could not materialize facet artifact: {error}"))
             })?;
             let manifest = crate::node::bundle::manifest_to_json_text(&FacetBundleManifest {
                 format: FACET_BUNDLE_FORMAT.to_string(),
                 format_version: FACET_BUNDLE_FORMAT_VERSION,
                 plugin: self.artifact.plugin.clone(),
-                entries: vec![(self.artifact.entry_name.clone(), self.artifact.entry.clone())],
+                entries: vec![(
+                    self.artifact.entry_name.clone(),
+                    self.artifact.entry.clone(),
+                )],
             });
             std::fs::write(
                 directory.join(FACET_BUNDLE_MANIFEST_FILE),
                 format!("{manifest}\n"),
             )
-            .map_err(|error| ChordError::Message(format!("Could not write facet artifact manifest: {error}")))?;
+            .map_err(|error| {
+                ChordError::Message(format!("Could not write facet artifact manifest: {error}"))
+            })?;
             let loader = FacetBundleLoader {
                 manifest_path: directory.join(FACET_BUNDLE_MANIFEST_FILE),
                 entry: self.artifact.entry_name.clone(),
@@ -367,7 +402,9 @@ impl FacetLoader for ArtifactFacetLoader {
     }
 }
 
-fn settle(loaded: LocalBoxFuture<Result<LoadedFacets, ChordError>>) -> Result<LoadedFacets, ChordError> {
+fn settle(
+    loaded: LocalBoxFuture<Result<LoadedFacets, ChordError>>,
+) -> Result<LoadedFacets, ChordError> {
     crate::future::settle_now(loaded).unwrap_or_else(|| {
         Err(ChordError::Message(
             "Facet bundle loading must settle without awaiting; module hosts that yield are not materializable synchronously"

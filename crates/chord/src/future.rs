@@ -40,10 +40,7 @@ pub fn join_all<T>(futures: Vec<LocalBoxFuture<T>>) -> impl Future<Output = Vec<
     for _ in 0..futures.len() {
         results.push(None);
     }
-    JoinAll {
-        futures,
-        results,
-    }
+    JoinAll { futures, results }
 }
 
 struct JoinAll<T> {

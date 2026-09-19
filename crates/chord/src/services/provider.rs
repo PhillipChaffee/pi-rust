@@ -18,14 +18,17 @@ use crate::context::Context;
 use crate::delta::Op;
 use crate::errors::{ChordError, RemoteServiceError, RemoteServiceErrorCode, collect_errors};
 use crate::future::{LocalBoxFuture, boxed};
-use crate::handle::{RemoteMethod, ServiceImplementation, ServiceMember, validate_remote_implementation};
-use crate::services::state::service_delivery_context;
-use crate::types::{
-    JsonValue, Service, ServiceCall, ServiceCatalogueEntry, ServiceInstanceAddress, ServiceMemberKind,
-    ServiceMode, ServiceProviderListener, ServiceProviderUpdate, ServiceSubscription, Unsubscribe,
+use crate::handle::{
+    RemoteMethod, ServiceImplementation, ServiceMember, validate_remote_implementation,
 };
+use crate::services::state::service_delivery_context;
 use crate::services::wire::{
     ServiceControlCall, catalogue_to_json, decode_service_control_call, snapshot_to_json,
+};
+use crate::types::{
+    JsonValue, Service, ServiceCall, ServiceCatalogueEntry, ServiceInstanceAddress,
+    ServiceMemberKind, ServiceMode, ServiceProviderListener, ServiceProviderUpdate,
+    ServiceSubscription, Unsubscribe,
 };
 
 /// The definition one provider registers a service under.
@@ -39,7 +42,8 @@ pub struct ServiceProviderDefinition {
 
 /// The subscription close handle, upstream's `() => Promise<void>` as the
 /// boxed synchronous close the port hands back.
-pub(crate) type SubscriptionClose = Box<dyn Fn(Option<Context>) -> LocalBoxFuture<Result<(), ChordError>>>;
+pub(crate) type SubscriptionClose =
+    Box<dyn Fn(Option<Context>) -> LocalBoxFuture<Result<(), ChordError>>>;
 
 /// A singleton definition, upstream's bare `{ id }` catalogue entry.
 #[must_use]
@@ -111,7 +115,10 @@ impl RemoteServiceProvider {
                 )));
             }
         }
-        let ids: Vec<&str> = definitions.iter().map(|definition| definition.service.id.as_str()).collect();
+        let ids: Vec<&str> = definitions
+            .iter()
+            .map(|definition| definition.service.id.as_str())
+            .collect();
         let unique = ids.iter().collect::<std::collections::BTreeSet<_>>().len();
         if unique != ids.len() {
             return Err(ChordError::Message(
@@ -161,7 +168,11 @@ impl RemoteServiceProvider {
     /// [`ChordError`] when the provider is disposed, the service is local or
     /// not allowlisted, already provided, or the implementation is not
     /// remotely exposable.
-    pub fn provide(&self, service: &Service, implementation: ServiceImplementation) -> Result<(), ChordError> {
+    pub fn provide(
+        &self,
+        service: &Service,
+        implementation: ServiceImplementation,
+    ) -> Result<(), ChordError> {
         self.assert_active()?;
         assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
@@ -232,7 +243,11 @@ impl RemoteServiceProvider {
     /// # Errors
     /// [`ChordError`] when the provider is disposed, the service is local or
     /// not allowlisted, or the replacement breaks the member shape.
-    pub fn replace(&self, service: &Service, implementation: ServiceImplementation) -> Result<(), ChordError> {
+    pub fn replace(
+        &self,
+        service: &Service,
+        implementation: ServiceImplementation,
+    ) -> Result<(), ChordError> {
         self.assert_active()?;
         assert_remotable(service)?;
         self.assert_allowed(&service.id)?;
@@ -314,14 +329,31 @@ impl RemoteServiceProvider {
             ));
         }
         let registration = self.registration(&service.id, ServiceMode::Keyed)?;
-        if registration.borrow().instances.iter().any(|(live, _)| live == key) {
+        if registration
+            .borrow()
+            .instances
+            .iter()
+            .any(|(live, _)| live == key)
+        {
             return Err(remote_error(
                 RemoteServiceErrorCode::ServiceModeMismatch,
-                format!("Remote service {} already has a live instance with key {key}", service.id),
+                format!(
+                    "Remote service {} already has a live instance with key {key}",
+                    service.id
+                ),
             ));
         }
-        let generation = registration.borrow().generations.get(key).copied().unwrap_or(0) + 1;
-        registration.borrow_mut().generations.insert(key.to_string(), generation);
+        let generation = registration
+            .borrow()
+            .generations
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        registration
+            .borrow_mut()
+            .generations
+            .insert(key.to_string(), generation);
         let address = ServiceInstanceAddress {
             key: key.to_string(),
             generation,
@@ -355,14 +387,23 @@ impl RemoteServiceProvider {
             for remove in close_instance.remove_member_listeners.borrow().iter() {
                 remove();
             }
-            registration.instances.retain(|(_, current)| !Rc::ptr_eq(current, &close_instance));
+            registration
+                .instances
+                .retain(|(_, current)| !Rc::ptr_eq(current, &close_instance));
             #[allow(
                 clippy::expect_used,
                 reason = "keyed instances always carry the address spawn attached; this closure only closes instances spawn created"
             )]
-            let address = close_instance.address.clone().expect("keyed instances carry addresses");
+            let address = close_instance
+                .address
+                .clone()
+                .expect("keyed instances carry addresses");
             drop(registration);
-            emit(&close_registration, &ServiceProviderUpdate::Closed { instance: address }, None)
+            emit(
+                &close_registration,
+                &ServiceProviderUpdate::Closed { instance: address },
+                None,
+            )
         })
     }
 
@@ -372,7 +413,11 @@ impl RemoteServiceProvider {
     /// [`ChordError`] when the provider is disposed, the service or member
     /// is unknown, the mode or member mismatches, or the member fails.
     #[must_use]
-    pub fn invoke(&self, call: ServiceCall, context: Context) -> LocalBoxFuture<Result<Option<JsonValue>, ChordError>> {
+    pub fn invoke(
+        &self,
+        call: ServiceCall,
+        context: Context,
+    ) -> LocalBoxFuture<Result<Option<JsonValue>, ChordError>> {
         let resolved = self.resolve_method(call);
         boxed(async move {
             let (method, args) = resolved?;
@@ -398,7 +443,9 @@ impl RemoteServiceProvider {
         self.assert_active()?;
         self.assert_allowed(service_id)?;
         let registration = self.registration(service_id, mode)?;
-        if registration.borrow().mode == ServiceMode::Singleton && registration.borrow().singleton.is_none() {
+        if registration.borrow().mode == ServiceMode::Singleton
+            && registration.borrow().singleton.is_none()
+        {
             return Err(remote_error(
                 RemoteServiceErrorCode::ServiceNotFound,
                 format!("Remote service {service_id} has no provider"),
@@ -412,7 +459,10 @@ impl RemoteServiceProvider {
             terminated: Cell::new(false),
             closed: Cell::new(false),
         });
-        registration.borrow_mut().subscribers.push(subscriber.clone());
+        registration
+            .borrow_mut()
+            .subscribers
+            .push(subscriber.clone());
         let snapshot = snapshot(&registration.borrow());
         let activate_subscriber = subscriber.clone();
         let activate: Box<dyn Fn() -> Result<(), ChordError>> = Box::new(move || {
@@ -424,14 +474,16 @@ impl RemoteServiceProvider {
                 activate_subscriber.buffer.borrow_mut().drain(..).collect();
             let mut errors = Vec::new();
             for (update, context) in entries {
-                if let Err(error) = call_listener(&activate_subscriber.listener, &update, &context) {
+                if let Err(error) = call_listener(&activate_subscriber.listener, &update, &context)
+                {
                     errors.push(error);
                 }
             }
             if activate_subscriber.terminated.get() {
                 activate_subscriber.closed.set(true);
             }
-            collect_errors(errors, "Failed to activate remote service subscription").map_or(Ok(()), Err)
+            collect_errors(errors, "Failed to activate remote service subscription")
+                .map_or(Ok(()), Err)
         });
         let close_subscriber = subscriber;
         let close_registration = registration;
@@ -471,8 +523,13 @@ impl RemoteServiceProvider {
         }
         self.0.disposed.set(true);
         let mut errors = Vec::new();
-        let registrations: Vec<Rc<RefCell<Registration>>> =
-            self.0.registrations.borrow().iter().map(|(_, r)| r.clone()).collect();
+        let registrations: Vec<Rc<RefCell<Registration>>> = self
+            .0
+            .registrations
+            .borrow()
+            .iter()
+            .map(|(_, r)| r.clone())
+            .collect();
         for registration in registrations {
             let singleton = registration.borrow().singleton.clone();
             if let Some(singleton) = singleton {
@@ -488,8 +545,12 @@ impl RemoteServiceProvider {
                     errors.push(error);
                 }
             }
-            let instances: Vec<Rc<ProviderInstance>> =
-                registration.borrow().instances.iter().map(|(_, i)| i.clone()).collect();
+            let instances: Vec<Rc<ProviderInstance>> = registration
+                .borrow()
+                .instances
+                .iter()
+                .map(|(_, i)| i.clone())
+                .collect();
             for instance in instances {
                 {
                     let mut registration = registration.borrow_mut();
@@ -505,8 +566,15 @@ impl RemoteServiceProvider {
                     clippy::expect_used,
                     reason = "keyed instances always carry the address spawn attached; dispose only closes instances spawn created"
                 )]
-                let address = instance.address.clone().expect("keyed instances carry addresses");
-                if let Err(error) = emit(&registration, &ServiceProviderUpdate::Closed { instance: address }, None) {
+                let address = instance
+                    .address
+                    .clone()
+                    .expect("keyed instances carry addresses");
+                if let Err(error) = emit(
+                    &registration,
+                    &ServiceProviderUpdate::Closed { instance: address },
+                    None,
+                ) {
                     errors.push(error);
                 }
             }
@@ -540,7 +608,11 @@ impl RemoteServiceProvider {
             })
     }
 
-    fn registration(&self, service_id: &str, mode: ServiceMode) -> Result<Rc<RefCell<Registration>>, ChordError> {
+    fn registration(
+        &self,
+        service_id: &str,
+        mode: ServiceMode,
+    ) -> Result<Rc<RefCell<Registration>>, ChordError> {
         let registration = self.find_registration(service_id)?;
         if registration.borrow().mode != mode {
             return Err(remote_error(
@@ -557,7 +629,13 @@ impl RemoteServiceProvider {
     }
 
     fn assert_allowed(&self, service_id: &str) -> Result<(), ChordError> {
-        if !self.0.registrations.borrow().iter().any(|(id, _)| id == service_id) {
+        if !self
+            .0
+            .registrations
+            .borrow()
+            .iter()
+            .any(|(id, _)| id == service_id)
+        {
             return Err(remote_error(
                 RemoteServiceErrorCode::ServiceNotAllowed,
                 format!("Remote service {service_id} is not allowlisted"),
@@ -568,7 +646,9 @@ impl RemoteServiceProvider {
 
     fn assert_active(&self) -> Result<(), ChordError> {
         if self.0.disposed.get() {
-            return Err(ChordError::Message("Remote service provider is disposed".to_string()));
+            return Err(ChordError::Message(
+                "Remote service provider is disposed".to_string(),
+            ));
         }
         Ok(())
     }
@@ -582,12 +662,18 @@ impl RemoteServiceProvider {
         let registration = self.find_registration(&call.service_id)?;
         let registration = registration.borrow();
         let instance = resolve_instance(&registration, call.instance.as_ref())?;
-        let member = instance.implementation.member(&call.member).ok_or_else(|| {
-            remote_error(
-                RemoteServiceErrorCode::ServiceMemberNotFound,
-                format!("Unknown remote service member {}.{}", call.service_id, call.member),
-            )
-        })?;
+        let member = instance
+            .implementation
+            .member(&call.member)
+            .ok_or_else(|| {
+                remote_error(
+                    RemoteServiceErrorCode::ServiceMemberNotFound,
+                    format!(
+                        "Unknown remote service member {}.{}",
+                        call.service_id, call.member
+                    ),
+                )
+            })?;
         let ServiceMember::Method(method) = member else {
             return Err(remote_error(
                 RemoteServiceErrorCode::ServiceMemberMismatch,
@@ -665,7 +751,12 @@ fn resolve_instance(
 fn publish_pending(registration: &Rc<RefCell<Registration>>) -> Result<(), ChordError> {
     let context = service_delivery_context();
     let instances: Vec<Rc<ProviderInstance>> = match registration.borrow().mode {
-        ServiceMode::Singleton => registration.borrow().singleton.clone().into_iter().collect(),
+        ServiceMode::Singleton => registration
+            .borrow()
+            .singleton
+            .clone()
+            .into_iter()
+            .collect(),
         ServiceMode::Keyed => registration
             .borrow()
             .instances
@@ -693,8 +784,11 @@ fn snapshot(registration: &Registration) -> crate::types::ServiceSubscriptionSna
             .map(|singleton| vec![snapshot_instance(singleton)])
             .unwrap_or_default(),
         ServiceMode::Keyed => {
-            let mut instances: Vec<Rc<ProviderInstance>> =
-                registration.instances.iter().map(|(_, i)| i.clone()).collect();
+            let mut instances: Vec<Rc<ProviderInstance>> = registration
+                .instances
+                .iter()
+                .map(|(_, i)| i.clone())
+                .collect();
             instances.sort_by_key(|instance| {
                 instance
                     .address
@@ -702,7 +796,10 @@ fn snapshot(registration: &Registration) -> crate::types::ServiceSubscriptionSna
                     .map(|address| address.key.clone())
                     .unwrap_or_default()
             });
-            instances.iter().map(|instance| snapshot_instance(instance)).collect()
+            instances
+                .iter()
+                .map(|instance| snapshot_instance(instance))
+                .collect()
         }
     };
     crate::types::ServiceSubscriptionSnapshot {
@@ -718,7 +815,9 @@ fn snapshot_instance(instance: &ProviderInstance) -> crate::types::ServiceInstan
         .implementation
         .members()
         .map(|(name, member)| match member {
-            ServiceMember::Method(_) => crate::types::ServiceMemberSnapshot::Method { name: name.clone() },
+            ServiceMember::Method(_) => {
+                crate::types::ServiceMemberSnapshot::Method { name: name.clone() }
+            }
             ServiceMember::State(state) => crate::types::ServiceMemberSnapshot::State {
                 name: name.clone(),
                 sequence: state.sequence(),
@@ -770,7 +869,10 @@ fn emit(
     }
     collect_errors(
         errors,
-        format!("Failed to publish remote service {service_id} update", service_id = registration.borrow().service_id),
+        format!(
+            "Failed to publish remote service {service_id} update",
+            service_id = registration.borrow().service_id
+        ),
     )
     .map_or(Ok(()), Err)
 }
@@ -839,7 +941,10 @@ fn create_instance(
             }
         };
         let unsubscribe = state.source_subscribe(Rc::new(listener));
-        instance.remove_member_listeners.borrow_mut().push(unsubscribe);
+        instance
+            .remove_member_listeners
+            .borrow_mut()
+            .push(unsubscribe);
     }
     instance
 }
@@ -891,7 +996,8 @@ pub struct RemoteServiceEndpoint {
 
 impl std::fmt::Debug for RemoteServiceEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteServiceEndpoint").finish_non_exhaustive()
+        f.debug_struct("RemoteServiceEndpoint")
+            .finish_non_exhaustive()
     }
 }
 
@@ -915,9 +1021,9 @@ impl RemoteServiceEndpoint {
         }
         let control = decode_service_control_call(&call);
         match control {
-            Some(ServiceControlCall::Catalogue) => {
-                boxed(std::future::ready(Ok(Some(catalogue_to_json(self.provider.catalogue())))))
-            }
+            Some(ServiceControlCall::Catalogue) => boxed(std::future::ready(Ok(Some(
+                catalogue_to_json(self.provider.catalogue()),
+            )))),
             Some(ServiceControlCall::Subscribe {
                 subscription_id,
                 service_id,
@@ -935,9 +1041,11 @@ impl RemoteServiceEndpoint {
                 }
                 let listener: ServiceProviderListener = {
                     let subscription_id = subscription_id.clone();
-                    Rc::new(move |update: &ServiceProviderUpdate, update_context: &Context| {
-                        publish(&subscription_id, update, update_context);
-                    })
+                    Rc::new(
+                        move |update: &ServiceProviderUpdate, update_context: &Context| {
+                            publish(&subscription_id, update, update_context);
+                        },
+                    )
                 };
                 let subscription = match self.provider.subscribe(&service_id, mode, listener) {
                     Ok(subscription) => subscription,
@@ -985,8 +1093,12 @@ impl RemoteServiceEndpoint {
             return;
         }
         self.disposed.set(true);
-        let subscriptions: Vec<ServiceSubscription> =
-            self.subscriptions.borrow_mut().drain(..).map(|(_, s)| s).collect();
+        let subscriptions: Vec<ServiceSubscription> = self
+            .subscriptions
+            .borrow_mut()
+            .drain(..)
+            .map(|(_, s)| s)
+            .collect();
         for subscription in subscriptions {
             drop((subscription.close)(None));
         }

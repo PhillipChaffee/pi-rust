@@ -167,7 +167,12 @@ impl From<&str> for ChordError {
 pub fn collect_errors(errors: Vec<ChordError>, message: impl Into<String>) -> Option<ChordError> {
     match errors.len() {
         0 => None,
-        1 => Some(errors.into_iter().next().unwrap_or(ChordError::Message(String::new()))),
+        1 => Some(
+            errors
+                .into_iter()
+                .next()
+                .unwrap_or(ChordError::Message(String::new())),
+        ),
         _ => Some(ChordError::Aggregate(errors, message.into())),
     }
 }

@@ -15,17 +15,20 @@
     reason = "test helpers settle results the case's own assertions would reject"
 )]
 
-
 use std::path::Path;
 
 #[test]
 fn does_not_depend_on_pi_packages_or_files_outside_chord() {
-    let manifest = std::fs::read_to_string(manifest_path()).unwrap_or_else(|error| panic!("manifest: {error}"));
+    let manifest = std::fs::read_to_string(manifest_path())
+        .unwrap_or_else(|error| panic!("manifest: {error}"));
     // The `[dependencies]` table carries no Pi workspace package; the
     // upstream test reads package.json's dependency map, the manifest's
     // TOML table is its restatement.
     let in_dependencies = manifest.split("[dependencies]").nth(1).unwrap_or_default();
-    let dependency_table = in_dependencies.split("[dev-dependencies]").next().unwrap_or_default();
+    let dependency_table = in_dependencies
+        .split("[dev-dependencies]")
+        .next()
+        .unwrap_or_default();
     let violations: Vec<String> = dependency_table
         .lines()
         .filter(|line| line.trim_start().starts_with("@earendil-works/pi-"))

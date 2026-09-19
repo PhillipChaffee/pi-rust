@@ -132,7 +132,11 @@ pub fn create_service_catalogue_call() -> ServiceCall {
 
 /// Builds the subscribe control call.
 #[must_use]
-pub fn create_service_subscribe_call(subscription_id: &str, service_id: &str, mode: ServiceMode) -> ServiceCall {
+pub fn create_service_subscribe_call(
+    subscription_id: &str,
+    service_id: &str,
+    mode: ServiceMode,
+) -> ServiceCall {
     ServiceCall {
         service_id: SERVICE_CONTROL_ID.to_string(),
         instance: None,
@@ -171,10 +175,11 @@ pub fn decode_service_control_call(call: &ServiceCall) -> Option<ServiceControlC
     }
     match call.member.as_str() {
         "catalogue" if call.args.is_empty() => Some(ServiceControlCall::Catalogue),
-        "subscribe" if call.args.len() == 3
-            && is_id(&call.args[0])
-            && is_id(&call.args[1])
-            && ServiceMode::parse(call.args[2].as_str()?).is_some() =>
+        "subscribe"
+            if call.args.len() == 3
+                && is_id(&call.args[0])
+                && is_id(&call.args[1])
+                && ServiceMode::parse(call.args[2].as_str()?).is_some() =>
         {
             #[allow(
                 clippy::expect_used,
@@ -203,7 +208,12 @@ pub fn decode_service_control_call(call: &ServiceCall) -> Option<ServiceControlC
 /// [`ChordError::Message`] `"Invalid service call"` on any shape violation.
 pub fn parse_service_call(value: &JsonValue) -> Result<ServiceCall, ChordError> {
     let call = record(value, "service call")?;
-    assert_keys(call, &["serviceId", "member", "args"], &["instance"], "service call")?;
+    assert_keys(
+        call,
+        &["serviceId", "member", "args"],
+        &["instance"],
+        "service call",
+    )?;
     let service_id = string_field(call, "serviceId").ok_or_else(|| invalid("service call"))?;
     let member = string_field(call, "member").ok_or_else(|| invalid("service call"))?;
     let JsonValue::Array(args) = call.get("args").unwrap_or(&JsonValue::Null) else {
@@ -227,7 +237,9 @@ pub fn parse_service_call(value: &JsonValue) -> Result<ServiceCall, ChordError> 
 /// # Errors
 /// [`ChordError::Message`] `"Invalid service catalogue"` on any shape
 /// violation or duplicate ID.
-pub fn parse_service_catalogue(value: &JsonValue) -> Result<Vec<ServiceCatalogueEntry>, ChordError> {
+pub fn parse_service_catalogue(
+    value: &JsonValue,
+) -> Result<Vec<ServiceCatalogueEntry>, ChordError> {
     let JsonValue::Array(items) = value else {
         return Err(invalid("service catalogue"));
     };
@@ -235,8 +247,14 @@ pub fn parse_service_catalogue(value: &JsonValue) -> Result<Vec<ServiceCatalogue
     let mut entries = Vec::with_capacity(items.len());
     for item in items {
         let entry = record(item, "service catalogue entry")?;
-        assert_keys(entry, &["serviceId", "mode"], &[], "service catalogue entry")?;
-        let service_id = string_field(entry, "serviceId").ok_or_else(|| invalid("service catalogue"))?;
+        assert_keys(
+            entry,
+            &["serviceId", "mode"],
+            &[],
+            "service catalogue entry",
+        )?;
+        let service_id =
+            string_field(entry, "serviceId").ok_or_else(|| invalid("service catalogue"))?;
         let mode = mode_field(entry).ok_or_else(|| invalid("service catalogue"))?;
         if ids.contains(&service_id.to_string()) {
             return Err(invalid("service catalogue"));
@@ -255,7 +273,9 @@ pub fn parse_service_catalogue(value: &JsonValue) -> Result<Vec<ServiceCatalogue
 /// # Errors
 /// [`ChordError::Message`] `"Invalid service subscription snapshot"` on any
 /// shape violation.
-pub fn parse_service_subscription_snapshot(value: &JsonValue) -> Result<ServiceSubscriptionSnapshot, ChordError> {
+pub fn parse_service_subscription_snapshot(
+    value: &JsonValue,
+) -> Result<ServiceSubscriptionSnapshot, ChordError> {
     let snapshot = parse_snapshot(value, decode_op)?;
     let instances = snapshot
         .instances
@@ -332,7 +352,9 @@ pub fn parse_wire_service_subscription_snapshot(
 /// # Errors
 /// [`ChordError`] on any shape violation, with the message the update kind
 /// names.
-pub fn parse_service_provider_update(value: &JsonValue) -> Result<ServiceProviderUpdate, ChordError> {
+pub fn parse_service_provider_update(
+    value: &JsonValue,
+) -> Result<ServiceProviderUpdate, ChordError> {
     match parse_update(value, decode_op)? {
         ParsedUpdate::State {
             instance,
@@ -360,7 +382,9 @@ pub fn parse_service_provider_update(value: &JsonValue) -> Result<ServiceProvide
 ///
 /// # Errors
 /// [`ChordError`] on any shape violation, including malformed wire ops.
-pub fn parse_wire_service_provider_update(value: &JsonValue) -> Result<WireServiceProviderUpdate, ChordError> {
+pub fn parse_wire_service_provider_update(
+    value: &JsonValue,
+) -> Result<WireServiceProviderUpdate, ChordError> {
     match parse_update(value, decode_wire_op)? {
         ParsedUpdate::State {
             instance,
@@ -430,9 +454,14 @@ fn parse_snapshot<OP>(
     decode_op: impl Fn(&JsonValue) -> Result<OP, ChordError>,
 ) -> Result<ParsedSnapshot<OP>, ChordError> {
     let snapshot = record(value, "service subscription snapshot")?;
-    assert_keys(snapshot, &["serviceId", "mode", "instances"], &[], "service subscription snapshot")?;
-    let service_id =
-        string_field(snapshot, "serviceId").ok_or_else(|| invalid("service subscription snapshot"))?;
+    assert_keys(
+        snapshot,
+        &["serviceId", "mode", "instances"],
+        &[],
+        "service subscription snapshot",
+    )?;
+    let service_id = string_field(snapshot, "serviceId")
+        .ok_or_else(|| invalid("service subscription snapshot"))?;
     let mode = mode_field(snapshot).ok_or_else(|| invalid("service subscription snapshot"))?;
     let JsonValue::Array(instances) = snapshot.get("instances").unwrap_or(&JsonValue::Null) else {
         return Err(invalid("service subscription snapshot"));
@@ -453,7 +482,12 @@ fn parse_instance<OP>(
     decode_op: &impl Fn(&JsonValue) -> Result<OP, ChordError>,
 ) -> Result<ParsedInstance<OP>, ChordError> {
     let instance = record(value, "service instance snapshot")?;
-    assert_keys(instance, &["members"], &["instance"], "service instance snapshot")?;
+    assert_keys(
+        instance,
+        &["members"],
+        &["instance"],
+        "service instance snapshot",
+    )?;
     let address = match instance.get("instance") {
         Some(address) => Some(parse_address(address)?),
         None => None,
@@ -468,14 +502,23 @@ fn parse_instance<OP>(
         match kind {
             "method" => {
                 assert_keys(member, &["name", "kind"], &[], "service method snapshot")?;
-                let name = string_field(member, "name").ok_or_else(|| invalid("service method snapshot"))?;
-                parsed.push(ParsedMember::Method { name: name.to_string() });
+                let name = string_field(member, "name")
+                    .ok_or_else(|| invalid("service method snapshot"))?;
+                parsed.push(ParsedMember::Method {
+                    name: name.to_string(),
+                });
             }
             "state" => {
-                assert_keys(member, &["name", "kind", "sequence", "ops"], &[], "service state snapshot")?;
-                let name = string_field(member, "name").ok_or_else(|| invalid("service state snapshot"))?;
-                let sequence =
-                    integer_field(member, "sequence", 0).ok_or_else(|| invalid("service state snapshot"))?;
+                assert_keys(
+                    member,
+                    &["name", "kind", "sequence", "ops"],
+                    &[],
+                    "service state snapshot",
+                )?;
+                let name = string_field(member, "name")
+                    .ok_or_else(|| invalid("service state snapshot"))?;
+                let sequence = integer_field(member, "sequence", 0)
+                    .ok_or_else(|| invalid("service state snapshot"))?;
                 let JsonValue::Array(ops) = member.get("ops").unwrap_or(&JsonValue::Null) else {
                     return Err(invalid("service state snapshot"));
                 };
@@ -505,10 +548,16 @@ fn parse_update<OP>(
     let update = record(value, "service provider update")?;
     match update.get("type").and_then(JsonValue::as_str) {
         Some("state") => {
-            assert_keys(update, &["type", "member", "sequence", "ops"], &["instance"], "state update")?;
-            let member = string_field(update, "member").ok_or_else(|| invalid("service state update"))?;
-            let sequence =
-                integer_field(update, "sequence", 1).ok_or_else(|| invalid("service state update"))?;
+            assert_keys(
+                update,
+                &["type", "member", "sequence", "ops"],
+                &["instance"],
+                "state update",
+            )?;
+            let member =
+                string_field(update, "member").ok_or_else(|| invalid("service state update"))?;
+            let sequence = integer_field(update, "sequence", 1)
+                .ok_or_else(|| invalid("service state update"))?;
             let JsonValue::Array(ops) = update.get("ops").unwrap_or(&JsonValue::Null) else {
                 return Err(invalid("service state update"));
             };
@@ -533,12 +582,18 @@ fn parse_update<OP>(
         }
         Some("replaced") => {
             assert_keys(update, &["type", "snapshot"], &[], "replacement update")?;
-            let snapshot = parse_instance(update.get("snapshot").unwrap_or(&JsonValue::Null), &decode_op)?;
+            let snapshot = parse_instance(
+                update.get("snapshot").unwrap_or(&JsonValue::Null),
+                &decode_op,
+            )?;
             Ok(ParsedUpdate::Replaced { snapshot })
         }
         Some("spawned") => {
             assert_keys(update, &["type", "instance"], &[], "spawn update")?;
-            let instance = parse_instance(update.get("instance").unwrap_or(&JsonValue::Null), &decode_op)?;
+            let instance = parse_instance(
+                update.get("instance").unwrap_or(&JsonValue::Null),
+                &decode_op,
+            )?;
             Ok(ParsedUpdate::Spawned { instance })
         }
         Some("closed") => {
@@ -596,10 +651,15 @@ fn wire_instance(instance: ParsedInstance<WireOp>) -> WireServiceInstanceSnapsho
 
 fn parse_address(value: &JsonValue) -> Result<ServiceInstanceAddress, ChordError> {
     let address = record(value, "service instance address")?;
-    assert_keys(address, &["key", "generation"], &[], "service instance address")?;
+    assert_keys(
+        address,
+        &["key", "generation"],
+        &[],
+        "service instance address",
+    )?;
     let key = string_field(address, "key").ok_or_else(|| invalid("service instance address"))?;
-    let generation =
-        integer_field(address, "generation", 1).ok_or_else(|| invalid("service instance address"))?;
+    let generation = integer_field(address, "generation", 1)
+        .ok_or_else(|| invalid("service instance address"))?;
     Ok(ServiceInstanceAddress {
         key: key.to_string(),
         generation,
@@ -726,7 +786,10 @@ fn instance_to_json(instance: &ServiceInstanceSnapshot) -> JsonValue {
                         ("name", JsonValue::Str(name.clone())),
                         ("kind", JsonValue::Str("state".to_string())),
                         ("sequence", JsonValue::Number(JsonNumber::from(*sequence))),
-                        ("ops", JsonValue::Array(ops.iter().map(Op::to_json).collect())),
+                        (
+                            "ops",
+                            JsonValue::Array(ops.iter().map(Op::to_json).collect()),
+                        ),
                     ]),
                 })
                 .collect(),
@@ -738,7 +801,10 @@ fn instance_to_json(instance: &ServiceInstanceSnapshot) -> JsonValue {
 fn address_to_json(address: &ServiceInstanceAddress) -> JsonValue {
     object(vec![
         ("key", JsonValue::Str(address.key.clone())),
-        ("generation", JsonValue::Number(JsonNumber::from(address.generation))),
+        (
+            "generation",
+            JsonValue::Number(JsonNumber::from(address.generation)),
+        ),
     ])
 }
 

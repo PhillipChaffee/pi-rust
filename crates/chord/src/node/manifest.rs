@@ -123,13 +123,20 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
     let plugin = manifest
         .get("plugin")
         .and_then(JsonValue::as_object)
-        .ok_or_else(|| manifest_error(path, "Facet bundle manifest has an invalid plugin identity"))?;
+        .ok_or_else(|| {
+            manifest_error(path, "Facet bundle manifest has an invalid plugin identity")
+        })?;
     let plugin_id = plugin
         .get("id")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| manifest_error(path, "Facet bundle manifest has an invalid plugin identity"))?;
+        .ok_or_else(|| {
+            manifest_error(path, "Facet bundle manifest has an invalid plugin identity")
+        })?;
     if plugin_id.is_empty() {
-        return Err(manifest_error(path, "Facet bundle manifest has an invalid plugin identity"));
+        return Err(manifest_error(
+            path,
+            "Facet bundle manifest has an invalid plugin identity",
+        ));
     }
     let version = match plugin.get("version") {
         None => None,
@@ -138,7 +145,10 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
                 manifest_error(path, "Facet bundle manifest has an invalid plugin version")
             })?;
             if version.is_empty() {
-                return Err(manifest_error(path, "Facet bundle manifest has an invalid plugin version"));
+                return Err(manifest_error(
+                    path,
+                    "Facet bundle manifest has an invalid plugin version",
+                ));
             }
             Some(version.to_string())
         }
@@ -171,9 +181,16 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
 /// # Errors
 /// [`ChordError`] describing the first violation, with the reader's path
 /// label and the entry name.
-fn validate_entry(name: &str, candidate: &JsonValue, path: &str) -> Result<FacetBundleEntry, ChordError> {
+fn validate_entry(
+    name: &str,
+    candidate: &JsonValue,
+    path: &str,
+) -> Result<FacetBundleEntry, ChordError> {
     if name.is_empty() {
-        return Err(manifest_error(path, "Facet bundle manifest has an invalid entry"));
+        return Err(manifest_error(
+            path,
+            "Facet bundle manifest has an invalid entry",
+        ));
     }
     let entry = candidate
         .as_object()
@@ -186,13 +203,18 @@ fn validate_entry(name: &str, candidate: &JsonValue, path: &str) -> Result<Facet
     let integrity = entry
         .get("integrity")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| manifest_error(path, &format!("Facet bundle entry {name} has no integrity")))?;
+        .ok_or_else(|| {
+            manifest_error(path, &format!("Facet bundle entry {name} has no integrity"))
+        })?;
     parse_integrity(integrity)?;
     let declared_imports = entry
         .get("externalImports")
         .and_then(JsonValue::as_array)
         .ok_or_else(|| {
-            manifest_error(path, &format!("Facet bundle entry {name} has invalid external imports"))
+            manifest_error(
+                path,
+                &format!("Facet bundle entry {name} has invalid external imports"),
+            )
         })?;
     let mut external_imports: Vec<&str> = Vec::with_capacity(declared_imports.len());
     for item in declared_imports {
@@ -217,7 +239,10 @@ fn validate_entry(name: &str, candidate: &JsonValue, path: &str) -> Result<Facet
         None => None,
         Some(source_map) => {
             let source_map = source_map.as_str().ok_or_else(|| {
-                manifest_error(path, &format!("Facet bundle entry {name} has an invalid source map"))
+                manifest_error(
+                    path,
+                    &format!("Facet bundle entry {name} has an invalid source map"),
+                )
             })?;
             resolve_bundle_file(source_map)?;
             Some(source_map.to_string())
@@ -294,11 +319,19 @@ pub fn resolve_bundle_file(file: &str) -> Result<(), ChordError> {
 /// # Errors
 /// [`ChordError`] when the file cannot be read or the JSON is malformed or
 /// invalid.
-pub fn read_facet_bundle_manifest(path: &std::path::Path) -> Result<FacetBundleManifest, ChordError> {
+pub fn read_facet_bundle_manifest(
+    path: &std::path::Path,
+) -> Result<FacetBundleManifest, ChordError> {
     let text = std::fs::read_to_string(path).map_err(|error| {
-        ChordError::Message(format!("Could not read facet bundle manifest {}: {error}", path.display()))
+        ChordError::Message(format!(
+            "Could not read facet bundle manifest {}: {error}",
+            path.display()
+        ))
     })?;
-    let parsed = parse_json(&text, format!("Could not read facet bundle manifest {}", path.display()))?;
+    let parsed = parse_json(
+        &text,
+        format!("Could not read facet bundle manifest {}", path.display()),
+    )?;
     validate_manifest(&parsed, &path.to_string_lossy())
 }
 
@@ -311,8 +344,8 @@ pub fn read_facet_bundle_manifest(path: &std::path::Path) -> Result<FacetBundleM
     reason = "the context is an owned error label by contract; the by-value signature is the ported public surface"
 )]
 pub fn parse_json(text: &str, context: String) -> Result<JsonValue, ChordError> {
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| ChordError::Message(format!("{context}: {error}")))?;
+    let value: serde_json::Value = serde_json::from_str(text)
+        .map_err(|error| ChordError::Message(format!("{context}: {error}")))?;
     Ok(json_from_serde(&value))
 }
 
@@ -330,7 +363,9 @@ fn json_from_serde(value: &serde_json::Value) -> JsonValue {
             JsonValue::Number(JsonNumber::new(number).unwrap_or(zero))
         }
         serde_json::Value::String(text) => JsonValue::Str(text.clone()),
-        serde_json::Value::Array(items) => JsonValue::Array(items.iter().map(json_from_serde).collect()),
+        serde_json::Value::Array(items) => {
+            JsonValue::Array(items.iter().map(json_from_serde).collect())
+        }
         serde_json::Value::Object(entries) => JsonValue::Object(JsonObject::from_entries(
             entries
                 .iter()

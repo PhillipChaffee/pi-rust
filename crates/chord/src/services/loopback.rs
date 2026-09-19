@@ -18,7 +18,9 @@ use crate::types::{
 /// Connects a provider to a binding without changing remote service
 /// semantics, upstream's `createLoopbackServiceTransport`.
 #[must_use]
-pub fn create_loopback_service_transport(provider: &RemoteServiceProvider) -> Rc<dyn RemoteServiceTransport> {
+pub fn create_loopback_service_transport(
+    provider: &RemoteServiceProvider,
+) -> Rc<dyn RemoteServiceTransport> {
     Rc::new(LoopbackTransport {
         provider: provider.clone(),
     })

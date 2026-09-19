@@ -98,7 +98,9 @@ pub fn define_local_service(id: &str) -> Result<crate::types::Service, ChordErro
 
 fn define_service_options(id: &str, local: bool) -> Result<crate::types::Service, ChordError> {
     if id.is_empty() {
-        return Err(ChordError::Message("Service ID must not be empty".to_string()));
+        return Err(ChordError::Message(
+            "Service ID must not be empty".to_string(),
+        ));
     }
     if id.starts_with("$chord.") {
         return Err(ChordError::Message(
@@ -172,7 +174,10 @@ impl FacetLoader for CombinedLoader {
             let mut disposals: Vec<Disposal> = Vec::new();
             for loader in loaders.iter() {
                 match loader.load().await {
-                    Ok(LoadedFacets { facets: loaded, dispose }) => {
+                    Ok(LoadedFacets {
+                        facets: loaded,
+                        dispose,
+                    }) => {
                         facets.extend(loaded);
                         disposals.push(dispose);
                     }
@@ -215,7 +220,8 @@ fn combined_disposal(disposals: Vec<Disposal>) -> Disposal {
                     failures.push(cleanup);
                 }
             }
-            crate::errors::collect_errors(failures, "Failed to dispose loaded facets").map_or(Ok(()), Err)
+            crate::errors::collect_errors(failures, "Failed to dispose loaded facets")
+                .map_or(Ok(()), Err)
         })
     })
 }

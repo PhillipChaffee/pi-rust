@@ -431,7 +431,7 @@ pub struct ServiceInstanceAddress {
     pub generation: u64,
 }
 
-/// Whether a member is invokable or replicated state, the wire `kind`
+/// Whether a member is invocable or replicated state, the wire `kind`
 /// spelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceMemberKind {
@@ -593,8 +593,11 @@ pub struct ReplicatedStateDelivery {
 pub type Unsubscribe = Box<dyn Fn()>;
 
 /// The close path of one live [`ServiceSubscription`].
-pub(crate) type SubscriptionClose =
-    Box<dyn Fn(Option<crate::context::Context>) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>>;
+pub(crate) type SubscriptionClose = Box<
+    dyn Fn(
+        Option<crate::context::Context>,
+    ) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>,
+>;
 
 /// A keyed-service observer, upstream's `(service, context) => void |
 /// Promise<void>` with the promise arm dropped.
@@ -662,7 +665,8 @@ pub type ServiceProviderListener = Rc<dyn Fn(&ServiceProviderUpdate, &crate::con
 ///
 /// Publishing is synchronous, and a failure propagates like upstream's
 /// sync throw before the `Promise.resolve` wrapper.
-pub type ServiceUpdatePublisher = Rc<dyn Fn(&str, &ServiceProviderUpdate, &crate::context::Context)>;
+pub type ServiceUpdatePublisher =
+    Rc<dyn Fn(&str, &ServiceProviderUpdate, &crate::context::Context)>;
 
 /// The service surface a facet or binding consumes, upstream's
 /// `RemoteServices`. Handles returned here stay stable across provider
@@ -672,20 +676,33 @@ pub trait RemoteServices {
     ///
     /// # Errors
     /// The crate's error model; upstream throws.
-    fn use_service(&self, service: &Service) -> Result<crate::handle::ServiceView, crate::errors::ChordError>;
+    fn use_service(
+        &self,
+        service: &Service,
+    ) -> Result<crate::handle::ServiceView, crate::errors::ChordError>;
 
     /// Observe every live instance of one keyed service.
     ///
     /// # Errors
     /// The crate's error model; upstream throws.
-    fn observe(&self, service: &Service, handler: KeyedViewHandler) -> Result<Unsubscribe, crate::errors::ChordError>;
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedViewHandler,
+    ) -> Result<Unsubscribe, crate::errors::ChordError>;
 
     /// Wait until every currently acquired service has installed its initial
     /// snapshot.
-    fn ready(&self, context: crate::context::Context) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>;
+    fn ready(
+        &self,
+        context: crate::context::Context,
+    ) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>;
 
     /// Tear down every subscription and facade this binding owns.
-    fn dispose(&self, context: crate::context::Context) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>;
+    fn dispose(
+        &self,
+        context: crate::context::Context,
+    ) -> crate::future::LocalBoxFuture<Result<(), crate::errors::ChordError>>;
 }
 
 /// Whether a source may provisionally own absent requirements while it is
@@ -710,10 +727,7 @@ pub trait RemoteServiceSource {
     ) -> crate::future::LocalBoxFuture<Result<Vec<ServiceCatalogueEntry>, crate::errors::ChordError>>;
 
     /// Opens the services interface for the listed service IDs.
-    fn open(
-        &self,
-        options: RemoteServiceSourceOpenOptions,
-    ) -> Rc<dyn RemoteServices>;
+    fn open(&self, options: RemoteServiceSourceOpenOptions) -> Rc<dyn RemoteServices>;
 }
 
 /// The options [`RemoteServiceSource::open`] receives.
@@ -750,7 +764,9 @@ pub struct FacetDef {
 
 impl fmt::Debug for FacetDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("FacetDef").field("id", &self.id).finish_non_exhaustive()
+        f.debug_struct("FacetDef")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -775,7 +791,14 @@ pub struct LoadedFacets {
 impl fmt::Debug for LoadedFacets {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LoadedFacets")
-            .field("facets", &self.facets.iter().map(|facet| facet.id.as_str()).collect::<Vec<_>>())
+            .field(
+                "facets",
+                &self
+                    .facets
+                    .iter()
+                    .map(|facet| facet.id.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -783,5 +806,7 @@ impl fmt::Debug for LoadedFacets {
 /// Produces one generation of facets, upstream's `FacetLoader`.
 pub trait FacetLoader {
     /// Loads the facets.
-    fn load(&self) -> crate::future::LocalBoxFuture<Result<LoadedFacets, crate::errors::ChordError>>;
+    fn load(
+        &self,
+    ) -> crate::future::LocalBoxFuture<Result<LoadedFacets, crate::errors::ChordError>>;
 }

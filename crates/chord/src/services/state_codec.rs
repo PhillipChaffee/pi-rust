@@ -12,13 +12,13 @@ use std::rc::Rc;
 
 use crate::delta::{Decoder, Encoder};
 use crate::errors::ChordError;
-use crate::types::{
-    ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceProviderUpdate,
-    ServiceSubscriptionSnapshot,
-};
 use crate::services::wire::{
     WireServiceInstanceSnapshot, WireServiceMemberSnapshot, WireServiceProviderUpdate,
     WireServiceSubscriptionSnapshot,
+};
+use crate::types::{
+    ServiceInstanceAddress, ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceProviderUpdate,
+    ServiceSubscriptionSnapshot,
 };
 
 /// Stateful operation encoders for every replicated state in one service
@@ -29,7 +29,8 @@ pub struct ServiceStateEncoder {
 
 impl std::fmt::Debug for ServiceStateEncoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServiceStateEncoder").finish_non_exhaustive()
+        f.debug_struct("ServiceStateEncoder")
+            .finish_non_exhaustive()
     }
 }
 
@@ -59,7 +60,10 @@ impl ServiceStateEncoder {
     /// # Errors
     /// [`ChordError`] when the update names a state this subscription never
     /// saw.
-    pub fn encode_update(&mut self, update: &ServiceProviderUpdate) -> Result<WireServiceProviderUpdate, ChordError> {
+    pub fn encode_update(
+        &mut self,
+        update: &ServiceProviderUpdate,
+    ) -> Result<WireServiceProviderUpdate, ChordError> {
         match update {
             ServiceProviderUpdate::State {
                 instance,
@@ -138,7 +142,8 @@ pub struct ServiceStateDecoder {
 
 impl std::fmt::Debug for ServiceStateDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServiceStateDecoder").finish_non_exhaustive()
+        f.debug_struct("ServiceStateDecoder")
+            .finish_non_exhaustive()
     }
 }
 
@@ -193,7 +198,10 @@ impl ServiceStateDecoder {
     /// # Errors
     /// [`ChordError`] when the update names a state this subscription never
     /// saw or an op fails to decode.
-    pub fn decode_update(&mut self, update: &WireServiceProviderUpdate) -> Result<ServiceProviderUpdate, ChordError> {
+    pub fn decode_update(
+        &mut self,
+        update: &WireServiceProviderUpdate,
+    ) -> Result<ServiceProviderUpdate, ChordError> {
         match update {
             WireServiceProviderUpdate::State {
                 instance,
@@ -316,7 +324,11 @@ impl<C> CodecRegistry<C> {
         self.entries.clear();
     }
 
-    fn add(&mut self, instance: Option<&ServiceInstanceAddress>, member: &str) -> Result<SharedCodec<C>, ChordError> {
+    fn add(
+        &mut self,
+        instance: Option<&ServiceInstanceAddress>,
+        member: &str,
+    ) -> Result<SharedCodec<C>, ChordError> {
         let key = state_key(instance, member);
         if self.entries.iter().any(|(stored, _)| *stored == key) {
             return Err(ChordError::Message(format!(
@@ -329,7 +341,11 @@ impl<C> CodecRegistry<C> {
         Ok(codec)
     }
 
-    fn get(&self, instance: Option<&ServiceInstanceAddress>, member: &str) -> Result<SharedCodec<C>, ChordError> {
+    fn get(
+        &self,
+        instance: Option<&ServiceInstanceAddress>,
+        member: &str,
+    ) -> Result<SharedCodec<C>, ChordError> {
         let key = state_key(instance, member);
         self.entries
             .iter()

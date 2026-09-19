@@ -16,7 +16,10 @@ use pi_chord::types::JsonObject;
 
 fn jo(entries: Vec<(&str, pi_chord::types::JsonValue)>) -> pi_chord::types::JsonValue {
     pi_chord::types::JsonValue::Object(JsonObject::from_entries(
-        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
     ))
 }
 

@@ -136,7 +136,7 @@ pub(crate) fn seeded_rng(seed: u64) -> StdRng {
     StdRng::seed_from_u64(seed)
 }
 
-/// Call counter standing in for upstream's `vi.fn()` spies: a clonable
+/// Call counter standing in for upstream's `vi.fn()` spies: a cloneable
 /// handle tests capture in closures to record how many times a callback
 /// ran.
 #[derive(Debug, Default)]

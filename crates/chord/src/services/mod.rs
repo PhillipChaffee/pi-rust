@@ -19,11 +19,12 @@ pub mod wire;
 pub use provider::{RemoteServiceEndpoint, RemoteServiceProvider, create_remote_service_endpoint};
 pub use state::{MutableReplicatedState, ReplicatedStateReplica};
 pub use state_codec::{
-    ServiceStateDecoder, ServiceStateEncoder, create_service_state_decoder, create_service_state_encoder,
+    ServiceStateDecoder, ServiceStateEncoder, create_service_state_decoder,
+    create_service_state_encoder,
 };
 pub use wire::{
     ServiceControlCall, WireServiceInstanceSnapshot, WireServiceMemberSnapshot,
-    WireServiceSubscriptionSnapshot, WireServiceProviderUpdate, catalogue_to_json,
+    WireServiceProviderUpdate, WireServiceSubscriptionSnapshot, catalogue_to_json,
     create_service_catalogue_call, create_service_subscribe_call, create_service_unsubscribe_call,
     decode_service_control_call, parse_service_call, parse_service_catalogue,
     parse_service_provider_update, parse_service_subscription_snapshot,

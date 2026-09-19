@@ -12,8 +12,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::context::background_context;
+use crate::consumer::create_remote_service_binding;
 use crate::consumer::{RemoteServiceBinding, RemoteServiceBindingOptions};
+use crate::context::background_context;
 use crate::errors::{ChordError, collect_errors};
 use crate::future::{LocalBoxFuture, boxed, join_all};
 use crate::handle::{
@@ -21,12 +22,11 @@ use crate::handle::{
     ServiceView, allow_access, sync_disposal,
 };
 use crate::services::instances::{InstanceDirectory, InstanceDirectoryEntry};
-use crate::consumer::create_remote_service_binding;
 use crate::services::provider::RemoteServiceProvider;
 use crate::services::state::MutableReplicatedState;
 use crate::types::{
-    FacetDef, KeyedServiceHandler, RemoteServiceSource, RemoteServices, Service, ServiceCatalogueEntry,
-    ServiceMode, Unsubscribe,
+    FacetDef, KeyedServiceHandler, RemoteServiceSource, RemoteServices, Service,
+    ServiceCatalogueEntry, ServiceMode, Unsubscribe,
 };
 
 /// One declared service reference on a facet's requirement or provision
@@ -74,8 +74,6 @@ enum LifecycleState {
     Disposing,
     Dead,
 }
-
-
 
 struct FacetLifecycle {
     id: String,
@@ -179,16 +177,19 @@ impl FacetLifecycle {
 
     async fn activate(&self) -> Result<(), ChordError> {
         if self.state.get() != LifecycleState::Prepared {
-            return Err(ChordError::Message(format!("Facet {} is not prepared", self.id)));
+            return Err(ChordError::Message(format!(
+                "Facet {} is not prepared",
+                self.id
+            )));
         }
         self.state.set(LifecycleState::Active);
         self.service_access.set(true);
-        let starts: Vec<Observation> =
-            self.observations.borrow_mut().drain(..).collect();
+        let starts: Vec<Observation> = self.observations.borrow_mut().drain(..).collect();
         for start in starts {
             self.effects.borrow_mut().push(start()?);
         }
-        let callbacks: Vec<ActivationCallback> = self.activate_callbacks.borrow_mut().drain(..).collect();
+        let callbacks: Vec<ActivationCallback> =
+            self.activate_callbacks.borrow_mut().drain(..).collect();
         for callback in callbacks {
             callback().await?;
         }
@@ -245,12 +246,21 @@ impl FacetEnvironment {
     ///
     /// # Errors
     /// [`ChordError`] when the facet is no longer setting up.
-    pub fn provide(&mut self, service: &Service, implementation: ServiceImplementation) -> Result<(), ChordError> {
-        self.runtime.lifecycle.assert_setting_up("provide services")?;
-        self.runtime.provides.borrow_mut().push(FacetServiceReference {
-            service_id: service.id.clone(),
-            mode: ServiceMode::Singleton,
-        });
+    pub fn provide(
+        &mut self,
+        service: &Service,
+        implementation: ServiceImplementation,
+    ) -> Result<(), ChordError> {
+        self.runtime
+            .lifecycle
+            .assert_setting_up("provide services")?;
+        self.runtime
+            .provides
+            .borrow_mut()
+            .push(FacetServiceReference {
+                service_id: service.id.clone(),
+                mode: ServiceMode::Singleton,
+            });
         self.runtime
             .provisions
             .borrow_mut()
@@ -266,12 +276,20 @@ impl FacetEnvironment {
     ///
     /// # Errors
     /// [`ChordError`] when the facet is no longer setting up.
-    pub fn provide_many(&mut self, service: &Service) -> Result<Rc<StagedServiceSpawner>, ChordError> {
-        self.runtime.lifecycle.assert_setting_up("provide service instances")?;
-        self.runtime.provides.borrow_mut().push(FacetServiceReference {
-            service_id: service.id.clone(),
-            mode: ServiceMode::Keyed,
-        });
+    pub fn provide_many(
+        &mut self,
+        service: &Service,
+    ) -> Result<Rc<StagedServiceSpawner>, ChordError> {
+        self.runtime
+            .lifecycle
+            .assert_setting_up("provide service instances")?;
+        self.runtime
+            .provides
+            .borrow_mut()
+            .push(FacetServiceReference {
+                service_id: service.id.clone(),
+                mode: ServiceMode::Keyed,
+            });
         let spawner = Rc::new(StagedServiceSpawner {
             lifecycle: self.runtime.lifecycle.clone(),
             service: service.clone(),
@@ -279,13 +297,10 @@ impl FacetEnvironment {
             installer: Rc::new(RefCell::new(None)),
             connected: Cell::new(false),
         });
-        self.runtime
-            .provisions
-            .borrow_mut()
-            .push(Provision::Keyed {
-                service: service.clone(),
-                spawner: spawner.clone(),
-            });
+        self.runtime.provisions.borrow_mut().push(Provision::Keyed {
+            service: service.clone(),
+            spawner: spawner.clone(),
+        });
         Ok(spawner)
     }
 
@@ -295,11 +310,16 @@ impl FacetEnvironment {
     /// # Errors
     /// [`ChordError`] when the facet is no longer setting up.
     pub fn use_service(&mut self, service: &Service) -> Result<ServiceView, ChordError> {
-        self.runtime.lifecycle.assert_setting_up("acquire services")?;
-        self.runtime.requires.borrow_mut().push(FacetServiceReference {
-            service_id: service.id.clone(),
-            mode: ServiceMode::Singleton,
-        });
+        self.runtime
+            .lifecycle
+            .assert_setting_up("acquire services")?;
+        self.runtime
+            .requires
+            .borrow_mut()
+            .push(FacetServiceReference {
+                service_id: service.id.clone(),
+                mode: ServiceMode::Singleton,
+            });
         if let Some(view) = self.runtime.singleton_views.borrow().get(&service.id) {
             return Ok(view.clone());
         }
@@ -324,11 +344,16 @@ impl FacetEnvironment {
         service: &Service,
         handler: crate::types::KeyedViewHandler,
     ) -> Result<(), ChordError> {
-        self.runtime.lifecycle.assert_setting_up("observe services")?;
-        self.runtime.requires.borrow_mut().push(FacetServiceReference {
-            service_id: service.id.clone(),
-            mode: ServiceMode::Keyed,
-        });
+        self.runtime
+            .lifecycle
+            .assert_setting_up("observe services")?;
+        self.runtime
+            .requires
+            .borrow_mut()
+            .push(FacetServiceReference {
+                service_id: service.id.clone(),
+                mode: ServiceMode::Keyed,
+            });
         let slots = self.slots.clone();
         let lifecycle = self.runtime.lifecycle.clone();
         let service = service.clone();
@@ -356,8 +381,13 @@ impl FacetEnvironment {
     ///
     /// # Errors
     /// [`ChordError`] when the facet is neither setting up nor active.
-    pub fn replicated_state(&mut self, initial: crate::types::JsonValue) -> Result<MutableReplicatedState, ChordError> {
-        self.runtime.lifecycle.assert_running("create replicated state")?;
+    pub fn replicated_state(
+        &mut self,
+        initial: crate::types::JsonValue,
+    ) -> Result<MutableReplicatedState, ChordError> {
+        self.runtime
+            .lifecycle
+            .assert_running("create replicated state")?;
         Ok(MutableReplicatedState::new(initial))
     }
 
@@ -427,10 +457,13 @@ impl StagedServiceSpawner {
     /// [`ChordError`] when the spawner is already connected.
     pub fn connect(
         &self,
-        installer: impl Fn(&str, Rc<ServiceImplementation>) -> Result<CloseInstance, ChordError> + 'static,
+        installer: impl Fn(&str, Rc<ServiceImplementation>) -> Result<CloseInstance, ChordError>
+        + 'static,
     ) -> Result<(), ChordError> {
         if self.connected.get() {
-            return Err(ChordError::Message("Facet service provider is already connected".to_string()));
+            return Err(ChordError::Message(
+                "Facet service provider is already connected".to_string(),
+            ));
         }
         self.connected.set(true);
         let installer = Rc::new(installer);
@@ -538,7 +571,11 @@ pub trait KeyedSource {
     ///
     /// # Errors
     /// [`ChordError`] when the source is disconnected or disposed.
-    fn observe(&self, service: &Service, handler: KeyedServiceHandler) -> Result<Unsubscribe, ChordError>;
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedServiceHandler,
+    ) -> Result<Unsubscribe, ChordError>;
 }
 
 /// The registry of process-local keyed services, upstream's
@@ -606,8 +643,17 @@ impl LocalKeyedServiceRegistry {
                 service.id
             )));
         }
-        let generation = registration.borrow().generations.get(key).copied().unwrap_or(0) + 1;
-        registration.borrow_mut().generations.insert(key.to_string(), generation);
+        let generation = registration
+            .borrow()
+            .generations
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+            + 1;
+        registration
+            .borrow_mut()
+            .generations
+            .insert(key.to_string(), generation);
         let entry = Rc::new(InstanceDirectoryEntry {
             key: key.to_string(),
             generation,
@@ -620,18 +666,27 @@ impl LocalKeyedServiceRegistry {
         })
     }
 
-    fn registration(&self, service_id: &str) -> Result<Rc<RefCell<LocalKeyedRegistration>>, ChordError> {
+    fn registration(
+        &self,
+        service_id: &str,
+    ) -> Result<Rc<RefCell<LocalKeyedRegistration>>, ChordError> {
         self.registrations
             .borrow()
             .iter()
             .find(|(id, _)| id == service_id)
             .map(|(_, registration)| registration.clone())
-            .ok_or_else(|| ChordError::Message(format!("Local keyed service {service_id} is not registered")))
+            .ok_or_else(|| {
+                ChordError::Message(format!(
+                    "Local keyed service {service_id} is not registered"
+                ))
+            })
     }
 
     fn assert_active(&self) -> Result<(), ChordError> {
         if self.disposed.get() {
-            return Err(ChordError::Message("Local keyed service registry is disposed".to_string()));
+            return Err(ChordError::Message(
+                "Local keyed service registry is disposed".to_string(),
+            ));
         }
         Ok(())
     }
@@ -649,7 +704,11 @@ impl LocalKeyedServiceRegistry {
 }
 
 impl KeyedSource for LocalKeyedServiceRegistry {
-    fn observe(&self, service: &Service, handler: KeyedServiceHandler) -> Result<Unsubscribe, ChordError> {
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedServiceHandler,
+    ) -> Result<Unsubscribe, ChordError> {
         self.assert_active()?;
         let registration = self.registration(&service.id)?;
         registration.borrow().directory.observe(handler)
@@ -681,12 +740,7 @@ impl HostServiceSlots {
         let mut singletons = self.singletons.borrow_mut();
         singletons
             .entry(service.id.clone())
-            .or_insert_with(|| {
-                (
-                    ServiceSlot::new(&service.id),
-                    Rc::new(allow_access()),
-                )
-            })
+            .or_insert_with(|| (ServiceSlot::new(&service.id), Rc::new(allow_access())))
             .0
             .clone()
     }
@@ -702,7 +756,9 @@ impl HostServiceSlots {
     }
 
     fn bind_keyed(&self, service_id: &str, source: Rc<dyn KeyedSource>) {
-        self.keyed_sources.borrow_mut().insert(service_id.to_string(), source);
+        self.keyed_sources
+            .borrow_mut()
+            .insert(service_id.to_string(), source);
     }
 
     fn observe(
@@ -716,7 +772,9 @@ impl HostServiceSlots {
             .borrow()
             .get(&service.id)
             .cloned()
-            .ok_or_else(|| ChordError::Message(format!("Service {} is disconnected", service.id)))?;
+            .ok_or_else(|| {
+                ChordError::Message(format!("Service {} is disconnected", service.id))
+            })?;
         let stopped = Rc::new(Cell::new(false));
         let wrapped: KeyedServiceHandler = {
             let service_id = Rc::new(service.id.clone());
@@ -870,7 +928,9 @@ impl FacetKernel {
         let mut ids = std::collections::HashSet::new();
         for facet in &options.facets {
             if facet.id.is_empty() {
-                return Err(ChordError::Message("Facet ID must not be empty".to_string()));
+                return Err(ChordError::Message(
+                    "Facet ID must not be empty".to_string(),
+                ));
             }
             if !ids.insert(facet.id.clone()) {
                 return Err(ChordError::Message(
@@ -906,7 +966,11 @@ impl FacetKernel {
         })
     }
 
-    fn setup_facet(core: &Rc<KernelCore>, facet: &FacetDef, record: &Rc<RuntimeRecord>) -> Result<(), ChordError> {
+    fn setup_facet(
+        core: &Rc<KernelCore>,
+        facet: &FacetDef,
+        record: &Rc<RuntimeRecord>,
+    ) -> Result<(), ChordError> {
         let mut environment = FacetEnvironment {
             runtime: record.clone(),
             slots: core.slots.clone(),
@@ -920,11 +984,9 @@ impl FacetKernel {
     /// # Errors
     /// [`ChordError`] when the provider is not assembled.
     pub fn provider(&self) -> Result<RemoteServiceProvider, ChordError> {
-        self.core
-            .provider
-            .borrow()
-            .clone()
-            .ok_or_else(|| ChordError::Message("Facet service provider is not assembled".to_string()))
+        self.core.provider.borrow().clone().ok_or_else(|| {
+            ChordError::Message("Facet service provider is not assembled".to_string())
+        })
     }
 }
 
@@ -958,8 +1020,11 @@ impl FacetKernel {
         let facets: Vec<FacetDef> = self.core.initial_facets.borrow_mut().drain(..).collect();
         for facet in facets {
             let record = Self::create_runtime(&self.core, &facet.id);
-            self.core.facets.borrow_mut().push((facet.id.clone(), record.clone()));
-Self::setup_facet(&self.core, &facet, &record)?;
+            self.core
+                .facets
+                .borrow_mut()
+                .push((facet.id.clone(), record.clone()));
+            Self::setup_facet(&self.core, &facet, &record)?;
         }
         self.core.phase.set(GenerationPhase::Assembling);
         let external = self.resolve_external_services().await?;
@@ -1019,15 +1084,28 @@ Self::setup_facet(&self.core, &facet, &record)?;
         let mut ids = std::collections::HashSet::new();
         for facet in &facets {
             if facet.id.is_empty() {
-                return Err(ChordError::Message("Facet ID must not be empty".to_string()));
+                return Err(ChordError::Message(
+                    "Facet ID must not be empty".to_string(),
+                ));
             }
             if !ids.insert(facet.id.clone()) {
-                return Err(ChordError::Message("Reloaded facet IDs must be unique".to_string()));
+                return Err(ChordError::Message(
+                    "Reloaded facet IDs must be unique".to_string(),
+                ));
             }
         }
         for facet in &facets {
-            if !self.core.facets.borrow().iter().any(|(id, _)| id == &facet.id) {
-                return Err(ChordError::Message(format!("Facet {} is not active", facet.id)));
+            if !self
+                .core
+                .facets
+                .borrow()
+                .iter()
+                .any(|(id, _)| id == &facet.id)
+            {
+                return Err(ChordError::Message(format!(
+                    "Facet {} is not active",
+                    facet.id
+                )));
             }
         }
         self.core.phase.set(GenerationPhase::Reloading);
@@ -1035,7 +1113,9 @@ Self::setup_facet(&self.core, &facet, &record)?;
         let staged = match self.stage_generation(facets) {
             Ok(staged) => staged,
             Err((error, staged)) => {
-                return self.dispose_failed_stage(error, staged, "Facet reload setup and cleanup failed").await;
+                return self
+                    .dispose_failed_stage(error, staged, "Facet reload setup and cleanup failed")
+                    .await;
             }
         };
 
@@ -1062,7 +1142,8 @@ Self::setup_facet(&self.core, &facet, &record)?;
         }
         .await;
         if let Err(error) = activation_result {
-            let cleanup_errors = dispose_records(&candidate_order.iter().rev().cloned().collect::<Vec<_>>()).await;
+            let cleanup_errors =
+                dispose_records(&candidate_order.iter().rev().cloned().collect::<Vec<_>>()).await;
             if cleanup_errors.is_empty() {
                 self.core.phase.set(GenerationPhase::Active);
                 return Err(error);
@@ -1090,10 +1171,7 @@ Self::setup_facet(&self.core, &facet, &record)?;
             .collect();
         for candidate in &candidate_order {
             let mut facets = self.core.facets.borrow_mut();
-            if let Some(slot) = facets
-                .iter_mut()
-                .find(|(id, _)| id == &candidate.facet_id)
-            {
+            if let Some(slot) = facets.iter_mut().find(|(id, _)| id == &candidate.facet_id) {
                 slot.1 = candidate.clone();
             }
         }
@@ -1130,9 +1208,9 @@ Self::setup_facet(&self.core, &facet, &record)?;
         collect_errors(errors, "Failed to dispose facet generation").map_or(Ok(()), Err)
     }
 
-/// Disposes a failed reload stage in reverse order and folds the cleanup
-/// failures into the reported error.
-async fn dispose_failed_stage(
+    /// Disposes a failed reload stage in reverse order and folds the cleanup
+    /// failures into the reported error.
+    async fn dispose_failed_stage(
         &self,
         error: ChordError,
         staged: Vec<Rc<RuntimeRecord>>,
@@ -1147,15 +1225,15 @@ async fn dispose_failed_stage(
         }
         let abort_errors = self.abort(&[]).await;
         Err(ChordError::Aggregate(
-            std::iter::once(error).chain(cleanup_errors).chain(abort_errors).collect(),
+            std::iter::once(error)
+                .chain(cleanup_errors)
+                .chain(abort_errors)
+                .collect(),
             label.to_string(),
         ))
     }
 
-    fn stage_generation(
-        &self,
-        facets: Vec<FacetDef>,
-    ) -> StagedGeneration {
+    fn stage_generation(&self, facets: Vec<FacetDef>) -> StagedGeneration {
         let mut staged: Vec<Rc<RuntimeRecord>> = Vec::new();
         for facet in facets {
             let record = Self::create_runtime(&self.core, &facet.id);
@@ -1202,12 +1280,12 @@ async fn dispose_failed_stage(
                     continue;
                 };
                 if service.local {
-                    self.core.slots.bind_singleton(
-                        &service.id,
-                        ServiceTarget::Local(implementation.clone()),
-                    );
+                    self.core
+                        .slots
+                        .bind_singleton(&service.id, ServiceTarget::Local(implementation.clone()));
                 } else {
-                    self.provider()?.replace(service, implementation.as_ref().clone())?;
+                    self.provider()?
+                        .replace(service, implementation.as_ref().clone())?;
                 }
             }
         }
@@ -1232,17 +1310,22 @@ async fn dispose_failed_stage(
                     continue;
                 };
                 if service.local {
-                    let registry = self
-                        .core
-                        .local_keyed_services
-                        .borrow()
-                        .clone()
-                        .ok_or_else(|| ChordError::Message("Facet keyed services are not assembled".to_string()))?;
+                    let registry =
+                        self.core
+                            .local_keyed_services
+                            .borrow()
+                            .clone()
+                            .ok_or_else(|| {
+                                ChordError::Message(
+                                    "Facet keyed services are not assembled".to_string(),
+                                )
+                            })?;
                     spawner.connect({
                         let registry = registry.clone();
                         let service = service.clone();
                         move |key, implementation| {
-                            let close = registry.spawn(&service, key, implementation.as_ref().clone())?;
+                            let close =
+                                registry.spawn(&service, key, implementation.as_ref().clone())?;
                             Ok(Rc::new(move || {
                                 close();
                                 Ok(())
@@ -1265,35 +1348,44 @@ async fn dispose_failed_stage(
         Ok(())
     }
 
-    fn validate_replacement_provisions(&self, record: &Rc<RuntimeRecord>) -> Result<(), ChordError> {
+    fn validate_replacement_provisions(
+        &self,
+        record: &Rc<RuntimeRecord>,
+    ) -> Result<(), ChordError> {
         for provision in record.provisions.borrow().iter() {
-            let Provision::Singleton { service, implementation } = provision else {
+            let Provision::Singleton {
+                service,
+                implementation,
+            } = provision
+            else {
                 continue;
             };
             if service.local {
                 continue;
             }
-            self.provider()?.validate_replacement(service, implementation)?;
+            self.provider()?
+                .validate_replacement(service, implementation)?;
         }
         Ok(())
     }
 
-    async fn resolve_external_services(&self) -> Result<HashMap<String, ExternalService>, ChordError> {
+    async fn resolve_external_services(
+        &self,
+    ) -> Result<HashMap<String, ExternalService>, ChordError> {
         let sources = self.core.service_sources.clone();
-        let catalogues: Vec<Result<(usize, Vec<ServiceCatalogueEntry>), ChordError>> =
-            join_all(
-                sources
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, source)| {
-                        boxed(async move {
-                            let entries = source.catalogue(background_context()).await?;
-                            Ok((index, entries))
-                        })
+        let catalogues: Vec<Result<(usize, Vec<ServiceCatalogueEntry>), ChordError>> = join_all(
+            sources
+                .into_iter()
+                .enumerate()
+                .map(|(index, source)| {
+                    boxed(async move {
+                        let entries = source.catalogue(background_context()).await?;
+                        Ok((index, entries))
                     })
-                    .collect(),
-            )
-            .await;
+                })
+                .collect(),
+        )
+        .await;
         let mut offered: Vec<(String, ServiceMode, usize)> = Vec::new();
         for result in catalogues {
             let (index, entries) = result?;
@@ -1354,7 +1446,9 @@ async fn dispose_failed_stage(
 
         let mut service_ids_by_source: HashMap<usize, Vec<Service>> = HashMap::new();
         for (service_id, external) in &external {
-            let services = service_ids_by_source.entry(external.source_index).or_default();
+            let services = service_ids_by_source
+                .entry(external.source_index)
+                .or_default();
             services.push(Service {
                 id: service_id.clone(),
                 local: false,
@@ -1371,7 +1465,10 @@ async fn dispose_failed_stage(
                 },
                 on_error: self.core.on_error.clone(),
             });
-            self.core.source_bindings.borrow_mut().push((source_index, binding.clone()));
+            self.core
+                .source_bindings
+                .borrow_mut()
+                .push((source_index, binding.clone()));
             opened.push((source_index, binding));
         }
         let _ = opened;
@@ -1384,16 +1481,19 @@ async fn dispose_failed_stage(
             .iter()
             .filter(|provision| !provision.service().local)
             .collect();
-        let definitions: Vec<crate::services::provider::ServiceProviderDefinition> = remote_provisions
-            .iter()
-            .map(|provision| crate::services::provider::ServiceProviderDefinition {
-                service: provision.service().clone(),
-                mode: match provision {
-                    Provision::Singleton { .. } => ServiceMode::Singleton,
-                    Provision::Keyed { .. } => ServiceMode::Keyed,
-                },
-            })
-            .collect();
+        let definitions: Vec<crate::services::provider::ServiceProviderDefinition> =
+            remote_provisions
+                .iter()
+                .map(
+                    |provision| crate::services::provider::ServiceProviderDefinition {
+                        service: provision.service().clone(),
+                        mode: match provision {
+                            Provision::Singleton { .. } => ServiceMode::Singleton,
+                            Provision::Keyed { .. } => ServiceMode::Keyed,
+                        },
+                    },
+                )
+                .collect();
         let provider = RemoteServiceProvider::new(definitions)?;
         let transport = crate::services::loopback::create_loopback_service_transport(&provider);
         let internal_services = create_remote_service_binding(RemoteServiceBindingOptions {
@@ -1419,24 +1519,32 @@ async fn dispose_failed_stage(
         ));
         for provision in &provisions {
             match provision {
-                Provision::Singleton { service, implementation } => {
+                Provision::Singleton {
+                    service,
+                    implementation,
+                } => {
                     if !service.local {
                         provider.provide(service, implementation.as_ref().clone())?;
                     }
                 }
                 Provision::Keyed { service, spawner } => {
                     if service.local {
-                        let registry = self
-                            .core
-                            .local_keyed_services
-                            .borrow()
-                            .clone()
-                            .ok_or_else(|| ChordError::Message("Facet keyed services are not assembled".to_string()))?;
+                        let registry =
+                            self.core
+                                .local_keyed_services
+                                .borrow()
+                                .clone()
+                                .ok_or_else(|| {
+                                    ChordError::Message(
+                                        "Facet keyed services are not assembled".to_string(),
+                                    )
+                                })?;
                         spawner.connect({
                             let registry = registry.clone();
                             let service = service.clone();
                             move |key, implementation| {
-                                let close = registry.spawn(&service, key, (*implementation).clone())?;
+                                let close =
+                                    registry.spawn(&service, key, (*implementation).clone())?;
                                 Ok(Rc::new(move || {
                                     close();
                                     Ok(())
@@ -1463,41 +1571,55 @@ async fn dispose_failed_stage(
     fn bind_services(&self, external: &HashMap<String, ExternalService>) -> Result<(), ChordError> {
         for provision in self.provisions() {
             match provision {
-                Provision::Singleton { service, implementation } => {
+                Provision::Singleton {
+                    service,
+                    implementation,
+                } => {
                     if !self.core.slots.has_singleton(&service.id) {
                         continue;
                     }
                     let target = if service.local {
                         ServiceTarget::Local(implementation.clone())
                     } else {
-                        let internal = self
-                            .core
-                            .internal_services
-                            .borrow()
-                            .clone()
-                            .ok_or_else(|| ChordError::Message("Facet remote services are not assembled".to_string()))?;
+                        let internal =
+                            self.core
+                                .internal_services
+                                .borrow()
+                                .clone()
+                                .ok_or_else(|| {
+                                    ChordError::Message(
+                                        "Facet remote services are not assembled".to_string(),
+                                    )
+                                })?;
                         ServiceTarget::View(internal.use_service(&service)?)
                     };
                     self.core.slots.bind_singleton(&service.id, target);
                 }
                 Provision::Keyed { service, .. } => {
-                    let source: Rc<dyn KeyedSource> = if service.local {
-                        let registry = self
-                            .core
-                            .local_keyed_services
-                            .borrow()
-                            .clone()
-                            .ok_or_else(|| ChordError::Message("Facet keyed services are not assembled".to_string()))?;
-                        Rc::new(RegistryKeyedSource(registry))
-                    } else {
-                        let internal = self
-                            .core
-                            .internal_services
-                            .borrow()
-                            .clone()
-                            .ok_or_else(|| ChordError::Message("Facet remote services are not assembled".to_string()))?;
-                        Rc::new(SourceKeyedSource(internal))
-                    };
+                    let source: Rc<dyn KeyedSource> =
+                        if service.local {
+                            let registry =
+                                self.core.local_keyed_services.borrow().clone().ok_or_else(
+                                    || {
+                                        ChordError::Message(
+                                            "Facet keyed services are not assembled".to_string(),
+                                        )
+                                    },
+                                )?;
+                            Rc::new(RegistryKeyedSource(registry))
+                        } else {
+                            let internal = self
+                                .core
+                                .internal_services
+                                .borrow()
+                                .clone()
+                                .ok_or_else(|| {
+                                    ChordError::Message(
+                                        "Facet remote services are not assembled".to_string(),
+                                    )
+                                })?;
+                            Rc::new(SourceKeyedSource(internal))
+                        };
                     self.core.slots.bind_keyed(&service.id, source);
                 }
             }
@@ -1510,11 +1632,14 @@ async fn dispose_failed_stage(
                 .iter()
                 .find(|(index, _)| *index == external.source_index)
                 .map(|(_, services)| services.clone())
-                .ok_or_else(|| ChordError::Message(format!("Service source for {service_id} is not open")))?;
+                .ok_or_else(|| {
+                    ChordError::Message(format!("Service source for {service_id} is not open"))
+                })?;
             if external.mode == ServiceMode::Singleton {
-                self.core
-                    .slots
-                    .bind_singleton(service_id, ServiceTarget::View(services.use_service(&external.service)?));
+                self.core.slots.bind_singleton(
+                    service_id,
+                    ServiceTarget::View(services.use_service(&external.service)?),
+                );
             } else {
                 let source = SourceKeyedSource(services.clone());
                 self.core.slots.bind_keyed(service_id, Rc::new(source));
@@ -1589,7 +1714,13 @@ async fn dispose_failed_stage(
                 .rev()
                 .collect()
         } else {
-            self.core.activation_order.borrow().iter().rev().cloned().collect()
+            self.core
+                .activation_order
+                .borrow()
+                .iter()
+                .rev()
+                .cloned()
+                .collect()
         };
         let mut errors = Vec::new();
         for id in order {
@@ -1634,9 +1765,9 @@ fn same_facet_shape(left: &RuntimeRecord, right: &RuntimeRecord) -> bool {
 fn same_references(left: &[FacetServiceReference], right: &[FacetServiceReference]) -> bool {
     left.len() == right.len()
         && left.iter().all(|reference| {
-            right
-                .iter()
-                .any(|other| other.service_id == reference.service_id && other.mode == reference.mode)
+            right.iter().any(|other| {
+                other.service_id == reference.service_id && other.mode == reference.mode
+            })
         })
 }
 
@@ -1645,7 +1776,11 @@ fn same_references(left: &[FacetServiceReference], right: &[FacetServiceReferenc
 struct RegistryKeyedSource(Rc<LocalKeyedServiceRegistry>);
 
 impl KeyedSource for RegistryKeyedSource {
-    fn observe(&self, service: &Service, handler: KeyedServiceHandler) -> Result<Unsubscribe, ChordError> {
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedServiceHandler,
+    ) -> Result<Unsubscribe, ChordError> {
         LocalKeyedServiceRegistry::observe(&self.0, service, handler)
     }
 }
@@ -1656,7 +1791,11 @@ impl KeyedSource for RegistryKeyedSource {
 struct SourceKeyedSource(Rc<dyn RemoteServices>);
 
 impl KeyedSource for SourceKeyedSource {
-    fn observe(&self, service: &Service, handler: KeyedServiceHandler) -> Result<Unsubscribe, ChordError> {
+    fn observe(
+        &self,
+        service: &Service,
+        handler: KeyedServiceHandler,
+    ) -> Result<Unsubscribe, ChordError> {
         let handler = Rc::new(handler);
         let wrapped: crate::types::KeyedViewHandler =
             Rc::new(move |view, context| handler(ServiceTarget::View(view), context));
@@ -1667,7 +1806,10 @@ impl KeyedSource for SourceKeyedSource {
 fn assert_service_target_access(core: &KernelCore) -> Result<(), ChordError> {
     if !matches!(
         core.phase.get(),
-        GenerationPhase::Activating | GenerationPhase::Active | GenerationPhase::Reloading | GenerationPhase::Disposing
+        GenerationPhase::Activating
+            | GenerationPhase::Active
+            | GenerationPhase::Reloading
+            | GenerationPhase::Disposing
     ) {
         return Err(ChordError::Message(format!(
             "Facet service targets cannot be used during {}",
@@ -1697,7 +1839,11 @@ fn requirement_source(
         .collect();
     match deferred.len() {
         0 => Ok(None),
-        1 => Ok(Some((requirement.service_id.clone(), requirement.mode, deferred[0]))),
+        1 => Ok(Some((
+            requirement.service_id.clone(),
+            requirement.mode,
+            deferred[0],
+        ))),
         _ => Err(ChordError::Message(format!(
             "Facet host service {} has more than one deferred source",
             requirement.service_id
@@ -1736,7 +1882,11 @@ fn validate_facets(
                     "Service {service_id} is provided by both {provider_facet:?} and {facet_id}"
                 )));
             }
-            providers.push((provision.service_id.clone(), Some(facet_id.clone()), Some(provision.mode)));
+            providers.push((
+                provision.service_id.clone(),
+                Some(facet_id.clone()),
+                Some(provision.mode),
+            ));
         }
     }
 
@@ -1780,7 +1930,10 @@ fn validate_facets(
                 reason = "every facet id was seeded into both maps before this loop"
             )]
             {
-                dependencies.get_mut(facet_id).expect("seeded").insert(provider_facet.clone());
+                dependencies
+                    .get_mut(facet_id)
+                    .expect("seeded")
+                    .insert(provider_facet.clone());
                 dependents
                     .get_mut(provider_facet)
                     .expect("registered when staged")
