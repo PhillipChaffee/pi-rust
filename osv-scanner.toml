@@ -1,0 +1,11 @@
+# Overrides for osv-scanner, consulted when scanning this directory (the
+# Cargo.lock's directory). Rule of the house: every override carries its
+# reason, and it comes off when the condition it papers over disappears.
+
+# Unpublished workspace crates resolve as UNKNOWN from the lockfile because
+# crates.io has no metadata for them; each member's manifest declares its
+# license. Add one override per new workspace crate.
+[[PackageOverrides]]
+name = "pi-telemetry"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/telemetry/Cargo.toml"

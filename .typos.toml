@@ -4,3 +4,7 @@
 [default.extend-identifiers]
 recieve = "recieve"
 calender = "calender"
+# ratatui is the TUI crate's actual name; the port decision cites it.
+ratatui = "ratatui"
+# evn is the macro variable binding an event's name.
+evn = "evn"
