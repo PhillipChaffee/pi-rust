@@ -206,6 +206,15 @@ impl JsonValue {
         }
     }
 
+    /// The boolean, or [`None`] when this is not a boolean.
+    #[must_use]
+    pub const fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(flag) => Some(*flag),
+            _ => None,
+        }
+    }
+
     /// Whether the value is a container: an array or an object.
     ///
     /// Upstream spells this `isObj`; every walk, diff, and resolve branches on
@@ -809,4 +818,59 @@ pub trait FacetLoader {
     fn load(
         &self,
     ) -> crate::future::LocalBoxFuture<Result<LoadedFacets, crate::errors::ChordError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::Context;
+    use crate::test_support::{jb, jn, js};
+
+    #[test]
+    fn spells_json_shapes_and_escapes_control_characters() {
+        assert_eq!(JsonValue::string("text"), js("text"));
+        assert_eq!(jn(1.0).as_number(), Some(1.0));
+        assert_eq!(js("x").as_number(), None);
+        let mut null = JsonValue::Null;
+        assert!(null.as_object_mut().is_none());
+        assert_eq!(JsonValue::Null.to_json_string(), "null");
+        assert_eq!(jb(true).to_json_string(), "true");
+        assert_eq!(jb(false).to_json_string(), "false");
+        assert_eq!(
+            js("quote\"back\\newline\nreturn\rtab\tbackspace\u{08}form\u{0C}unit\u{01}")
+                .to_json_string(),
+            "\"quote\\\"back\\\\newline\\nreturn\\rtab\\tbackspace\\bform\\funit\\u0001\""
+        );
+    }
+
+    #[test]
+    fn spells_the_vocabulary_debug_surfaces() {
+        let snapshot = ServiceSubscriptionSnapshot {
+            mode: ServiceMode::Singleton,
+            service_id: "test.subscription".to_string(),
+            instances: Vec::new(),
+        };
+        let subscription = ServiceSubscription {
+            snapshot,
+            activate: Box::new(|| Ok(())),
+            close: Box::new(|_context: Option<Context>| Box::pin(std::future::ready(Ok(())))),
+        };
+        assert!(format!("{subscription:?}").contains("test.subscription"));
+        let options = RemoteServiceSourceOpenOptions {
+            services: Vec::new(),
+            assert_access: crate::handle::allow_access(),
+            on_error: crate::handle::no_error_reporter(),
+        };
+        assert!(format!("{options:?}").contains("services"));
+        let facet = FacetDef {
+            id: "test.facet".to_string(),
+            setup: Rc::new(|_env: &mut crate::facets::host::FacetEnvironment| ()),
+        };
+        assert!(format!("{facet:?}").contains("test.facet"));
+        let loaded = LoadedFacets {
+            facets: vec![facet],
+            dispose: crate::handle::sync_disposal(|| Ok(())),
+        };
+        assert!(format!("{loaded:?}").contains("test.facet"));
+    }
 }

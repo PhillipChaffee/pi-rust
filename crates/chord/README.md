@@ -21,8 +21,10 @@ so the port replaces facet execution with a deliberately open seam:
 loader registry, and the manifest, artifact, integrity, and resolution
 machinery ports as data validation (`node::manifest`, `node::bundle`,
 `node::package`). The esbuild and `node:vm` pipeline itself is not ported;
-upstream's five real-esbuild bundle test cases stay unported until the
-extension-mechanism decision lands.
+the bundling pipeline runs over built sources, the packaging pipeline
+carries the package.json conventions 1:1, and the ported bundle suite
+(`tests/bundle.rs`) drives the loader seam through a fixture module host
+whose program language stands in for the extension mechanism's.
 
 ## The string-segment contract
 

@@ -140,9 +140,11 @@ pub async fn bundle_facet_package(
     let metadata = read_facet_package_metadata(&options.package_path)?;
     let mut entries: Vec<(String, FacetEntrySource)> = Vec::new();
     for (name, source) in &options.default_facets {
-        let path = resolve(&metadata.package_directory, Path::new(source));
+        validate_facet_mapping(name, source, "default")?;
+        let path = resolve_package_entry(&metadata.package_directory, source, name)?;
         match std::fs::read_to_string(&path) {
             Ok(text) => {
+                validate_canonical_package_entry(&metadata.package_directory, &path, name)?;
                 entries.push((
                     name.clone(),
                     FacetEntrySource {
@@ -169,14 +171,15 @@ pub async fn bundle_facet_package(
         let FacetSource::File(relative) = source else {
             continue;
         };
-        let path = resolve(&metadata.package_directory, Path::new(relative));
-        validate_package_entry(&metadata.package_directory, &path, name)?;
+        validate_facet_mapping(name, relative, "configured")?;
+        let path = resolve_package_entry(&metadata.package_directory, relative, name)?;
         let text = std::fs::read_to_string(&path).map_err(|error| {
             ChordError::Message(format!(
                 "Could not access configured facet entry {name}: {}: {error}",
                 path.display()
             ))
         })?;
+        validate_canonical_package_entry(&metadata.package_directory, &path, name)?;
         entries.retain(|(entry_name, _)| entry_name != name);
         entries.push((
             name.clone(),
@@ -193,18 +196,6 @@ pub async fn bundle_facet_package(
             metadata.name
         )));
     }
-    #[allow(
-        clippy::collection_is_never_read,
-        reason = "the merged set mirrors upstream's externalImports assembly and is only mutated until the entries carry it; deleting it would strand the metadata fields"
-    )]
-    let mut external: Vec<String> = metadata
-        .peer_dependencies
-        .iter()
-        .chain(metadata.external.iter())
-        .cloned()
-        .collect();
-    external.sort_unstable();
-    external.dedup();
     let result = bundle_facets(BundleFacetsOptions {
         plugin: FacetBundlePlugin {
             id: metadata.name.clone(),
@@ -264,14 +255,7 @@ struct PackageMetadata {
     package_json_path: PathBuf,
     name: String,
     version: String,
-    peer_dependencies: Vec<String>,
     configured_facets: Vec<(String, FacetSource)>,
-    external: Vec<String>,
-    #[allow(
-        dead_code,
-        reason = "the source map flag rides the metadata the builder seam consumes"
-    )]
-    source_map: bool,
 }
 
 fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, ChordError> {
@@ -343,72 +327,125 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
             package_json_path.display()
         ))
     })?;
-    let peer_dependencies = object
-        .get("peerDependencies")
-        .and_then(JsonValue::as_object)
-        .map_or_else(Vec::new, |peer| {
-            let mut names: Vec<String> = peer
-                .keys()
-                .filter(|name| !name.is_empty())
-                .map(str::to_string)
-                .collect();
-            names.sort_unstable();
-            names
-        });
-    let (configured_facets, external, _source_map) =
-        parse_chord_configuration(object, &package_json_path);
+    validate_peer_dependencies(object, &package_json_path)?;
+    let configured_facets = parse_chord_configuration(object, &package_json_path)?;
     Ok(PackageMetadata {
         package_directory,
         package_json_path,
         name: name.to_string(),
         version: version.to_string(),
-        peer_dependencies,
         configured_facets,
-        external,
-        source_map: true,
     })
 }
 
+/// Validates the `peerDependencies` record upstream's metadata reader
+/// requires: an object whose entries are all `(non-empty name, string
+/// version)`. The sorted names only fed upstream's esbuild external
+/// marking, which the built-source seam owns, so the port validates the
+/// record and discards the names.
+fn validate_peer_dependencies(
+    object: &JsonObject,
+    package_json_path: &Path,
+) -> Result<(), ChordError> {
+    let Some(peer) = object.get("peerDependencies") else {
+        return Ok(());
+    };
+    let invalid = || {
+        ChordError::Message(format!(
+            "Facet package has invalid peerDependencies: {}",
+            package_json_path.display()
+        ))
+    };
+    let peer = peer.as_object().ok_or_else(invalid)?;
+    for (name, version) in peer.iter() {
+        if name.is_empty() || version.as_str().is_none() {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// Parses the `chord` configuration object, upstream's
+/// `parseChordConfiguration`: the facet set with `false` removals, the
+/// external specifiers, and the source-map flag, each validated. The
+/// external specifiers and the source-map flag only fed the esbuild build
+/// the built-source seam replaces, so the port validates them and carries
+/// just the facet set.
+///
+/// # Errors
+/// [`ChordError`] when the configuration object, a facet entry, the
+/// external list, or the source-map flag is invalid.
 fn parse_chord_configuration(
     object: &JsonObject,
     package_json_path: &Path,
-) -> (Vec<(String, FacetSource)>, Vec<String>, bool) {
-    let Some(chord) = object.get("chord").and_then(JsonValue::as_object) else {
-        return (Vec::new(), Vec::new(), true);
+) -> Result<Vec<(String, FacetSource)>, ChordError> {
+    let Some(chord) = object.get("chord") else {
+        return Ok(Vec::new());
     };
+    let chord = chord.as_object().ok_or_else(|| {
+        ChordError::Message(format!(
+            "Facet package chord configuration must be an object: {}",
+            package_json_path.display()
+        ))
+    })?;
+    for key in chord.keys() {
+        if key != "facets" && key != "external" && key != "sourceMap" {
+            return Err(ChordError::Message(format!(
+                "Facet package chord configuration has an unknown field: {}",
+                package_json_path.display()
+            )));
+        }
+    }
     let mut configured_facets: Vec<(String, FacetSource)> = Vec::new();
-    if let Some(facets) = chord.get("facets").and_then(JsonValue::as_object) {
+    if let Some(facets) = chord.get("facets") {
+        let facets = facets.as_object().ok_or_else(|| {
+            ChordError::Message(format!(
+                "Facet package chord.facets must be an object: {}",
+                package_json_path.display()
+            ))
+        })?;
         for (name, source) in facets.iter() {
+            let source = match source {
+                JsonValue::Bool(false) => FacetSource::Removed,
+                JsonValue::Str(text) if !text.is_empty() => FacetSource::File(text.clone()),
+                _ => return Err(invalid_chord_facets_entry(package_json_path)),
+            };
             if name.is_empty() {
-                continue;
+                return Err(invalid_chord_facets_entry(package_json_path));
             }
-            match source {
-                JsonValue::Bool(false) => {
-                    configured_facets.push((name.to_string(), FacetSource::Removed));
-                }
-                JsonValue::Str(source) => {
-                    configured_facets.push((name.to_string(), FacetSource::File(source.clone())));
-                }
-                _ => {}
+            configured_facets.push((name.to_string(), source));
+        }
+    }
+    if let Some(items) = chord.get("external") {
+        let invalid = || {
+            ChordError::Message(format!(
+                "Facet package chord.external must contain non-empty strings: {}",
+                package_json_path.display()
+            ))
+        };
+        let items = items.as_array().ok_or_else(invalid)?;
+        for item in items {
+            if item.as_str().is_none_or(str::is_empty) {
+                return Err(invalid());
             }
         }
     }
-    let mut external: Vec<String> = chord
-        .get("external")
-        .and_then(JsonValue::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(JsonValue::as_str)
-                .filter(|specifier| !specifier.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    external.sort_unstable();
-    external.dedup();
-    let _ = package_json_path;
-    (configured_facets, external, true)
+    if let Some(source_map) = chord.get("sourceMap")
+        && source_map.as_bool().is_none()
+    {
+        return Err(ChordError::Message(format!(
+            "Facet package chord.sourceMap must be a boolean: {}",
+            package_json_path.display()
+        )));
+    }
+    Ok(configured_facets)
+}
+
+fn invalid_chord_facets_entry(package_json_path: &Path) -> ChordError {
+    ChordError::Message(format!(
+        "Facet package has an invalid chord.facets entry: {}",
+        package_json_path.display()
+    ))
 }
 
 fn validate_options(options: &BundleFacetsOptions) -> Result<(), ChordError> {
@@ -549,19 +586,85 @@ fn string_field<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
     }
 }
 
-fn validate_package_entry(
+/// Validates a facet mapping's name and source, upstream's
+/// `validateFacetMapping`.
+///
+/// # Errors
+/// [`ChordError`] when the name or the source path is empty.
+fn validate_facet_mapping(name: &str, source: &str, kind: &str) -> Result<(), ChordError> {
+    if name.is_empty() {
+        return Err(ChordError::Message(format!(
+            "Facet package {kind} entry name must not be empty"
+        )));
+    }
+    if source.is_empty() {
+        return Err(ChordError::Message(format!(
+            "Facet package {kind} entry {name} must have a source path"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolves one facet entry source against the package directory and
+/// rejects absolute sources and paths that escape it, upstream's
+/// `resolvePackageEntry`.
+///
+/// # Errors
+/// [`ChordError`] when the source is absolute or resolves outside the
+/// package directory.
+fn resolve_package_entry(
+    package_directory: &Path,
+    source: &str,
+    name: &str,
+) -> Result<PathBuf, ChordError> {
+    if Path::new(source).is_absolute() {
+        return Err(ChordError::Message(format!(
+            "Facet package entry {name} must be relative to the package directory"
+        )));
+    }
+    let path = package_directory.join(source);
+    let relative = path.strip_prefix(package_directory).map_err(|_| {
+        ChordError::Message(format!(
+            "Facet package entry {name} escapes the package directory"
+        ))
+    })?;
+    if relative.as_os_str().is_empty() || relative == Path::new("..") || relative.starts_with("..")
+    {
+        return Err(ChordError::Message(format!(
+            "Facet package entry {name} escapes the package directory"
+        )));
+    }
+    Ok(path)
+}
+
+/// Validates the entry's canonical path stays inside the package directory,
+/// rejecting symlink escapes, upstream's `validateCanonicalPackageEntry`.
+/// The package directory is already canonical, so the canonicalized entry
+/// is compared against it directly.
+///
+/// # Errors
+/// [`ChordError`] when the canonical path cannot be resolved or resolves
+/// outside the package directory.
+fn validate_canonical_package_entry(
     package_directory: &Path,
     path: &Path,
     name: &str,
 ) -> Result<(), ChordError> {
-    let relative = path.strip_prefix(package_directory).map_err(|_| {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        ChordError::Message(format!(
+            "Could not resolve facet package entry {name}: {}: {error}",
+            path.display()
+        ))
+    })?;
+    let relative = canonical.strip_prefix(package_directory).map_err(|_| {
         ChordError::Message(format!(
             "Facet package entry {name} resolves outside the package directory"
         ))
     })?;
-    if relative.as_os_str().is_empty() {
+    if relative.as_os_str().is_empty() || relative == Path::new("..") || relative.starts_with("..")
+    {
         return Err(ChordError::Message(format!(
-            "Facet package entry {name} escapes the package directory"
+            "Facet package entry {name} resolves outside the package directory"
         )));
     }
     Ok(())

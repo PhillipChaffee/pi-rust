@@ -19,7 +19,7 @@ use crate::future::{LocalBoxFuture, boxed};
 use crate::node::manifest::{
     FACET_BUNDLE_ARTIFACT_FORMAT, FACET_BUNDLE_ARTIFACT_FORMAT_VERSION, FACET_BUNDLE_FORMAT,
     FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact,
-    FacetBundleManifest, read_facet_bundle_manifest, verify_source,
+    FacetBundleManifest, parse_json, read_facet_bundle_manifest, validate_manifest, verify_source,
 };
 use crate::types::{FacetDef, FacetLoader, LoadedFacets};
 
@@ -90,9 +90,6 @@ pub struct FacetBundleLoaderOptions {
     pub manifest_path: PathBuf,
     /// The opaque entry name to load.
     pub entry: String,
-    /// Whether the entry's integrity is verified before the module host
-    /// runs; defaults to true.
-    pub verify_integrity: bool,
     /// Resolves host-provided external imports.
     pub resolve_external: Option<FacetBundleExternalResolver>,
     /// The module host the verified source rides to.
@@ -104,7 +101,6 @@ impl std::fmt::Debug for FacetBundleLoaderOptions {
         f.debug_struct("FacetBundleLoaderOptions")
             .field("manifest_path", &self.manifest_path)
             .field("entry", &self.entry)
-            .field("verify_integrity", &self.verify_integrity)
             .finish_non_exhaustive()
     }
 }
@@ -197,14 +193,9 @@ pub fn read_facet_bundle_artifact(
 /// upstream's `createFacetBundleLoader`.
 #[must_use]
 pub fn create_facet_bundle_loader(options: FacetBundleLoaderOptions) -> FacetBundleLoader {
-    if options.entry.is_empty() {
-        // The constructor checks are the load-time errors upstream throws;
-        // the port reports them at load.
-    }
     FacetBundleLoader {
         manifest_path: options.manifest_path,
         entry: options.entry,
-        verify_integrity: options.verify_integrity,
         resolve_external: options.resolve_external,
         module_host: options.module_host,
     }
@@ -214,7 +205,6 @@ pub fn create_facet_bundle_loader(options: FacetBundleLoaderOptions) -> FacetBun
 pub struct FacetBundleLoader {
     manifest_path: PathBuf,
     entry: String,
-    verify_integrity: bool,
     resolve_external: Option<FacetBundleExternalResolver>,
     module_host: Rc<dyn FacetModuleHost>,
 }
@@ -224,7 +214,6 @@ impl std::fmt::Debug for FacetBundleLoader {
         f.debug_struct("FacetBundleLoader")
             .field("manifest_path", &self.manifest_path)
             .field("entry", &self.entry)
-            .field("verify_integrity", &self.verify_integrity)
             .finish_non_exhaustive()
     }
 }
@@ -233,7 +222,6 @@ impl FacetLoader for FacetBundleLoader {
     fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
         let manifest_path = self.manifest_path.clone();
         let entry = self.entry.clone();
-        let verify = self.verify_integrity;
         let resolver = self.resolve_external.clone();
         let host = self.module_host.clone();
         boxed(async move {
@@ -260,9 +248,7 @@ impl FacetLoader for FacetBundleLoader {
                         module_path.display()
                     ))
                 })?;
-                if verify {
-                    verify_source(&source, bundle_entry)?;
-                }
+                verify_source(&source, bundle_entry)?;
                 let facets = host.load(
                     &source,
                     &module_path,
@@ -289,17 +275,60 @@ impl FacetLoader for FacetBundleLoader {
 /// call, upstream's `createFacetBundleArtifactLoader`.
 ///
 /// # Errors
-/// [`ChordError`] when the artifact is invalid.
+/// [`ChordError`] when the artifact is invalid: a wrong format marker or
+/// version, an empty entry name, an invalid entry record, inconsistent
+/// source-map contents, or a source that fails its integrity check.
 pub fn create_facet_bundle_artifact_loader(
     options: FacetBundleArtifactLoaderOptions,
-) -> ArtifactFacetLoader {
-    ArtifactFacetLoader {
+) -> Result<ArtifactFacetLoader, ChordError> {
+    validate_artifact(&options.artifact)?;
+    Ok(ArtifactFacetLoader {
         artifact: options.artifact,
         temporary_parent: options
             .temporary_directory
             .unwrap_or_else(std::env::temp_dir),
         resolve_external: options.resolve_external,
         module_host: options.module_host,
+    })
+}
+
+/// Validates a transported artifact at construction, upstream's
+/// `validateArtifact`: the format markers, the single-entry manifest shape,
+/// source-map content consistency, and the entry's integrity against its
+/// declared source.
+///
+/// # Errors
+/// [`ChordError`] with upstream's artifact-validation messages.
+fn validate_artifact(artifact: &FacetBundleArtifact) -> Result<(), ChordError> {
+    if artifact.format != FACET_BUNDLE_ARTIFACT_FORMAT
+        || artifact.format_version != FACET_BUNDLE_ARTIFACT_FORMAT_VERSION
+        || artifact.entry_name.is_empty()
+    {
+        return Err(ChordError::Message(
+            "Invalid facet bundle artifact".to_string(),
+        ));
+    }
+    let manifest_text = crate::node::bundle::manifest_to_json_text(&FacetBundleManifest {
+        format: FACET_BUNDLE_FORMAT.to_string(),
+        format_version: FACET_BUNDLE_FORMAT_VERSION,
+        plugin: artifact.plugin.clone(),
+        entries: vec![(artifact.entry_name.clone(), artifact.entry.clone())],
+    });
+    let parsed = parse_json(&manifest_text, "Invalid facet bundle artifact".to_string())?;
+    let manifest = validate_manifest(&parsed, "facet bundle artifact")?;
+    let Some(entry) = manifest.entry(&artifact.entry_name) else {
+        return Err(ChordError::Message(
+            "Invalid facet bundle artifact".to_string(),
+        ));
+    };
+    match (&entry.source_map, &artifact.source_map_contents) {
+        (None, Some(_)) => Err(ChordError::Message(
+            "Facet bundle artifact has source map contents without a source map".to_string(),
+        )),
+        (Some(_), None) => Err(ChordError::Message(
+            "Facet bundle artifact is missing its source map contents".to_string(),
+        )),
+        _ => verify_source(&artifact.source, entry),
     }
 }
 
@@ -346,6 +375,16 @@ impl ArtifactFacetLoader {
             .map_err(|error| {
                 ChordError::Message(format!("Could not materialize facet artifact: {error}"))
             })?;
+            if let (Some(source_map), Some(contents)) = (
+                &self.artifact.entry.source_map,
+                &self.artifact.source_map_contents,
+            ) {
+                std::fs::write(directory.join(source_map), contents).map_err(|error| {
+                    ChordError::Message(format!(
+                        "Could not materialize facet artifact source map: {error}"
+                    ))
+                })?;
+            }
             let manifest = crate::node::bundle::manifest_to_json_text(&FacetBundleManifest {
                 format: FACET_BUNDLE_FORMAT.to_string(),
                 format_version: FACET_BUNDLE_FORMAT_VERSION,
@@ -365,22 +404,23 @@ impl ArtifactFacetLoader {
             let loader = FacetBundleLoader {
                 manifest_path: directory.join(FACET_BUNDLE_MANIFEST_FILE),
                 entry: self.artifact.entry_name.clone(),
-                verify_integrity: true,
                 resolve_external: self.resolve_external.clone(),
                 module_host: self.module_host.clone(),
             };
             Ok(settle(loader.load()))
         })();
         let loaded = match result {
-            Ok(loaded) => loaded,
-            Err(error) => {
+            Ok(Ok(loaded)) => loaded,
+            // A failed load cleans its generation directory up, upstream's
+            // catch-and-cleanup around the artifact load.
+            Ok(Err(error)) | Err(error) => {
                 let _ = std::fs::remove_dir_all(&directory);
                 return Err(error);
             }
         };
         let dispose_directory = directory;
         Ok(LoadedFacets {
-            facets: loaded?.facets,
+            facets: loaded.facets,
             dispose: Box::new(move || {
                 boxed(async move {
                     if let Err(error) = std::fs::remove_dir_all(&dispose_directory) {
