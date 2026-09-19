@@ -438,7 +438,7 @@ mod dispatch {
             TuiMouseEventResult {
                 handled: true,
                 target: Some(TuiMouseDispatchTarget {
-                    component: Rc::clone(&inner),
+                    component: inner.clone(),
                     origin_x: 7,
                     origin_y: 8,
                     width: 3,
@@ -754,7 +754,7 @@ mod cancellable_loader_component {
                 interval_ms: None,
             }),
         );
-        let slot = Rc::clone(&aborts);
+        let slot = aborts.clone();
         loader.set_on_abort(Some(std::boxed::Box::new(move || slot.set(slot.get() + 1))));
         (loader, aborts)
     }

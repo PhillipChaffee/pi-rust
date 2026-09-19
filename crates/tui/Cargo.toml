@@ -34,3 +34,10 @@ signal-hook = "0.4"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# vte: the headless terminal emulator behind the VirtualTerminal stand-in, the
+# survey's answer to upstream's @xterm/headless harness (survey flag 9); the
+# TUI-core overlay suites drive it before the harness ticket (#45) formalizes
+# the port.
+vte = "0.15.0"
