@@ -1,0 +1,46 @@
+[package]
+name = "pi-chord"
+version = "0.1.0"
+edition = "2024"
+description = "Application composition runtime for services, replicated state, RPC, and plugins, ported from @earendil-works/chord"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["services", "rpc", "replication", "facets", "plugins"]
+categories = ["development-tools", "development-tools::build-utils"]
+
+# Upstream packages/chord imports no other Pi workspace package and pins that
+# boundary with its own test; its one npm dependency (esbuild) belongs to the
+# JS bundling pipeline the port replaces with an in-process loader seam.
+# Keeping this table empty is the ported boundary, not a placeholder.
+[dependencies]
+
+[dev-dependencies]
+# The async runtime the TS event loop's concurrency cases port onto; chord
+# never re-exports it.
+tokio = { version = "1.47", default-features = false, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+# Cancellation tokens carry the Context cancellation port and per-observer
+# task cancellation; the `rt` feature is what its spawn helpers need.
+tokio-util = { version = "0.7", features = ["rt"] }
+# Test-only: the crate owns its JsonValue enum to keep `Number.isFinite`
+# semantics and the hostile-payload restatement, so serde types cannot leak
+# into the public API.
+serde_json = "1"
+# Artifact-integrity fixtures for the node bundle tests; node/manifest.rs
+# promotes this to a runtime dependency when real verification lands there.
+sha2 = "0.10"
+# Seeded generators for the property tests; the LCG case hand-rolls its own
+# generator, so rand covers only the `Math.random` round-trip.
+rand = "0.9"
+# Manifest and artifact tests need real files on disk, matching upstream's
+# real-fs test style.
+tempfile = "3"
+
+[lints]
+workspace = true
