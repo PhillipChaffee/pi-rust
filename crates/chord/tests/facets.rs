@@ -2419,3 +2419,184 @@ fn keeps_the_old_generation_active_when_replacement_activation_fails_before_cuto
         );
     });
 }
+
+#[test]
+fn fences_generation_construction_and_reloads() {
+    let rt = rt();
+    rt.block_on(async {
+        let source = source_service();
+        let noop = |env: &mut FacetEnvironment| {
+            let _ = env;
+        };
+
+        // Facet IDs must be unique and non-empty within a generation.
+        let error = create_facet_host(FacetKernelOptions {
+            facets: vec![facet("twin", noop), facet("twin", noop)],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect_err("duplicate facet IDs reject");
+        assert!(error_message(&error).contains("must be unique within a generation"));
+        let error = create_facet_host(FacetKernelOptions {
+            facets: vec![facet("", noop)],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect_err("an empty facet ID rejects");
+        assert!(error_message(&error).contains("Facet ID must not be empty"));
+
+        // A live host rejects reloads that break those rules or touch unknown
+        // facets.
+        let provider = facet("provider", {
+            let source = source.clone();
+            move |env| {
+                env.provide(&source, read_implementation("value"))
+                    .expect("provide lands");
+            }
+        });
+        let consumer = facet("consumer", {
+            let source = source.clone();
+            move |env| {
+                let _handle = env.use_service(&source).expect("use lands");
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![provider, consumer],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("host: {e}"));
+        assert!(format!("{host:?}").starts_with("FacetHost"));
+        let options = FacetKernelOptions {
+            facets: Vec::new(),
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        };
+        assert!(format!("{options:?}").contains("facets"));
+
+        let error = host
+            .reload(vec![facet("unknown", noop)])
+            .await
+            .expect_err("an unknown facet rejects the reload");
+        assert!(error_message(&error).contains("is not active"));
+        let error = host
+            .reload(vec![facet("twin", noop), facet("twin", noop)])
+            .await
+            .expect_err("a duplicate reload rejects");
+        assert!(error_message(&error).contains("must be unique"));
+        let error = host
+            .reload(vec![facet("", noop)])
+            .await
+            .expect_err("an empty reload ID rejects");
+        assert!(error_message(&error).contains("must not be empty"));
+
+        // Disposal settles once; a dead host accepts the second disposal and
+        // rejects further service access.
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("second dispose: {e}"));
+        let error = host
+            .services()
+            .expect_err("a disposed host has no provider");
+        assert!(error_message(&error).contains("not assembled"));
+    });
+}
+
+#[test]
+fn keyed_spawners_fence_their_instances() {
+    let rt = rt();
+    rt.block_on(async {
+        let dialogs = local_keyed_service();
+
+        // An empty instance key rejects at activation.
+        let empty = facet("empty-key", {
+            let dialogs = dialogs.clone();
+            move |env| {
+                let values = env.provide_many(&dialogs).expect("provide_many lands");
+                env.on_activate(Box::new(move |_env: &mut FacetEnvironment| {
+                    let error = values.spawn("", read_implementation("value"));
+                    let error = error.err().expect("an empty key rejects");
+                    assert!(error_message(&error).contains("key must not be empty"));
+                    boxed(async { Ok(()) })
+                }));
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![empty],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("host: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        // A repeated live key rejects.
+        let duplicate = facet("duplicate-key", {
+            let dialogs = dialogs.clone();
+            move |env| {
+                let values = env.provide_many(&dialogs).expect("provide_many lands");
+                env.on_activate(Box::new(move |_env: &mut FacetEnvironment| {
+                    values
+                        .spawn("current", read_implementation("value"))
+                        .expect("spawn lands");
+                    let error = values
+                        .spawn("current", read_implementation("value"))
+                        .err()
+                        .expect("a repeated live key rejects");
+                    assert!(
+                        error_message(&error).contains("already has a live instance"),
+                        "{error}"
+                    );
+                    boxed(async { Ok(()) })
+                }));
+            }
+        });
+        let host = create_facet_host(FacetKernelOptions {
+            facets: vec![duplicate],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("host: {e}"));
+        host.dispose()
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+    });
+}
+
+#[test]
+fn startup_failures_aggregate_with_cleanup_failures() {
+    let rt = rt();
+    rt.block_on(async {
+        // A facet whose activation fails and whose teardown fails as well
+        // aggregates both, upstream's aggregate over cleanup errors.
+        let failing = facet("failing", |env| {
+            env.on_activate(Box::new(|_env: &mut FacetEnvironment| {
+                boxed(async { Err(ChordError::Message("activation failed".to_string())) })
+            }));
+            env.on_deactivate(Box::new(|| {
+                boxed(async { Err(ChordError::Message("cleanup failed".to_string())) })
+            }));
+        });
+        let error = create_facet_host(FacetKernelOptions {
+            facets: vec![failing],
+            service_sources: Vec::new(),
+            on_error: pi_chord::handle::no_error_reporter(),
+        })
+        .await
+        .expect_err("a failing activation rejects the host");
+        let message = error_message(&error);
+        assert!(
+            message.contains("startup and cleanup failed"),
+            "the failures aggregate: {message}"
+        );
+    });
+}

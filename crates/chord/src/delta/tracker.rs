@@ -893,7 +893,7 @@ fn sync_into(baseline: &mut JsonValue, root: &JsonValue, node: &DirtyNode) {
 mod tests {
     use super::*;
     use crate::delta::codec::{decoder, encoder};
-    use crate::delta::{PathRef, WireOp, is_base};
+    use crate::delta::{PathRef, WireOp, is_base, track};
     use crate::test_support::{applied, idx, ja, jb, jn, jo, js, key, ok, some};
 
     fn pad() -> JsonValue {
@@ -2254,5 +2254,235 @@ mod tests {
         // Most random pairs are shape-incompatible and skipped; this only
         // guards against the loop silently checking nothing.
         assert!(checked > 200);
+    }
+
+    fn rejection(message: &str, run: impl FnOnce() -> Result<(), TrackerError>) {
+        let Err(error) = run() else {
+            unreachable!("the case's mutation rejects")
+        };
+        assert!(error.to_string().contains(message), "{error}");
+    }
+
+    #[test]
+    fn spells_tracker_errors() {
+        assert_eq!(TrackerError::TypeError("no".to_string()).to_string(), "no");
+        let error: TrackerError = UnsafePathError {
+            segment: key("__proto__"),
+        }
+        .into();
+        assert_eq!(error.to_string(), "unsafe path segment: __proto__");
+    }
+
+    #[test]
+    fn rejects_type_mismatches_on_the_typed_surface() {
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0)]))]));
+        rejection("cannot be assigned through set", || t.set(&[], jn(1.0)));
+        rejection("tracked root cannot be deleted", || t.delete(&[]));
+        rejection("tracked arrays are addressed by index", || {
+            t.set(&[key("xs"), key("a")], jn(1.0))
+        });
+        rejection("the tracked value at", || {
+            t.set(&[idx(9), key("a")], jn(1.0))
+        });
+        rejection("the tracked parent is not a container", || {
+            t.set(&[key("xs"), idx(0), key("a")], jn(1.0))
+        });
+        let mut t = track(jo(vec![("object", jo(vec![]))]));
+        rejection("tracked objects are addressed by key", || {
+            t.set(&[key("object"), idx(0)], jn(1.0))
+        });
+        rejection("the tracked value at", || {
+            t.set(&[idx(0), key("a")], jn(1.0))
+        });
+        // The array-trap surface rejects object containers, one trap at a time.
+        let mut t = track(jo(vec![("object", jo(vec![]))]));
+        rejection("push runs on an array", || {
+            t.push(&[key("object")], vec![jn(1.0)]).map(|_| ())
+        });
+        rejection("unshift runs on an array", || {
+            t.unshift(&[key("object")], vec![jn(1.0)]).map(|_| ())
+        });
+        rejection("pop runs on an array", || {
+            t.pop(&[key("object")]).map(|_| ())
+        });
+        rejection("shift runs on an array", || {
+            t.shift(&[key("object")]).map(|_| ())
+        });
+        rejection("splice runs on an array", || {
+            t.splice(&[key("object")], 0, 0, &[jn(1.0)]).map(|_| ())
+        });
+        rejection("length runs on an array", || {
+            t.set_length(&[key("object")], 0)
+        });
+        rejection("sort runs on an array", || t.sort(&[key("object")]));
+        rejection("reverse runs on an array", || t.reverse(&[key("object")]));
+        rejection("fill runs on an array", || {
+            t.fill(&[key("object")], jn(1.0))
+        });
+        rejection("copyWithin runs on an array", || {
+            t.copy_within(&[key("object")], 0, 1, 1)
+        });
+        // Deleting through an array value's index would create a sparse array,
+        // and deleting a property under an array resolves to nothing.
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0)]))]));
+        rejection("delete would create a sparse array", || {
+            t.delete(&[key("xs"), idx(0)])
+        });
+        rejection("the tracked value at", || t.delete(&[idx(0), key("a")]));
+        rejection("delete would create a sparse array", || {
+            t.delete(&[key("xs"), idx(0), key("a")])
+        });
+        rejection("delete would create a sparse array", || t.delete(&[idx(0)]));
+    }
+
+    #[test]
+    fn set_into_arrays_marks_within_and_beyond_appends() {
+        // A sparse write beyond the current length rejects with the index.
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0)]))]));
+        rejection("unsafe path segment: 3", || {
+            t.set(&[key("xs"), idx(3)], jn(1.0))
+        });
+
+        // Writing at an index inside an already-marked append range skips a
+        // second mark: the append diff already covers it.
+        let mut t = track(jo(vec![("xs", ja(Vec::new()))]));
+        ok(t.push(&[key("xs")], vec![jn(1.0), jn(2.0), jn(3.0)]));
+        ok(t.set(&[key("xs"), idx(1)], jn(9.0)));
+        let ops = t.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("xs", ja(Vec::new()))])), ops.clone()),
+            t.value().clone()
+        );
+        // The append covers both the push and the overwrite.
+        assert!(
+            ops.len() == 1,
+            "the overwrite inside an append stays part of the append: {ops:?}"
+        );
+
+        // Popping outside an append batch marks the array.
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0), jn(2.0)]))]));
+        ok(t.push(&[key("xs")], vec![jn(3.0)]));
+        let _ = t.flush();
+        assert_eq!(ok(t.pop(&[key("xs")])), Some(jn(3.0)));
+        let ops = t.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("xs", ja(vec![jn(1.0), jn(2.0)]))])), ops),
+            t.value().clone()
+        );
+
+        // An empty array shifts to nothing.
+        let mut t = track(jo(vec![("xs", ja(Vec::new()))]));
+        assert_eq!(ok(t.shift(&[key("xs")])), None);
+        let base = jo(vec![("xs", ja(Vec::new()))]);
+        assert_eq!(applied(Some(base), t.flush()), t.value().clone());
+        assert_eq!(t.flush(), Vec::new());
+    }
+
+    #[test]
+    fn set_length_marks_within_and_across_appends() {
+        // Truncating into an append batch marks the array for diffing.
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0), jn(2.0)]))]));
+        ok(t.push(&[key("xs")], vec![jn(3.0)]));
+        ok(t.set_length(&[key("xs")], 1));
+        let ops = t.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("xs", ja(vec![jn(1.0), jn(2.0)]))])), ops),
+            t.value().clone()
+        );
+
+        // Truncating to nothing replaces the array.
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0)]))]));
+        ok(t.set_length(&[key("xs")], 0));
+        let ops = t.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("xs", ja(vec![jn(1.0)]))])), ops),
+            t.value().clone()
+        );
+
+        // Extending past the length fills with explicit nulls, upstream's
+        // null-filled growth.
+        ok(t.set_length(&[key("xs")], 2));
+        assert_eq!(
+            t.value()
+                .as_object()
+                .and_then(|object| object.get("xs"))
+                .and_then(JsonValue::as_array)
+                .cloned()
+                .unwrap_or_default(),
+            vec![JsonValue::Null, JsonValue::Null]
+        );
+    }
+
+    #[test]
+    fn copy_within_moves_elements_in_bounds() {
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0), jn(2.0), jn(3.0)]))]));
+        ok(t.copy_within(&[key("xs")], 0, 1, 2));
+        let xs = t
+            .value()
+            .as_object()
+            .and_then(|object| object.get("xs"))
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(xs, vec![jn(1.0), jn(1.0), jn(1.0)]);
+        // A source past the end stops the copy without failing.
+        ok(t.copy_within(&[key("xs")], 9, 0, 1));
+        // An overflow destination breaks the loop without failing.
+        ok(t.copy_within(&[key("xs")], 0, usize::MAX, 1));
+        // An overflow source breaks the loop without failing.
+        ok(t.copy_within(&[key("xs")], usize::MAX, 0, 1));
+        let ops = t.flush();
+        assert_eq!(
+            applied(
+                Some(jo(vec![("xs", ja(vec![jn(1.0), jn(2.0), jn(3.0)]))])),
+                ops
+            ),
+            t.value().clone()
+        );
+    }
+
+    #[test]
+    fn reconciles_flattened_and_reshaped_dirty_trees() {
+        // An append whose container is replaced by a non-array flattens to a
+        // value diff.
+        let mut t = track(jo(vec![("xs", ja(vec![jn(1.0)]))]));
+        ok(t.push(&[key("xs")], vec![jn(2.0)]));
+        let _ = t.flush();
+        t.replace_root(js("scalar"));
+        let ops = t.flush();
+        assert_eq!(applied(Some(js("scalar")), ops.clone()), js("scalar"));
+        assert!(is_base(&ops), "the replaced root re-bases: {ops:?}");
+
+        // A resolved child that vanished is removed during sync.
+        let mut t = track(jo(vec![("a", jo(vec![("b", jn(1.0))]))]));
+        ok(t.delete(&[key("a")]));
+        ok(t.set(&[key("b")], jn(2.0)));
+        let ops = t.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("a", jo(vec![("b", jn(1.0))]))])), ops),
+            t.value().clone()
+        );
+
+        // `track` and `track_with_options` build trackers with the same
+        // surface; the first flush re-bases the whole tree.
+        let mut factory_tracked = track(jo(vec![("n", jn(1.0))]));
+        ok(factory_tracked.set(&[key("n")], jn(2.0)));
+        let ops = factory_tracked.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("n", jn(1.0))])), ops),
+            factory_tracked.value().clone()
+        );
+        let mut bounded = crate::delta::track_with_options(
+            jo(vec![("t", js("text"))]),
+            TrackerOptions {
+                max_overlap_scan: Some(8),
+            },
+        );
+        append_text(&mut bounded, &[key("t")], "!");
+        let ops = bounded.flush();
+        assert_eq!(
+            applied(Some(jo(vec![("t", js("text"))])), ops),
+            bounded.value().clone()
+        );
     }
 }

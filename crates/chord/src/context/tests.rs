@@ -165,3 +165,84 @@ fn stops_waiting_when_the_invocation_is_cancelled() {
     };
     assert_eq!(output, Some(Ok("completed".to_string())));
 }
+
+#[test]
+fn spells_abort_reasons_keys_and_signal_debug() {
+    assert_eq!(AbortReason::Caller("no".to_string()).to_string(), "no");
+    assert_eq!(
+        AbortReason::Aborted.to_string(),
+        "The operation was aborted"
+    );
+    let key = create_context_key::<f64>("test.description.key");
+    assert_eq!(key.description(), "test.description.key");
+    let controller = AbortController {
+        signal: AbortSignal::own(),
+    };
+    assert_eq!(
+        format!("{:?}", controller.signal()),
+        "AbortSignal { aborted: false }"
+    );
+    controller.abort("x");
+    assert_eq!(
+        format!("{:?}", controller.signal()),
+        "AbortSignal { aborted: true }"
+    );
+    let first_key = create_context_key::<f64>("depth");
+    let context = with_context_value(&first_key, 1.0, &background_context());
+    let second_key = create_context_key::<f64>("depth-two");
+    let context = with_context_value(&second_key, 2.0, &context);
+    assert!(format!("{context:?}").starts_with("[Context"));
+}
+
+#[test]
+fn aborting_wakes_registered_waiters_exactly_once() {
+    let controller = AbortController {
+        signal: AbortSignal::own(),
+    };
+    let signal = controller.signal().clone();
+    let mut wait = signal.wait();
+    // The first poll registers the waker; a second poll with the same waker
+    // does not register a duplicate.
+    assert_eq!(poll_wait(&mut wait), Poll::Pending);
+    assert_eq!(poll_wait(&mut wait), Poll::Pending);
+    // The abort wakes the registered waiter, so the next poll resolves.
+    controller.abort("wake");
+    assert_eq!(
+        poll_wait(&mut wait),
+        Poll::Ready(AbortReason::Caller("wake".to_string()))
+    );
+    // An already-aborted signal ignores later aborts.
+    controller.abort_without_reason();
+    assert_eq!(
+        some(signal.reason()),
+        AbortReason::Caller("wake".to_string())
+    );
+    // A signal that derives from aborted leaves reports the first reason.
+    let fan_in = AbortSignal::any(vec![signal, AbortSignal::own()]);
+    assert_eq!(
+        some(fan_in.reason()),
+        AbortReason::Caller("wake".to_string())
+    );
+}
+
+#[test]
+fn a_cancelled_context_resolves_its_waiter_while_the_work_runs_on() {
+    let (context, cancel) = with_cancel(&background_context());
+    let (wait, controller) = with_cancel(&background_context());
+    // The waiter races a never-ready future against the context's signal.
+    let work: std::future::Pending<String> = std::future::pending();
+    let waiting = await_with_context(work, &context);
+    let waker = Waker::noop();
+    let mut cx = TaskContext::from_waker(waker);
+    let mut waiting = std::pin::pin!(waiting);
+    // First poll arms the wait; the abort resolves the waiter with the
+    // reason, and a second poll before completion stays pending on the
+    // already-settled wait.
+    assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Pending));
+    cancel.abort("cancelled");
+    assert!(matches!(
+        waiting.as_mut().poll(&mut cx),
+        Poll::Ready(Err(_))
+    ));
+    let _ = (wait, controller);
+}

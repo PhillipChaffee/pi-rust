@@ -894,3 +894,235 @@ fn decoded_instance_to_json(instance: &ServiceInstanceSnapshot) -> JsonValue {
     ));
     object(fields)
 }
+
+#[test]
+fn encodes_and_decodes_lifecycle_updates_over_the_state_codecs() {
+    // Unavailable round-trips and resets the codec registry.
+    let wire = expect_ok(encoder().encode_update(&ServiceProviderUpdate::Unavailable));
+    assert!(matches!(
+        wire,
+        pi_chord::services::wire::WireServiceProviderUpdate::Unavailable
+    ));
+    let decoded = expect_ok(decoder().decode_update(&wire));
+    assert!(matches!(decoded, ServiceProviderUpdate::Unavailable));
+
+    // Replaced snapshots round-trip method and state members.
+    let replaced = ServiceProviderUpdate::Replaced {
+        snapshot: ServiceInstanceSnapshot {
+            instance: None,
+            members: vec![
+                ServiceMemberSnapshot::Method {
+                    name: "read".to_string(),
+                },
+                ServiceMemberSnapshot::State {
+                    name: "state".to_string(),
+                    sequence: 2,
+                    ops: vec![Op::Replace(js("next"))],
+                },
+            ],
+        },
+    };
+    let wire = expect_ok(encoder().encode_update(&replaced));
+    let decoded = expect_ok(decoder().decode_update(&wire));
+    let ServiceProviderUpdate::Replaced { snapshot } = decoded else {
+        panic!("a replaced update decodes");
+    };
+    assert_eq!(snapshot.members.len(), 2);
+
+    // The codec surfaces carry debug spellings.
+    assert!(format!("{:?}", encoder()).starts_with("ServiceStateEncoder"));
+    assert!(format!("{:?}", decoder()).starts_with("ServiceStateDecoder"));
+
+    // Two snapshots naming the same state member reject at registration.
+    let duplicated = ServiceSubscriptionSnapshot {
+        service_id: "pi.models".to_string(),
+        mode: ServiceMode::Singleton,
+        instances: vec![ServiceInstanceSnapshot {
+            instance: None,
+            members: vec![
+                ServiceMemberSnapshot::State {
+                    name: "state".to_string(),
+                    sequence: 0,
+                    ops: vec![Op::Replace(js("one"))],
+                },
+                ServiceMemberSnapshot::State {
+                    name: "state".to_string(),
+                    sequence: 0,
+                    ops: vec![Op::Replace(js("one"))],
+                },
+            ],
+        }],
+    };
+    let error = expect_err(encoder().encode_snapshot(&duplicated));
+    assert!(error.to_string().contains("Duplicate service state"));
+
+    // State updates decode against the codec registration a snapshot built.
+    let address = ServiceInstanceAddress {
+        key: "instance".to_string(),
+        generation: 0,
+    };
+    let subscription = ServiceSubscriptionSnapshot {
+        service_id: "pi.models".to_string(),
+        mode: ServiceMode::Singleton,
+        instances: vec![ServiceInstanceSnapshot {
+            instance: Some(address.clone()),
+            members: vec![ServiceMemberSnapshot::State {
+                name: "state".to_string(),
+                sequence: 0,
+                ops: vec![Op::Replace(js("one"))],
+            }],
+        }],
+    };
+    let mut codec_encoder = encoder();
+    let snapshot_wire = expect_ok(codec_encoder.encode_snapshot(&subscription));
+    let mut receiving = decoder();
+    let _ = expect_ok(receiving.decode_snapshot(&snapshot_wire));
+    let state = ServiceProviderUpdate::State {
+        instance: Some(address.clone()),
+        member: "state".to_string(),
+        sequence: 1,
+        ops: vec![Op::Replace(js("two"))],
+    };
+    let state_wire = expect_ok(codec_encoder.encode_update(&state));
+    let decoded = expect_ok(receiving.decode_update(&state_wire));
+    let ServiceProviderUpdate::State { ops, .. } = decoded else {
+        panic!("a state update decodes");
+    };
+    assert_eq!(ops, vec![Op::Replace(js("two"))]);
+
+    // A state update the subscription never saw rejects on both sides.
+    let error = expect_err(codec_encoder.encode_update(&ServiceProviderUpdate::State {
+        instance: Some(address.clone()),
+        member: "unknown".to_string(),
+        sequence: 1,
+        ops: Vec::new(),
+    }));
+    assert!(error.to_string().contains("Unknown service state"));
+    let closed = ServiceProviderUpdate::Closed { instance: address };
+    let _ = expect_ok(codec_encoder.encode_update(&closed));
+}
+
+#[test]
+fn spells_the_codec_dictionary_isolation_on_the_method_members() {
+    // Method members carry no dictionary state; snapshots with both kinds
+    // round-trip through encode_snapshot / decode_snapshot.
+    let snapshot = ServiceSubscriptionSnapshot {
+        service_id: "pi.models".to_string(),
+        mode: ServiceMode::Keyed,
+        instances: vec![ServiceInstanceSnapshot {
+            instance: Some(ServiceInstanceAddress {
+                key: "dialog".to_string(),
+                generation: 1,
+            }),
+            members: vec![ServiceMemberSnapshot::Method {
+                name: "send".to_string(),
+            }],
+        }],
+    };
+    let wire = expect_ok(encoder().encode_snapshot(&snapshot));
+    let decoded = expect_ok(decoder().decode_snapshot(&wire));
+    assert_eq!(decoded.service_id, "pi.models");
+    assert_eq!(decoded.mode, ServiceMode::Keyed);
+    assert_eq!(decoded.instances.len(), 1);
+    assert!(matches!(
+        decoded.instances[0].members[0],
+        ServiceMemberSnapshot::Method { .. }
+    ));
+}
+
+#[test]
+fn parses_every_update_arm_and_guards_control_calls() {
+    let address = ServiceInstanceAddress {
+        key: "dialog".to_string(),
+        generation: 1,
+    };
+    let instance = ServiceInstanceSnapshot {
+        instance: Some(address.clone()),
+        members: vec![ServiceMemberSnapshot::Method {
+            name: "send".to_string(),
+        }],
+    };
+    let updates = [
+        ServiceProviderUpdate::Unavailable,
+        ServiceProviderUpdate::Replaced {
+            snapshot: ServiceInstanceSnapshot {
+                instance: None,
+                members: Vec::new(),
+            },
+        },
+        ServiceProviderUpdate::Spawned { instance },
+        ServiceProviderUpdate::Closed {
+            instance: address.clone(),
+        },
+    ];
+    for update in updates {
+        let json = update_to_json(&update);
+        let parsed = parse_service_provider_update(&json)
+            .unwrap_or_else(|error| panic!("update parses: {error}"));
+        assert_eq!(
+            update_to_json(&parsed).to_json_string(),
+            json.to_json_string()
+        );
+    }
+
+    // The control call guards reject foreign services, instances, unknown
+    // members, and mismatched arguments.
+    let call = pi_chord::types::ServiceCall {
+        service_id: "other".to_string(),
+        member: "catalogue".to_string(),
+        args: Vec::new(),
+        instance: None,
+    };
+    assert!(decode_service_control_call(&call).is_none());
+    let call = pi_chord::types::ServiceCall {
+        service_id: pi_chord::services::wire::SERVICE_CONTROL_ID.to_string(),
+        member: "catalogue".to_string(),
+        args: Vec::new(),
+        instance: Some(address),
+    };
+    assert!(decode_service_control_call(&call).is_none());
+    let call = pi_chord::types::ServiceCall {
+        service_id: pi_chord::services::wire::SERVICE_CONTROL_ID.to_string(),
+        member: "unknown".to_string(),
+        args: Vec::new(),
+        instance: None,
+    };
+    assert!(decode_service_control_call(&call).is_none());
+    let call = pi_chord::types::ServiceCall {
+        service_id: pi_chord::services::wire::SERVICE_CONTROL_ID.to_string(),
+        member: "catalogue".to_string(),
+        args: vec![js("spurious")],
+        instance: None,
+    };
+    assert!(decode_service_control_call(&call).is_none());
+
+    // Catalogue rejections: a non-array, an entry with unknown keys, and a
+    // duplicate service ID.
+    let error = expect_err(parse_service_catalogue(&js("not a list")));
+    assert!(error.to_string().contains("Invalid service catalogue"));
+    let duplicate = JsonValue::Array(vec![
+        jo(vec![
+            ("serviceId", js("pi.models")),
+            ("mode", js("singleton")),
+        ]),
+        jo(vec![("serviceId", js("pi.models")), ("mode", js("keyed"))]),
+    ]);
+    let error = expect_err(parse_service_catalogue(&duplicate));
+    assert!(error.to_string().contains("Invalid service catalogue"));
+    let bad_entry = JsonValue::Array(vec![jo(vec![
+        ("serviceId", js("pi.models")),
+        ("mode", js("singleton")),
+        ("extra", JsonValue::Bool(true)),
+    ])]);
+    let error = expect_err(parse_service_catalogue(&bad_entry));
+    assert!(error.to_string().contains("Invalid service catalogue"));
+
+    // A service call with non-array args rejects.
+    let bad_args = jo(vec![
+        ("serviceId", js("pi.models")),
+        ("member", js("list")),
+        ("args", js("not a list")),
+    ]);
+    let error = expect_err(parse_service_call(&bad_args));
+    assert!(error.to_string().contains("Invalid service call"));
+}

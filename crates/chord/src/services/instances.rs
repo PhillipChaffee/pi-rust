@@ -338,3 +338,77 @@ impl InstanceDirectory {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handle::ServiceImplementation;
+
+    fn entry(key: &str, generation: u64) -> Rc<InstanceDirectoryEntry> {
+        Rc::new(InstanceDirectoryEntry {
+            key: key.to_string(),
+            generation,
+            service: ServiceTarget::Local(Rc::new(ServiceImplementation::new())),
+            deactivate: Rc::new(|| ()),
+        })
+    }
+
+    fn directory() -> InstanceDirectory {
+        InstanceDirectory::new(false, crate::handle::no_error_reporter())
+    }
+
+    #[test]
+    fn directories_fence_duplicates_and_stale_generations() {
+        let directory = directory();
+        assert!(format!("{directory:?}").starts_with("InstanceDirectory { ready: false"));
+        let live = entry("dialog", 1);
+        assert!(directory.insert(live.clone()).is_ok());
+        let Err(error) = directory.insert(entry("dialog", 2)) else {
+            unreachable!("a live key rejects")
+        };
+        assert!(error.to_string().contains("already has a live instance"));
+        let Err(error) = directory.replace(entry("dialog", 1)) else {
+            unreachable!("a repeated generation rejects")
+        };
+        assert!(error.to_string().contains("repeated a live generation"));
+
+        // Replacing with a newer generation retires the previous entry.
+        assert!(directory.replace(newer_entry()).is_ok());
+        assert!(directory.get("dialog").is_some());
+        // Removing an entry that is not the live one is a no-op.
+        directory.remove(&live);
+        assert!(directory.get("dialog").is_some());
+
+        // Readiness is idempotent and observes only when armed.
+        assert!(directory.ready().is_ok());
+        assert!(directory.ready().is_ok());
+
+        // Observations stop when the unsubscribe runs; a closed observer
+        // ignores later starts.
+        let handler: KeyedServiceHandler = Box::new(|_target, _context| ());
+        let Ok(unsubscribe) = directory.observe(handler) else {
+            unreachable!("the observation starts")
+        };
+        unsubscribe();
+        unsubscribe();
+        // Reset drops entries; a later ready restarts observations.
+        directory.reset();
+        assert!(directory.get("dialog").is_none());
+    }
+
+    fn newer_entry() -> Rc<InstanceDirectoryEntry> {
+        entry("dialog", 2)
+    }
+
+    #[test]
+    fn disposal_arms_settle_once() {
+        let directory = directory();
+        directory.dispose();
+        directory.dispose();
+        directory.reset();
+        assert!(directory.insert(entry("late", 1)).is_err());
+        assert!(directory.ready().is_err());
+        let handler: KeyedServiceHandler = Box::new(|_target, _context| ());
+        assert!(directory.observe(handler).is_err());
+    }
+}

@@ -607,4 +607,65 @@ mod tests {
             jo(vec![("xs", ja(Vec::new()))])
         );
     }
+
+    /// Settles a result the case expects to reject.
+    fn rejection_or_panic(result: Result<JsonValue, DeltaError>) -> DeltaError {
+        match result {
+            Err(error) => error,
+            Ok(_) => unreachable!("the case's mutation rejects"),
+        }
+    }
+
+    #[test]
+    fn rejects_apply_edge_shapes() {
+        // Deleting a missing array index rejects.
+        let base = jo(vec![("xs", ja(vec![jn(1.0), jn(2.0)]))]);
+        let error = rejection_or_panic(apply(
+            Some(base.clone()),
+            vec![Op::Delete {
+                path: vec![key("xs"), idx(5)],
+            }],
+        ));
+        assert!(error.to_string().contains("unsafe path segment"), "{error}");
+
+        // Splicing outside an array rejects.
+        let error = rejection_or_panic(apply(
+            Some(jo(vec![("nested", jo(vec![]))])),
+            vec![Op::Splice {
+                path: vec![key("nested"), idx(0)],
+                index: 0,
+                remove: 0,
+                items: Vec::new(),
+            }],
+        ));
+        assert!(error.to_string().contains("unresolvable path"), "{error}");
+
+        // Writing through a key into an array rejects as unsafe.
+        let error = rejection_or_panic(apply(
+            Some(base),
+            vec![Op::Set {
+                path: vec![key("xs"), key("value")],
+                value: jn(1.0),
+            }],
+        ));
+        assert!(error.to_string().contains("unsafe path segment"));
+
+        // Truncating across a UTF-8 boundary rejects.
+        let error = rejection_or_panic(apply(
+            Some(jo(vec![("t", js("héllo"))])),
+            vec![Op::Truncate {
+                path: vec![key("t")],
+                count: 2,
+            }],
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("splits a UTF-8 character boundary")
+        );
+
+        // The whole-root replacement is in place.
+        let applied_root = ok(apply(None, vec![Op::Replace(jn(1.0))]));
+        assert_eq!(applied_root, jn(1.0));
+    }
 }

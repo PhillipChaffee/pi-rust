@@ -41,9 +41,9 @@ use pi_chord::services::loopback::create_loopback_service_transport;
 use pi_chord::services::provider::{RemoteServiceProvider, singleton_definition};
 use pi_chord::services::state::MutableReplicatedState;
 use pi_chord::types::{
-    JsonValue, RemoteServiceTransport, Service, ServiceCall, ServiceMemberSnapshot, ServiceMode,
-    ServiceProviderListener, ServiceProviderUpdate, ServiceSubscription,
-    ServiceSubscriptionSnapshot,
+    JsonValue, RemoteServiceTransport, Service, ServiceCall, ServiceInstanceAddress,
+    ServiceInstanceSnapshot, ServiceMemberSnapshot, ServiceMode, ServiceProviderListener,
+    ServiceProviderUpdate, ServiceSubscription, ServiceSubscriptionSnapshot,
 };
 
 fn key(text: &str) -> Seg {
@@ -1408,7 +1408,7 @@ impl RemoteServiceTransport for ManualTransport {
         let snapshot = ServiceSubscriptionSnapshot {
             service_id: self.service_id.clone(),
             mode: ServiceMode::Singleton,
-            instances: vec![pi_chord::types::ServiceInstanceSnapshot {
+            instances: vec![ServiceInstanceSnapshot {
                 instance: None,
                 members: vec![
                     ServiceMemberSnapshot::Method {
@@ -1763,4 +1763,425 @@ fn keyed_dialogs_with(
         }),
     );
     implementation
+}
+
+#[test]
+fn providers_fence_their_registrations() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.fence.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let absent = define_service("test.fence.absent").unwrap_or_else(|e| panic!("define: {e}"));
+        let dialogs =
+            define_service("test.fence.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // The catalogue rejects duplicate IDs and spells its debug surface.
+        let error = RemoteServiceProvider::new(vec![
+            singleton_definition(models.clone()),
+            singleton_definition(models.clone()),
+        ])
+        .expect_err("a duplicate catalogue rejects");
+        assert!(error_message(&error).contains("duplicate IDs"));
+
+        let provider = provider_for(&[&models, &absent]);
+        assert!(format!("{provider:?}").contains("test.fence.models"));
+
+        // Providing the same singleton twice mismatches the mode.
+        provider
+            .provide(&models, method_only_implementation())
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+        let error = provider
+            .provide(&models, method_only_implementation())
+            .expect_err("a second provider rejects");
+        assert!(
+            error_code(&error)
+                .is_some_and(|code| code == RemoteServiceErrorCode::ServiceModeMismatch)
+        );
+
+        // Withdrawing an unprovided singleton is a no-op.
+        provider
+            .withdraw(&absent)
+            .unwrap_or_else(|e| panic!("withdraw: {e}"));
+
+        // The implementation lookup and subscriptions of an unprovided
+        // singleton reject.
+        let error = provider
+            .use_service(&absent)
+            .expect_err("an unprovided singleton rejects");
+        assert!(
+            error_code(&error).is_some_and(|code| code == RemoteServiceErrorCode::ServiceNotFound)
+        );
+        let listener: ServiceProviderListener = Rc::new(|_update, _context| ());
+        let error = provider
+            .subscribe(&absent.id, ServiceMode::Singleton, listener)
+            .expect_err("an unprovided singleton rejects");
+        assert!(
+            error_code(&error).is_some_and(|code| code == RemoteServiceErrorCode::ServiceNotFound)
+        );
+
+        // Spawn guards: an empty key and a repeated live key.
+        let error = provider
+            .spawn(&models, "", method_only_implementation())
+            .err()
+            .expect("an empty key rejects");
+        assert!(error.to_string().contains("key must not be empty"));
+
+        // Disposal settles once; later use rejects.
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        provider
+            .dispose()
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+
+        let provider = RemoteServiceProvider::new(vec![
+            pi_chord::services::provider::ServiceProviderDefinition {
+                service: dialogs.clone(),
+                mode: ServiceMode::Keyed,
+            },
+        ])
+        .unwrap_or_else(|e| panic!("keyed provider: {e}"));
+        let _close = provider
+            .spawn(&dialogs, "dialog", method_only_implementation())
+            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let error = provider
+            .spawn(&dialogs, "dialog", method_only_implementation())
+            .err()
+            .expect("a repeated live key rejects");
+        assert!(
+            error_code(&error)
+                .is_some_and(|code| code == RemoteServiceErrorCode::ServiceModeMismatch)
+        );
+        // A keyed registration rejects singleton-shaped lookups.
+        let error = provider
+            .use_service(&dialogs)
+            .expect_err("a keyed registration rejects singleton lookups");
+        assert!(
+            error_code(&error).is_some_and(|code| code == RemoteServiceErrorCode::ServiceNotFound)
+        );
+    });
+}
+
+#[test]
+fn bindings_fence_their_services_and_survive_disposal() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.bind.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let foreign = define_service("test.bind.foreign").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = provider_for(&[&models]);
+        provider
+            .provide(&models, method_only_implementation())
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+
+        // Duplicate service IDs reject at construction.
+        let error =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![models.clone(), models.clone()],
+                transport: create_loopback_service_transport(&provider),
+                bound: true,
+                on_error: pi_chord::handle::no_error_reporter(),
+                assert_access: None,
+            })
+            .expect_err("duplicate service IDs reject");
+        assert!(error_message(&error).contains("duplicate service IDs"));
+
+        let binding = binding_for(vec![models.clone()], &provider, None);
+        assert!(format!("{binding:?}").contains("bound: true"));
+
+        // A foreign service rejects the allowlist.
+        let error = binding
+            .use_service(&foreign)
+            .expect_err("a foreign service rejects");
+        assert!(
+            error_code(&error)
+                .is_some_and(|code| code == RemoteServiceErrorCode::ServiceNotAllowed)
+        );
+
+        // A service used as one mode rejects the other.
+        let handler: pi_chord::types::KeyedViewHandler = Rc::new(|_view, _context| ());
+        let _unsubscribe = binding
+            .observe(&models, handler)
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        let error = binding
+            .use_service(&models)
+            .expect_err("a keyed registration rejects singleton use");
+        assert!(
+            error_code(&error)
+                .is_some_and(|code| code == RemoteServiceErrorCode::ServiceModeMismatch)
+        );
+
+        // Disposal settles once and rejects later readiness and rebinding.
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let error = binding
+            .ready(background_context())
+            .await
+            .expect_err("readiness after disposal rejects");
+        assert!(error_message(&error).contains("disposed"));
+        let error = binding
+            .rebind(true, background_context())
+            .await
+            .expect_err("rebinding after disposal rejects");
+        assert!(error_message(&error).contains("disposed"));
+    });
+}
+
+#[test]
+fn closed_bindings_reject_member_use() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models = define_service("test.closed.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let provider = provider_for(&[&models]);
+        provider
+            .provide(&models, method_only_implementation())
+            .unwrap_or_else(|e| panic!("provide: {e}"));
+        let binding = binding_for(vec![models.clone()], &provider, None);
+        let view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        binding
+            .rebind(false, background_context())
+            .await
+            .unwrap_or_else(|e| panic!("rebind: {e}"));
+        let error = view
+            .call("select", vec![], background_context())
+            .await
+            .expect_err("a closed binding rejects calls");
+        assert!(error_message(&error).contains("binding is closed"));
+        binding
+            .rebind(true, background_context())
+            .await
+            .unwrap_or_else(|e| panic!("rebind: {e}"));
+        let answer = view
+            .call("select", vec![], background_context())
+            .await
+            .unwrap_or_else(|e| panic!("read: {e}"));
+        assert!(answer.is_none());
+    });
+}
+
+struct SnapshotTransport {
+    snapshot: Rc<RefCell<ServiceSubscriptionSnapshot>>,
+    updates: Rc<RefCell<Vec<ServiceProviderUpdate>>>,
+}
+
+impl RemoteServiceTransport for SnapshotTransport {
+    fn invoke(
+        &self,
+        _call: ServiceCall,
+        _context: Context,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<JsonValue>, ChordError>>>> {
+        boxed(async { Err(ChordError::Message("unexpected invocation".to_string())) })
+    }
+
+    fn subscribe(
+        &self,
+        _service_id: String,
+        _mode: ServiceMode,
+        listener: ServiceProviderListener,
+        _context: Context,
+    ) -> Pin<Box<dyn Future<Output = Result<ServiceSubscription, ChordError>>>> {
+        let snapshot = self.snapshot.borrow().clone();
+        let updates = self.updates.clone();
+        let listener = listener.clone();
+        boxed(async move {
+            Ok(ServiceSubscription {
+                snapshot: snapshot.clone(),
+                activate: Box::new(move || {
+                    for update in updates.borrow().clone() {
+                        listener(&update, &background_context());
+                    }
+                    Ok(())
+                }),
+                close: Box::new(|_context| Box::pin(std::future::ready(Ok(())))),
+            })
+        })
+    }
+}
+
+#[test]
+fn bindings_reject_snapshots_that_break_their_contract() {
+    let rt = runtime();
+    rt.block_on(async {
+        let models =
+            define_service("test.snapshot.models").unwrap_or_else(|e| panic!("define: {e}"));
+        let _keyed =
+            define_service("test.snapshot.keyed").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // A singleton subscription whose snapshot is not singleton-shaped
+        // rejects hydration.
+        let wrong_mode = Rc::new(RefCell::new(ServiceSubscriptionSnapshot {
+            service_id: "test.snapshot.models".to_string(),
+            mode: ServiceMode::Keyed,
+            instances: Vec::new(),
+        }));
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(SnapshotTransport {
+            snapshot: wrong_mode.clone(),
+            updates: Rc::new(RefCell::new(Vec::new())),
+        });
+        let (errors, on_error) = error_sink();
+        let binding =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![models.clone()],
+                transport,
+                bound: true,
+                on_error,
+                assert_access: None,
+            })
+            .unwrap_or_else(|e| panic!("binding: {e}"));
+        let _view = binding
+            .use_service(&models)
+            .unwrap_or_else(|e| panic!("use: {e}"));
+        let error = binding
+            .ready(background_context())
+            .await
+            .expect_err("readiness rejects the snapshot");
+        assert!(error_message(&error).contains("invalid singleton snapshot"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let _ = (errors, wrong_mode.clone());
+    });
+}
+
+#[test]
+fn keyed_bindings_reject_snapshot_and_update_contract_breaks() {
+    let rt = runtime();
+    rt.block_on(async {
+        let dialogs = define_service("test.snap.dialogs").unwrap_or_else(|e| panic!("define: {e}"));
+
+        // A keyed subscription whose snapshot is not keyed-shaped reports the
+        // break and rejects readiness.
+        let wrong_mode = ServiceSubscriptionSnapshot {
+            service_id: "test.snap.dialogs".to_string(),
+            mode: ServiceMode::Singleton,
+            instances: Vec::new(),
+        };
+        let (errors, on_error) = error_sink();
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(SnapshotTransport {
+            snapshot: Rc::new(RefCell::new(wrong_mode)),
+            updates: Rc::new(RefCell::new(Vec::new())),
+        });
+        let binding =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![dialogs.clone()],
+                transport,
+                bound: true,
+                on_error,
+                assert_access: None,
+            })
+            .unwrap_or_else(|e| panic!("binding: {e}"));
+        let handler: pi_chord::types::KeyedViewHandler = Rc::new(|_view, _context| ());
+        let _subscription = binding
+            .observe(&dialogs, handler)
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        let error = binding
+            .ready(background_context())
+            .await
+            .expect_err("readiness rejects the keyed snapshot");
+        assert!(error_message(&error).contains("wrong keyed snapshot"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert_eq!(errors.borrow().len(), 1);
+
+        // A spawned instance without an address rejects.
+        let (errors, on_error) = error_sink();
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(SnapshotTransport {
+            snapshot: Rc::new(RefCell::new(ServiceSubscriptionSnapshot {
+                service_id: "test.snap.dialogs".to_string(),
+                mode: ServiceMode::Keyed,
+                instances: vec![ServiceInstanceSnapshot {
+                    instance: None,
+                    members: Vec::new(),
+                }],
+            })),
+            updates: Rc::new(RefCell::new(Vec::new())),
+        });
+        let binding =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![dialogs.clone()],
+                transport,
+                bound: true,
+                on_error,
+                assert_access: None,
+            })
+            .unwrap_or_else(|e| panic!("binding: {e}"));
+        let handler: pi_chord::types::KeyedViewHandler = Rc::new(|_view, _context| ());
+        let _subscription = binding
+            .observe(&dialogs, handler)
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        let error = binding
+            .ready(background_context())
+            .await
+            .expect_err("a spawned snapshot without an address rejects");
+        assert!(error_message(&error).contains("no address"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        assert_eq!(errors.borrow().len(), 1);
+
+        // Lifecycle updates that do not fit the keyed contract report.
+        let (errors, on_error) = error_sink();
+        let address = ServiceInstanceAddress {
+            key: "dialog".to_string(),
+            generation: 1,
+        };
+        let updates = vec![
+            ServiceProviderUpdate::Unavailable,
+            ServiceProviderUpdate::State {
+                instance: None,
+                member: "state".to_string(),
+                sequence: 1,
+                ops: Vec::new(),
+            },
+        ];
+        let transport: Rc<dyn RemoteServiceTransport> = Rc::new(SnapshotTransport {
+            snapshot: Rc::new(RefCell::new(ServiceSubscriptionSnapshot {
+                service_id: "test.snap.dialogs".to_string(),
+                mode: ServiceMode::Keyed,
+                instances: Vec::new(),
+            })),
+            updates: Rc::new(RefCell::new(updates)),
+        });
+        let binding =
+            create_remote_service_binding(pi_chord::consumer::RemoteServiceBindingOptions {
+                services: vec![dialogs.clone()],
+                transport,
+                bound: true,
+                on_error,
+                assert_access: None,
+            })
+            .unwrap_or_else(|e| panic!("binding: {e}"));
+        let handler: pi_chord::types::KeyedViewHandler = Rc::new(|_view, _context| ());
+        let _subscription = binding
+            .observe(&dialogs, handler)
+            .unwrap_or_else(|e| panic!("observe: {e}"));
+        binding
+            .ready(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("readiness: {e}"));
+        binding
+            .dispose(background_context())
+            .await
+            .unwrap_or_else(|e| panic!("dispose: {e}"));
+        let reported = errors.borrow().clone();
+        assert!(
+            reported
+                .iter()
+                .any(|error| error.to_string().contains("singleton lifecycle update")),
+            "the singleton-shaped update is reported: {reported:?}"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|error| error.to_string().contains("no instance address")),
+            "the address-less state update is reported: {reported:?}"
+        );
+        let _ = address;
+    });
 }
