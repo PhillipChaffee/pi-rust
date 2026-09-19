@@ -2,7 +2,7 @@
 //! `src/delta/index.ts`.
 //!
 //! [`Op`] is the decoded form — complete paths, in memory, on disk, and the
-//! form [`crate::delta::apply`] takes. [`WireOp`] is what crosses a boundary,
+//! form [`crate::delta::apply()`] takes. [`WireOp`] is what crosses a boundary,
 //! adding path interning and arity omission between [`crate::delta::encoder`]
 //! and [`crate::delta::decoder`] only.
 //!
@@ -30,7 +30,7 @@ pub enum PathRef {
 /// no short forms.
 ///
 /// `r` is the ONLY op that replaces a whole value; `s`/`d`/`a`/`t` cannot
-/// target the root, which [`crate::delta::apply`] enforces on the paths. `p`
+/// target the root, which [`crate::delta::apply()`] enforces on the paths. `p`
 /// may target the root, because a tracked value can itself be an array.
 ///
 /// String operations carry byte offsets, the port's segment contract (see the

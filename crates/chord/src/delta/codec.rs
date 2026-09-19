@@ -2,7 +2,7 @@
 //! (`encoder`/`decoder`).
 //!
 //! Path interning and arity omission live between the tracker and a boundary;
-//! [`Op`] and [`apply`][crate::delta::apply] know nothing about them.
+//! [`Op`] and [`apply()`][crate::delta::apply()] knows nothing about them.
 //!
 //! ONE PAIR PER INDEPENDENT STATE STREAM. Every decoder must observe exactly
 //! the batches encoded by its matching encoder, beginning with that state's
