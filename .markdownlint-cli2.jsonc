@@ -18,7 +18,10 @@
     "**/*.md",
     // rustdoc vendors license .md files into target/doc/static.files on every
     // doc build; CI lints a fresh checkout without target/, and the exclusion
-    // keeps the local runner deterministic after a doc build
-    "!target/**"
+    // keeps the local runner deterministic after a doc build. Sibling
+    // sessions' worktrees under .worktrees/ carry their own target/doc trees,
+    // which is the same artifact class.
+    "!target/**",
+    "!.worktrees/**"
   ]
 }
