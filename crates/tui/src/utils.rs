@@ -62,7 +62,7 @@ static WIDTH_CACHE: LazyLock<Mutex<WidthCache>> = LazyLock::new(|| {
     clippy::expect_used,
     reason = "every pattern here is a compile-time constant; a bad pattern is a programmer error that must surface, not be swallowed"
 )]
-fn static_regex(pattern: &str) -> Regex {
+pub(crate) fn static_regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("static regex pattern is compile-time verified")
 }
 
