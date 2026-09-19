@@ -18,13 +18,4 @@ pub use manifest::{
     FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact, FacetBundleEntry,
     FacetBundleManifest, FacetBundlePlugin, integrity_digest, parse_integrity, read_facet_bundle_manifest,
     resolve_bundle_file, validate_manifest, verify_source,
-};EOF
-cat > crates/chord/src/bundler.rs << 'EOF'
-//! The bundler subpath, ported from upstream `src/bundler.ts`: the
-//! packaging pipeline and manifest contracts under one import point.
-
-pub use crate::node::bundle::{bundle_facet_package, bundle_facets};
-pub use crate::node::manifest::{
-    FacetBundleArtifact, FacetBundleEntry, FacetBundleManifest, FacetBundlePlugin,
-};EOF
-cargo check -p pi-chord 2>&1 | rg "^error" -A 6 | head -60
+}}
