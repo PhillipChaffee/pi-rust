@@ -17,7 +17,8 @@ use std::rc::Rc;
 use crate::errors::ChordError;
 use crate::future::{LocalBoxFuture, boxed, ready_with};
 use crate::node::manifest::{
-    FACET_BUNDLE_FORMAT, FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleManifest,
+    FACET_BUNDLE_ARTIFACT_FORMAT, FACET_BUNDLE_ARTIFACT_FORMAT_VERSION, FACET_BUNDLE_FORMAT,
+    FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact, FacetBundleManifest,
     read_facet_bundle_manifest, verify_source,
 };
 use crate::types::{FacetDef, FacetLoader, LoadedFacets};
@@ -148,10 +149,11 @@ pub fn read_facet_bundle_artifact(
                 })
         })
         .transpose()?;
+    let plugin = manifest.plugin.clone();
     Ok(FacetBundleArtifact {
         format: FACET_BUNDLE_ARTIFACT_FORMAT.to_string(),
         format_version: FACET_BUNDLE_ARTIFACT_FORMAT_VERSION,
-        plugin: manifest.plugin,
+        plugin,
         entry_name: entry_name.to_string(),
         entry: entry.clone(),
         source,
@@ -287,21 +289,25 @@ impl ArtifactFacetLoader {
                 format!("{manifest}\n"),
             )
             .map_err(|error| ChordError::Message(format!("Could not write facet artifact manifest: {error}")))?;
-            let loader = create_facet_bundle_loader(FacetBundleLoaderOptions {
+            let loader = FacetBundleLoader {
                 manifest_path: directory.join(FACET_BUNDLE_MANIFEST_FILE),
                 entry: self.artifact.entry_name.clone(),
                 verify_integrity: true,
                 resolve_external: self.resolve_external.clone(),
                 module_host: self.module_host.clone(),
-            });
-            loader.load()
+            };
+            Ok(settle(loader.load()))
         })();
-        if let Err(error) = result {
-            let _ = std::fs::remove_dir_all(&directory);
-            return Err(error);
-        }
+        let loaded = match result {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
         let dispose_directory = directory;
         Ok(LoadedFacets {
+            facets: loaded?.facets,
             dispose: Box::new(move || {
                 boxed(async move {
                     if let Err(error) = std::fs::remove_dir_all(&dispose_directory) {
@@ -320,6 +326,16 @@ impl FacetLoader for ArtifactFacetLoader {
     fn load(&self) -> LocalBoxFuture<Result<LoadedFacets, ChordError>> {
         let result = self.load_sync();
         boxed(async move { result })
+    }
+}
+
+fn settle(loaded: LocalBoxFuture<Result<LoadedFacets, ChordError>>) -> Result<LoadedFacets, ChordError> {
+    match crate::future::settle_now(loaded) {
+        Some(result) => result,
+        None => Err(ChordError::Message(
+            "Facet bundle loading must settle without awaiting; module hosts that yield are not materializable synchronously"
+                .to_string(),
+        )),
     }
 }
 

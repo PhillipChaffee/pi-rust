@@ -163,17 +163,21 @@ pub fn validate_manifest(value: &JsonValue, path: &str) -> Result<FacetBundleMan
             .and_then(JsonValue::as_str)
             .ok_or_else(|| manifest_error(path, &format!("Facet bundle entry {name} has no integrity")))?;
         parse_integrity(integrity)?;
-        let external_imports = entry
+        let declared_imports = entry
             .get("externalImports")
             .and_then(JsonValue::as_array)
             .ok_or_else(|| {
                 manifest_error(path, &format!("Facet bundle entry {name} has invalid external imports"))
             })?;
-        let mut external_imports = Vec::with_capacity(external_imports.len());
-        for item in external_imports {
-            external_imports.push(item.as_str().ok_or_else(|| {
-                manifest_error(path, &format!("Facet bundle entry {name} has invalid external imports"))
-            })?);
+        let mut external_imports: Vec<&str> = Vec::with_capacity(declared_imports.len());
+        for item in declared_imports {
+            let Some(item) = item.as_str() else {
+                return Err(manifest_error(
+                    path,
+                    &format!("Facet bundle entry {name} has invalid external imports"),
+                ));
+            };
+            external_imports.push(item);
         }
         let mut unique = external_imports.clone();
         unique.sort_unstable();
@@ -290,9 +294,9 @@ pub fn read_facet_bundle_manifest(path: &std::path::Path) -> Result<FacetBundleM
 ///
 /// # Errors
 /// [`ChordError`] when the text is not valid JSON.
-pub fn parse_json(text: &str, context: impl Into<String>) -> Result<JsonValue, ChordError> {
+pub fn parse_json(text: &str, context: String) -> Result<JsonValue, ChordError> {
     let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| ChordError::Message(format!("{}: {error}", context)))?;
+        serde_json::from_str(text).map_err(|error| ChordError::Message(format!("{context}: {error}")))?;
     Ok(json_from_serde(&value))
 }
 

@@ -12,13 +12,13 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::types::{JsonNumber, JsonObject, JsonValue};
+
 use crate::errors::ChordError;
 use crate::node::manifest::{
     FACET_BUNDLE_FORMAT, FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleEntry,
     FacetBundleManifest, FacetBundlePlugin, integrity_digest,
 };
-use crate::types::{JsonObject, JsonValue};
-
 /// One built facet entry the packaging pipeline takes, upstream's esbuild
 /// output: the source text, the external imports it left undeclared, and
 /// its source map text when one was emitted.
@@ -74,7 +74,8 @@ pub async fn bundle_facets(options: BundleFacetsOptions) -> Result<BundleFacetsR
         .parent()
         .ok_or_else(|| ChordError::Message("Facet bundle output directory has no parent".to_string()))?
         .to_path_buf();
-    std::fs::create_dir_all(&output_parent).map_err(fs_error("create output parent"))?;
+    std::fs::create_dir_all(&output_parent)
+        .map_err(|error| ChordError::Message(format!("Could not create output parent: {error}")))?;
     let temporary_directory = output_parent.join(format!(
         ".{}.tmp-{}",
         file_name(&output_directory),
@@ -330,7 +331,7 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
             names
         }
     };
-    let (configured_facets, external, _source_map) = parse_chord_configuration(object, &package_json_path)?;
+    let (configured_facets, external, _source_map) = parse_chord_configuration(object, &package_json_path);
     Ok(PackageMetadata {
         package_directory,
         package_json_path,
@@ -339,6 +340,7 @@ fn read_facet_package_metadata(package_path: &Path) -> Result<PackageMetadata, C
         peer_dependencies,
         configured_facets,
         external,
+        source_map: true,
     })
 }
 
@@ -356,9 +358,9 @@ fn parse_chord_configuration(
                 continue;
             }
             match source {
-                JsonValue::Bool(false) => configured_facets.push((name.clone(), FacetSource::Removed)),
+                JsonValue::Bool(false) => configured_facets.push((name.to_string(), FacetSource::Removed)),
                 JsonValue::Str(source) => {
-                    configured_facets.push((name.clone(), FacetSource::File(source.clone())));
+                    configured_facets.push((name.to_string(), FacetSource::File(source.clone())));
                 }
                 _ => {}
             }
@@ -490,8 +492,6 @@ pub fn manifest_to_json_text(manifest: &crate::node::manifest::FacetBundleManife
     ]);
     JsonValue::Object(root).to_json_string()
 }
-
-use crate::types::{JsonNumber, JsonValue};
 
 fn string_field<'a>(object: &'a JsonObject, key: &str) -> Option<&'a str> {
     match object.get(key) {

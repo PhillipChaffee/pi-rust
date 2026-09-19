@@ -18,4 +18,4 @@ pub use manifest::{
     FACET_BUNDLE_FORMAT_VERSION, FACET_BUNDLE_MANIFEST_FILE, FacetBundleArtifact, FacetBundleEntry,
     FacetBundleManifest, FacetBundlePlugin, integrity_digest, parse_integrity, read_facet_bundle_manifest,
     resolve_bundle_file, validate_manifest, verify_source,
-}}
+};
