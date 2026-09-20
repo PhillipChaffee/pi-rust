@@ -16,137 +16,33 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::auth_fixtures::oauth_credentials;
-use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
+use common::auth_interaction::ScriptedAuthInteraction;
+use common::auth_interaction::provider_interaction;
+use common::oauth_fixtures::{task_credential, url_query_param, wait_until};
+use common::radius_fixtures::{
+    AUTHORIZE_ENDPOINT, CALLBACK_PORT, DEVICE_URL, DISCOVERY_URL, GATEWAY, START, TOKEN_URL,
+    code_callback_get, interaction, mount_browser_routes, mount_device_routes, mount_device_start,
+    mount_discovery, radius_oauth, send_callback, wait_for_auth_url,
+};
 use common::seam_forms::{form_field, form_fields};
-use pi_ai::auth::clock::{AuthClock as _, FixedClock, SteppedClock};
+use pi_ai::auth::clock::FixedClock;
 use pi_ai::auth::oauth::radius::{RadiusOAuth, normalize_radius_gateway_url};
-use pi_ai::auth::types::{AuthEvent, ModelAuth};
+use pi_ai::auth::types::AuthEvent;
+use pi_ai::auth::types::ModelAuth;
 use pi_ai::http::{MockHttpClient, MockResponse, json_response};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
-
-const GATEWAY: &str = "https://radius.example";
-const DISCOVERY_URL: &str = "https://radius.example/v1/oauth";
-const DEVICE_URL: &str = "https://radius.example/v1/oauth/device";
-const TOKEN_URL: &str = "https://radius.example/v1/oauth/token";
-const AUTHORIZE_ENDPOINT: &str = "https://radius-ui.example/authorize";
-const CALLBACK_PORT: u16 = 1456;
-
-/// `new Date("2026-07-24T00:00:00Z").getTime()`, upstream's pinned system
-/// time.
-const START: i64 = 1_784_851_200_000;
 
 /// The two port-1456 cases serialize: the login's callback server claims the
 /// fixed port for the whole login.
 static CALLBACK_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// `createRadiusOAuth({ name: "Radius", gateway: GATEWAY })` over the fixed
-/// epoch.
-fn radius_oauth(mock: &MockHttpClient, clock: &FixedClock) -> RadiusOAuth {
-    // The stepped clock freezes the epoch the login reads: the browser path
-    // spends real time waiting for the loopback callback, and a riding clock
-    // would drift the pinned expiry by the callback delay.
-    RadiusOAuth::new(
-        "Radius".to_owned(),
-        GATEWAY.to_owned(),
-        Arc::new(mock.clone()),
-        Arc::new(SteppedClock::new(clock.now_ms())),
-    )
-}
-
-/// The scripted interaction answering `login_method`, upstream's
-/// `interaction(loginMethod, events)` helper.
-fn interaction(
-    login_method: &str,
-) -> (
-    pi_ai::auth::types::ProviderAuthInteraction,
-    Arc<ScriptedAuthInteraction>,
-) {
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(login_method));
-    (
-        provider_interaction(&scripted, CancellationToken::new()),
-        scripted,
-    )
-}
-
-/// Wait for a condition the login task reaches, stepping the scheduler
-/// between probes.
-async fn wait_until<T>(condition: impl Fn() -> Option<T>, what: &str) -> T {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(value) = condition() {
-            return value;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::task::yield_now().await;
-    }
-}
-
-/// The URL of the first reported authorize event, asserting one was reported.
-async fn wait_for_auth_url(scripted: &Arc<ScriptedAuthInteraction>) -> String {
-    wait_until(
-        || {
-            scripted.events().into_iter().find_map(|event| match event {
-                AuthEvent::AuthUrl { url, .. } => Some(url),
-                _ => None,
-            })
-        },
-        "the authorize URL",
-    )
-    .await
-}
-
-/// A query parameter of a URL, the authorize URL's carried params.
-fn url_query_param(url: &str, name: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
-        .query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
-}
-
-/// The one-request-per-connection GET the browser sends to the flow's fixed
-/// loopback port, returning the raw response.
-async fn send_callback(request: &str) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", CALLBACK_PORT))
-        .await
-        .expect("the callback server accepts");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("the callback writes");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("the response reads to EOF");
-    String::from_utf8(raw).expect("the response is utf-8")
-}
-
-/// The discovery + token routes a browser login shares.
-fn mount_browser_routes(mock: &MockHttpClient) {
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
-    mock.on(|request| request.url == TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": "access-token",
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-                "scope": "gateway offline_access",
-            }),
-        ));
+/// The authorize-URL state the browser callback carries back, the pairing
+/// the callback-path cases drive.
+async fn browser_state(scripted: &Arc<ScriptedAuthInteraction>) -> String {
+    let auth_url = wait_for_auth_url(scripted).await;
+    url_query_param(&auth_url, "state").expect("the state")
 }
 
 #[test]
@@ -178,8 +74,7 @@ async fn browser_login_completes_through_a_real_loopback_callback() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     let mock = MockHttpClient::new();
     mount_browser_routes(&mock);
-    let clock = FixedClock::new(START);
-    let oauth = radius_oauth(&mock, &clock);
+    let oauth = radius_oauth(&mock, START);
     let (interaction, scripted) = interaction("browser");
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
@@ -225,10 +120,7 @@ async fn browser_login_completes_through_a_real_loopback_callback() {
         "the success page names the gateway: {response:?}"
     );
 
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, "access-token");
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(
@@ -283,12 +175,8 @@ async fn browser_login_completes_through_a_real_loopback_callback() {
 async fn a_state_mismatched_callback_is_rejected_and_the_login_can_be_cancelled() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    mount_discovery(&mock);
+    let oauth = radius_oauth(&mock, START);
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("browser"));
     let interaction = provider_interaction(&scripted, signal.clone());
@@ -322,17 +210,12 @@ async fn a_state_mismatched_callback_is_rejected_and_the_login_can_be_cancelled(
 async fn the_callback_error_and_missing_code_pages_keep_the_login_waiting() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    mount_discovery(&mock);
+    let oauth = radius_oauth(&mock, START);
     let (interaction, scripted) = interaction("browser");
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
-    let auth_url = wait_for_auth_url(&scripted).await;
-    let state = url_query_param(&auth_url, "state").expect("the state");
+    let state = browser_state(&scripted).await;
 
     // An OAuth error from the provider: the page carries the description and
     // the wait hands over as cancelled.
@@ -365,12 +248,11 @@ async fn a_missing_code_page_keeps_the_login_waiting_until_cancelled() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     let mock = MockHttpClient::new();
     mount_browser_routes(&mock);
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (interaction, scripted) = interaction("browser");
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
-    let auth_url = wait_for_auth_url(&scripted).await;
-    let state = url_query_param(&auth_url, "state").expect("the state");
+    let state = browser_state(&scripted).await;
 
     let response = send_callback(&format!(
         "GET /oauth/callback?state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -392,18 +274,12 @@ async fn a_missing_code_page_keeps_the_login_waiting_until_cancelled() {
 
     // Both pages leave the wait open, so the login still completes through
     // the real code callback.
-    let response = send_callback(&format!(
-        "GET /oauth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
-    ))
-    .await;
+    let response = send_callback(code_callback_get(&state)).await;
     assert!(
         response.starts_with("HTTP/1.1 200 OK"),
         "the late valid callback still completes the login: {response:?}"
     );
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, "access-token");
 }
 
@@ -411,12 +287,8 @@ async fn a_missing_code_page_keeps_the_login_waiting_until_cancelled() {
 async fn an_aborted_transport_cancels_the_browser_login() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    mount_discovery(&mock);
+    let oauth = radius_oauth(&mock, START);
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("browser"));
     let interaction = provider_interaction(&scripted, signal.clone());
@@ -440,7 +312,7 @@ async fn a_failed_discovery_reports_the_gateway_status() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == DISCOVERY_URL)
         .respond(MockResponse::status(500).with_body("boom"));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (interaction, _scripted) = interaction("browser");
 
     let error = oauth
@@ -476,15 +348,12 @@ async fn a_failed_token_exchange_reports_the_structured_oauth_error() {
             ));
         mock.on(|request| request.url == TOKEN_URL)
             .respond(json_response(400, &body));
-        let oauth = radius_oauth(&mock, &FixedClock::new(START));
+        let oauth = radius_oauth(&mock, START);
         let (interaction, scripted) = interaction("browser");
         let handle = tokio::spawn(async move { oauth.login(interaction).await });
         let auth_url = wait_for_auth_url(&scripted).await;
         let state = url_query_param(&auth_url, "state").expect("the state");
-        let response = send_callback(&format!(
-            "GET /oauth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
-        ))
-        .await;
+        let response = send_callback(code_callback_get(&state)).await;
         assert!(
             response.starts_with("HTTP/1.1 200 OK"),
             "the callback succeeded before the exchange failed: {response:?}"
@@ -509,7 +378,7 @@ async fn a_failed_device_authorization_reports_the_gateway_status() {
             500,
             &serde_json::json!({"error": "server_error", "error_description": "kaput"}),
         ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (interaction, _scripted) = interaction("device-code");
     let error = oauth
         .login(interaction)
@@ -533,7 +402,7 @@ async fn an_incomplete_device_response_rejects_with_the_missing_fields_message()
                 "expires_in": 600,
             }),
         ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (interaction, _scripted) = interaction("device-code");
     let error = oauth
         .login(interaction)
@@ -548,7 +417,7 @@ async fn an_incomplete_device_response_rejects_with_the_missing_fields_message()
 #[tokio::test(start_paused = true)]
 async fn an_unknown_sign_in_method_rejects_with_the_method_error() {
     let mock = MockHttpClient::new();
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (interaction, _scripted) = interaction("telepathy");
     let error = oauth
         .login(interaction)
@@ -563,7 +432,7 @@ async fn an_unknown_sign_in_method_rejects_with_the_method_error() {
 #[tokio::test]
 async fn the_flow_reports_its_name_and_derives_the_api_key_auth() {
     let mock = MockHttpClient::new();
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     assert_eq!(oauth.auth().name, "Radius");
     assert_eq!(format!("{oauth:?}"), "RadiusOAuth");
     assert_eq!(
@@ -583,7 +452,7 @@ async fn refresh_failures_report_the_structured_oauth_error() {
             400,
             &serde_json::json!({"error": "invalid_grant", "error_description": "expired"}),
         ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let error = oauth
         .refresh(
             oauth_credentials("old", "old-refresh", 0),
@@ -605,19 +474,7 @@ async fn refresh_failures_report_the_structured_oauth_error() {
 /// succeeds with a one-second interval and a three-second lifetime, so the
 /// poll loop reaches its deadline after three strikes.
 fn mount_poll_routes(mock: &MockHttpClient, token_responses: Vec<MockResponse>) {
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://radius-ui.example/pair",
-                "expires_in": 3,
-                "interval": 1,
-            }),
-        ));
-    mock.on(|request| request.url == TOKEN_URL)
-        .respond_sequence(token_responses);
+    mount_device_routes(mock, 3, 1, token_responses);
 }
 
 #[tokio::test(start_paused = true)]
@@ -630,7 +487,7 @@ async fn the_device_poll_keeps_parking_on_pending_until_cancellation() {
             json_response(400, &serde_json::json!({"error": "authorization_pending"})),
         ],
     );
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("device-code"));
     let interaction = provider_interaction(&scripted, signal.clone());
@@ -661,7 +518,7 @@ async fn the_device_poll_parks_on_slow_down_until_cancellation() {
             &serde_json::json!({"error": "slow_down"}),
         )],
     );
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("device-code"));
     let interaction = provider_interaction(&scripted, signal.clone());
@@ -698,7 +555,7 @@ async fn terminal_poll_errors_reject_with_their_wire_messages() {
     ] {
         let mock = MockHttpClient::new();
         mount_poll_routes(&mock, vec![json_response(400, &token_body)]);
-        let oauth = radius_oauth(&mock, &FixedClock::new(START));
+        let oauth = radius_oauth(&mock, START);
         let (interaction, _scripted) = interaction("device-code");
         let error = oauth
             .login(interaction)
@@ -709,18 +566,8 @@ async fn terminal_poll_errors_reject_with_their_wire_messages() {
 
     // A transport failure propagates as its own message.
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://radius-ui.example/pair",
-                "expires_in": 600,
-                "interval": 5,
-            }),
-        ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    mount_device_start(&mock, 600, 5);
+    let oauth = radius_oauth(&mock, START);
     let (interaction, _scripted) = interaction("device-code");
     let error = oauth
         .login(interaction)
@@ -772,7 +619,7 @@ async fn an_unparsable_gateway_rejects_every_request_path() {
 async fn the_discovery_transport_and_json_failures_report_the_seam() {
     // No discovery route: the transport failure propagates.
     let mock = MockHttpClient::new();
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (browser_interaction, _scripted) = interaction("browser");
     let error = oauth
         .login(browser_interaction)
@@ -787,7 +634,7 @@ async fn the_discovery_transport_and_json_failures_report_the_seam() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == DISCOVERY_URL)
         .respond(MockResponse::status(200).with_body("not json"));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (browser_interaction, _scripted) = interaction("browser");
     let error = oauth
         .login(browser_interaction)
@@ -807,12 +654,8 @@ async fn an_occupied_callback_port_fails_the_radius_browser_login_before_prompti
         .expect("the holder occupies the callback port");
 
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    mount_discovery(&mock);
+    let oauth = radius_oauth(&mock, START);
     let (interaction, scripted) = interaction("browser");
     let error = oauth
         .login(interaction)
@@ -835,21 +678,13 @@ async fn an_occupied_callback_port_fails_the_radius_browser_login_before_prompti
 async fn the_token_request_transport_failure_surfaces_through_the_browser_path() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    mount_discovery(&mock);
+    let oauth = radius_oauth(&mock, START);
     let (interaction, scripted) = interaction("browser");
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
-    let auth_url = wait_for_auth_url(&scripted).await;
-    let state = url_query_param(&auth_url, "state").expect("the state");
-    let response = send_callback(&format!(
-        "GET /oauth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
-    ))
-    .await;
+    let state = browser_state(&scripted).await;
+    let response = send_callback(code_callback_get(&state)).await;
     assert!(
         response.starts_with("HTTP/1.1 200 OK"),
         "the callback succeeded before the exchange failed: {response:?}"
@@ -870,22 +705,14 @@ async fn the_token_exchange_failure_body_shapes_reach_the_error_message() {
     let _port = CALLBACK_PORT_LOCK.lock().await;
     // A non-JSON body becomes the description.
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
+    mount_discovery(&mock);
     mock.on(|request| request.url == TOKEN_URL)
         .respond(MockResponse::status(400).with_body("oops"));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (browser_interaction, scripted) = interaction("browser");
     let handle = tokio::spawn(async move { oauth.login(browser_interaction).await });
-    let auth_url = wait_for_auth_url(&scripted).await;
-    let state = url_query_param(&auth_url, "state").expect("the state");
-    send_callback(&format!(
-        "GET /oauth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
-    ))
-    .await;
+    let state = browser_state(&scripted).await;
+    send_callback(code_callback_get(&state)).await;
     let error = handle
         .await
         .expect("the login task joins")
@@ -894,22 +721,14 @@ async fn the_token_exchange_failure_body_shapes_reach_the_error_message() {
 
     // An empty body falls back to the status.
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DISCOVERY_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "authorizationEndpoint": AUTHORIZE_ENDPOINT }),
-        ));
+    mount_discovery(&mock);
     mock.on(|request| request.url == TOKEN_URL)
         .respond(MockResponse::status(400));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (browser_interaction, scripted) = interaction("browser");
     let handle = tokio::spawn(async move { oauth.login(browser_interaction).await });
-    let auth_url = wait_for_auth_url(&scripted).await;
-    let state = url_query_param(&auth_url, "state").expect("the state");
-    send_callback(&format!(
-        "GET /oauth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"
-    ))
-    .await;
+    let state = browser_state(&scripted).await;
+    send_callback(code_callback_get(&state)).await;
     let error = handle
         .await
         .expect("the login task joins")
@@ -925,7 +744,7 @@ async fn the_token_exchange_failure_body_shapes_reach_the_error_message() {
 async fn the_device_request_transport_and_parse_failures_propagate() {
     // No device route: the transport failure propagates.
     let mock = MockHttpClient::new();
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (device_interaction, _scripted) = interaction("device-code");
     let error = oauth
         .login(device_interaction)
@@ -940,7 +759,7 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == DEVICE_URL)
         .respond(MockResponse::status(200).with_body("not json"));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (device_interaction, _scripted) = interaction("device-code");
     let error = oauth
         .login(device_interaction)
@@ -955,7 +774,7 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == DEVICE_URL)
         .respond(MockResponse::status(500));
-    let oauth = radius_oauth(&mock, &FixedClock::new(START));
+    let oauth = radius_oauth(&mock, START);
     let (device_interaction, _scripted) = interaction("device-code");
     let error = oauth
         .login(device_interaction)

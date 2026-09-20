@@ -21,15 +21,12 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(
-    clippy::panic,
-    reason = "the tests pin outcomes; an unexpected shape panics by design"
-)]
 
 mod common;
 
 use common::auth_fixtures::{RecordingInteraction, oauth_credentials};
 use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
+use common::oauth_fixtures::{advance_until, task_credential, task_error};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +71,33 @@ fn never_aborted() -> CancellationToken {
     CancellationToken::new()
 }
 
+/// The derivation asserting: the flow derives the plain api-key auth from
+/// the access token, the default `ModelAuth` shape.
+fn assert_derives_api_key(derive: impl Fn(&OAuthCredentials) -> ModelAuth, expected: &str) {
+    assert_eq!(
+        derive(&oauth_credentials(expected, "r", 0)),
+        ModelAuth {
+            api_key: Some(expected.to_owned()),
+            ..ModelAuth::default()
+        }
+    );
+}
+
+/// The derivation asserting over the merged core's `to_auth` closure, the
+/// async surface the auth-closure cases drive.
+async fn assert_derives_api_key_async(derive: pi_ai::auth::types::OAuthToAuthFn, expected: &str) {
+    let derived = derive(oauth_credentials(expected, "r", 0))
+        .await
+        .expect("the derivation resolves");
+    assert_eq!(
+        derived,
+        ModelAuth {
+            api_key: Some(expected.to_owned()),
+            ..ModelAuth::default()
+        }
+    );
+}
+
 #[test]
 fn identifies_only_subscription_backed_oauth_flows_as_subscriptions() {
     let client: Arc<dyn HttpClient> = Arc::new(mock());
@@ -108,27 +132,13 @@ fn identifies_only_subscription_backed_oauth_flows_as_subscriptions() {
 #[test]
 fn anthropic_to_auth_derives_the_api_key_from_the_access_token() {
     let flow = AnthropicOAuth::new(Arc::new(mock()), clock());
-    let auth = flow.to_auth(&oauth_credentials("token", "r", 0));
-    assert_eq!(
-        auth,
-        ModelAuth {
-            api_key: Some("token".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key(|credential| flow.to_auth(credential), "token");
 }
 
 #[test]
 fn openai_codex_to_auth_derives_the_api_key_from_the_access_token() {
     let flow = OpenAICodexOAuth::new(Arc::new(mock()), clock());
-    let auth = flow.to_auth(&oauth_credentials("token", "r", 0));
-    assert_eq!(
-        auth,
-        ModelAuth {
-            api_key: Some("token".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key(|credential| flow.to_auth(credential), "token");
 }
 
 #[tokio::test]
@@ -154,14 +164,7 @@ async fn openrouter_keeps_the_permanent_credential_on_refresh() {
 #[test]
 fn xai_to_auth_derives_the_api_key_from_the_access_token() {
     let flow = XaiOAuth::new(Arc::new(mock()), clock());
-    let auth = flow.to_auth(&oauth_credentials("token", "r", 0));
-    assert_eq!(
-        auth,
-        ModelAuth {
-            api_key: Some("token".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key(|credential| flow.to_auth(credential), "token");
 }
 
 #[test]
@@ -470,17 +473,21 @@ fn xai_login(
     (handle, recording)
 }
 
-/// Step the paused clock until `condition` holds, `advanceTimersByTimeAsync`'s
-/// single-knob behaviour.
-async fn advance_until(condition: impl Fn() -> bool, what: &str) {
-    for _ in 0..2_000 {
-        if condition() {
-            return;
-        }
-        tokio::time::advance(Duration::from_millis(5)).await;
-        tokio::task::yield_now().await;
-    }
-    panic!("timed out waiting for {what}");
+/// Mount the xAI device-start route answering `status`/`body`.
+fn mount_xai_device_start(mock: &MockHttpClient, status: u16, body: &serde_json::Value) {
+    common::oauth_fixtures::mount_json_route(mock, XAI_DEVICE_URL, status, body);
+}
+
+/// The device-start outcome over `mock`, joined as the pinned error.
+async fn xai_start_error(mock: MockHttpClient, what: &str) -> AuthError {
+    let flow = XaiOAuth::new(Arc::new(mock), clock());
+    let (handle, _recording) = xai_login(flow);
+    task_error(handle, "the login task joins", what).await
+}
+
+/// The zero epoch the poll cases ride, upstream's `new Date(0)` stub.
+fn zero_clock() -> Arc<dyn pi_ai::auth::clock::AuthClock> {
+    Arc::new(FixedClock::new(0))
 }
 
 #[test]
@@ -519,12 +526,7 @@ async fn xai_device_start_failures_carry_the_status_and_error_detail() {
             400,
             &serde_json::json!({"error": "invalid_client", "error_description": "nope"}),
         ));
-    let flow = XaiOAuth::new(Arc::new(client), clock());
-    let error = xai_login(flow)
-        .0
-        .await
-        .expect("the login task joins")
-        .expect_err("the failed start fails login");
+    let error = xai_start_error(client, "the failed start fails login").await;
     assert_eq!(
         error.to_string(),
         "xAI OAuth device authorization failed (HTTP 400): invalid_client: nope"
@@ -535,12 +537,7 @@ async fn xai_device_start_failures_carry_the_status_and_error_detail() {
     client
         .on(|request| request.url == XAI_DEVICE_URL)
         .respond(MockResponse::status(400));
-    let flow = XaiOAuth::new(Arc::new(client), clock());
-    let error = xai_login(flow)
-        .0
-        .await
-        .expect("the login task joins")
-        .expect_err("the failed start fails login");
+    let error = xai_start_error(client, "the failed start fails login").await;
     assert_eq!(
         error.to_string(),
         "xAI OAuth device authorization failed (HTTP 400)",
@@ -554,12 +551,7 @@ async fn xai_device_start_rejects_malformed_fields() {
     client
         .on(|request| request.url == XAI_DEVICE_URL)
         .respond(MockResponse::status(200).with_body("[1,2]"));
-    let flow = XaiOAuth::new(Arc::new(client), clock());
-    let error = xai_login(flow)
-        .0
-        .await
-        .expect("the login task joins")
-        .expect_err("the non-object body fails login");
+    let error = xai_start_error(client, "the non-object body fails login").await;
     assert_eq!(
         error.to_string(),
         "Invalid xAI OAuth response field: device_code",
@@ -570,15 +562,8 @@ async fn xai_device_start_rejects_malformed_fields() {
     let client = mock();
     let mut body = xai_device_response();
     body["expires_in"] = serde_json::json!(0);
-    client
-        .on(|request| request.url == XAI_DEVICE_URL)
-        .respond(json_response(200, &body));
-    let flow = XaiOAuth::new(Arc::new(client), clock());
-    let error = xai_login(flow)
-        .0
-        .await
-        .expect("the login task joins")
-        .expect_err("the non-positive expiry fails login");
+    mount_xai_device_start(&client, 200, &body);
+    let error = xai_start_error(client, "the non-positive expiry fails login").await;
     assert_eq!(
         error.to_string(),
         "Invalid xAI OAuth response field: expires_in"
@@ -588,15 +573,8 @@ async fn xai_device_start_rejects_malformed_fields() {
     let client = mock();
     let mut body = xai_device_response();
     body["user_code"] = serde_json::json!("");
-    client
-        .on(|request| request.url == XAI_DEVICE_URL)
-        .respond(json_response(200, &body));
-    let flow = XaiOAuth::new(Arc::new(client), clock());
-    let error = xai_login(flow)
-        .0
-        .await
-        .expect("the login task joins")
-        .expect_err("the empty user code fails login");
+    mount_xai_device_start(&client, 200, &body);
+    let error = xai_start_error(client, "the empty user code fails login").await;
     assert_eq!(
         error.to_string(),
         "Invalid xAI OAuth response field: user_code"
@@ -609,15 +587,8 @@ async fn xai_device_start_rejects_untrusted_verification_uris() {
         let client = mock();
         let mut body = xai_device_response();
         body[field] = serde_json::json!("http://auth.x.ai/device");
-        client
-            .on(|request| request.url == XAI_DEVICE_URL)
-            .respond(json_response(200, &body));
-        let flow = XaiOAuth::new(Arc::new(client), clock());
-        let error = xai_login(flow)
-            .0
-            .await
-            .expect("the login task joins")
-            .expect_err("the untrusted uri fails login");
+        mount_xai_device_start(&client, 200, &body);
+        let error = xai_start_error(client, "the untrusted uri fails login").await;
         assert_eq!(
             error.to_string(),
             "Untrusted verification URI in xAI OAuth response",
@@ -643,9 +614,7 @@ async fn xai_poll_failures_reject_with_the_wire_message() {
         ),
     ] {
         let client = mock();
-        client
-            .on(|request| request.url == XAI_DEVICE_URL)
-            .respond(json_response(200, &xai_device_response()));
+        mount_xai_device_start(&client, 200, &xai_device_response());
         client
             .on(|request| request.url == XAI_TOKEN_URL)
             .respond(json_response(400, &error_body));
@@ -658,10 +627,12 @@ async fn xai_poll_failures_reject_with_the_wire_message() {
             "the failed poll to finish the login",
         )
         .await;
-        let error = handle
-            .await
-            .expect("the login task joins")
-            .expect_err("the failed poll fails login");
+        let error = task_error(
+            handle,
+            "the login task joins",
+            "the failed poll fails login",
+        )
+        .await;
         assert_eq!(error.to_string(), expected, "{error_body:?}");
     }
 }
@@ -669,9 +640,7 @@ async fn xai_poll_failures_reject_with_the_wire_message() {
 #[tokio::test(start_paused = true)]
 async fn xai_slow_down_uses_the_server_interval_and_completes() {
     let client = mock();
-    client
-        .on(|request| request.url == XAI_DEVICE_URL)
-        .respond(json_response(200, &xai_device_response()));
+    mount_xai_device_start(&client, 200, &xai_device_response());
     client
         .on(|request| request.url == XAI_TOKEN_URL)
         .respond_sequence(vec![
@@ -689,7 +658,7 @@ async fn xai_slow_down_uses_the_server_interval_and_completes() {
                 }),
             ),
         ]);
-    let clock: Arc<dyn pi_ai::auth::clock::AuthClock> = Arc::new(FixedClock::new(0));
+    let clock = zero_clock();
     let flow = XaiOAuth::new(Arc::new(client.clone()), Arc::clone(&clock));
     let (handle, _recording) = xai_login(flow);
 
@@ -699,10 +668,12 @@ async fn xai_slow_down_uses_the_server_interval_and_completes() {
     advance_until(|| client.request_count() >= 3, "the slow-down poll").await;
     tokio::time::advance(Duration::from_secs(7)).await;
 
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the slow-down flow completes");
+    let credential = task_credential(
+        handle,
+        "the login task joins",
+        "the slow-down flow completes",
+    )
+    .await;
     assert_eq!(credential.access, "access-token");
     assert_eq!(client.request_count(), 4, "device start, then three polls");
 }
@@ -710,24 +681,24 @@ async fn xai_slow_down_uses_the_server_interval_and_completes() {
 #[tokio::test(start_paused = true)]
 async fn xai_poll_rejects_a_token_response_without_a_refresh_token() {
     let client = mock();
-    client
-        .on(|request| request.url == XAI_DEVICE_URL)
-        .respond(json_response(200, &xai_device_response()));
+    mount_xai_device_start(&client, 200, &xai_device_response());
     client
         .on(|request| request.url == XAI_TOKEN_URL)
         .respond(json_response(
             200,
             &serde_json::json!({"access_token": "a"}),
         ));
-    let clock: Arc<dyn pi_ai::auth::clock::AuthClock> = Arc::new(FixedClock::new(0));
+    let clock = zero_clock();
     let flow = XaiOAuth::new(Arc::new(client), Arc::clone(&clock));
     let (handle, _recording) = xai_login(flow);
 
     tokio::time::advance(Duration::from_secs(5)).await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the missing refresh token fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the missing refresh token fails login",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "Invalid xAI OAuth response field: refresh_token",
@@ -772,19 +743,19 @@ async fn xai_refresh_transport_failures_propagate_the_seam_message() {
 #[tokio::test(start_paused = true)]
 async fn xai_poll_transport_failures_propagate_the_seam_message() {
     let client = mock();
-    client
-        .on(|request| request.url == XAI_DEVICE_URL)
-        .respond(json_response(200, &xai_device_response()));
-    let clock: Arc<dyn pi_ai::auth::clock::AuthClock> = Arc::new(FixedClock::new(0));
+    mount_xai_device_start(&client, 200, &xai_device_response());
+    let clock = zero_clock();
     let flow = XaiOAuth::new(Arc::new(client), Arc::clone(&clock));
     let (handle, _recording) = xai_login(flow);
     // waitBeforeFirstPoll parks the flow before the first token request.
     tokio::time::advance(Duration::from_secs(5)).await;
     advance_until(|| handle.is_finished(), "the transport failure").await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the unmatched token route fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the unmatched token route fails login",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "no mock route matched POST https://auth.x.ai/oauth2/token"
@@ -796,15 +767,8 @@ async fn xai_device_start_rejects_a_missing_verification_uri() {
     let client = mock();
     let mut body = xai_device_response();
     body["verification_uri"] = serde_json::json!(null);
-    client
-        .on(|request| request.url == XAI_DEVICE_URL)
-        .respond(json_response(200, &body));
-    let flow = XaiOAuth::new(Arc::new(client), clock());
-    let error = xai_login(flow)
-        .0
-        .await
-        .expect("the login task joins")
-        .expect_err("the missing verification uri fails login");
+    mount_xai_device_start(&client, 200, &body);
+    let error = xai_start_error(client, "the missing verification uri fails login").await;
     assert_eq!(
         error.to_string(),
         "Invalid xAI OAuth response field: verification_uri"
@@ -828,20 +792,20 @@ async fn xai_poll_rejects_an_empty_or_invalid_refresh_token_and_expiry() {
         ),
     ] {
         let client = mock();
-        client
-            .on(|request| request.url == XAI_DEVICE_URL)
-            .respond(json_response(200, &xai_device_response()));
+        mount_xai_device_start(&client, 200, &xai_device_response());
         client
             .on(|request| request.url == XAI_TOKEN_URL)
             .respond(json_response(200, &body));
-        let clock: Arc<dyn pi_ai::auth::clock::AuthClock> = Arc::new(FixedClock::new(0));
+        let clock = zero_clock();
         let flow = XaiOAuth::new(Arc::new(client), Arc::clone(&clock));
         let (handle, _recording) = xai_login(flow);
         tokio::time::advance(Duration::from_secs(5)).await;
-        let error = handle
-            .await
-            .expect("the login task joins")
-            .expect_err("the malformed token response fails login");
+        let error = task_error(
+            handle,
+            "the login task joins",
+            "the malformed token response fails login",
+        )
+        .await;
         assert_eq!(error.to_string(), expected, "{body:?}");
     }
 }
@@ -880,16 +844,7 @@ async fn the_xai_auth_closures_drive_the_flow() {
         .await
         .expect("the refresh closure resolves");
     assert_eq!(refreshed.access, "new-access");
-    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
-        .await
-        .expect("the derivation resolves");
-    assert_eq!(
-        derived,
-        ModelAuth {
-            api_key: Some("tok".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key_async(Arc::clone(&auth.to_auth), "tok").await;
 }
 
 #[tokio::test]
@@ -1023,16 +978,7 @@ async fn the_radius_auth_closures_drive_the_flow() {
         .expect("the refresh closure resolves");
     assert_eq!(refreshed.access, "new-access");
 
-    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
-        .await
-        .expect("the derivation resolves");
-    assert_eq!(
-        derived,
-        ModelAuth {
-            api_key: Some("tok".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key_async(Arc::clone(&auth.to_auth), "tok").await;
 }
 
 #[tokio::test]
@@ -1145,16 +1091,7 @@ async fn the_codex_auth_closures_drive_the_flow() {
         .expect_err("the unextractable account id fails the refresh closure");
     assert_eq!(error.to_string(), "Failed to extract accountId from token");
 
-    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
-        .await
-        .expect("the derivation resolves");
-    assert_eq!(
-        derived,
-        ModelAuth {
-            api_key: Some("tok".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key_async(Arc::clone(&auth.to_auth), "tok").await;
 }
 
 #[tokio::test]
@@ -1178,14 +1115,5 @@ async fn the_anthropic_auth_closures_drive_the_flow() {
         .expect("the refresh closure resolves");
     assert_eq!(refreshed.access, "new-access");
 
-    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
-        .await
-        .expect("the derivation resolves");
-    assert_eq!(
-        derived,
-        ModelAuth {
-            api_key: Some("tok".to_owned()),
-            ..ModelAuth::default()
-        }
-    );
+    assert_derives_api_key_async(Arc::clone(&auth.to_auth), "tok").await;
 }

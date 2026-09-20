@@ -134,13 +134,50 @@ fn unwatched_poll_times() -> Arc<Mutex<Vec<i64>>> {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// Mount the device-code start route answering the default response with
+/// the given field overrides.
+fn mount_device_start(mock: &MockHttpClient, overrides: &[(&str, serde_json::Value)]) {
+    mock.on(|request| request.url == DEVICE_CODE_URL)
+        .respond(json_response(200, &device_code_response(overrides)));
+}
+
+/// The login task over the default scripted interaction, with the token
+/// route mounted over `clock` answering `replies` in order.
+fn spawn_default_login(
+    mock: MockHttpClient,
+    clock: &Arc<FixedClock>,
+    poll_times: &Arc<Mutex<Vec<i64>>>,
+    replies: Vec<(u16, serde_json::Value)>,
+) -> (
+    Arc<ScriptedAuthInteraction>,
+    tokio::task::JoinHandle<Result<OAuthCredentials, AuthError>>,
+) {
+    let _marker = mount_token_route(&mock, clock, poll_times, replies);
+    let clock = Arc::clone(clock);
+    let oauth = XaiOAuth::new(Arc::new(mock), clock);
+    let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
+    let handle = tokio::spawn(login_xai(&oauth, CancellationToken::new(), &scripted));
+    (scripted, handle)
+}
+
+/// The refresh outcome over `mock`, joined as the pinned error.
+async fn refresh_error(mock: MockHttpClient, what: &str) -> AuthError {
+    let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
+    oauth
+        .refresh(
+            oauth_credentials("old-access", "old-refresh", 0),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err(what)
+}
+
 #[tokio::test(start_paused = true)]
 async fn uses_the_device_grant_delays_polling_and_handles_pending_and_slow_down() {
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = Arc::new(Mutex::new(Vec::new()));
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DEVICE_CODE_URL)
-        .respond(json_response(200, &device_code_response(&[])));
+    mount_device_start(&mock, &[]);
     let mut poll_marker = mount_token_route(
         &mock,
         &clock,
@@ -242,19 +279,9 @@ async fn falls_back_to_the_default_poll_interval_when_the_response_reports_inter
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = Arc::new(Mutex::new(Vec::new()));
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DEVICE_CODE_URL)
-        .respond(json_response(
-            200,
-            &device_code_response(&[("interval", serde_json::json!(0))]),
-        ));
-    let _marker = mount_token_route(&mock, &clock, &poll_times, vec![(200, token_response(&[]))]);
-
-    let oauth = XaiOAuth::new(Arc::new(mock), clock.clone());
-    let runner = tokio::spawn(login_xai(
-        &oauth,
-        CancellationToken::new(),
-        &Arc::new(ScriptedAuthInteraction::rejecting_prompt()),
-    ));
+    mount_device_start(&mock, &[("interval", serde_json::json!(0))]);
+    let (_, runner) =
+        spawn_default_login(mock, &clock, &poll_times, vec![(200, token_response(&[]))]);
 
     tokio::time::advance(Duration::ZERO).await;
     // RFC 8628 default interval is 5 seconds when the server does not
@@ -272,19 +299,15 @@ async fn prefers_verification_uri_complete_when_the_server_provides_it() {
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = unwatched_poll_times();
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DEVICE_CODE_URL)
-        .respond(json_response(
-            200,
-            &device_code_response(&[(
-                "verification_uri_complete",
-                serde_json::json!("https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"),
-            )]),
-        ));
-    let _marker = mount_token_route(&mock, &clock, &poll_times, vec![(200, token_response(&[]))]);
-
-    let oauth = XaiOAuth::new(Arc::new(mock), clock.clone());
-    let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
-    let runner = tokio::spawn(login_xai(&oauth, CancellationToken::new(), &scripted));
+    mount_device_start(
+        &mock,
+        &[(
+            "verification_uri_complete",
+            serde_json::json!("https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"),
+        )],
+    );
+    let (scripted, runner) =
+        spawn_default_login(mock, &clock, &poll_times, vec![(200, token_response(&[]))]);
 
     tokio::time::advance(Duration::ZERO).await;
     advance(&clock, 5_000).await;
@@ -427,8 +450,7 @@ async fn login_denied(oauth_error: &str) -> String {
 #[tokio::test(start_paused = true)]
 async fn cancels_while_waiting_for_the_first_token_poll() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DEVICE_CODE_URL)
-        .respond(json_response(200, &device_code_response(&[])));
+    mount_device_start(&mock, &[]);
 
     let clock = Arc::new(FixedClock::new(START));
     let oauth = XaiOAuth::new(Arc::new(mock.clone()), clock);
@@ -548,14 +570,7 @@ async fn rejects_token_responses_with_missing_fields() {
             &token_response(&[("access_token", None)]),
         ));
 
-    let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
-    let error = oauth
-        .refresh(
-            oauth_credentials("old-access", "old-refresh", 0),
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("missing access token rejects");
+    let error = refresh_error(mock, "missing access token rejects").await;
 
     assert_eq!(
         error.to_string(),
@@ -575,14 +590,7 @@ async fn surfaces_the_upstream_error_code_and_description_on_refresh_failure() {
             }),
         ));
 
-    let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
-    let error = oauth
-        .refresh(
-            oauth_credentials("old-access", "old-refresh", 0),
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("revoked refresh rejects");
+    let error = refresh_error(mock, "revoked refresh rejects").await;
 
     assert_eq!(
         error.to_string(),

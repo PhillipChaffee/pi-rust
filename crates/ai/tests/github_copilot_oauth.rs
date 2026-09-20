@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use common::auth_fixtures::oauth_credentials;
 use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
+use common::oauth_fixtures::{task_credential, task_error};
 use common::seam_forms::{form_field, form_fields};
 use pi_ai::auth::clock::SteppedClock;
 use pi_ai::auth::oauth::github_copilot::{
@@ -110,22 +111,47 @@ fn mount_login_route_builder(
     mount_models(mock.on(move |request| request.url == MODELS_URL));
 }
 
+/// The device-start, poll, and token-exchange routes the login-path poll
+/// cases mount, with the models GET mounted separately.
+fn mount_poll_routes(mock: &MockHttpClient) {
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+}
+
+/// The login task over `mock` answering `""`, the scripted reply the
+/// device-flow cases drive; the caller joins and reads the events.
+fn spawn_login_task(
+    mock: &MockHttpClient,
+) -> (
+    Arc<ScriptedAuthInteraction>,
+    tokio::task::JoinHandle<
+        Result<pi_ai::auth::types::OAuthCredentials, pi_ai::auth::types::AuthError>,
+    >,
+) {
+    let oauth = flow(mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    (scripted, handle)
+}
+
 #[tokio::test(start_paused = true)]
 async fn login_completes_through_the_device_flow_and_merges_the_catalog() {
     let mock = MockHttpClient::new();
     mount_login_routes(&mock, &serde_json::json!({ "data": [] }));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (scripted, handle) = spawn_login_task(&mock);
 
     // waitBeforeFirstPoll: the first poll lands after the server interval.
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
 
     let AuthEvent::DeviceCode {
         user_code,
@@ -193,16 +219,10 @@ async fn login_enables_unconfigured_policy_models_and_merges_the_enabled_ids() {
         &serde_json::json!({ "state": "enabled" }),
     ));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (scripted, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
 
     assert_eq!(
         credential.extra.get("availableModelIds"),
@@ -271,10 +291,7 @@ async fn login_routes_the_exchange_through_the_enterprise_domain() {
         tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(
         credential.extra.get("enterpriseUrl"),
         Some(&serde_json::json!("company.ghe.com")),
@@ -352,16 +369,15 @@ async fn the_device_poll_reports_the_wire_error_and_description() {
             }),
         ));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the failed poll fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the failed poll fails login",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "Device flow failed: expired_token: restart"
@@ -386,17 +402,11 @@ async fn the_device_poll_honours_the_server_slow_down_interval() {
     mock.on(|request| request.url == MODELS_URL)
         .respond(json_response(200, &serde_json::json!({ "data": [] })));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_secs(4)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, COPILOT_TOKEN);
     assert_eq!(
         mock.request_count(),
@@ -516,19 +526,14 @@ async fn the_login_models_fetch_retries_a_429_with_the_seconds_delay() {
         ]);
     });
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
     // The wait-before-first-poll sleep and the one-second retry-after backoff
     // both ride the paused clock.
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::task::yield_now().await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the retried login resolves");
+    let credential =
+        task_credential(handle, "the login task joins", "the retried login resolves").await;
     assert_eq!(
         credential.extra.get("availableModelIds"),
         Some(&serde_json::json!([])),
@@ -559,10 +564,12 @@ async fn a_429_retry_after_http_date_waits_out_the_date_delta() {
         tokio::spawn(oauth.refresh(oauth_credentials("a", "r", 0), CancellationToken::new()));
     // The dated retry-after is one hour out; the five-second retry budget
     // cannot cover it, so the retry stops and the 429 is the outcome.
-    let error = handle
-        .await
-        .expect("the refresh task joins")
-        .expect_err("the over-budget dated retry fails refresh");
+    let error = task_error(
+        handle,
+        "the refresh task joins",
+        "the over-budget dated retry fails refresh",
+    )
+    .await;
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
     assert_eq!(mock.request_count(), 2);
 }
@@ -762,16 +769,15 @@ async fn an_enable_that_rate_limits_exhausting_the_budget_fails_the_login() {
     mock.on(|request| request.url.ends_with("/policy"))
         .respond(MockResponse::status(429).with_header("Retry-After", "30"));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the rate-limited policy update is best effort");
+    let credential = task_credential(
+        handle,
+        "the login task joins",
+        "the rate-limited policy update is best effort",
+    )
+    .await;
     assert_eq!(
         credential.extra.get("availableModelIds"),
         Some(&serde_json::json!([])),
@@ -792,28 +798,19 @@ async fn a_429_without_a_retry_after_uses_the_default_backoff() {
             json_response(200, &serde_json::json!({ "data": [] })),
         ]);
     });
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(200, &device_response()));
-    mock.on(|request| request.url == ACCESS_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "access_token": "gh-token" }),
-        ));
-    mock.on(|request| request.url == COPILOT_TOKEN_URL)
-        .respond(json_response(200, &copilot_token_response()));
+    mount_poll_routes(&mock);
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
     // The wait-before-first-poll sleep, then the 500 ms default backoff.
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_millis(500)).await;
     tokio::task::yield_now().await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the backoff retried login resolves");
+    let credential = task_credential(
+        handle,
+        "the login task joins",
+        "the backoff retried login resolves",
+    )
+    .await;
     assert_eq!(
         credential.extra.get("availableModelIds"),
         Some(&serde_json::json!([]))
@@ -826,15 +823,7 @@ async fn a_429_with_a_far_retry_after_date_exhausts_the_budget() {
     let mock = MockHttpClient::new();
     // The wait-before-first-poll sleep and the poll fire on the real clock:
     // no backoff sleep runs because the dated retry is out of budget.
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(200, &device_response()));
-    mock.on(|request| request.url == ACCESS_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "access_token": "gh-token" }),
-        ));
-    mock.on(|request| request.url == COPILOT_TOKEN_URL)
-        .respond(json_response(200, &copilot_token_response()));
+    mount_poll_routes(&mock);
     // One hour after START, in IMF-fixdate form.
     mount_login_route_builder(&mock, |builder| {
         builder.respond_sequence(vec![
@@ -843,15 +832,14 @@ async fn a_429_with_a_far_retry_after_date_exhausts_the_budget() {
         ]);
     });
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
     // The one-second wait-before-first-poll sleep runs on the real clock.
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the out-of-budget dated retry fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the out-of-budget dated retry fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
 }
 
@@ -863,16 +851,15 @@ async fn the_device_poll_fails_without_an_error_or_access_token_field() {
     mock.on(|request| request.url == ACCESS_TOKEN_URL)
         .respond(json_response(200, &serde_json::json!({})));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the fieldless poll fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the fieldless poll fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "Invalid device token response");
 }
 
@@ -894,17 +881,11 @@ async fn the_device_poll_parks_on_authorization_pending_then_completes() {
     mock.on(|request| request.url == MODELS_URL)
         .respond(json_response(200, &serde_json::json!({ "data": [] })));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, COPILOT_TOKEN);
     assert_eq!(
         mock.request_count(),
@@ -925,16 +906,15 @@ async fn a_failing_policy_update_stops_the_batch_without_failing_the_login() {
         ]}),
     );
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the best-effort batch stop keeps the login");
+    let credential = task_credential(
+        handle,
+        "the login task joins",
+        "the best-effort batch stop keeps the login",
+    )
+    .await;
     assert_eq!(
         credential.extra.get("availableModelIds"),
         Some(&serde_json::json!([]))
@@ -955,16 +935,15 @@ async fn a_failed_policy_status_counts_as_not_enabled() {
     mock.on(|request| request.url.ends_with("/policy"))
         .respond(MockResponse::status(400).with_body("nope"));
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the failed policy updates are not enabled");
+    let credential = task_credential(
+        handle,
+        "the login task joins",
+        "the failed policy updates are not enabled",
+    )
+    .await;
     assert_eq!(
         credential.extra.get("availableModelIds"),
         Some(&serde_json::json!([]))
@@ -1000,10 +979,12 @@ async fn a_cancelled_enable_fails_the_login() {
     let handle = tokio::spawn(oauth.login(provider_interaction(&scripted, signal)));
 
     tokio::time::advance(Duration::from_secs(1)).await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the cancelled enable fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the cancelled enable fails login",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "Login cancelled",
@@ -1085,20 +1066,15 @@ async fn a_429_with_an_unparsable_date_and_headerless_replies_stop_the_retry() {
             json_response(200, &serde_json::json!({ "data": [] })),
         ]);
     });
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(200, &device_response()));
-    mock.on(|request| request.url == ACCESS_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "access_token": "gh-token" }),
-        ));
-    mock.on(|request| request.url == COPILOT_TOKEN_URL)
-        .respond(json_response(200, &copilot_token_response()));
+    mount_poll_routes(&mock);
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let outcome = oauth.login(provider_interaction(&scripted, CancellationToken::new()));
-    let error = outcome.await.expect_err("the unparsable date fails login");
+    let (_, handle) = spawn_login_task(&mock);
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the unparsable date fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
 }
 
@@ -1113,25 +1089,16 @@ async fn a_429_with_only_a_date_header_out_of_budget_exits_before_the_sleep() {
             json_response(200, &serde_json::json!({ "data": [] })),
         ]);
     });
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(200, &device_response()));
-    mock.on(|request| request.url == ACCESS_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "access_token": "gh-token" }),
-        ));
-    mock.on(|request| request.url == COPILOT_TOKEN_URL)
-        .respond(json_response(200, &copilot_token_response()));
+    mount_poll_routes(&mock);
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
     tokio::time::advance(Duration::from_secs(1)).await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the dated retry over the budget fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the dated retry over the budget fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
 }
 
@@ -1212,26 +1179,17 @@ async fn a_429_with_a_non_finite_retry_header_stops_the_login_retry() {
             json_response(200, &serde_json::json!({ "data": [] })),
         ]);
     });
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(200, &device_response()));
-    mock.on(|request| request.url == ACCESS_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "access_token": "gh-token" }),
-        ));
-    mock.on(|request| request.url == COPILOT_TOKEN_URL)
-        .respond(json_response(200, &copilot_token_response()));
+    mount_poll_routes(&mock);
 
-    let oauth = flow(&mock);
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle =
-        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
+    let (_, handle) = spawn_login_task(&mock);
     // The wait-before-first-poll sleep rides the paused clock.
     tokio::time::advance(Duration::from_secs(1)).await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the non-finite retry-after fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the non-finite retry-after fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
     assert_eq!(
         mock.request_count(),

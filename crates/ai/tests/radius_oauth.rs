@@ -10,70 +10,29 @@
 
 mod common;
 
-use std::sync::Arc;
-
-use pi_ai::auth::clock::FixedClock;
-use pi_ai::auth::oauth::radius::RadiusOAuth;
 use pi_ai::auth::types::AuthEvent;
 use pi_ai::http::{MockHttpClient, json_response};
 use tokio_util::sync::CancellationToken;
 
 use common::auth_fixtures::oauth_credentials;
-use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
+use common::radius_fixtures::{
+    DEVICE_URL, DISCOVERY_URL, GATEWAY, START, TOKEN_URL, interaction, mount_device_routes,
+    radius_oauth,
+};
 use common::seam_forms::{form_field, form_fields};
 
-const GATEWAY: &str = "https://radius.example";
-const DISCOVERY_URL: &str = "https://radius.example/v1/oauth";
-const DEVICE_URL: &str = "https://radius.example/v1/oauth/device";
-const TOKEN_URL: &str = "https://radius.example/v1/oauth/token";
+/// `urn:ietf:params:oauth:grant-type:device_code`, the device grant the
+/// exchange posts.
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
-
-/// `new Date("2026-07-24T00:00:00Z").getTime()`, upstream's pinned system
-/// time.
-const START: i64 = 1_784_851_200_000;
-
-/// `createRadiusOAuth({ name: "Radius", gateway: GATEWAY })`.
-fn radius_oauth(mock: &MockHttpClient, clock: Arc<FixedClock>) -> RadiusOAuth {
-    RadiusOAuth::new(
-        "Radius".to_owned(),
-        GATEWAY.to_owned(),
-        Arc::new(mock.clone()),
-        clock,
-    )
-}
-
-/// The scripted interaction answering `login_method`, upstream's
-/// `interaction(loginMethod, events)` helper.
-fn interaction(
-    login_method: &str,
-) -> (
-    pi_ai::auth::types::ProviderAuthInteraction,
-    Arc<ScriptedAuthInteraction>,
-) {
-    let scripted = Arc::new(ScriptedAuthInteraction::answering(login_method));
-    (
-        provider_interaction(&scripted, CancellationToken::new()),
-        scripted,
-    )
-}
 
 #[tokio::test(start_paused = true)]
 async fn uses_gateway_endpoints_directly_for_device_login() {
-    let clock = Arc::new(FixedClock::new(START));
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://radius-ui.example/pair",
-                "expires_in": 600,
-                "interval": 5,
-            }),
-        ));
-    mock.on(|request| request.url == TOKEN_URL)
-        .respond(json_response(
+    mount_device_routes(
+        &mock,
+        600,
+        5,
+        vec![json_response(
             200,
             &serde_json::json!({
                 "access_token": "access-token",
@@ -81,9 +40,10 @@ async fn uses_gateway_endpoints_directly_for_device_login() {
                 "expires_in": 3600,
                 "scope": "gateway offline_access",
             }),
-        ));
+        )],
+    );
 
-    let oauth = radius_oauth(&mock, Arc::clone(&clock));
+    let oauth = radius_oauth(&mock, START);
     let (interaction, scripted) = interaction("device-code");
     let credential = oauth
         .login(interaction)
@@ -145,7 +105,7 @@ async fn refreshes_directly_through_the_gateway_without_discovery() {
             }),
         ));
 
-    let oauth = radius_oauth(&mock, Arc::new(FixedClock::new(0)));
+    let oauth = radius_oauth(&mock, 0);
     let refreshed = oauth
         .refresh(
             oauth_credentials("old-access", "old-refresh", 0),
@@ -174,7 +134,7 @@ async fn discovers_only_the_interactive_browser_authorization_endpoint() {
             &serde_json::json!({ "issuer": "https://radius-ui.example" }),
         ));
 
-    let oauth = radius_oauth(&mock, Arc::new(FixedClock::new(0)));
+    let oauth = radius_oauth(&mock, 0);
     let (interaction, _scripted) = interaction("browser");
     let error = oauth
         .login(interaction)

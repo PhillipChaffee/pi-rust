@@ -18,12 +18,12 @@
 //!   sleeps ride the paused tokio clock the fake-timer suites drive.
 
 #![expect(
-    clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(
     clippy::panic,
     reason = "the tests pin outcomes; an unexpected shape panics by design"
+)]
+#![expect(
+    clippy::expect_used,
+    reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
 mod common;
@@ -31,7 +31,13 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::auth_fixtures::{RecordingInteraction, oauth_credentials};
+use common::auth_fixtures::{
+    RecordingInteraction, oauth_credentials, provider_interaction as recording_interaction,
+};
+use common::oauth_fixtures::{
+    advance_until, mount_json_route, send_loopback, spawn_login, task_credential, task_error,
+    token_success, url_query_param, wait_until,
+};
 use pi_ai::auth::clock::SteppedClock;
 use pi_ai::auth::oauth::anthropic::AnthropicOAuth;
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
@@ -41,7 +47,6 @@ use pi_ai::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use pi_ai::http::{MockHttpClient, MockResponse, json_response};
 use pi_ai::types::BoxedFuture;
 use pi_ai::utils::abort::AbortError;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -66,46 +71,6 @@ fn callback_host() -> String {
 /// A clock fixed at [`EPOCH_MS`], the `Date.now()` the flows read.
 fn stepped_clock() -> Arc<dyn pi_ai::auth::clock::AuthClock> {
     Arc::new(SteppedClock::new(EPOCH_MS))
-}
-
-/// A fresh uncancelled interaction bundle over `recording`.
-fn provider_interaction(
-    recording: &RecordingInteraction,
-) -> pi_ai::auth::types::ProviderAuthInteraction {
-    pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
-        recording.interaction(),
-        CancellationToken::new(),
-    )
-}
-
-/// Wait for a condition the login task reaches without clock dependence,
-/// stepping the scheduler between probes like `advanceTimersByTimeAsync`
-/// does, and return the probed value.
-async fn wait_until<T>(condition: impl Fn() -> Option<T>, what: &str) -> T {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(value) = condition() {
-            return value;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
-        tokio::task::yield_now().await;
-    }
-}
-
-/// Step the paused clock until `condition` holds, `advanceTimersByTimeAsync`'s
-/// single-knob behaviour.
-async fn advance_until(condition: impl Fn() -> bool, what: &str) {
-    for _ in 0..2_000 {
-        if condition() {
-            return;
-        }
-        tokio::time::advance(Duration::from_millis(5)).await;
-        tokio::task::yield_now().await;
-    }
-    panic!("timed out waiting for {what}");
 }
 
 /// Advance the paused clock in one-second steps until `condition` holds or
@@ -185,13 +150,32 @@ fn device_code_event(recording: &RecordingInteraction) -> AuthEvent {
         .expect("the flow reported the device code")
 }
 
-/// A query parameter of an event's URL, the authorize URL's carried params.
-fn url_query_param(url: &str, name: &str) -> Option<String> {
-    url::Url::parse(url)
-        .ok()?
-        .query_pairs()
-        .find(|(key, _)| key == name)
-        .map(|(_, value)| value.into_owned())
+/// The authorize URL the login announced, reduced to its `state` parameter —
+/// the pairing the callback-path cases drive.
+async fn authorize_state(recording: &RecordingInteraction) -> String {
+    let auth_url = wait_until(|| recording.auth_url(), "the authorize URL").await;
+    url_query_param(&auth_url, "state").expect("the authorize URL carries the state")
+}
+
+/// The credentials' `accountId` extra, asserting it carries the minted id.
+fn assert_account_id(credential: &OAuthCredentials, expected: &str) {
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some(expected)
+    );
+}
+
+/// The port and path of the callback URL a flow announced, the pair its
+/// loopback cases connect against.
+fn callback_parts(callback_url: &str) -> (u16, String) {
+    let parsed = url::Url::parse(callback_url).expect("the callback url parses");
+    (
+        parsed.port().expect("the callback url carries the port"),
+        parsed.path().to_owned(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -205,22 +189,101 @@ static ANTHROPIC_PORT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 /// The port-1455 cases serialize the same way for the Codex callback server.
 static CODEX_PORT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// A raw one-request-per-connection GET to `port`, the loopback callback the
-/// browser sends; returns the raw response bytes as text.
-async fn send_request(port: u16, request: impl AsRef<[u8]>) -> String {
-    let mut stream = tokio::net::TcpStream::connect((callback_host().as_str(), port))
-        .await
-        .expect("the callback server accepts");
-    stream
-        .write_all(request.as_ref())
-        .await
-        .expect("the callback writes");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("the response reads to EOF");
-    String::from_utf8(raw).expect("the response is utf-8")
+/// Mount the token route a browser-path login exchanges against.
+fn mount_anthropic_token_route(mock: &MockHttpClient) {
+    mount_json_route(
+        mock,
+        ANTHROPIC_TOKEN_URL,
+        200,
+        &token_success("access-token", "refresh-token", 3600),
+    );
+}
+
+/// Mount the Codex token route answering the minted `acc` JWT with the
+/// given refresh rotation.
+fn mount_codex_token_route(mock: &MockHttpClient, refresh: &str, expires_in: i64) {
+    mount_json_route(
+        mock,
+        CODEX_TOKEN_URL,
+        200,
+        &token_success(&codex_jwt("acc"), refresh, expires_in),
+    );
+}
+
+/// Mount the Codex device-start route with the server's own five-second
+/// interval, the response every device-flow case starts from.
+fn mount_codex_usercode_route(mock: &MockHttpClient) {
+    mount_json_route(
+        mock,
+        CODEX_USERCODE_URL,
+        200,
+        &serde_json::json!({
+            "device_auth_id": "device-auth-id",
+            "user_code": "ABCD-1234",
+            "interval": 5,
+        }),
+    );
+}
+
+/// Mount the Kimi device-start route with the standard body, carrying
+/// `complete_uri` as the `verification_uri_complete` the notification uses.
+fn mount_kimi_device_route(mock: &MockHttpClient, complete_uri: &str) {
+    mount_json_route(
+        mock,
+        KIMI_DEVICE_URL,
+        200,
+        &serde_json::json!({
+            "device_code": "device-code-123",
+            "user_code": "ABCD-1234",
+            "verification_uri": "https://www.kimi.com/code",
+            "verification_uri_complete": complete_uri,
+            "interval": 5,
+            "expires_in": 600,
+        }),
+    );
+}
+
+/// The Codex login task over `mock`, answering prompts from `answers`; the
+/// callback-path cases drive it against the fixed port.
+fn spawn_codex_login(
+    mock: &MockHttpClient,
+    answers: Vec<Result<String, AbortError>>,
+) -> (
+    RecordingInteraction,
+    tokio::task::JoinHandle<Result<OAuthCredentials, AuthError>>,
+) {
+    let recording = RecordingInteraction::with_answers(answers);
+    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
+    let handle = spawn_login(|interaction| flow.login(interaction), &recording);
+    (recording, handle)
+}
+
+/// The Kimi login task over `mock`, over an interaction that hangs on the
+/// prompt signal; the poll cases join it after the clock advances.
+fn spawn_kimi_login(
+    mock: &MockHttpClient,
+) -> (
+    RecordingInteraction,
+    tokio::task::JoinHandle<Result<OAuthCredentials, AuthError>>,
+) {
+    let recording = RecordingInteraction::new();
+    let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
+    let handle = spawn_login(|interaction| flow.login(interaction), &recording);
+    (recording, handle)
+}
+
+/// The OpenRouter login task over `mock`, over an interaction that hangs on
+/// the prompt signal; the callback cases drive the printed URL.
+fn spawn_openrouter_login(
+    mock: &MockHttpClient,
+) -> (
+    RecordingInteraction,
+    tokio::task::JoinHandle<Result<OAuthCredentials, AuthError>>,
+) {
+    let recording = RecordingInteraction::new();
+    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
+    let handle = spawn_login(|interaction| flow.login(interaction), &recording);
+    (recording, handle)
 }
 
 #[tokio::test]
@@ -238,17 +301,14 @@ async fn anthropic_login_completes_through_a_real_callback_and_cancels_the_manua
         ));
     let recording = RecordingInteraction::new();
     let flow = AnthropicOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let handle = spawn_login(|interaction| flow.login(interaction), &recording);
 
     // The authorize URL the user's browser opens carries the verifier as
     // its state; the callback server is already bound on the fixed port.
-    let auth_url = wait_until(|| recording.auth_url(), "the authorize URL").await;
-    let state = url_query_param(&auth_url, "state").expect("the authorize URL carries the state");
+    let state = authorize_state(&recording).await;
 
-    let response = send_callback(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         &format!("GET /callback?code=C&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
     )
@@ -258,10 +318,7 @@ async fn anthropic_login_completes_through_a_real_callback_and_cancels_the_manua
         "the browser gets the success page: {response:?}"
     );
 
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, "access-token");
     assert_eq!(credential.refresh, "refresh-token");
     // now + expires_in - the five-minute expiry skew, on the stepped clock.
@@ -289,24 +346,6 @@ async fn anthropic_login_completes_through_a_real_callback_and_cancels_the_manua
     );
 }
 
-/// The pasted-redirect one-shot the manual race uses, over a real loopback
-/// connection to the flow's own callback server.
-async fn send_callback(port: u16, request: &str) -> String {
-    let mut stream = tokio::net::TcpStream::connect((callback_host().as_str(), port))
-        .await
-        .expect("the callback server accepts");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("the callback writes");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("the response reads to EOF");
-    String::from_utf8(raw).expect("the response is utf-8")
-}
-
 #[tokio::test]
 async fn an_occupied_callback_port_surfaces_the_bind_error() {
     let _port = ANTHROPIC_PORT.lock().await;
@@ -316,7 +355,7 @@ async fn an_occupied_callback_port_surfaces_the_bind_error() {
 
     let recording = RecordingInteraction::new();
     let outcome = AnthropicOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await;
     let error = outcome.expect_err("the occupied port fails login");
     assert!(
@@ -367,7 +406,7 @@ async fn openrouter_manual_input_mints_the_key_without_a_callback() {
     );
 
     let credential = OpenRouterOAuth::new(Arc::new(mock.clone()))
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect("the pasted redirect mints the key");
     assert_eq!(credential.access, "sk-or-test");
@@ -392,7 +431,7 @@ async fn a_cancelled_openrouter_manual_prompt_fails_login_without_exchanging() {
     let recording = RecordingInteraction::with_answers(vec![Err(AbortError)]);
 
     let error = OpenRouterOAuth::new(Arc::new(mock.clone()))
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the cancelled prompt fails login");
     assert_eq!(error.to_string(), AbortError::MESSAGE);
@@ -410,7 +449,7 @@ async fn an_empty_openrouter_manual_input_rejects_without_exchanging() {
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("   "))]);
 
     let error = OpenRouterOAuth::new(Arc::new(mock.clone()))
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("empty input fails login");
     assert_eq!(error.to_string(), "Missing authorization code");
@@ -425,15 +464,7 @@ async fn an_empty_openrouter_manual_input_rejects_without_exchanging() {
 async fn openai_codex_browser_login_mints_the_account_from_manual_input() {
     let _port = CODEX_PORT.lock().await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-            }),
-        ));
+    mount_codex_token_route(&mock, "refresh-token", 3600);
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     let for_answer = Arc::new(recording.clone());
     recording.set_dynamic(
@@ -450,17 +481,11 @@ async fn openai_codex_browser_login_mints_the_account_from_manual_input() {
     );
 
     let credential = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect("the manual paste mints the credential");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    assert_account_id(&credential, "acc");
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(credential.expires, EPOCH_MS + 3_600_000);
 
@@ -485,15 +510,7 @@ async fn openai_codex_browser_login_mints_the_account_from_manual_input() {
 #[tokio::test(start_paused = true)]
 async fn the_openai_codex_device_flow_logs_in_through_pending_polls() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_USERCODE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_auth_id": "device-auth-id",
-                "user_code": "ABCD-1234",
-                "interval": "5",
-            }),
-        ));
+    mount_codex_usercode_route(&mock);
     mock.on(|request| request.url == CODEX_DEVICE_TOKEN_URL)
         .respond_sequence(vec![
             json_response(
@@ -508,39 +525,17 @@ async fn the_openai_codex_device_flow_logs_in_through_pending_polls() {
                 }),
             ),
         ]);
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-            }),
-        ));
-    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
-    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    mount_codex_token_route(&mock, "refresh-token", 3600);
+    let (recording, handle) = spawn_codex_login(&mock, vec![Ok(String::from("device_code"))]);
 
     // The poller's first strike is immediate; the pending reply schedules
     // the server's five-second interval.
     advance_until(|| mock.request_count() >= 2, "the first device poll").await;
     tokio::time::advance(Duration::from_secs(5)).await;
 
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    assert_account_id(&credential, "acc");
 
     let AuthEvent::DeviceCode {
         user_code,
@@ -576,7 +571,7 @@ async fn a_disabled_openai_codex_device_auth_reports_the_not_enabled_error() {
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
 
     let error = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the disabled server fails login");
     assert_eq!(
@@ -592,18 +587,7 @@ async fn a_disabled_openai_codex_device_auth_reports_the_not_enabled_error() {
 #[tokio::test(start_paused = true)]
 async fn the_kimi_device_flow_logs_in_and_notifies_the_complete_uri() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == KIMI_DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code-123",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://www.kimi.com/code",
-                "verification_uri_complete": "https://www.kimi.com/code?user_code=ABCD-1234",
-                "interval": 5,
-                "expires_in": 600,
-            }),
-        ));
+    mount_kimi_device_route(&mock, "https://www.kimi.com/code?user_code=ABCD-1234");
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond_sequence(vec![
             json_response(
@@ -619,22 +603,14 @@ async fn the_kimi_device_flow_logs_in_and_notifies_the_complete_uri() {
                 }),
             ),
         ]);
-    let recording = RecordingInteraction::new();
-    let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let (recording, handle) = spawn_kimi_login(&mock);
 
     // waitBeforeFirstPoll: the first poll lands after the server's interval.
     tokio::time::advance(Duration::from_secs(5)).await;
     advance_until(|| mock.request_count() >= 2, "the first token poll").await;
     tokio::time::advance(Duration::from_secs(5)).await;
 
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, "access-token");
     assert_eq!(credential.refresh, "refresh-token");
     let AuthEvent::DeviceCode {
@@ -704,10 +680,7 @@ async fn the_kimi_refresh_retries_backoffs_then_succeeds() {
     advance_until(|| mock.request_count() >= 2, "the second refresh attempt").await;
     tokio::time::advance(Duration::from_secs(2)).await;
 
-    let credential = handle
-        .await
-        .expect("the refresh task joins")
-        .expect("refresh resolves");
+    let credential = task_credential(handle, "the refresh task joins", "refresh resolves").await;
     assert_eq!(credential.access, "a");
     assert_eq!(mock.request_count(), 3, "two 500s, then the success");
 }
@@ -745,14 +718,10 @@ async fn the_openrouter_callback_route_rejects_unknown_paths() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == OPENROUTER_TOKEN_URL)
         .respond(json_response(200, &serde_json::json!({ "key": "sk-or" })));
-    let recording = RecordingInteraction::new();
-    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let (recording, handle) = spawn_openrouter_login(&mock);
     let callback_url = wait_for_openrouter_callback_url(&recording).await;
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         url::Url::parse(&callback_url)
             .expect("the callback url parses")
             .port()
@@ -771,12 +740,7 @@ async fn the_openrouter_callback_route_rejects_unknown_paths() {
 #[tokio::test]
 async fn the_openrouter_callback_error_page_fails_the_login_with_the_description() {
     let mock = MockHttpClient::new();
-    let recording = RecordingInteraction::new();
-    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let (recording, handle) = spawn_openrouter_login(&mock);
     let callback_url = wait_for_openrouter_callback_url(&recording).await;
     let port = url::Url::parse(&callback_url)
         .expect("the callback url parses")
@@ -787,7 +751,8 @@ async fn the_openrouter_callback_error_page_fails_the_login_with_the_description
         .path()
         .to_owned();
 
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         port,
         &format!(
             "GET {path}?error=access_denied&error_description=Nope HTTP/1.1\r\nHost: x\r\n\r\n"
@@ -800,10 +765,7 @@ async fn the_openrouter_callback_error_page_fails_the_login_with_the_description
             && response.contains("Nope"),
         "the denial page carries the description: {response:?}"
     );
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the denial fails login");
+    let error = task_error(handle, "the login task joins", "the denial fails login").await;
     assert_eq!(error.to_string(), "OpenRouter authorization failed: Nope");
 }
 
@@ -812,18 +774,11 @@ async fn the_openrouter_callback_without_a_code_rejects_the_page_and_waits() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == OPENROUTER_TOKEN_URL)
         .respond(json_response(200, &serde_json::json!({ "key": "sk-or" })));
-    let recording = RecordingInteraction::new();
-    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
-    let callback_url = wait_for_openrouter_callback_url(&recording).await;
-    let parsed = url::Url::parse(&callback_url).expect("the callback url parses");
-    let port = parsed.port().expect("the callback url carries the port");
-    let path = parsed.path().to_owned();
+    let (recording, handle) = spawn_openrouter_login(&mock);
+    let (port, path) = callback_parts(&wait_for_openrouter_callback_url(&recording).await);
 
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         port,
         &format!("GET {path}?state=s HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -855,26 +810,18 @@ async fn a_second_openrouter_callback_reports_the_already_used_page() {
                 Ok(json_response(200, &serde_json::json!({ "key": "sk-or" })))
             }
         });
-    let recording = RecordingInteraction::new();
-    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
-    let callback_url = wait_for_openrouter_callback_url(&recording).await;
-    let parsed = url::Url::parse(&callback_url).expect("the callback url parses");
-    let port = parsed.port().expect("the callback url carries the port");
-    let path = parsed.path().to_owned();
+    let (recording, handle) = spawn_openrouter_login(&mock);
+    let (port, path) = callback_parts(&wait_for_openrouter_callback_url(&recording).await);
 
-    let first = tokio::spawn(send_request(
-        port,
-        format!("GET {path}?code=C HTTP/1.1\r\nHost: x\r\n\r\n"),
-    ));
+    let host = callback_host();
+    let request = format!("GET {path}?code=C HTTP/1.1\r\nHost: x\r\n\r\n");
+    let first = tokio::spawn(async move { send_loopback(&host, port, request).await });
     exchange_started_rx
         .await
         .expect("the first exchange started");
 
-    let second = send_request(
+    let second = send_loopback(
+        &callback_host(),
         port,
         &format!("GET {path}?code=C2 HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -890,10 +837,7 @@ async fn a_second_openrouter_callback_reports_the_already_used_page() {
         first_response.starts_with("HTTP/1.1 200 OK"),
         "the first callback succeeds: {first_response:?}"
     );
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, "sk-or");
 }
 
@@ -905,18 +849,11 @@ async fn a_failed_openrouter_exchange_answers_the_bad_gateway_page() {
             400,
             &serde_json::json!({"error": "invalid_grant", "error_description": "bad"}),
         ));
-    let recording = RecordingInteraction::new();
-    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
-    let callback_url = wait_for_openrouter_callback_url(&recording).await;
-    let parsed = url::Url::parse(&callback_url).expect("the callback url parses");
-    let port = parsed.port().expect("the callback url carries the port");
-    let path = parsed.path().to_owned();
+    let (recording, handle) = spawn_openrouter_login(&mock);
+    let (port, path) = callback_parts(&wait_for_openrouter_callback_url(&recording).await);
 
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         port,
         &format!("GET {path}?code=C HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -927,10 +864,12 @@ async fn a_failed_openrouter_exchange_answers_the_bad_gateway_page() {
             && response.contains("bad"),
         "the exchange failure page carries the detail: {response:?}"
     );
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the failed exchange fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the failed exchange fails login",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "OpenRouter OAuth key exchange failed (HTTP 400): bad",
@@ -972,14 +911,16 @@ async fn an_openrouter_exchange_that_outlives_thirty_seconds_times_out() {
     let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
     let handle = {
         let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
+        tokio::spawn(async move { flow.login(recording_interaction(&recording)).await })
     };
 
     advance_seconds_until(|| handle.is_finished(), 40, "the exchange timeout").await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the stuck exchange times out");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the stuck exchange times out",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "OpenRouter OAuth token exchange timed out"
@@ -988,17 +929,14 @@ async fn an_openrouter_exchange_that_outlives_thirty_seconds_times_out() {
 
 #[tokio::test(start_paused = true)]
 async fn the_openrouter_login_times_out_after_five_minutes() {
-    let recording = RecordingInteraction::new();
-    let flow = OpenRouterOAuth::new(Arc::new(MockHttpClient::new()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let (_, handle) = spawn_openrouter_login(&MockHttpClient::new());
     advance_seconds_until(|| handle.is_finished(), 320, "the login timeout").await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the abandoned login times out");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the abandoned login times out",
+    )
+    .await;
     assert_eq!(error.to_string(), "OpenRouter OAuth login timed out");
 }
 
@@ -1034,7 +972,7 @@ async fn openrouter_login_with_paste(
         },
     );
     OpenRouterOAuth::new(Arc::new(mock))
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
 }
 
@@ -1110,26 +1048,14 @@ async fn openai_codex_browser_login_completes_through_the_real_callback_port() {
     let _port = CODEX_PORT.lock().await;
     wait_port_free(1455).await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-            }),
-        ));
-    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
-    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    mount_codex_token_route(&mock, "refresh-token", 3600);
+    let (recording, handle) = spawn_codex_login(&mock, vec![Ok(String::from("browser"))]);
 
     let auth_url = wait_until(|| recording.auth_url(), "the authorize URL").await;
     let state = url_query_param(&auth_url, "state").expect("the authorize URL carries the state");
 
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         1455,
         &format!("GET /auth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -1140,18 +1066,9 @@ async fn openai_codex_browser_login_completes_through_the_real_callback_port() {
         "the callback page succeeds: {response:?}"
     );
 
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    assert_account_id(&credential, "acc");
 
     let exchange_pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(exchange_pairs.contains(&(String::from("code"), String::from("C"))));
@@ -1166,15 +1083,7 @@ async fn the_openai_codex_manual_paste_state_mismatch_rejects() {
     let _port = CODEX_PORT.lock().await;
     wait_port_free(1455).await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-            }),
-        ));
+    mount_codex_token_route(&mock, "refresh-token", 3600);
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
         |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
@@ -1184,7 +1093,7 @@ async fn the_openai_codex_manual_paste_state_mismatch_rejects() {
         },
     );
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the mismatched state fails login");
     assert_eq!(error.to_string(), "State mismatch");
@@ -1202,7 +1111,7 @@ async fn the_openai_codex_manual_paste_without_a_code_rejects() {
         },
     );
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the empty paste fails login");
     assert_eq!(error.to_string(), "Missing authorization code");
@@ -1228,27 +1137,13 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         },
     );
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "r",
-                "expires_in": 60,
-            }),
-        ));
+    mount_codex_token_route(&mock, "r", 60);
     let credential = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect("the pasted url mints the credential");
     wait_port_free(1455).await;
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    assert_account_id(&credential, "acc");
     let pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(pairs.contains(&(String::from("code"), String::from("url-code"))));
 
@@ -1260,27 +1155,13 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         },
     );
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "r",
-                "expires_in": 60,
-            }),
-        ));
+    mount_codex_token_route(&mock, "r", 60);
     let credential = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect("the form paste mints the credential");
     wait_port_free(1455).await;
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    assert_account_id(&credential, "acc");
     let pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(pairs.contains(&(String::from("code"), String::from("form-code"))));
 
@@ -1292,26 +1173,12 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         },
     );
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "r",
-                "expires_in": 60,
-            }),
-        ));
+    mount_codex_token_route(&mock, "r", 60);
     let credential = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect("the bare paste mints the credential");
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    assert_account_id(&credential, "acc");
 }
 
 #[tokio::test]
@@ -1319,7 +1186,7 @@ async fn the_openai_codex_select_rejects_unknown_methods() {
     let mock = MockHttpClient::new();
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("telepathy"))]);
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the unknown method fails login");
     assert_eq!(
@@ -1403,7 +1270,7 @@ async fn an_unextractable_account_id_rejects_the_credential() {
         },
     );
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the unextractable account id fails login");
     assert_eq!(error.to_string(), "Failed to extract accountId from token");
@@ -1427,7 +1294,7 @@ async fn an_unextractable_account_id_rejects_the_credential() {
         },
     );
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the undecodable payload fails login");
     assert_eq!(error.to_string(), "Failed to extract accountId from token");
@@ -1442,7 +1309,7 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         .respond(MockResponse::status(500).with_body("kaput"));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the failed start fails login");
     assert_eq!(
@@ -1455,7 +1322,7 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         .respond(MockResponse::status(502));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the failed start fails login");
     assert_eq!(
@@ -1473,7 +1340,7 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         ));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the incomplete response fails login");
     assert!(
@@ -1517,56 +1384,33 @@ async fn the_openai_codex_device_flow_polls_failure_shapes() {
         ),
     ] {
         let mock = MockHttpClient::new();
-        mock.on(|request| request.url == CODEX_USERCODE_URL)
-            .respond(json_response(
-                200,
-                &serde_json::json!({
-                    "device_auth_id": "device-auth-id",
-                    "user_code": "ABCD-1234",
-                    "interval": 5,
-                }),
-            ));
+        mount_codex_usercode_route(&mock);
         mock.on(|request| request.url == CODEX_DEVICE_TOKEN_URL)
             .respond_sequence(responses);
         if expected.is_none() {
-            mock.on(|request| request.url == CODEX_TOKEN_URL)
-                .respond(json_response(
-                    200,
-                    &serde_json::json!({
-                        "access_token": codex_jwt("acc"),
-                        "refresh_token": "r",
-                        "expires_in": 60,
-                    }),
-                ));
+            mount_codex_token_route(&mock, "r", 60);
         }
-        let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
-        let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-        let handle = {
-            let recording = recording.clone();
-            tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-        };
+        let (_, handle) = spawn_codex_login(&mock, vec![Ok(String::from("device_code"))]);
         advance_until(|| mock.request_count() >= 2, "the first device poll").await;
         if let Some(prefix) = expected {
             advance_until(|| handle.is_finished(), "the failed poll").await;
-            let error = handle
-                .await
-                .expect("the login task joins")
-                .expect_err("the failed poll fails login");
+            let error = task_error(
+                handle,
+                "the login task joins",
+                "the failed poll fails login",
+            )
+            .await;
             assert!(error.to_string().starts_with(prefix), "{error:?}");
         } else {
             // The slow-down bump adds five seconds to the server interval.
             tokio::time::advance(Duration::from_secs(15)).await;
-            let credential = handle
-                .await
-                .expect("the login task joins")
-                .expect("the slow-down poll resolves");
-            assert_eq!(
-                credential
-                    .extra
-                    .get("accountId")
-                    .and_then(serde_json::Value::as_str),
-                Some("acc")
-            );
+            let credential = task_credential(
+                handle,
+                "the login task joins",
+                "the slow-down poll resolves",
+            )
+            .await;
+            assert_account_id(&credential, "acc");
         }
     }
 }
@@ -1574,31 +1418,20 @@ async fn the_openai_codex_device_flow_polls_failure_shapes() {
 #[tokio::test(start_paused = true)]
 async fn the_openai_codex_device_flow_rejects_a_token_response_without_fields() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_USERCODE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_auth_id": "device-auth-id",
-                "user_code": "ABCD-1234",
-                "interval": 5,
-            }),
-        ));
+    mount_codex_usercode_route(&mock);
     mock.on(|request| request.url == CODEX_DEVICE_TOKEN_URL)
         .respond(json_response(
             200,
             &serde_json::json!({"authorization_code": ""}),
         ));
-    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
-    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let (_, handle) = spawn_codex_login(&mock, vec![Ok(String::from("device_code"))]);
     advance_until(|| handle.is_finished(), "the failed poll").await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the incomplete token response fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the incomplete token response fails login",
+    )
+    .await;
     assert!(
         error
             .to_string()
@@ -1610,15 +1443,7 @@ async fn the_openai_codex_device_flow_rejects_a_token_response_without_fields() 
 #[tokio::test(start_paused = true)]
 async fn the_openai_codex_device_flow_accepts_a_numeric_interval() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_USERCODE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_auth_id": "device-auth-id",
-                "user_code": "ABCD-1234",
-                "interval": 5,
-            }),
-        ));
+    mount_codex_usercode_route(&mock);
     mock.on(|request| request.url == CODEX_DEVICE_TOKEN_URL)
         .respond(json_response(
             200,
@@ -1627,34 +1452,17 @@ async fn the_openai_codex_device_flow_accepts_a_numeric_interval() {
                 "code_verifier": "device-code-verifier",
             }),
         ));
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "r",
-                "expires_in": 60,
-            }),
-        ));
-    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
-    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    mount_codex_token_route(&mock, "r", 60);
+    let (_, handle) = spawn_codex_login(&mock, vec![Ok(String::from("device_code"))]);
     advance_until(|| mock.request_count() >= 2, "the first device poll").await;
     advance_until(|| handle.is_finished(), "the numeric interval flow").await;
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("the numeric interval flow completes");
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    let credential = task_credential(
+        handle,
+        "the login task joins",
+        "the numeric interval flow completes",
+    )
+    .await;
+    assert_account_id(&credential, "acc");
 }
 
 // ---------------------------------------------------------------------------
@@ -1702,33 +1510,19 @@ async fn the_kimi_poll_failure_shapes_reject_with_their_wire_messages() {
         ),
     ] {
         let mock = MockHttpClient::new();
-        mock.on(|request| request.url == KIMI_DEVICE_URL)
-            .respond(json_response(
-                200,
-                &serde_json::json!({
-                    "device_code": "device-code-123",
-                    "user_code": "ABCD-1234",
-                    "verification_uri": "https://www.kimi.com/code",
-                    "verification_uri_complete": "https://www.kimi.com/code?user_code=ABCD-1234",
-                    "interval": 5,
-                    "expires_in": 600,
-                }),
-            ));
+        mount_kimi_device_route(&mock, "https://www.kimi.com/code?user_code=ABCD-1234");
         mock.on(|request| request.url == KIMI_TOKEN_URL)
             .respond_sequence(responses);
-        let recording = RecordingInteraction::new();
-        let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
-        let handle = {
-            let recording = recording.clone();
-            tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-        };
+        let (_, handle) = spawn_kimi_login(&mock);
         // waitBeforeFirstPoll: the first poll lands after the interval.
         tokio::time::advance(Duration::from_secs(5)).await;
         advance_until(|| handle.is_finished(), "the failed poll").await;
-        let error = handle
-            .await
-            .expect("the login task joins")
-            .expect_err("the failed poll fails login");
+        let error = task_error(
+            handle,
+            "the login task joins",
+            "the failed poll fails login",
+        )
+        .await;
         assert!(
             error.to_string().starts_with(expected),
             "expected {expected:?}: {error:?}"
@@ -1739,35 +1533,21 @@ async fn the_kimi_poll_failure_shapes_reject_with_their_wire_messages() {
 #[tokio::test(start_paused = true)]
 async fn the_kimi_poll_rejects_a_token_response_missing_fields() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == KIMI_DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code-123",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://www.kimi.com/code",
-                "verification_uri_complete": "https://www.kimi.com/code?user_code=ABCD-1234",
-                "interval": 5,
-                "expires_in": 600,
-            }),
-        ));
+    mount_kimi_device_route(&mock, "https://www.kimi.com/code?user_code=ABCD-1234");
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond(json_response(
             200,
             &serde_json::json!({"access_token": "a"}),
         ));
-    let recording = RecordingInteraction::new();
-    let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let (_, handle) = spawn_kimi_login(&mock);
     tokio::time::advance(Duration::from_secs(5)).await;
     advance_until(|| handle.is_finished(), "the failed poll").await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the missing fields fail the poll");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the missing fields fail the poll",
+    )
+    .await;
     assert!(
         error
             .to_string()
@@ -1779,18 +1559,7 @@ async fn the_kimi_poll_rejects_a_token_response_missing_fields() {
 #[tokio::test(start_paused = true)]
 async fn the_kimi_poll_slow_down_parks_until_cancelled() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == KIMI_DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code-123",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://www.kimi.com/code",
-                "verification_uri_complete": "https://www.kimi.com/code?user_code=ABCD-1234",
-                "interval": 5,
-                "expires_in": 600,
-            }),
-        ));
+    mount_kimi_device_route(&mock, "https://www.kimi.com/code?user_code=ABCD-1234");
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond(json_response(
             400,
@@ -1807,10 +1576,7 @@ async fn the_kimi_poll_slow_down_parks_until_cancelled() {
     tokio::time::advance(Duration::from_secs(5)).await;
     advance_until(|| mock.request_count() >= 2, "the slow-down poll").await;
     signal.cancel();
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the cancelled poll rejects");
+    let error = task_error(handle, "the login task joins", "the cancelled poll rejects").await;
     assert_eq!(error.to_string(), "Login cancelled");
 }
 
@@ -1832,10 +1598,12 @@ async fn the_kimi_refresh_rejects_after_the_retries_are_exhausted() {
         tokio::time::advance(Duration::from_secs(backoff)).await;
     }
     advance_until(|| handle.is_finished(), "the final refresh attempt").await;
-    let error = handle
-        .await
-        .expect("the refresh task joins")
-        .expect_err("the exhausted retries fail refresh");
+    let error = task_error(
+        handle,
+        "the refresh task joins",
+        "the exhausted retries fail refresh",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "no mock route matched POST https://auth.kimi.com/api/oauth/token",
@@ -1889,10 +1657,12 @@ async fn the_kimi_refresh_retries_a_429_then_succeeds() {
     )
     .await;
     tokio::time::advance(Duration::from_secs(1)).await;
-    let credential = handle
-        .await
-        .expect("the refresh task joins")
-        .expect("the retried refresh resolves");
+    let credential = task_credential(
+        handle,
+        "the refresh task joins",
+        "the retried refresh resolves",
+    )
+    .await;
     assert_eq!(credential.access, "a");
     assert_eq!(credential.refresh, "r");
 }
@@ -1954,10 +1724,12 @@ async fn a_kimi_refresh_cancelled_during_the_backoff_rejects_as_aborted() {
 
     advance_until(|| mock.request_count() >= 1, "the first refresh attempt").await;
     signal.cancel();
-    let error = handle
-        .await
-        .expect("the refresh task joins")
-        .expect_err("the cancelled backoff fails refresh");
+    let error = task_error(
+        handle,
+        "the refresh task joins",
+        "the cancelled backoff fails refresh",
+    )
+    .await;
     assert_eq!(error.to_string(), "Kimi Code token refresh aborted");
 }
 
@@ -1979,16 +1751,13 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
     mount_anthropic_token_route(&mock);
     let recording = RecordingInteraction::new();
     let flow = AnthropicOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let handle = spawn_login(|interaction| flow.login(interaction), &recording);
 
-    let auth_url = wait_until(|| recording.auth_url(), "the authorize URL").await;
-    let state = url_query_param(&auth_url, "state").expect("the authorize URL carries the state");
+    let state = authorize_state(&recording).await;
 
     // Route not found.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n",
     )
@@ -2000,7 +1769,8 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
     );
 
     // Provider error parameter.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         "GET /callback?error=access_denied HTTP/1.1\r\nHost: x\r\n\r\n",
     )
@@ -2013,7 +1783,8 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
     );
 
     // Missing code and missing state.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         "GET /callback HTTP/1.1\r\nHost: x\r\n\r\n",
     )
@@ -2022,7 +1793,8 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
         response.contains("Missing code or state parameter."),
         "the missing-parameters page rejects: {response:?}"
     );
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         "GET /callback?code=C HTTP/1.1\r\nHost: x\r\n\r\n",
     )
@@ -2033,7 +1805,8 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
     );
 
     // State mismatch.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         "GET /callback?code=C&state=wrong HTTP/1.1\r\nHost: x\r\n\r\n",
     )
@@ -2044,7 +1817,8 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
     );
 
     // The real callback still completes the login.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         ANTHROPIC_CALLBACK_PORT,
         &format!("GET /callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -2053,25 +1827,9 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
         response.starts_with("HTTP/1.1 200 OK"),
         "the late valid callback completes the login: {response:?}"
     );
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
     assert_eq!(credential.access, "access-token");
     wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
-}
-
-/// Mount the token route a browser-path login exchanges against.
-fn mount_anthropic_token_route(mock: &MockHttpClient) {
-    mock.on(|request| request.url == ANTHROPIC_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": "access-token",
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-            }),
-        ));
 }
 
 /// An anthropic login whose manual prompt answers `paste` (no callback).
@@ -2083,7 +1841,7 @@ async fn anthropic_login_with_paste(
     let recording = RecordingInteraction::new();
     recording.set_dynamic(move |_prompt| Box::pin(std::future::ready(Ok(paste.clone()))));
     let outcome = AnthropicOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await;
     wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
     outcome
@@ -2102,7 +1860,7 @@ async fn the_anthropic_login_closure_drives_the_flow_through_the_paste() {
         move |_prompt| Box::pin(std::future::ready(Ok(String::from("bare-code"))))
     });
     let flow = AnthropicOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let credential = ((flow.auth().login)(provider_interaction(&recording)))
+    let credential = ((flow.auth().login)(recording_interaction(&recording)))
         .await
         .expect("the login closure mints the credential");
     wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
@@ -2163,7 +1921,7 @@ async fn the_anthropic_manual_prompt_rejection_surfaces() {
     wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
     let recording = RecordingInteraction::with_answers(vec![Err(AbortError)]);
     let error = AnthropicOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the rejected prompt fails login");
     assert_eq!(error.to_string(), AbortError::MESSAGE);
@@ -2244,27 +2002,18 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
     let _port = CODEX_PORT.lock().await;
     wait_port_free(1455).await;
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == CODEX_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "access_token": codex_jwt("acc"),
-                "refresh_token": "refresh-token",
-                "expires_in": 3600,
-            }),
-        ));
-    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
-    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    mount_codex_token_route(&mock, "refresh-token", 3600);
+    let (recording, handle) = spawn_codex_login(&mock, vec![Ok(String::from("browser"))]);
 
-    let auth_url = wait_until(|| recording.auth_url(), "the authorize URL").await;
-    let state = url_query_param(&auth_url, "state").expect("the authorize URL carries the state");
+    let state = authorize_state(&recording).await;
 
     // Route not found.
-    let response = send_request(1455, "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n").await;
+    let response = send_loopback(
+        &callback_host(),
+        1455,
+        "GET /nope HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await;
     assert!(
         response.starts_with("HTTP/1.1 404 Not Found")
             && response.contains("Callback route not found."),
@@ -2272,7 +2021,8 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
     );
 
     // State mismatch.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         1455,
         "GET /auth/callback?code=C&state=wrong HTTP/1.1\r\nHost: x\r\n\r\n",
     )
@@ -2283,7 +2033,8 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
     );
 
     // Missing code (with a valid state).
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         1455,
         &format!("GET /auth/callback?state={state} HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -2294,7 +2045,8 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
     );
 
     // The real callback still completes the login.
-    let response = send_request(
+    let response = send_loopback(
+        &callback_host(),
         1455,
         &format!("GET /auth/callback?code=C&state={state} HTTP/1.1\r\nHost: x\r\n\r\n"),
     )
@@ -2303,17 +2055,8 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
         response.starts_with("HTTP/1.1 200 OK"),
         "the late valid callback completes the login: {response:?}"
     );
-    let credential = handle
-        .await
-        .expect("the login task joins")
-        .expect("login resolves");
-    assert_eq!(
-        credential
-            .extra
-            .get("accountId")
-            .and_then(serde_json::Value::as_str),
-        Some("acc")
-    );
+    let credential = task_credential(handle, "the login task joins", "login resolves").await;
+    assert_account_id(&credential, "acc");
     wait_port_free(1455).await;
 }
 
@@ -2324,7 +2067,7 @@ async fn the_openai_codex_manual_prompt_rejection_surfaces() {
     let recording =
         RecordingInteraction::with_answers(vec![Ok(String::from("browser")), Err(AbortError)]);
     let error = OpenAICodexOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the rejected prompt fails login");
     assert_eq!(error.to_string(), AbortError::MESSAGE);
@@ -2363,28 +2106,17 @@ async fn the_openai_codex_poll_error_shapes_without_error_objects() {
         ),
     ] {
         let mock = MockHttpClient::new();
-        mock.on(|request| request.url == CODEX_USERCODE_URL)
-            .respond(json_response(
-                200,
-                &serde_json::json!({
-                    "device_auth_id": "device-auth-id",
-                    "user_code": "ABCD-1234",
-                    "interval": 5,
-                }),
-            ));
+        mount_codex_usercode_route(&mock);
         mock.on(|request| request.url == CODEX_DEVICE_TOKEN_URL)
             .respond(json_response(400, &body));
-        let recording = RecordingInteraction::with_answers(vec![Ok(String::from("device_code"))]);
-        let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), stepped_clock());
-        let handle = {
-            let recording = recording.clone();
-            tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-        };
+        let (_, handle) = spawn_codex_login(&mock, vec![Ok(String::from("device_code"))]);
         advance_until(|| handle.is_finished(), "the failed poll").await;
-        let error = handle
-            .await
-            .expect("the login task joins")
-            .expect_err("the failed poll fails login");
+        let error = task_error(
+            handle,
+            "the login task joins",
+            "the failed poll fails login",
+        )
+        .await;
         assert!(
             error.to_string().starts_with(expected),
             "expected {expected:?}: {error:?}"
@@ -2420,7 +2152,7 @@ async fn a_jwt_with_an_unparsable_payload_rejects_the_credential() {
         },
     );
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the unparsable payload fails login");
     assert_eq!(error.to_string(), "Failed to extract accountId from token");
@@ -2454,7 +2186,7 @@ async fn a_jwt_without_the_auth_claim_rejects_the_credential() {
         },
     );
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the claimless token fails login");
     assert_eq!(error.to_string(), "Failed to extract accountId from token");
@@ -2559,10 +2291,12 @@ async fn an_openrouter_login_cancelled_mid_flight_reports_the_cancellation() {
     });
     wait_for_openrouter_callback_url(&recording).await;
     signal.cancel();
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the mid-flight cancel fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the mid-flight cancel fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "Login cancelled");
 }
 
@@ -2605,7 +2339,7 @@ async fn the_kimi_device_start_rejects_untrusted_or_missing_verification_uris() 
             ));
         let recording = RecordingInteraction::new();
         let error = KimiCodingOAuth::new(Arc::new(mock))
-            .login(provider_interaction(&recording))
+            .login(recording_interaction(&recording))
             .await
             .expect_err("the untrusted uri fails login");
         assert!(
@@ -2628,7 +2362,7 @@ async fn the_kimi_device_start_failure_without_a_body_stops_at_the_status() {
         .respond(MockResponse::status(500));
     let recording = RecordingInteraction::new();
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .login(provider_interaction(&recording))
+        .login(recording_interaction(&recording))
         .await
         .expect_err("the empty-body failure fails login");
     assert_eq!(
@@ -2662,7 +2396,7 @@ async fn the_kimi_device_start_rejects_each_missing_field() {
             .respond(json_response(200, &body));
         let recording = RecordingInteraction::new();
         let error = KimiCodingOAuth::new(Arc::new(mock))
-            .login(provider_interaction(&recording))
+            .login(recording_interaction(&recording))
             .await
             .expect_err("the missing field fails login");
         assert!(
@@ -2677,30 +2411,18 @@ async fn the_kimi_device_start_rejects_each_missing_field() {
 #[tokio::test(start_paused = true)]
 async fn the_kimi_poll_transport_failure_propagates() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == KIMI_DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code-123",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://www.kimi.com/code",
-                "verification_uri_complete": "https://www.kimi.com/code?user_code=ABCD-1234",
-                "interval": 5,
-                "expires_in": 600,
-            }),
-        ));
+    mount_kimi_device_route(&mock, "https://www.kimi.com/code?user_code=ABCD-1234");
     let recording = RecordingInteraction::new();
     let flow = KimiCodingOAuth::new(Arc::new(mock));
-    let handle = {
-        let recording = recording.clone();
-        tokio::spawn(async move { flow.login(provider_interaction(&recording)).await })
-    };
+    let handle = spawn_login(|interaction| flow.login(interaction), &recording);
     // waitBeforeFirstPoll parks the flow before the first token request.
     advance_seconds_until(|| handle.is_finished(), 10, "the transport failure").await;
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the unmatched token route fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the unmatched token route fails login",
+    )
+    .await;
     assert_eq!(
         error.to_string(),
         "no mock route matched POST https://auth.kimi.com/api/oauth/token"
@@ -2710,18 +2432,7 @@ async fn the_kimi_poll_transport_failure_propagates() {
 #[tokio::test(start_paused = true)]
 async fn the_kimi_login_cancels_during_the_first_poll_wait() {
     let mock = MockHttpClient::new();
-    mock.on(|request| request.url == KIMI_DEVICE_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({
-                "device_code": "device-code-123",
-                "user_code": "ABCD-1234",
-                "verification_uri": "https://www.kimi.com/code",
-                "verification_uri_complete": "https://www.kimi.com/code?user_code=ABCD-1234",
-                "interval": 5,
-                "expires_in": 600,
-            }),
-        ));
+    mount_kimi_device_route(&mock, "https://www.kimi.com/code?user_code=ABCD-1234");
     let signal = CancellationToken::new();
     let recording = RecordingInteraction::new();
     let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
@@ -2739,10 +2450,12 @@ async fn the_kimi_login_cancels_during_the_first_poll_wait() {
     )
     .await;
     signal.cancel();
-    let error = handle
-        .await
-        .expect("the login task joins")
-        .expect_err("the cancelled first wait fails login");
+    let error = task_error(
+        handle,
+        "the login task joins",
+        "the cancelled first wait fails login",
+    )
+    .await;
     assert_eq!(error.to_string(), "Login cancelled");
 }
 
