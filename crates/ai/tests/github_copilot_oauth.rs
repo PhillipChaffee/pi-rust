@@ -1112,3 +1112,105 @@ async fn refresh_surfaces_the_exchange_status_reason() {
         .expect_err("the 401 fails refresh");
     assert_eq!(error.to_string(), "401 Unauthorized: revoked");
 }
+
+// ---------------------------------------------------------------------------
+// The remaining retry and status-reason arms
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_429_with_an_unparseable_date_and_headerless_replies_stop_the_retry() {
+    // A Retry-After that parses as neither seconds nor an HTTP date returns
+    // the response; covered together with the date-shaped arm above it.
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+    mount_login_route_builder(&mock, |builder| {
+        builder.respond_sequence(vec![
+            MockResponse::status(429).with_header("Retry-After", "1"),
+            MockResponse::status(429).with_header("Retry-After", "not a date"),
+            json_response(200, &serde_json::json!({ "data": [] })),
+        ])
+    });
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let outcome = oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    ));
+    let error = outcome.await.expect_err("the unparseable date fails login");
+    assert_eq!(error.to_string(), "429 Too Many Requests: ");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_429_with_only_a_date_header_out_of_budget_exits_before_the_sleep() {
+    // The dated retry-after is an hour out; the five-second budget rejects
+    // the retry before the sleep, covering the budget-exit branch.
+    let mock = MockHttpClient::new();
+    mount_login_route_builder(&mock, |builder| {
+        builder.respond_sequence(vec![
+            MockResponse::status(429).with_header("Retry-After", "Tue, 14 Jul 2026 04:33:20 GMT"),
+            json_response(200, &serde_json::json!({ "data": [] })),
+        ])
+    });
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = handle
+        .await
+        .expect("the login task joins")
+        .expect_err("the dated retry over the budget fails login");
+    assert_eq!(error.to_string(), "429 Too Many Requests: ");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_models_fetch_reports_each_status_reason() {
+    // The status-reason match arms the Copilot APIs answer with, exercised
+    // through the exchange failure message.
+    for (status, reason) in [
+        (404_u16, "Not Found"),
+        (405, "Method Not Allowed"),
+        (409, "Conflict"),
+        (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
+        (503, "Service Unavailable"),
+        (504, "Gateway Timeout"),
+    ] {
+        let mock = MockHttpClient::new();
+        mock.on(|request| request.url == COPILOT_TOKEN_URL)
+            .respond(MockResponse::status(status).with_body("kaput"));
+        let oauth = flow(&mock);
+        let error = oauth
+            .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
+            .await
+            .expect_err("the status failure fails refresh");
+        assert_eq!(
+            error.to_string(),
+            format!("{status} {reason}: kaput"),
+            "reason phrase for {status}"
+        );
+    }
+}
