@@ -1253,3 +1253,45 @@ async fn an_unknown_status_reports_the_empty_reason() {
         .expect_err("the unknown status fails refresh");
     assert_eq!(error.to_string(), "418 : teapot");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_429_with_a_non_finite_retry_header_stops_the_login_retry() {
+    // The login path's models fetch carries the two-retry budget, so the
+    // Retry-After header is read: "nan" parses as a float but not a finite
+    // one, and the response returns without a retry.
+    let mock = MockHttpClient::new();
+    mount_login_route_builder(&mock, |builder| {
+        builder.respond_sequence(vec![
+            MockResponse::status(429).with_header("Retry-After", "nan"),
+            json_response(200, &serde_json::json!({ "data": [] })),
+        ])
+    });
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+    // The wait-before-first-poll sleep rides the paused clock.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = handle
+        .await
+        .expect("the login task joins")
+        .expect_err("the non-finite retry-after fails login");
+    assert_eq!(error.to_string(), "429 Too Many Requests: ");
+    assert_eq!(
+        mock.request_count(),
+        4,
+        "device start, poll, token exchange, 429"
+    );
+}
