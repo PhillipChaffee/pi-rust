@@ -904,12 +904,9 @@ async fn the_kimi_auth_closures_drive_the_flow() {
     let auth = flow.auth();
 
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let error = ((auth.login)(provider_interaction(
-        &scripted,
-        never_aborted(),
-    )))
-    .await
-    .expect_err("the malformed device authorization fails login");
+    let error = ((auth.login)(provider_interaction(&scripted, never_aborted())))
+        .await
+        .expect_err("the malformed device authorization fails login");
     assert!(
         error
             .to_string()
@@ -949,12 +946,9 @@ async fn the_kimi_auth_closures_drive_the_flow() {
         "{error}"
     );
 
-    let error = (auth.refresh)(
-        oauth_credentials("a", "r", 0),
-        never_aborted(),
-    )
-    .await
-    .expect_err("the dead credential fails refresh");
+    let error = (auth.refresh)(oauth_credentials("a", "r", 0), never_aborted())
+        .await
+        .expect_err("the dead credential fails refresh");
     assert_eq!(
         error.to_string(),
         "Kimi Code token refresh unauthorized (status 401)"
@@ -963,7 +957,10 @@ async fn the_kimi_auth_closures_drive_the_flow() {
     let auth_model = (auth.to_auth)(oauth_credentials("tok", "r", 0))
         .await
         .expect("the derivation resolves");
-    assert_eq!(auth_model.api_key, None, "kimi authenticates through headers");
+    assert_eq!(
+        auth_model.api_key, None,
+        "kimi authenticates through headers"
+    );
     let headers = auth_model.headers.expect("the bearer header set");
     assert_eq!(
         headers.get("Authorization").and_then(Option::as_deref),
@@ -1009,24 +1006,21 @@ async fn the_radius_auth_closures_drive_the_flow() {
     // The login closure answers the device-code path and completes through
     // the gateway routes.
     let scripted = Arc::new(ScriptedAuthInteraction::answering("device-code"));
-    let credential = ((auth.login)(provider_interaction(
-        &scripted,
-        never_aborted(),
-    )))
-    .await
-    .expect("the device login resolves");
+    let credential = ((auth.login)(provider_interaction(&scripted, never_aborted())))
+        .await
+        .expect("the device login resolves");
     assert_eq!(credential.access, "new-access");
     assert_eq!(
-        credential.extra.get("scope").and_then(serde_json::Value::as_str),
+        credential
+            .extra
+            .get("scope")
+            .and_then(serde_json::Value::as_str),
         Some("gateway offline_access")
     );
 
-    let refreshed = (auth.refresh)(
-        oauth_credentials("old", "old-refresh", 0),
-        never_aborted(),
-    )
-    .await
-    .expect("the refresh closure resolves");
+    let refreshed = (auth.refresh)(oauth_credentials("old", "old-refresh", 0), never_aborted())
+        .await
+        .expect("the refresh closure resolves");
     assert_eq!(refreshed.access, "new-access");
 
     let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
@@ -1137,12 +1131,9 @@ async fn the_codex_auth_closures_drive_the_flow() {
     // The login closure prompts for the method first; an unknown answer
     // rejects before any wire call.
     let scripted = Arc::new(ScriptedAuthInteraction::answering("telepathy"));
-    let error = ((auth.login)(provider_interaction(
-        &scripted,
-        never_aborted(),
-    )))
-    .await
-    .expect_err("the unknown method fails login");
+    let error = ((auth.login)(provider_interaction(&scripted, never_aborted())))
+        .await
+        .expect_err("the unknown method fails login");
     assert_eq!(
         error.to_string(),
         "Unknown OpenAI Codex login method: telepathy"
@@ -1152,10 +1143,7 @@ async fn the_codex_auth_closures_drive_the_flow() {
     let error = (auth.refresh)(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the unextractable account id fails the refresh closure");
-    assert_eq!(
-        error.to_string(),
-        "Failed to extract accountId from token"
-    );
+    assert_eq!(error.to_string(), "Failed to extract accountId from token");
 
     let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
         .await

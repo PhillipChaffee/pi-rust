@@ -26,7 +26,7 @@ use pi_ai::auth::oauth::github_copilot::{
     GitHubCopilotOAuth, KnownModels, parse_github_copilot_model_catalog,
 };
 use pi_ai::auth::oauth::load_github_copilot_oauth;
-use pi_ai::auth::types::{AuthEvent, ModelAuth, OAuthCredentials};
+use pi_ai::auth::types::{AuthEvent, ModelAuth};
 use pi_ai::http::{MockHttpClient, MockResponse, json_response};
 use tokio_util::sync::CancellationToken;
 
@@ -35,8 +35,7 @@ const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const MODELS_URL: &str = "https://api.individual.githubcopilot.com/models";
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
-const COPILOT_TOKEN: &str =
-    "tid=abc;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com";
+const COPILOT_TOKEN: &str = "tid=abc;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com";
 
 /// `new Date("2026-07-24T00:00:00Z").getTime()`, the epoch the flow's expiry
 /// arithmetic pins against.
@@ -89,8 +88,8 @@ fn model_entry(id: &str, picker_enabled: bool, policy_state: &str) -> serde_json
 
 /// Mount the routes a device login runs: start, poll, Copilot token, and
 /// `models` as the models GET's answer.
-fn mount_login_routes(mock: &MockHttpClient, models: serde_json::Value) {
-    mount_login_route_builder(mock, |builder| builder.respond(json_response(200, &models)));
+fn mount_login_routes(mock: &MockHttpClient, models: &serde_json::Value) {
+    mount_login_route_builder(mock, |builder| builder.respond(json_response(200, models)));
 }
 
 /// Mount the device-login routes with a custom models responder, for the
@@ -111,27 +110,15 @@ fn mount_login_route_builder(
     mount_models(mock.on(move |request| request.url == MODELS_URL));
 }
 
-/// The Copilot credential the suites drive `to_auth` and refresh with.
-fn copilot_credential() -> OAuthCredentials {
-    let mut credential = oauth_credentials(COPILOT_TOKEN, "gh-refresh", START + 3_600_000);
-    credential.extra.insert(
-        "enterpriseUrl".to_owned(),
-        serde_json::Value::String("company.ghe.com".to_owned()),
-    );
-    credential
-}
-
 #[tokio::test(start_paused = true)]
 async fn login_completes_through_the_device_flow_and_merges_the_catalog() {
     let mock = MockHttpClient::new();
-    mount_login_routes(&mock, serde_json::json!({ "data": [] }));
+    mount_login_routes(&mock, &serde_json::json!({ "data": [] }));
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     // waitBeforeFirstPoll: the first poll lands after the server interval.
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -193,7 +180,7 @@ async fn login_enables_unconfigured_policy_models_and_merges_the_enabled_ids() {
     let mock = MockHttpClient::new();
     mount_login_routes(
         &mock,
-        serde_json::json!({ "data": [
+        &serde_json::json!({ "data": [
             model_entry("claude-sonnet-4.6", false, "unconfigured"),
             model_entry("unknown-model", false, "unconfigured"),
         ]}),
@@ -201,14 +188,15 @@ async fn login_enables_unconfigured_policy_models_and_merges_the_enabled_ids() {
     mock.on(|request| {
         request.url == "https://api.individual.githubcopilot.com/models/claude-sonnet-4.6/policy"
     })
-    .respond(json_response(200, &serde_json::json!({ "state": "enabled" })));
+    .respond(json_response(
+        200,
+        &serde_json::json!({ "state": "enabled" }),
+    ));
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let credential = handle
@@ -248,7 +236,7 @@ async fn login_enables_unconfigured_policy_models_and_merges_the_enabled_ids() {
 #[tokio::test]
 async fn login_rejects_an_invalid_enterprise_domain_before_prompting_the_device() {
     let mock = MockHttpClient::new();
-    mount_login_routes(&mock, serde_json::json!({ "data": [] }));
+    mount_login_routes(&mock, &serde_json::json!({ "data": [] }));
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering("ht tp://bad"));
@@ -263,21 +251,15 @@ async fn login_rejects_an_invalid_enterprise_domain_before_prompting_the_device(
 #[tokio::test(start_paused = true)]
 async fn login_routes_the_exchange_through_the_enterprise_domain() {
     let mock = MockHttpClient::new();
-    mock.on(|request| {
-        request.url == "https://company.ghe.com/login/device/code"
-    })
-    .respond(json_response(200, &device_response()));
-    mock.on(|request| {
-        request.url == "https://company.ghe.com/login/oauth/access_token"
-    })
-    .respond(json_response(
-        200,
-        &serde_json::json!({ "access_token": "gh-token" }),
-    ));
-    mock.on(|request| {
-        request.url == "https://api.company.ghe.com/copilot_internal/v2/token"
-    })
-    .respond(json_response(200, &copilot_token_response()));
+    mock.on(|request| request.url == "https://company.ghe.com/login/device/code")
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == "https://company.ghe.com/login/oauth/access_token")
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == "https://api.company.ghe.com/copilot_internal/v2/token")
+        .respond(json_response(200, &copilot_token_response()));
     // The exchanged token's proxy-ep endpoint wins the models fetch even
     // through the enterprise login, upstream's precedence.
     mock.on(|request| request.url == "https://api.individual.githubcopilot.com/models")
@@ -285,10 +267,8 @@ async fn login_routes_the_exchange_through_the_enterprise_domain() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering("company.ghe.com"));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let credential = handle
@@ -350,7 +330,9 @@ async fn login_rejects_incomplete_device_responses() {
             .await;
         let error = outcome.expect_err("the malformed start fails login");
         assert!(
-            error.to_string().starts_with("Invalid device code response"),
+            error
+                .to_string()
+                .starts_with("Invalid device code response"),
             "the start failure names the shape: {error}"
         );
     }
@@ -372,10 +354,8 @@ async fn the_device_poll_reports_the_wire_error_and_description() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let error = handle
@@ -399,10 +379,7 @@ async fn the_device_poll_honours_the_server_slow_down_interval() {
                 200,
                 &serde_json::json!({ "error": "slow_down", "interval": 4 }),
             ),
-            json_response(
-                200,
-                &serde_json::json!({ "access_token": "gh-token" }),
-            ),
+            json_response(200, &serde_json::json!({ "access_token": "gh-token" })),
         ]);
     mock.on(|request| request.url == COPILOT_TOKEN_URL)
         .respond(json_response(200, &copilot_token_response()));
@@ -411,10 +388,8 @@ async fn the_device_poll_honours_the_server_slow_down_interval() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_secs(4)).await;
@@ -423,13 +398,17 @@ async fn the_device_poll_honours_the_server_slow_down_interval() {
         .expect("the login task joins")
         .expect("login resolves");
     assert_eq!(credential.access, COPILOT_TOKEN);
-    assert_eq!(mock.request_count(), 5, "start, slow poll, poll, exchange, models");
+    assert_eq!(
+        mock.request_count(),
+        5,
+        "start, slow poll, poll, exchange, models"
+    );
 }
 
 #[tokio::test]
 async fn a_pre_cancelled_login_fails_before_any_wire_call() {
     let mock = MockHttpClient::new();
-    mount_login_routes(&mock, serde_json::json!({ "data": [] }));
+    mount_login_routes(&mock, &serde_json::json!({ "data": [] }));
     let signal = CancellationToken::new();
     signal.cancel();
 
@@ -446,10 +425,8 @@ async fn a_pre_cancelled_login_fails_before_any_wire_call() {
 #[tokio::test]
 async fn refresh_exchanges_the_github_token_again_and_keeps_the_enterprise_domain() {
     let mock = MockHttpClient::new();
-    mock.on(|request| {
-        request.url == "https://api.company.ghe.com/copilot_internal/v2/token"
-    })
-    .respond(json_response(200, &copilot_token_response()));
+    mock.on(|request| request.url == "https://api.company.ghe.com/copilot_internal/v2/token")
+        .respond(json_response(200, &copilot_token_response()));
     // The token's proxy-ep endpoint outranks the enterprise domain for the
     // models fetch, upstream's getGitHubCopilotBaseUrl precedence.
     mock.on(|request| request.url == "https://api.individual.githubcopilot.com/models")
@@ -480,9 +457,7 @@ async fn refresh_exchanges_the_github_token_again_and_keeps_the_enterprise_domai
         .map(|request| request.url)
         .collect();
     assert!(
-        served
-            .iter()
-            .all(|url| !url.contains("github.com/login")),
+        served.iter().all(|url| !url.contains("github.com/login")),
         "refresh skips the device flow: {served:?}"
     );
     assert!(
@@ -497,10 +472,7 @@ async fn refresh_exchanges_the_github_token_again_and_keeps_the_enterprise_domai
 async fn refresh_rejects_incomplete_copilot_token_responses() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == COPILOT_TOKEN_URL)
-        .respond(json_response(
-            200,
-            &serde_json::json!({ "token": "t" }),
-        ));
+        .respond(json_response(200, &serde_json::json!({ "token": "t" })));
 
     let oauth = flow(&mock);
     let error = oauth
@@ -541,15 +513,13 @@ async fn the_login_models_fetch_retries_a_429_with_the_seconds_delay() {
         builder.respond_sequence(vec![
             MockResponse::status(429).with_header("Retry-After", "1"),
             json_response(200, &serde_json::json!({ "data": [] })),
-        ])
+        ]);
     });
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
     // The wait-before-first-poll sleep and the one-second retry-after backoff
     // both ride the paused clock.
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -585,10 +555,8 @@ async fn a_429_retry_after_http_date_waits_out_the_date_delta() {
         ]);
 
     let oauth = flow(&mock);
-    let handle = tokio::spawn(oauth.refresh(
-        oauth_credentials("a", "r", 0),
-        CancellationToken::new(),
-    ));
+    let handle =
+        tokio::spawn(oauth.refresh(oauth_credentials("a", "r", 0), CancellationToken::new()));
     // The dated retry-after is one hour out; the five-second retry budget
     // cannot cover it, so the retry stops and the 429 is the outcome.
     let error = handle
@@ -641,8 +609,8 @@ fn the_catalog_filters_disabled_tool_calls_and_gates_by_picker() {
             "model_picker_enabled": true,
         },
     ]});
-    let catalog = parse_github_copilot_model_catalog(&raw, false, &known)
-        .expect("the catalog parses");
+    let catalog =
+        parse_github_copilot_model_catalog(&raw, false, &known).expect("the catalog parses");
     assert_eq!(catalog.available_model_ids, vec!["picker-on"]);
     assert!(
         catalog.policy_model_ids.is_empty(),
@@ -657,15 +625,15 @@ fn the_catalog_policy_fallback_applies_only_when_allowed() {
         model_entry("enabled-a", false, "enabled"),
         model_entry("disabled", false, "disabled"),
     ]});
-    let strict = parse_github_copilot_model_catalog(&raw, false, &known)
-        .expect("the catalog parses");
+    let strict =
+        parse_github_copilot_model_catalog(&raw, false, &known).expect("the catalog parses");
     assert!(
         strict.available_model_ids.is_empty(),
         "picker-disabled models stay out without the fallback: {strict:?}"
     );
 
-    let fallback = parse_github_copilot_model_catalog(&raw, true, &known)
-        .expect("the catalog parses");
+    let fallback =
+        parse_github_copilot_model_catalog(&raw, true, &known).expect("the catalog parses");
     assert_eq!(
         fallback.available_model_ids,
         vec!["enabled-a"],
@@ -680,8 +648,8 @@ fn the_catalog_policy_ids_need_the_known_models_gate() {
         model_entry("claude-sonnet-4.6", true, "unconfigured"),
         model_entry("unknown-model", true, "unconfigured"),
     ]});
-    let catalog = parse_github_copilot_model_catalog(&raw, false, &known)
-        .expect("the catalog parses");
+    let catalog =
+        parse_github_copilot_model_catalog(&raw, false, &known).expect("the catalog parses");
     assert_eq!(
         catalog.policy_model_ids,
         vec!["claude-sonnet-4.6"],
@@ -745,12 +713,9 @@ async fn the_loader_wires_the_login_and_derivation_closures() {
     assert_eq!(oauth.is_subscription, Some(true));
 
     let scripted = Arc::new(ScriptedAuthInteraction::answering("ht tp://bad"));
-    let error = ((oauth.login)(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )))
-    .await
-    .expect_err("the malformed domain rejects before the wire");
+    let error = ((oauth.login)(provider_interaction(&scripted, CancellationToken::new())))
+        .await
+        .expect_err("the malformed domain rejects before the wire");
     assert_eq!(error.to_string(), "Invalid GitHub Enterprise URL/domain");
 
     let auth = (oauth.to_auth)(oauth_credentials(COPILOT_TOKEN, "r", 0))
@@ -790,7 +755,7 @@ async fn an_enable_that_rate_limits_exhausting_the_budget_fails_the_login() {
     let mock = MockHttpClient::new();
     mount_login_routes(
         &mock,
-        serde_json::json!({ "data": [
+        &serde_json::json!({ "data": [
             model_entry("claude-sonnet-4.6", false, "unconfigured"),
         ]}),
     );
@@ -799,10 +764,8 @@ async fn an_enable_that_rate_limits_exhausting_the_budget_fails_the_login() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let credential = handle
@@ -827,7 +790,7 @@ async fn a_429_without_a_retry_after_uses_the_default_backoff() {
         builder.respond_sequence(vec![
             MockResponse::status(429),
             json_response(200, &serde_json::json!({ "data": [] })),
-        ])
+        ]);
     });
     mock.on(|request| request.url == DEVICE_URL)
         .respond(json_response(200, &device_response()));
@@ -841,10 +804,8 @@ async fn a_429_without_a_retry_after_uses_the_default_backoff() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
     // The wait-before-first-poll sleep, then the 500 ms default backoff.
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_millis(500)).await;
@@ -879,15 +840,13 @@ async fn a_429_with_a_far_retry_after_date_exhausts_the_budget() {
         builder.respond_sequence(vec![
             MockResponse::status(429).with_header("Retry-After", "Tue, 14 Jul 2026 04:33:20 GMT"),
             json_response(200, &serde_json::json!({ "data": [] })),
-        ])
+        ]);
     });
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
     // The one-second wait-before-first-poll sleep runs on the real clock.
     let error = handle
         .await
@@ -906,10 +865,8 @@ async fn the_device_poll_fails_without_an_error_or_access_token_field() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let error = handle
@@ -926,7 +883,10 @@ async fn the_device_poll_parks_on_authorization_pending_then_completes() {
         .respond(json_response(200, &device_response()));
     mock.on(|request| request.url == ACCESS_TOKEN_URL)
         .respond_sequence(vec![
-            json_response(200, &serde_json::json!({ "error": "authorization_pending" })),
+            json_response(
+                200,
+                &serde_json::json!({ "error": "authorization_pending" }),
+            ),
             json_response(200, &serde_json::json!({ "access_token": "gh-token" })),
         ]);
     mock.on(|request| request.url == COPILOT_TOKEN_URL)
@@ -936,10 +896,8 @@ async fn the_device_poll_parks_on_authorization_pending_then_completes() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -962,17 +920,15 @@ async fn a_failing_policy_update_stops_the_batch_without_failing_the_login() {
     let mock = MockHttpClient::new();
     mount_login_routes(
         &mock,
-        serde_json::json!({ "data": [
+        &serde_json::json!({ "data": [
             model_entry("claude-sonnet-4.6", false, "unconfigured"),
         ]}),
     );
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let credential = handle
@@ -991,7 +947,7 @@ async fn a_failed_policy_status_counts_as_not_enabled() {
     let mock = MockHttpClient::new();
     mount_login_routes(
         &mock,
-        serde_json::json!({ "data": [
+        &serde_json::json!({ "data": [
             model_entry("claude-sonnet-4.6", false, "unconfigured"),
             model_entry("gpt-5.4", false, "unconfigured"),
         ]}),
@@ -1001,10 +957,8 @@ async fn a_failed_policy_status_counts_as_not_enabled() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let credential = handle
@@ -1024,7 +978,7 @@ async fn a_cancelled_enable_fails_the_login() {
     let mock = MockHttpClient::new();
     mount_login_routes(
         &mock,
-        serde_json::json!({ "data": [
+        &serde_json::json!({ "data": [
             model_entry("claude-sonnet-4.6", false, "unconfigured"),
         ]}),
     );
@@ -1043,10 +997,7 @@ async fn a_cancelled_enable_fails_the_login() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        signal,
-    )));
+    let handle = tokio::spawn(oauth.login(provider_interaction(&scripted, signal)));
 
     tokio::time::advance(Duration::from_secs(1)).await;
     let error = handle
@@ -1132,7 +1083,7 @@ async fn a_429_with_an_unparseable_date_and_headerless_replies_stop_the_retry() 
             MockResponse::status(429).with_header("Retry-After", "1"),
             MockResponse::status(429).with_header("Retry-After", "not a date"),
             json_response(200, &serde_json::json!({ "data": [] })),
-        ])
+        ]);
     });
     mock.on(|request| request.url == DEVICE_URL)
         .respond(json_response(200, &device_response()));
@@ -1146,10 +1097,7 @@ async fn a_429_with_an_unparseable_date_and_headerless_replies_stop_the_retry() 
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let outcome = oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    ));
+    let outcome = oauth.login(provider_interaction(&scripted, CancellationToken::new()));
     let error = outcome.await.expect_err("the unparseable date fails login");
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
 }
@@ -1163,7 +1111,7 @@ async fn a_429_with_only_a_date_header_out_of_budget_exits_before_the_sleep() {
         builder.respond_sequence(vec![
             MockResponse::status(429).with_header("Retry-After", "Tue, 14 Jul 2026 04:33:20 GMT"),
             json_response(200, &serde_json::json!({ "data": [] })),
-        ])
+        ]);
     });
     mock.on(|request| request.url == DEVICE_URL)
         .respond(json_response(200, &device_response()));
@@ -1177,10 +1125,8 @@ async fn a_429_with_only_a_date_header_out_of_budget_exits_before_the_sleep() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
     tokio::time::advance(Duration::from_secs(1)).await;
     let error = handle
         .await
@@ -1264,7 +1210,7 @@ async fn a_429_with_a_non_finite_retry_header_stops_the_login_retry() {
         builder.respond_sequence(vec![
             MockResponse::status(429).with_header("Retry-After", "nan"),
             json_response(200, &serde_json::json!({ "data": [] })),
-        ])
+        ]);
     });
     mock.on(|request| request.url == DEVICE_URL)
         .respond(json_response(200, &device_response()));
@@ -1278,10 +1224,8 @@ async fn a_429_with_a_non_finite_retry_header_stops_the_login_retry() {
 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
-    let handle = tokio::spawn(oauth.login(provider_interaction(
-        &scripted,
-        CancellationToken::new(),
-    )));
+    let handle =
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
     // The wait-before-first-poll sleep rides the paused clock.
     tokio::time::advance(Duration::from_secs(1)).await;
     let error = handle
