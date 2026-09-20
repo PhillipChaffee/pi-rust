@@ -379,6 +379,19 @@ fn the_cli_interaction_drives_piped_stdin() {
         "the question renders with its placeholder: {stdout:?}"
     );
 
+    // The manual-code prompt renders through the same question line.
+    let output = run_probe("manual-code", b"pasted-code\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the manual-code probe passes: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Paste the code (http://localhost:1/cb): "),
+        "the manual-code prompt renders: {stdout:?}"
+    );
+
     // The secret prompt renders through the same question line.
     let output = run_probe("secret", b"sk-ambient\n");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -513,6 +526,20 @@ fn run_interaction_probe(mode: &str) {
                 entered.expect("the secret reads"),
                 "sk-ambient",
                 "the entered line answers the secret prompt"
+            );
+        }
+        "manual-code" => {
+            let entered = prompt(AuthPrompt {
+                signal: None,
+                kind: AuthPromptKind::ManualCode {
+                    message: "Paste the code".to_owned(),
+                    placeholder: Some("http://localhost:1/cb".to_owned()),
+                },
+            });
+            assert_eq!(
+                entered.expect("the manual-code reads"),
+                "pasted-code",
+                "the entered line answers the manual-code prompt"
             );
         }
         "eof" => {

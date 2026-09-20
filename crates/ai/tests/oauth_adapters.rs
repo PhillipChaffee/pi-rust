@@ -917,6 +917,38 @@ async fn the_kimi_auth_closures_drive_the_flow() {
         "{error}"
     );
 
+    // A failure status with a body carries the body; a 200 whose body is not
+    // JSON fails the parse.
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://auth.kimi.com/api/oauth/device_authorization")
+        .respond(MockResponse::status(500).with_body("kaput"));
+    let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
+    let error = ((flow.auth().login)(provider_interaction(
+        &Arc::new(ScriptedAuthInteraction::answering("")),
+        never_aborted(),
+    )))
+    .await
+    .expect_err("the bodyless failure fails login");
+    assert_eq!(
+        error.to_string(),
+        "Kimi Code device authorization failed with status 500: kaput"
+    );
+
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://auth.kimi.com/api/oauth/device_authorization")
+        .respond(MockResponse::status(200).with_body("not json"));
+    let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
+    let error = ((flow.auth().login)(provider_interaction(
+        &Arc::new(ScriptedAuthInteraction::answering("")),
+        never_aborted(),
+    )))
+    .await
+    .expect_err("the unparseable device response fails login");
+    assert!(
+        error.to_string().starts_with("invalid JSON response"),
+        "{error}"
+    );
+
     let error = (auth.refresh)(
         oauth_credentials("a", "r", 0),
         never_aborted(),
