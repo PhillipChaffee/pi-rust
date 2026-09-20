@@ -17,7 +17,9 @@
 
 pub mod auth_fixtures;
 pub mod auth_interaction;
+pub mod oauth_fixtures;
 pub mod paused_clock;
+pub mod radius_fixtures;
 pub mod seam_forms;
 
 use pi_ai::types::{

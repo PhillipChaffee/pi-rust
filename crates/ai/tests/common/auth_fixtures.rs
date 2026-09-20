@@ -24,7 +24,7 @@ use pi_ai::auth::types::{
     ApiKeyAuth, ApiKeyAuthInput, ApiKeyCredential, ApiKeyResolveFn, AuthContext, AuthError,
     AuthEvent, AuthInteraction, AuthPrompt, AuthResult, Credential, CredentialInfo,
     CredentialModifyFn, ModelAuth, OAuthAuth, OAuthCredentials, OAuthLoginFn, OAuthRefreshFn,
-    OAuthToAuthFn, PromptFn,
+    OAuthToAuthFn, PromptFn, ProviderAuthInteraction,
 };
 use pi_ai::types::BoxedFuture;
 use pi_ai::utils::abort::AbortError;
@@ -230,6 +230,14 @@ impl RecordingInteraction {
     }
 }
 
+/// Wrap the recording double as the interaction argument the flows take,
+/// over a never-cancelled signal — the default interaction the login-task
+/// cases drive.
+#[must_use]
+pub fn provider_interaction(recording: &RecordingInteraction) -> ProviderAuthInteraction {
+    ProviderAuthInteraction::from_interaction(recording.interaction(), CancellationToken::new())
+}
+
 /// An [`OAuthCredentials`] with the three wire fields set, the shape the
 /// suites' fixtures mint.
 #[must_use]
@@ -239,8 +247,8 @@ pub fn oauth_credentials(
     expires: i64,
 ) -> OAuthCredentials {
     OAuthCredentials {
-        refresh: refresh.into(),
         access: access.into(),
+        refresh: refresh.into(),
         expires,
         extra: BTreeMap::new(),
     }
