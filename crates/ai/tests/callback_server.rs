@@ -477,7 +477,7 @@ async fn garbage_flushed_at_eof_yields_the_internal_error_page() {
         .expect("the ephemeral bind succeeds");
     let port = server.local_addr().expect("the bound address").port();
 
-    // Unparseable bytes with no header terminator, then EOF: the buffered
+    // Unparsable bytes with no header terminator, then EOF: the buffered
     // request fails the parse, upstream's lenient-EOF read.
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
