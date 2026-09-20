@@ -52,7 +52,7 @@ fn interaction(
 ) {
     let scripted = Arc::new(ScriptedAuthInteraction::answering(login_method));
     (
-        provider_interaction(Arc::clone(&scripted), CancellationToken::new()),
+        provider_interaction(&scripted, CancellationToken::new()),
         scripted,
     )
 }
@@ -98,7 +98,10 @@ async fn uses_gateway_endpoints_directly_for_device_login() {
         "the expiry carries the one-minute skew off the pinned clock"
     );
     assert_eq!(
-        credential.extra.get("scope").and_then(serde_json::Value::as_str),
+        credential
+            .extra
+            .get("scope")
+            .and_then(serde_json::Value::as_str),
         Some("gateway offline_access")
     );
 

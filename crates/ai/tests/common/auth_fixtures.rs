@@ -50,7 +50,10 @@ impl std::error::Error for StubError {}
 /// The refresh implementation a [`StubOAuthAuth`] scripts: the credential
 /// under refresh and the operation's signal, resolving the replacement.
 pub type StubRefreshFn = Arc<
-    dyn Fn(OAuthCredentials, CancellationToken) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>>
+    dyn Fn(
+            OAuthCredentials,
+            CancellationToken,
+        ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>>
         + Send
         + Sync,
 >;
@@ -136,9 +139,9 @@ impl RecordingInteraction {
     pub fn set_dynamic(
         &self,
         answer: impl Fn(&AuthPrompt) -> BoxedFuture<'static, Result<String, AbortError>>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) {
         *RecordingInner::lock(&self.inner.dynamic) = Some(Arc::new(answer));
     }
@@ -149,9 +152,9 @@ impl RecordingInteraction {
     #[must_use]
     pub fn with_dynamic(
         answer: impl Fn(&AuthPrompt) -> BoxedFuture<'static, Result<String, AbortError>>
-            + Send
-            + Sync
-            + 'static,
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         let interaction = Self::new();
         *RecordingInner::lock(&interaction.inner.dynamic) = Some(Arc::new(answer));

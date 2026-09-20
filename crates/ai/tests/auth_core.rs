@@ -45,8 +45,7 @@ use pi_ai::auth::resolve::{
 use pi_ai::auth::types::{
     ApiKeyAuth, ApiKeyAuthInput, ApiKeyCredential, ApiKeyResolveFn, AuthContext, AuthOptions,
     AuthPrompt, AuthPromptKind, AuthResult, AuthType, Credential, CredentialInfo,
-    CredentialModifyFn,
-    ModelAuth, OAuthCredentials, ProviderAuth, ProviderAuthInteraction,
+    CredentialModifyFn, ModelAuth, OAuthCredentials, ProviderAuth, ProviderAuthInteraction,
 };
 use pi_ai::env_api_keys::{find_env_keys, get_env_api_key};
 use pi_ai::http::{MockHttpClient, MockResponse};
@@ -68,11 +67,7 @@ fn now() -> i64 {
 
 /// A modify closure storing `credential`, the write the suites drive.
 fn set_credential(credential: Credential) -> CredentialModifyFn {
-    Box::new(move |_| {
-        let next: Result<Option<Credential>, pi_ai::auth::types::AuthError> =
-            Ok(Some(credential.clone()));
-        Box::pin(std::future::ready(next))
-    })
+    Box::new(move |_| Box::pin(std::future::ready(Ok(Some(credential)))))
 }
 
 /// A stored api-key credential, upstream's `{ type: "api_key", key }` wire
@@ -150,10 +145,7 @@ fn resolution_error(
 #[tokio::test]
 async fn reads_missing_entries_as_none() {
     let store = InMemoryCredentialStore::default();
-    let read = store
-        .read(PROVIDER, None)
-        .await
-        .expect("read succeeds");
+    let read = store.read(PROVIDER, None).await.expect("read succeeds");
     assert_eq!(read, None);
 }
 
@@ -280,7 +272,7 @@ async fn concurrent_modifies_on_one_provider_serialize() {
                     "shared",
                     Box::new(move |current| {
                         let gate = Arc::clone(&gate);
-                        let credential = credential.clone();
+                        let credential = credential;
                         let entered = a_entered;
                         Box::pin(async move {
                             let _ = entered.send(current.clone());
@@ -312,7 +304,7 @@ async fn concurrent_modifies_on_one_provider_serialize() {
                     "shared",
                     Box::new(move |current| {
                         let seen = b_seen;
-                        let credential = credential.clone();
+                        let credential = credential;
                         Box::pin(async move {
                             let _ = seen.send(current);
                             Ok(Some(credential))
@@ -367,7 +359,6 @@ async fn delete_serializes_behind_a_pending_modify() {
                     Box::new(move |current| {
                         let entered = a_entered;
                         let gate = Arc::clone(&gate);
-                        let credential = credential.clone();
                         Box::pin(async move {
                             let _ = entered.send(current);
                             gate.wait_for_peer().await;
@@ -442,7 +433,10 @@ fn oauth_credentials_round_trip_with_extras() {
     assert_eq!(oauth.access, "a");
     assert_eq!(oauth.expires, 123);
     assert_eq!(
-        oauth.extra.get("enterpriseUrl").and_then(serde_json::Value::as_str),
+        oauth
+            .extra
+            .get("enterpriseUrl")
+            .and_then(serde_json::Value::as_str),
         Some("company.ghe.com")
     );
     assert_eq!(serde_json::to_value(&credential).expect("serializes"), wire);
@@ -528,9 +522,8 @@ async fn override_env_merges_under_a_stored_api_key_credential() {
         env: Some(overrides_env),
         ..AuthResolutionOverrides::default()
     };
-    let provider = api_key_provider(|| {
-        env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"])
-    });
+    let provider =
+        api_key_provider(|| env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"]));
 
     let resolved = resolution_error(
         resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
@@ -554,8 +547,14 @@ async fn the_api_key_override_short_circuits_resolution() {
     };
 
     let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &failing_store(), &context(), Some(&overrides))
-            .await,
+        resolve_provider_auth(
+            PROVIDER,
+            &provider,
+            &failing_store(),
+            &context(),
+            Some(&overrides),
+        )
+        .await,
     )
     .expect("the resolution succeeds")
     .expect("the override resolves");
@@ -814,10 +813,7 @@ async fn a_refreshed_token_below_the_requested_validity_rejects() {
 #[tokio::test(start_paused = true)]
 async fn a_stuck_refresh_times_out_after_fifteen_seconds() {
     let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(
-        refresh_after_sleeping(
-            30_000,
-            oauth_credentials("late-access", "r", 0),
-        ),
+        refresh_after_sleeping(30_000, oauth_credentials("late-access", "r", 0)),
     );
     let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
@@ -857,8 +853,11 @@ async fn a_stuck_refresh_times_out_after_fifteen_seconds() {
 #[tokio::test]
 async fn a_failed_api_key_resolution_surfaces_the_auth_models_error() {
     let provider = api_key_provider(|| {
-        ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::failing("ambient lookup exploded"))
-            .auth()
+        ApiKeyAuthStub::new(
+            "Stub key",
+            ApiKeyAuthStub::failing("ambient lookup exploded"),
+        )
+        .auth()
     });
 
     let error = resolution_error(
@@ -874,8 +873,9 @@ async fn a_failed_api_key_resolution_surfaces_the_auth_models_error() {
 
 #[tokio::test]
 async fn a_failing_store_read_surfaces_the_auth_models_error() {
-    let provider =
-        api_key_provider(|| ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth());
+    let provider = api_key_provider(|| {
+        ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth()
+    });
 
     let error = resolution_error(
         resolve_provider_auth(PROVIDER, &provider, &failing_store(), &context(), None).await,
@@ -890,8 +890,9 @@ async fn a_failing_store_read_surfaces_the_auth_models_error() {
 
 #[tokio::test]
 async fn an_aborted_resolution_rejects() {
-    let provider =
-        api_key_provider(|| ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth());
+    let provider = api_key_provider(|| {
+        ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth()
+    });
     let signal = CancellationToken::new();
     signal.cancel();
     let overrides = AuthResolutionOverrides {
@@ -1343,6 +1344,10 @@ fn the_process_env_readers_serve_the_probe_modes() {
 /// The child half of [`the_process_env_readers_serve_the_probe_modes`]:
 /// each mode drives one process-env reader against the child's own
 /// environment and asserts the contract.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one probe mode per branch keeps the child-environment contracts legible"
+)]
 fn run_env_probe_mode(mode: &str) {
     let context = DefaultAuthContext;
     match mode {
@@ -1391,7 +1396,11 @@ fn run_env_probe_mode(mode: &str) {
             );
         }
         "env-keys-unset" => {
-            assert_eq!(find_env_keys("nvidia", None), None, "unset vars do not resolve");
+            assert_eq!(
+                find_env_keys("nvidia", None),
+                None,
+                "unset vars do not resolve"
+            );
             assert_eq!(get_env_api_key("openai", None), None);
             assert_eq!(find_env_keys("unknown-provider", None), None);
         }
@@ -1597,8 +1606,7 @@ async fn stored_env_wins_when_the_override_carries_no_env() {
         }),
     )
     .await;
-    let provider =
-        api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
+    let provider = api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
 
     let resolved = resolution_error(
         resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
@@ -1626,8 +1634,7 @@ async fn the_override_env_applies_when_the_stored_credential_has_none() {
         env: Some(override_env.clone()),
         ..AuthResolutionOverrides::default()
     };
-    let provider =
-        api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
+    let provider = api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
 
     let resolved = resolution_error(
         resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
@@ -1674,9 +1681,8 @@ async fn the_overlay_context_delegates_file_checks_to_the_base_context() {
         env: Some(env),
         ..AuthResolutionOverrides::default()
     };
-    let provider = api_key_provider(|| {
-        file_probe_auth(dir.join("probe").to_string_lossy().into_owned())
-    });
+    let provider =
+        api_key_provider(|| file_probe_auth(dir.join("probe").to_string_lossy().into_owned()));
     let base: Arc<dyn AuthContext> = Arc::new(DefaultAuthContext);
 
     let resolved = resolution_error(
@@ -1822,7 +1828,11 @@ async fn pre_cancelled_store_operations_reject_as_aborted() {
     let error = store.list(Some(&options)).await.expect_err("list aborts");
     assert_eq!(error.to_string(), "The operation was aborted");
     let error: pi_ai::auth::types::AuthError = store
-        .modify(PROVIDER, set_credential(api_key_stored("k")), Some(&options))
+        .modify(
+            PROVIDER,
+            set_credential(api_key_stored("k")),
+            Some(&options),
+        )
         .await
         .expect_err("modify aborts");
     assert!(
@@ -1973,11 +1983,7 @@ async fn a_rejecting_modify_closure_propagates_through_the_store() {
     let error = store
         .modify(
             PROVIDER,
-            Box::new(|_| {
-                Box::pin(std::future::ready(Err(
-                    stub_error("modify refused"),
-                )))
-            }),
+            Box::new(|_| Box::pin(std::future::ready(Err(stub_error("modify refused"))))),
             None,
         )
         .await
@@ -2072,10 +2078,9 @@ fn bedrock_authenticates_through_every_declared_credential_source() {
         );
     }
     // A half IAM pair does not authenticate.
-    let env: ProviderEnv =
-        std::iter::once(("AWS_ACCESS_KEY_ID", "only"))
-            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-            .collect();
+    let env: ProviderEnv = std::iter::once(("AWS_ACCESS_KEY_ID", "only"))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
     assert_eq!(get_env_api_key("amazon-bedrock", Some(&env)), None);
 }
 
@@ -2110,7 +2115,10 @@ fn vertex_adc_auth_requires_project_and_location() {
     let complete = get_env_api_key(
         "google-vertex",
         Some(&ProviderEnv::from_iter([
-            ("GOOGLE_APPLICATION_CREDENTIALS".to_owned(), adc.to_string_lossy().into_owned()),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+                adc.to_string_lossy().into_owned(),
+            ),
             ("GOOGLE_CLOUD_PROJECT".to_owned(), "v".to_owned()),
             ("GOOGLE_CLOUD_LOCATION".to_owned(), "v".to_owned()),
         ])),
@@ -2150,10 +2158,7 @@ fn only_completed_poll_outcomes_complete() {
 
     // The credential-typed instantiations the flows poll for.
     let oauth = oauth_credentials("a", "r", 1);
-    assert_eq!(
-        PollOutcome::Complete(oauth.clone()).complete(),
-        Some(oauth)
-    );
+    assert_eq!(PollOutcome::Complete(oauth.clone()).complete(), Some(oauth));
     assert_eq!(PollOutcome::<OAuthCredentials>::Pending.complete(), None);
     assert_eq!(
         PollOutcome::<OAuthCredentials>::SlowDown {
@@ -2197,8 +2202,11 @@ fn poll_flow<F: Future>(flow: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 /// A poll script serving canned outcomes then parking.
 fn scripted_poll<T: Send + 'static>(
     outcomes: Vec<PollOutcome<T>>,
-) -> Arc<dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<T>, pi_ai::auth::types::AuthError>> + Send + Sync>
-{
+) -> Arc<
+    dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<T>, pi_ai::auth::types::AuthError>>
+        + Send
+        + Sync,
+> {
     let outcomes = Arc::new(Mutex::new(outcomes));
     Arc::new(move || {
         let next = outcomes
@@ -2390,10 +2398,8 @@ async fn an_abort_between_the_prompt_and_the_key_check_fails_the_login() {
             hung
         }
     });
-    let interaction = ProviderAuthInteraction::from_interaction(
-        recording.interaction(),
-        signal.clone(),
-    );
+    let interaction =
+        ProviderAuthInteraction::from_interaction(recording.interaction(), signal.clone());
     let auth = env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"]);
     let login = auth.login.expect("the standard login exists");
     let error = (login)(interaction)

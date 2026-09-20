@@ -37,16 +37,16 @@ use pi_ai::auth::clock::{FixedClock, SteppedClock};
 use pi_ai::auth::oauth::anthropic::AnthropicOAuth;
 use pi_ai::auth::oauth::github_copilot::GitHubCopilotOAuth;
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
+use pi_ai::auth::oauth::openai_codex::OpenAICodexOAuth;
+use pi_ai::auth::oauth::openrouter::OpenRouterOAuth;
+use pi_ai::auth::oauth::xai::XaiOAuth;
 use pi_ai::auth::oauth::{
     RadiusOAuthOptions, load_anthropic_oauth, load_github_copilot_oauth, load_kimi_coding_oauth,
     load_openai_codex_oauth, load_openrouter_oauth, load_radius_oauth, load_xai_oauth,
 };
-use pi_ai::auth::oauth::openai_codex::OpenAICodexOAuth;
-use pi_ai::auth::oauth::openrouter::OpenRouterOAuth;
-use pi_ai::auth::oauth::xai::XaiOAuth;
+use pi_ai::auth::types::ModelAuth;
 use pi_ai::auth::types::{AuthError, OAuthCredentials};
 use pi_ai::http::{HttpClient, MockHttpClient, MockResponse, json_response};
-use pi_ai::auth::types::ModelAuth;
 use tokio_util::sync::CancellationToken;
 
 /// The epoch the stepped clocks fix, so refresh arithmetic asserts exactly.
@@ -95,7 +95,9 @@ fn identifies_only_subscription_backed_oauth_flows_as_subscriptions() {
         );
     }
     assert_ne!(
-        OpenRouterOAuth::new(Arc::clone(&client)).auth().is_subscription,
+        OpenRouterOAuth::new(Arc::clone(&client))
+            .auth()
+            .is_subscription,
         Some(true),
         "openrouter's permanent key is not a subscription"
     );
@@ -249,7 +251,13 @@ async fn github_copilot_refresh_preserves_the_enterprise_domain() {
         .expect("refresh resolves");
 
     assert_eq!(refreshed.access, "new-token");
-    assert_eq!(refreshed.extra.get("enterpriseUrl").and_then(serde_json::Value::as_str), Some("company.ghe.com"));
+    assert_eq!(
+        refreshed
+            .extra
+            .get("enterpriseUrl")
+            .and_then(serde_json::Value::as_str),
+        Some("company.ghe.com")
+    );
     let fetched_urls: Vec<String> = client
         .recorded()
         .iter()
@@ -362,7 +370,8 @@ async fn anthropic_refresh_rejects_a_non_object_body_and_missing_fields() {
         .await
         .expect_err("the array body fails refresh");
     assert_eq!(
-        error.to_string(), "Anthropic token refresh returned invalid JSON",
+        error.to_string(),
+        "Anthropic token refresh returned invalid JSON",
         "a non-object body rejects"
     );
 
@@ -451,11 +460,10 @@ fn xai_login(
     Arc<RecordingInteraction>,
 ) {
     let recording: Arc<RecordingInteraction> = Arc::new(RecordingInteraction::new());
-    let interaction =
-        pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
-            recording.interaction(),
-            never_aborted(),
-        );
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        never_aborted(),
+    );
     let handle = tokio::spawn(async move { flow.login(interaction).await });
     (handle, recording)
 }
@@ -532,7 +540,8 @@ async fn xai_device_start_failures_carry_the_status_and_error_detail() {
         .expect("the login task joins")
         .expect_err("the failed start fails login");
     assert_eq!(
-        error.to_string(), "xAI OAuth device authorization failed (HTTP 400)",
+        error.to_string(),
+        "xAI OAuth device authorization failed (HTTP 400)",
         "the detail is empty"
     );
 }
@@ -550,7 +559,8 @@ async fn xai_device_start_rejects_malformed_fields() {
         .expect("the login task joins")
         .expect_err("the non-object body fails login");
     assert_eq!(
-        error.to_string(), "Invalid xAI OAuth response field: device_code",
+        error.to_string(),
+        "Invalid xAI OAuth response field: device_code",
         "a non-object body leaves every field missing"
     );
 
@@ -567,7 +577,10 @@ async fn xai_device_start_rejects_malformed_fields() {
         .await
         .expect("the login task joins")
         .expect_err("the non-positive expiry fails login");
-    assert_eq!(error.to_string(), "Invalid xAI OAuth response field: expires_in");
+    assert_eq!(
+        error.to_string(),
+        "Invalid xAI OAuth response field: expires_in"
+    );
 
     // A missing user_code rejects with its field's name.
     let client = mock();
@@ -582,7 +595,10 @@ async fn xai_device_start_rejects_malformed_fields() {
         .await
         .expect("the login task joins")
         .expect_err("the empty user code fails login");
-    assert_eq!(error.to_string(), "Invalid xAI OAuth response field: user_code");
+    assert_eq!(
+        error.to_string(),
+        "Invalid xAI OAuth response field: user_code"
+    );
 }
 
 #[tokio::test]
@@ -601,7 +617,8 @@ async fn xai_device_start_rejects_untrusted_verification_uris() {
             .expect("the login task joins")
             .expect_err("the untrusted uri fails login");
         assert_eq!(
-            error.to_string(), "Untrusted verification URI in xAI OAuth response",
+            error.to_string(),
+            "Untrusted verification URI in xAI OAuth response",
             "{field} must be https: {error:?}"
         );
     }
@@ -710,7 +727,8 @@ async fn xai_poll_rejects_a_token_response_without_a_refresh_token() {
         .expect("the login task joins")
         .expect_err("the missing refresh token fails login");
     assert_eq!(
-        error.to_string(), "Invalid xAI OAuth response field: refresh_token",
+        error.to_string(),
+        "Invalid xAI OAuth response field: refresh_token",
         "a first poll without rotation carries no previous token to reuse"
     );
 }

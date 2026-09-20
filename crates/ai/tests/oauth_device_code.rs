@@ -10,6 +10,10 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
+#![expect(
+    clippy::panic,
+    reason = "the tests pin outcomes; an unexpected shape panics by design"
+)]
 
 mod common;
 

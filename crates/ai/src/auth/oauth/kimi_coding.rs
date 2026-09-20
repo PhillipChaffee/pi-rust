@@ -11,8 +11,8 @@ use crate::auth::oauth::{
     auth_error, execute, form_post_request, json_object, oauth_credentials, read_body_lossy,
     read_json, wire_seconds_to_i64, wire_seconds_to_u64,
 };
-use crate::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use crate::auth::types::ModelAuth;
+use crate::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
@@ -372,6 +372,7 @@ async fn refresh_token(
 impl KimiCodingOAuth {
     /// Run the interactive login flow: device-code authorization against the
     /// configured host.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -391,25 +392,33 @@ impl KimiCodingOAuth {
             });
             let token =
                 poll_for_token(&client, &oauth_host, device, clock, &interaction.signal).await?;
-            Ok(oauth_credentials(token.access, token.refresh, token.expires))
+            Ok(oauth_credentials(
+                token.access,
+                token.refresh,
+                token.expires,
+            ))
         })
     }
 
     /// Exchange the refresh token for a rotated credential.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
         signal: CancellationToken,
     ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
-        let refresh_token_value = credential.refresh.clone();
         Box::pin(async move {
             let oauth_host = get_oauth_host();
             let clock: Arc<dyn crate::auth::clock::AuthClock> =
                 Arc::new(crate::auth::clock::SystemClock);
             let token =
-                refresh_token(&client, &oauth_host, &refresh_token_value, &clock, &signal).await?;
-            Ok(oauth_credentials(token.access, token.refresh, token.expires))
+                refresh_token(&client, &oauth_host, &credential.refresh, &clock, &signal).await?;
+            Ok(oauth_credentials(
+                token.access,
+                token.refresh,
+                token.expires,
+            ))
         })
     }
 

@@ -247,9 +247,7 @@ async fn run_login_unknown_provider_fails() {
     )
     .await;
     assert_eq!(
-        outcome
-            .expect_err("an unknown provider fails")
-            .to_string(),
+        outcome.expect_err("an unknown provider fails").to_string(),
         "Unknown provider: ghost"
     );
 }
@@ -433,6 +431,10 @@ fn run_interaction_probe_mode(mode: &str) {
     run_interaction_probe(mode);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one probe mode per branch keeps the piped-stdin contracts legible"
+)]
 fn run_interaction_probe(mode: &str) {
     use pi_ai::auth::types::{AuthEvent, AuthPrompt, AuthPromptKind, AuthPromptOption};
 
@@ -639,7 +641,11 @@ fn run_login_picker_rejects_invalid_and_eof_input() {
             // rejection carries the empty id upstream sends.
             "picker-invalid" => {
                 let error = outcome.expect_err("the invalid pick fails");
-                assert_eq!(error.to_string(), "", "the invalid pick carries the empty id");
+                assert_eq!(
+                    error.to_string(),
+                    "",
+                    "the invalid pick carries the empty id"
+                );
             }
             "picker-eof" => {
                 let error = outcome.expect_err("the closed stdin fails the picker");
@@ -779,7 +785,10 @@ fn run_login_surfaces_the_flow_and_persistence_failures() {
                     .expect("utf-8 path"),
             ));
         let error = outcome.expect_err("the persistence failure surfaces");
-        assert!(error.to_string().starts_with("Failed to create "), "{error:?}");
+        assert!(
+            error.to_string().starts_with("Failed to create "),
+            "{error:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
         return;
     }

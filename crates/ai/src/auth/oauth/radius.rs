@@ -548,6 +548,7 @@ async fn login_with_device_code(
 
 impl RadiusOAuth {
     /// Run the interactive login flow: pick the browser or device-code path.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -557,8 +558,7 @@ impl RadiusOAuth {
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
         Box::pin(async move {
-            let login_method = (interaction
-                .prompt)(AuthPrompt {
+            let login_method = (interaction.prompt)(AuthPrompt {
                 signal: None,
                 kind: AuthPromptKind::Select {
                     message: format!("Sign in to {name}:"),
@@ -601,6 +601,7 @@ impl RadiusOAuth {
     }
 
     /// Exchange the refresh token directly through the gateway.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
@@ -609,7 +610,6 @@ impl RadiusOAuth {
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
         let gateway = self.gateway.clone();
-        let refresh_token = credential.refresh.clone();
         Box::pin(async move {
             request_oauth_token(
                 &client,
@@ -618,7 +618,7 @@ impl RadiusOAuth {
                 vec![
                     ("grant_type".to_owned(), "refresh_token".to_owned()),
                     ("client_id".to_owned(), OAUTH_CLIENT_ID.to_owned()),
-                    ("refresh_token".to_owned(), refresh_token),
+                    ("refresh_token".to_owned(), credential.refresh),
                 ],
                 &signal,
             )
@@ -678,7 +678,7 @@ impl RadiusOAuth {
         let to_auth: crate::auth::types::OAuthToAuthFn = {
             Arc::new(|credential| {
                 let auth = ModelAuth {
-                    api_key: Some(credential.access.clone()),
+                    api_key: Some(credential.access),
                     ..ModelAuth::default()
                 };
                 Box::pin(async move { Ok(auth) })

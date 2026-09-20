@@ -18,9 +18,9 @@ use crate::auth::oauth::{
     auth_error, execute, json_post_request, oauth_credentials, parse_authorization_code_state,
     read_body_lossy, wire_seconds_to_i64,
 };
+use crate::auth::types::ModelAuth;
 use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, AuthPromptKind, OAuthCredentials};
 use crate::http::HttpClient;
-use crate::auth::types::ModelAuth;
 use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
@@ -107,6 +107,7 @@ impl AnthropicOAuth {
     }
 
     /// Run the interactive login flow.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -117,6 +118,7 @@ impl AnthropicOAuth {
     }
 
     /// Exchange the refresh token for a rotated credential.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
@@ -124,9 +126,8 @@ impl AnthropicOAuth {
     ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
         let clock = self.clock.clone();
-        let refresh_token = credential.refresh.clone();
         Box::pin(async move {
-            refresh_anthropic_token(&client, clock.as_ref(), &refresh_token, &signal).await
+            refresh_anthropic_token(&client, clock.as_ref(), &credential.refresh, &signal).await
         })
     }
 
@@ -267,8 +268,7 @@ async fn exchange_authorization_code(
         Ok(body) => body,
         Err(error) => {
             return Err(auth_error(format!(
-                "Token exchange request failed. url={TOKEN_URL}; redirect_uri={redirect_uri}; response_type=authorization_code; details={}",
-                error
+                "Token exchange request failed. url={TOKEN_URL}; redirect_uri={redirect_uri}; response_type=authorization_code; details={error}"
             )));
         }
     };
@@ -283,9 +283,7 @@ async fn exchange_authorization_code(
     let expires_in = map
         .get("expires_in")
         .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| {
-            auth_error("Token exchange returned invalid JSON: missing expires_in")
-        })?;
+        .ok_or_else(|| auth_error("Token exchange returned invalid JSON: missing expires_in"))?;
     Ok(oauth_credentials(
         access_token,
         refresh_token,
@@ -309,8 +307,7 @@ async fn refresh_anthropic_token(
         Ok(body) => body,
         Err(error) => {
             return Err(auth_error(format!(
-                "Anthropic token refresh request failed. url={TOKEN_URL}; details={}",
-                error
+                "Anthropic token refresh request failed. url={TOKEN_URL}; details={error}"
             )));
         }
     };
@@ -413,7 +410,7 @@ async fn login_anthropic(
                 message: "Exchanging authorization code for tokens...".to_owned(),
             });
             exchange_authorization_code(
-                &client,
+                client,
                 clock.as_ref(),
                 &code,
                 &state,
@@ -423,10 +420,7 @@ async fn login_anthropic(
             )
             .await
         }
-        (None, _) => {
-            Err(manual_error
-                .unwrap_or_else(|| auth_error("Missing authorization code")))
-        }
+        (None, _) => Err(manual_error.unwrap_or_else(|| auth_error("Missing authorization code"))),
         (Some(_), None) => Err(auth_error("Missing OAuth state")),
     };
     manual_abort.cancel();

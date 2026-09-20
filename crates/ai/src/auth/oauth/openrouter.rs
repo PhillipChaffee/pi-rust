@@ -26,7 +26,9 @@ use crate::auth::oauth::pkce::generate_pkce;
 use crate::auth::oauth::{
     auth_error, execute, json_post_request, oauth_credentials, random_uuid_v4,
 };
-use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, AuthPromptKind, ModelAuth, OAuthCredentials};
+use crate::auth::types::{
+    AuthError, AuthEvent, AuthPrompt, AuthPromptKind, ModelAuth, OAuthCredentials,
+};
 use crate::http::HttpClient;
 use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
@@ -429,6 +431,7 @@ async fn login_openrouter(
 
 impl OpenRouterOAuth {
     /// Run the interactive login flow.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -439,6 +442,7 @@ impl OpenRouterOAuth {
 
     /// Refresh is a no-op: the credential is a permanent, user-controlled API
     /// key.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
@@ -472,7 +476,7 @@ impl OpenRouterOAuth {
             Arc::new(|credential, _signal| Box::pin(async move { Ok(credential) }));
         let to_auth: crate::auth::types::OAuthToAuthFn = Arc::new(|credential| {
             let auth = ModelAuth {
-                api_key: Some(credential.access.clone()),
+                api_key: Some(credential.access),
                 ..ModelAuth::default()
             };
             Box::pin(async move { Ok(auth) })

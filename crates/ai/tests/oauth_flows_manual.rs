@@ -37,7 +37,7 @@ use pi_ai::auth::oauth::anthropic::AnthropicOAuth;
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
 use pi_ai::auth::oauth::openai_codex::OpenAICodexOAuth;
 use pi_ai::auth::oauth::openrouter::OpenRouterOAuth;
-use pi_ai::auth::types::{AuthEvent, AuthError, OAuthCredentials};
+use pi_ai::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use pi_ai::http::{MockHttpClient, MockResponse, json_response};
 use pi_ai::types::BoxedFuture;
 use pi_ai::utils::abort::AbortError;
@@ -69,7 +69,9 @@ fn stepped_clock() -> Arc<dyn pi_ai::auth::clock::AuthClock> {
 }
 
 /// A fresh uncancelled interaction bundle over `recording`.
-fn provider_interaction(recording: &RecordingInteraction) -> pi_ai::auth::types::ProviderAuthInteraction {
+fn provider_interaction(
+    recording: &RecordingInteraction,
+) -> pi_ai::auth::types::ProviderAuthInteraction {
     pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
         recording.interaction(),
         CancellationToken::new(),
@@ -452,7 +454,13 @@ async fn openai_codex_browser_login_mints_the_account_from_manual_input() {
         .await
         .expect("the manual paste mints the credential");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(credential.expires, EPOCH_MS + 3_600_000);
 
@@ -526,7 +534,13 @@ async fn the_openai_codex_device_flow_logs_in_through_pending_polls() {
         .expect("the login task joins")
         .expect("login resolves");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
 
     let AuthEvent::DeviceCode {
         user_code,
@@ -654,7 +668,10 @@ async fn an_unauthorized_kimi_refresh_reports_the_unauthorized_branch() {
         )
         .await
         .expect_err("the dead credential fails refresh");
-    assert_eq!(error.to_string(), "Kimi Code token refresh unauthorized (status 401)");
+    assert_eq!(
+        error.to_string(),
+        "Kimi Code token refresh unauthorized (status 401)"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -915,7 +932,8 @@ async fn a_failed_openrouter_exchange_answers_the_bad_gateway_page() {
         .expect("the login task joins")
         .expect_err("the failed exchange fails login");
     assert_eq!(
-        error.to_string(), "OpenRouter OAuth key exchange failed (HTTP 400): bad",
+        error.to_string(),
+        "OpenRouter OAuth key exchange failed (HTTP 400): bad",
         "the error_description detail wins the precedence"
     );
 }
@@ -962,7 +980,10 @@ async fn an_openrouter_exchange_that_outlives_thirty_seconds_times_out() {
         .await
         .expect("the login task joins")
         .expect_err("the stuck exchange times out");
-    assert_eq!(error.to_string(), "OpenRouter OAuth token exchange timed out");
+    assert_eq!(
+        error.to_string(),
+        "OpenRouter OAuth token exchange timed out"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1067,7 +1088,10 @@ async fn openrouter_rejects_invalid_json_and_missing_keys_on_success_statuses() 
     let error = openrouter_login_with_paste(mock, String::from("code"))
         .await
         .expect_err("the keyless response fails");
-    assert_eq!(error.to_string(), "OpenRouter OAuth response carries no \"key\"");
+    assert_eq!(
+        error.to_string(),
+        "OpenRouter OAuth response carries no \"key\""
+    );
 }
 
 #[test]
@@ -1121,7 +1145,13 @@ async fn openai_codex_browser_login_completes_through_the_real_callback_port() {
         .expect("the login task joins")
         .expect("login resolves");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
 
     let exchange_pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(exchange_pairs.contains(&(String::from("code"), String::from("C"))));
@@ -1212,7 +1242,13 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         .await
         .expect("the pasted url mints the credential");
     wait_port_free(1455).await;
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
     let pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(pairs.contains(&(String::from("code"), String::from("url-code"))));
 
@@ -1238,7 +1274,13 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         .await
         .expect("the form paste mints the credential");
     wait_port_free(1455).await;
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
     let pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(pairs.contains(&(String::from("code"), String::from("form-code"))));
 
@@ -1263,7 +1305,13 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         .login(provider_interaction(&recording))
         .await
         .expect("the bare paste mints the credential");
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
 }
 
 #[tokio::test]
@@ -1274,7 +1322,10 @@ async fn the_openai_codex_select_rejects_unknown_methods() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the unknown method fails login");
-    assert_eq!(error.to_string(), "Unknown OpenAI Codex login method: telepathy");
+    assert_eq!(
+        error.to_string(),
+        "Unknown OpenAI Codex login method: telepathy"
+    );
 }
 
 #[test]
@@ -1306,7 +1357,10 @@ async fn the_openai_codex_refresh_reports_its_failure_shapes() {
         .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the failure status fails refresh");
-    assert_eq!(error.to_string(), "OpenAI Codex token refresh failed (400): denied");
+    assert_eq!(
+        error.to_string(),
+        "OpenAI Codex token refresh failed (400): denied"
+    );
 
     // Missing token fields: the response is echoed.
     let mock = MockHttpClient::new();
@@ -1405,7 +1459,8 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         .await
         .expect_err("the failed start fails login");
     assert_eq!(
-        error.to_string(), "OpenAI Codex device code request failed with status 502",
+        error.to_string(),
+        "OpenAI Codex device code request failed with status 502",
         "an empty body leaves the message at the status"
     );
 
@@ -1505,7 +1560,13 @@ async fn the_openai_codex_device_flow_polls_failure_shapes() {
                 .await
                 .expect("the login task joins")
                 .expect("the slow-down poll resolves");
-            assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+            assert_eq!(
+                credential
+                    .extra
+                    .get("accountId")
+                    .and_then(serde_json::Value::as_str),
+                Some("acc")
+            );
         }
     }
 }
@@ -1587,7 +1648,13 @@ async fn the_openai_codex_device_flow_accepts_a_numeric_interval() {
         .await
         .expect("the login task joins")
         .expect("the numeric interval flow completes");
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1770,7 +1837,8 @@ async fn the_kimi_refresh_rejects_after_the_retries_are_exhausted() {
         .expect("the refresh task joins")
         .expect_err("the exhausted retries fail refresh");
     assert_eq!(
-        error.to_string(), "no mock route matched POST https://auth.kimi.com/api/oauth/token",
+        error.to_string(),
+        "no mock route matched POST https://auth.kimi.com/api/oauth/token",
         "the last transport error is the rejection"
     );
 
@@ -1838,7 +1906,10 @@ async fn the_kimi_refresh_reports_the_unauthorized_shapes() {
         .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the 403 fails refresh");
-    assert_eq!(error.to_string(), "Kimi Code token refresh unauthorized (status 403)");
+    assert_eq!(
+        error.to_string(),
+        "Kimi Code token refresh unauthorized (status 403)"
+    );
 
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == KIMI_TOKEN_URL)
@@ -2214,7 +2285,13 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
         .await
         .expect("the login task joins")
         .expect("login resolves");
-    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
+    assert_eq!(
+        credential
+            .extra
+            .get("accountId")
+            .and_then(serde_json::Value::as_str),
+        Some("acc")
+    );
     wait_port_free(1455).await;
 }
 
@@ -2222,7 +2299,8 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
 async fn the_openai_codex_manual_prompt_rejection_surfaces() {
     let _port = CODEX_PORT.lock().await;
     wait_port_free(1455).await;
-    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser")), Err(AbortError)]);
+    let recording =
+        RecordingInteraction::with_answers(vec![Ok(String::from("browser")), Err(AbortError)]);
     let error = OpenAICodexOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock())
         .login(provider_interaction(&recording))
         .await
@@ -2400,7 +2478,10 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
     let error = openrouter_login_with_paste(mock, String::from("some-code"))
         .await
         .expect_err("the array body fails login");
-    assert_eq!(error.to_string(), "OpenRouter OAuth response carries no \"key\"");
+    assert_eq!(
+        error.to_string(),
+        "OpenRouter OAuth response carries no \"key\""
+    );
 
     // A failure status with an unparseable body reports the bare status.
     let mock = MockHttpClient::new();
@@ -2410,7 +2491,8 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
         .await
         .expect_err("the unparseable failure fails login");
     assert_eq!(
-        error.to_string(), "OpenRouter OAuth key exchange failed (HTTP 400)",
+        error.to_string(),
+        "OpenRouter OAuth key exchange failed (HTTP 400)",
         "no detail survives an unparseable body"
     );
 }
@@ -2528,7 +2610,8 @@ async fn the_kimi_device_start_failure_without_a_body_stops_at_the_status() {
         .await
         .expect_err("the empty-body failure fails login");
     assert_eq!(
-        error.to_string(), "Kimi Code device authorization failed with status 500",
+        error.to_string(),
+        "Kimi Code device authorization failed with status 500",
         "an empty body leaves the message at the status"
     );
 }
@@ -2652,7 +2735,8 @@ async fn the_kimi_refresh_parse_and_body_shapes() {
         .await
         .expect_err("the non-object body fails refresh");
     assert_eq!(
-        error.to_string(), "Kimi Code token refresh response missing fields: {}",
+        error.to_string(),
+        "Kimi Code token refresh response missing fields: {}",
         "the array body parses to an empty object: {error:?}"
     );
 
@@ -2665,7 +2749,8 @@ async fn the_kimi_refresh_parse_and_body_shapes() {
         .await
         .expect_err("the empty failure fails refresh");
     assert_eq!(
-        error.to_string(), "Kimi Code token refresh failed with status 400",
+        error.to_string(),
+        "Kimi Code token refresh failed with status 400",
         "no body, no suffix"
     );
 
@@ -2677,5 +2762,8 @@ async fn the_kimi_refresh_parse_and_body_shapes() {
         .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the bodyless 400 fails refresh");
-    assert_eq!(error.to_string(), "Kimi Code token refresh failed with status 400");
+    assert_eq!(
+        error.to_string(),
+        "Kimi Code token refresh failed with status 400"
+    );
 }

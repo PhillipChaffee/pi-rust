@@ -24,11 +24,11 @@ use crate::auth::oauth::{
     auth_error, execute, form_post_request, json_post_request, oauth_credentials,
     parse_authorization_code_state, read_body_lossy, read_json,
 };
+use crate::auth::types::ModelAuth;
 use crate::auth::types::{
     AuthError, AuthEvent, AuthPrompt, AuthPromptKind, AuthPromptOption, OAuthCredentials,
 };
 use crate::http::{HttpClient, HttpResponse};
-use crate::auth::types::ModelAuth;
 use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
@@ -134,6 +134,7 @@ impl OpenAICodexOAuth {
     }
 
     /// Run the interactive login flow.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -141,8 +142,7 @@ impl OpenAICodexOAuth {
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
         Box::pin(async move {
-            let method = (interaction
-                .prompt)(AuthPrompt {
+            let method = (interaction.prompt)(AuthPrompt {
                 signal: None,
                 kind: AuthPromptKind::Select {
                     message: "Select OpenAI Codex login method:".to_owned(),
@@ -175,6 +175,7 @@ impl OpenAICodexOAuth {
     }
 
     /// Exchange the refresh token for a rotated credential.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
@@ -182,10 +183,9 @@ impl OpenAICodexOAuth {
     ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
-        let refresh_token = credential.refresh.clone();
         Box::pin(async move {
             let token =
-                refresh_access_token(&client, clock.as_ref(), &refresh_token, &signal).await?;
+                refresh_access_token(&client, clock.as_ref(), &credential.refresh, &signal).await?;
             credentials_from_token(token)
         })
     }
@@ -207,7 +207,8 @@ fn callback_host() -> String {
 /// The 16-byte hex state, upstream's `createState`.
 fn create_state() -> Result<String, AuthError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
     let mut state = String::with_capacity(32);
     for byte in bytes {
         let _ = write!(state, "{byte:02x}");
@@ -329,8 +330,7 @@ async fn refresh_access_token(
         Ok(response) => response,
         Err(error) => {
             return Err(auth_error(format!(
-                "OpenAI Codex token refresh error: {}",
-                error
+                "OpenAI Codex token refresh error: {error}"
             )));
         }
     };

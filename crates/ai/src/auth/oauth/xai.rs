@@ -11,9 +11,9 @@ use crate::auth::oauth::{
     auth_error, execute, form_post_request, oauth_credentials, read_json, required_string,
     wire_seconds_to_u64,
 };
+use crate::auth::types::ModelAuth;
 use crate::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use crate::http::HttpClient;
-use crate::auth::types::ModelAuth;
 use crate::types::BoxedFuture;
 
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -320,6 +320,7 @@ async fn refresh_xai_token(
 
 impl XaiOAuth {
     /// Run the interactive login flow: device-code authorization.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -343,6 +344,7 @@ impl XaiOAuth {
 
     /// Exchange the refresh token for a rotated credential; an unrotated
     /// refresh token survives an absent wire field.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
@@ -350,8 +352,9 @@ impl XaiOAuth {
     ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
         let clock = self.clock.clone();
-        let refresh_token = credential.refresh.clone();
-        Box::pin(async move { refresh_xai_token(&client, &clock, &refresh_token, &signal).await })
+        Box::pin(
+            async move { refresh_xai_token(&client, &clock, &credential.refresh, &signal).await },
+        )
     }
 
     /// Derive the request auth from a valid credential.
@@ -393,7 +396,7 @@ impl XaiOAuth {
         let to_auth: crate::auth::types::OAuthToAuthFn = {
             Arc::new(|credential| {
                 let auth = ModelAuth {
-                    api_key: Some(credential.access.clone()),
+                    api_key: Some(credential.access),
                     ..ModelAuth::default()
                 };
                 Box::pin(async move { Ok(auth) })

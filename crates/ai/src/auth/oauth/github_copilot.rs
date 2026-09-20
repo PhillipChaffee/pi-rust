@@ -26,9 +26,9 @@ use crate::auth::oauth::{
     auth_error, execute, form_post_request, json_post_request, oauth_credentials, read_body_lossy,
     read_json,
 };
+use crate::auth::types::ModelAuth;
 use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, OAuthCredentials};
 use crate::http::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
-use crate::auth::types::ModelAuth;
 use crate::types::BoxedFuture;
 use crate::utils::sleep::sleep;
 
@@ -142,6 +142,7 @@ impl GitHubCopilotOAuth {
     }
 
     /// Run the interactive login flow.
+    #[must_use]
     pub fn login(
         &self,
         interaction: crate::auth::types::ProviderAuthInteraction,
@@ -155,6 +156,7 @@ impl GitHubCopilotOAuth {
     }
 
     /// Exchange the refresh token for a rotated credential.
+    #[must_use]
     pub fn refresh(
         &self,
         credential: OAuthCredentials,
@@ -163,14 +165,13 @@ impl GitHubCopilotOAuth {
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
         let known_models = Arc::clone(&self.known_models);
-        let refresh_token = credential.refresh.clone();
-        let enterprise_domain = copilot_enterprise_domain(&credential);
         Box::pin(async move {
+            let enterprise_domain = copilot_enterprise_domain(&credential);
             refresh_github_copilot_token(
                 &client,
                 clock.as_ref(),
                 &known_models,
-                &refresh_token,
+                &credential.refresh,
                 enterprise_domain.as_deref(),
                 &signal,
             )
@@ -738,9 +739,10 @@ async fn refresh_github_copilot_access_token(
         wire_milliseconds(expires_at).saturating_mul(1000) - ACCESS_TOKEN_SKEW_MS,
     );
     if let Some(enterprise_domain) = enterprise_domain {
-        credential
-            .extra
-            .insert("enterpriseUrl".to_owned(), Value::String(enterprise_domain.to_owned()));
+        credential.extra.insert(
+            "enterpriseUrl".to_owned(),
+            Value::String(enterprise_domain.to_owned()),
+        );
     }
     Ok(credential)
 }
@@ -968,7 +970,9 @@ async fn login_github_copilot(
     let trimmed = input.trim();
     let enterprise_domain = normalize_domain(&input);
     if !trimmed.is_empty() && enterprise_domain.is_none() {
-        return Err(auth_error("Invalid GitHub Enterprise URL/domain".to_owned()));
+        return Err(auth_error(
+            "Invalid GitHub Enterprise URL/domain".to_owned(),
+        ));
     }
     let domain = enterprise_domain
         .clone()

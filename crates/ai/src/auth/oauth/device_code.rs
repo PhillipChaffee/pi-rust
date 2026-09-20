@@ -75,7 +75,8 @@ pub struct PollOptions<T> {
     /// immediate poll against the user.
     pub wait_before_first_poll: bool,
     /// The poll step itself; its rejections propagate out of the flow.
-    pub poll: Arc<dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<T>, AuthError>> + Send + Sync>,
+    pub poll:
+        Arc<dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<T>, AuthError>> + Send + Sync>,
     /// Cancels the whole flow.
     pub signal: CancellationToken,
 }

@@ -68,7 +68,7 @@ fn interaction(
 ) {
     let scripted = Arc::new(ScriptedAuthInteraction::answering(login_method));
     (
-        provider_interaction(Arc::clone(&scripted), CancellationToken::new()),
+        provider_interaction(&scripted, CancellationToken::new()),
         scripted,
     )
 }
@@ -237,7 +237,10 @@ async fn browser_login_completes_through_a_real_loopback_callback() {
         "the expiry carries the one-minute skew off the pinned clock"
     );
     assert_eq!(
-        credential.extra.get("scope").and_then(serde_json::Value::as_str),
+        credential
+            .extra
+            .get("scope")
+            .and_then(serde_json::Value::as_str),
         Some("gateway offline_access")
     );
 
@@ -288,7 +291,7 @@ async fn a_state_mismatched_callback_is_rejected_and_the_login_can_be_cancelled(
     let oauth = radius_oauth(&mock, &FixedClock::new(START));
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("browser"));
-    let interaction = provider_interaction(Arc::clone(&scripted), signal.clone());
+    let interaction = provider_interaction(&scripted, signal.clone());
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
     let auth_url = wait_for_auth_url(&scripted).await;
@@ -351,7 +354,8 @@ async fn the_callback_error_and_missing_code_pages_keep_the_login_waiting() {
         .expect("the login task joins")
         .expect_err("the error-param callback fails login");
     assert_eq!(
-        error.to_string(), "OAuth callback did not complete.",
+        error.to_string(),
+        "OAuth callback did not complete.",
         "a settled-but-empty wait without cancellation reports the incomplete callback"
     );
 }
@@ -415,7 +419,7 @@ async fn an_aborted_transport_cancels_the_browser_login() {
     let oauth = radius_oauth(&mock, &FixedClock::new(START));
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("browser"));
-    let interaction = provider_interaction(Arc::clone(&scripted), signal.clone());
+    let interaction = provider_interaction(&scripted, signal.clone());
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
     wait_for_auth_url(&scripted).await;
@@ -424,7 +428,11 @@ async fn an_aborted_transport_cancels_the_browser_login() {
         .await
         .expect("the login task joins")
         .expect_err("the cancelled login rejects");
-    assert_eq!(error.to_string(), "Login cancelled", "the abort settles the wait");
+    assert_eq!(
+        error.to_string(),
+        "Login cancelled",
+        "the abort settles the wait"
+    );
 }
 
 #[tokio::test]
@@ -546,7 +554,10 @@ async fn an_unknown_sign_in_method_rejects_with_the_method_error() {
         .login(interaction)
         .await
         .expect_err("the unknown method fails login");
-    assert_eq!(error.to_string(), "Unknown Radius sign-in method: telepathy");
+    assert_eq!(
+        error.to_string(),
+        "Unknown Radius sign-in method: telepathy"
+    );
 }
 
 #[tokio::test]
@@ -622,7 +633,7 @@ async fn the_device_poll_keeps_parking_on_pending_until_cancellation() {
     let oauth = radius_oauth(&mock, &FixedClock::new(START));
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("device-code"));
-    let interaction = provider_interaction(Arc::clone(&scripted), signal.clone());
+    let interaction = provider_interaction(&scripted, signal.clone());
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
     // The pending poll schedules the server's interval; the flow parks in the
@@ -653,7 +664,7 @@ async fn the_device_poll_parks_on_slow_down_until_cancellation() {
     let oauth = radius_oauth(&mock, &FixedClock::new(START));
     let signal = CancellationToken::new();
     let scripted = Arc::new(ScriptedAuthInteraction::answering("device-code"));
-    let interaction = provider_interaction(Arc::clone(&scripted), signal.clone());
+    let interaction = provider_interaction(&scripted, signal.clone());
     let handle = tokio::spawn(async move { oauth.login(interaction).await });
 
     wait_until(
@@ -848,7 +859,8 @@ async fn the_token_request_transport_failure_surfaces_through_the_browser_path()
         .expect("the login task joins")
         .expect_err("the token transport failure fails login");
     assert_eq!(
-        error.to_string(), "no mock route matched POST https://radius.example/v1/oauth/token",
+        error.to_string(),
+        "no mock route matched POST https://radius.example/v1/oauth/token",
         "the exchange's transport failure passes through: {error:?}"
     );
 }
@@ -903,7 +915,8 @@ async fn the_token_exchange_failure_body_shapes_reach_the_error_message() {
         .expect("the login task joins")
         .expect_err("the empty failure fails login");
     assert_eq!(
-        error.to_string(), "Radius OAuth token request failed: 400",
+        error.to_string(),
+        "Radius OAuth token request failed: 400",
         "the empty body falls back to the status: {error:?}"
     );
 }
@@ -933,7 +946,10 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
         .login(device_interaction)
         .await
         .expect_err("the invalid device JSON fails login");
-    assert!(error.to_string().starts_with("invalid JSON response: "), "{error:?}");
+    assert!(
+        error.to_string().starts_with("invalid JSON response: "),
+        "{error:?}"
+    );
 
     // A device failure without a body stops at the status.
     let mock = MockHttpClient::new();
@@ -946,7 +962,8 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
         .await
         .expect_err("the empty failure fails login");
     assert_eq!(
-        error.to_string(), "Radius OAuth device authorization failed: 500",
+        error.to_string(),
+        "Radius OAuth device authorization failed: 500",
         "the empty body falls back to the status"
     );
 }

@@ -49,7 +49,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::auth::oauth::auth_error;
-use crate::auth::types::{AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, Credential, PromptFn};
+use crate::auth::types::{
+    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, Credential, PromptFn,
+};
 
 /// One OAuth provider the CLI offers, upstream's filtered
 /// `builtinProviders()` entry: a provider whose `auth.oauth` is set.
@@ -271,25 +273,23 @@ fn prompt_fields(kind: &AuthPromptKind) -> (String, Option<String>) {
 
 /// The notify half of [`cli_interaction`], upstream's event switch.
 fn notify_fn() -> crate::auth::types::NotifyFn {
-    Arc::new(move |event: AuthEvent| {
-        match event {
-            AuthEvent::AuthUrl { url, instructions } => {
-                println!("\nOpen this URL in your browser:\n{url}");
-                if let Some(instructions) = instructions {
-                    println!("{instructions}");
-                }
+    Arc::new(move |event: AuthEvent| match event {
+        AuthEvent::AuthUrl { url, instructions } => {
+            println!("\nOpen this URL in your browser:\n{url}");
+            if let Some(instructions) = instructions {
+                println!("{instructions}");
             }
-            AuthEvent::DeviceCode {
-                user_code,
-                verification_uri,
-                ..
-            } => {
-                println!("\nOpen this URL in your browser:\n{verification_uri}");
-                println!("Enter code: {user_code}");
-            }
-            AuthEvent::Info { message, .. } | AuthEvent::Progress { message } => {
-                println!("{message}");
-            }
+        }
+        AuthEvent::DeviceCode {
+            user_code,
+            verification_uri,
+            ..
+        } => {
+            println!("\nOpen this URL in your browser:\n{verification_uri}");
+            println!("Enter code: {user_code}");
+        }
+        AuthEvent::Info { message, .. } | AuthEvent::Progress { message } => {
+            println!("{message}");
         }
     })
 }
@@ -421,11 +421,10 @@ async fn select_provider(providers: &[CliProvider]) -> Result<String, AuthError>
 /// # Errors
 /// Fails when the OAuth flow fails or when persisting the credential fails.
 async fn login_provider(provider: &CliProvider, auth_path: &str) -> Result<(), AuthError> {
-    let interaction =
-        crate::auth::types::ProviderAuthInteraction::from_interaction(
-            cli_interaction(),
-            tokio_util::sync::CancellationToken::new(),
-        );
+    let interaction = crate::auth::types::ProviderAuthInteraction::from_interaction(
+        cli_interaction(),
+        tokio_util::sync::CancellationToken::new(),
+    );
     let credential = (provider.oauth.login)(interaction).await?;
     save_credentials(
         Path::new(auth_path),

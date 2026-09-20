@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use pi_ai::auth::clock::{AuthClock as _, FixedClock};
 use pi_ai::auth::oauth::xai::XaiOAuth;
+use pi_ai::auth::types::ModelAuth;
 use pi_ai::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use pi_ai::http::{MockHttpClient, json_response};
-use pi_ai::auth::types::ModelAuth;
 use pi_ai::types::BoxedFuture;
 use tokio_util::sync::CancellationToken;
 
@@ -124,7 +124,7 @@ fn mount_token_route(
 fn login_xai(
     oauth: &XaiOAuth,
     signal: CancellationToken,
-    scripted: Arc<ScriptedAuthInteraction>,
+    scripted: &Arc<ScriptedAuthInteraction>,
 ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
     oauth.login(provider_interaction(scripted, signal))
 }
@@ -157,11 +157,7 @@ async fn uses_the_device_grant_delays_polling_and_handles_pending_and_slow_down(
 
     let oauth = XaiOAuth::new(Arc::new(mock.clone()), clock.clone());
     let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
-    let runner = tokio::spawn(login_xai(
-        &oauth,
-        CancellationToken::new(),
-        Arc::clone(&scripted),
-    ));
+    let runner = tokio::spawn(login_xai(&oauth, CancellationToken::new(), &scripted));
 
     // The device authorization flushes immediately, upstream's
     // advanceTimersByTimeAsync(0).
@@ -257,7 +253,7 @@ async fn falls_back_to_the_default_poll_interval_when_the_response_reports_inter
     let runner = tokio::spawn(login_xai(
         &oauth,
         CancellationToken::new(),
-        Arc::new(ScriptedAuthInteraction::rejecting_prompt()),
+        &Arc::new(ScriptedAuthInteraction::rejecting_prompt()),
     ));
 
     tokio::time::advance(Duration::ZERO).await;
@@ -288,11 +284,7 @@ async fn prefers_verification_uri_complete_when_the_server_provides_it() {
 
     let oauth = XaiOAuth::new(Arc::new(mock), clock.clone());
     let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
-    let runner = tokio::spawn(login_xai(
-        &oauth,
-        CancellationToken::new(),
-        Arc::clone(&scripted),
-    ));
+    let runner = tokio::spawn(login_xai(&oauth, CancellationToken::new(), &scripted));
 
     tokio::time::advance(Duration::ZERO).await;
     advance(&clock, 5_000).await;
@@ -327,7 +319,7 @@ async fn rejects_a_non_https_verification_uri_complete() {
     let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
     let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
     let error = oauth
-        .login(provider_interaction(scripted, CancellationToken::new()))
+        .login(provider_interaction(&scripted, CancellationToken::new()))
         .await
         .expect_err("the untrusted verification URI rejects");
 
@@ -378,7 +370,7 @@ async fn login_with_verification_uri(verification_uri: &str) -> AuthError {
     let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
     let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
     oauth
-        .login(provider_interaction(scripted, CancellationToken::new()))
+        .login(provider_interaction(&scripted, CancellationToken::new()))
         .await
         .expect_err("the untrusted verification URI rejects")
 }
@@ -421,7 +413,7 @@ async fn login_denied(oauth_error: &str) -> String {
     let oauth = XaiOAuth::new(Arc::new(mock), clock.clone());
     let scripted = Arc::new(ScriptedAuthInteraction::rejecting_prompt());
     let runner =
-        tokio::spawn(oauth.login(provider_interaction(scripted, CancellationToken::new())));
+        tokio::spawn(oauth.login(provider_interaction(&scripted, CancellationToken::new())));
 
     tokio::time::advance(Duration::ZERO).await;
     advance(&clock, 1_000).await;
@@ -442,10 +434,9 @@ async fn cancels_while_waiting_for_the_first_token_poll() {
     let oauth = XaiOAuth::new(Arc::new(mock.clone()), clock);
     let signal = CancellationToken::new();
     let scripted = Arc::new(
-        ScriptedAuthInteraction::rejecting_prompt()
-            .aborting_on_device_code(signal.clone()),
+        ScriptedAuthInteraction::rejecting_prompt().aborting_on_device_code(signal.clone()),
     );
-    let runner = tokio::spawn(login_xai(&oauth, signal, scripted));
+    let runner = tokio::spawn(login_xai(&oauth, signal, &scripted));
 
     // The device-code event aborts the flow before its first poll.
     tokio::time::advance(Duration::ZERO).await;
@@ -482,11 +473,17 @@ async fn refreshes_tokens_and_preserves_an_unrotated_refresh_token() {
 
     let oauth = XaiOAuth::new(Arc::new(mock.clone()), Arc::new(FixedClock::new(START)));
     let rotated = oauth
-        .refresh(oauth_credentials("old-access", "old-refresh", 0), CancellationToken::new())
+        .refresh(
+            oauth_credentials("old-access", "old-refresh", 0),
+            CancellationToken::new(),
+        )
         .await
         .expect("rotated refresh succeeds");
     let preserved = oauth
-        .refresh(oauth_credentials("old-access", "keep-refresh", 0), CancellationToken::new())
+        .refresh(
+            oauth_credentials("old-access", "keep-refresh", 0),
+            CancellationToken::new(),
+        )
         .await
         .expect("preserved refresh succeeds");
 
@@ -527,7 +524,10 @@ async fn assumes_a_one_hour_lifetime_when_expires_in_is_missing() {
 
     let oauth = XaiOAuth::new(Arc::new(mock), clock);
     let credential = oauth
-        .refresh(oauth_credentials("old-access", "old-refresh", 0), CancellationToken::new())
+        .refresh(
+            oauth_credentials("old-access", "old-refresh", 0),
+            CancellationToken::new(),
+        )
         .await
         .expect("refresh succeeds");
 
@@ -550,7 +550,10 @@ async fn rejects_token_responses_with_missing_fields() {
 
     let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
     let error = oauth
-        .refresh(oauth_credentials("old-access", "old-refresh", 0), CancellationToken::new())
+        .refresh(
+            oauth_credentials("old-access", "old-refresh", 0),
+            CancellationToken::new(),
+        )
         .await
         .expect_err("missing access token rejects");
 
@@ -574,7 +577,10 @@ async fn surfaces_the_upstream_error_code_and_description_on_refresh_failure() {
 
     let oauth = XaiOAuth::new(Arc::new(mock), Arc::new(FixedClock::new(START)));
     let error = oauth
-        .refresh(oauth_credentials("old-access", "old-refresh", 0), CancellationToken::new())
+        .refresh(
+            oauth_credentials("old-access", "old-refresh", 0),
+            CancellationToken::new(),
+        )
         .await
         .expect_err("revoked refresh rejects");
 

@@ -149,9 +149,7 @@ fn copilot_known_models() -> KnownModels {
 /// Loads the OpenRouter OAuth flow, upstream's `loadOpenRouterOAuth`.
 #[must_use]
 pub fn load_openrouter_oauth() -> BoxedFuture<'static, OAuthAuth> {
-    Box::pin(async move {
-        OpenRouterOAuth::new(crate::http::default_http_client()).auth()
-    })
+    Box::pin(async move { OpenRouterOAuth::new(crate::http::default_http_client()).auth() })
 }
 
 /// Loads the Kimi Code (subscription) OAuth flow, upstream's
@@ -175,8 +173,13 @@ pub fn load_radius_oauth(options: &RadiusOAuthOptions) -> BoxedFuture<'static, O
     let name = options.name.clone();
     let gateway = options.gateway.clone();
     Box::pin(async move {
-        RadiusOAuth::new(name, gateway, crate::http::default_http_client(), Arc::new(SystemClock))
-            .auth()
+        RadiusOAuth::new(
+            name,
+            gateway,
+            crate::http::default_http_client(),
+            Arc::new(SystemClock),
+        )
+        .auth()
     })
 }
 
@@ -388,7 +391,8 @@ fn query_value(url: &url::Url, name: &str) -> Option<String> {
 /// A random RFC 4122 version-4 UUID, upstream's `crypto.randomUUID`.
 pub(crate) fn random_uuid_v4() -> Result<String, AuthError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
+    getrandom::fill(&mut bytes)
+        .map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(format!(

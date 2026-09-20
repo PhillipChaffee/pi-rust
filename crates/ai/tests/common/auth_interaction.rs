@@ -104,7 +104,7 @@ impl ScriptedAuthInteraction {
 /// port of upstream's `{ signal, prompt, notify }` object.
 #[must_use]
 pub fn provider_interaction(
-    scripted: Arc<ScriptedAuthInteraction>,
+    scripted: &ScriptedAuthInteraction,
     signal: CancellationToken,
 ) -> ProviderAuthInteraction {
     ProviderAuthInteraction::from_interaction(scripted.interaction(), signal)
