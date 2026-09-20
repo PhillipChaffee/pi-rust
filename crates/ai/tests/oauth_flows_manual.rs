@@ -31,14 +31,16 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::auth_fixtures::RecordingInteraction;
+use common::auth_fixtures::{RecordingInteraction, oauth_credentials};
 use pi_ai::auth::clock::SteppedClock;
 use pi_ai::auth::oauth::anthropic::AnthropicOAuth;
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
 use pi_ai::auth::oauth::openai_codex::OpenAICodexOAuth;
 use pi_ai::auth::oauth::openrouter::OpenRouterOAuth;
-use pi_ai::auth::{AuthEvent, OAuthAuth as _, OAuthCredential, ProviderAuthInteraction};
+use pi_ai::auth::types::{AuthEvent, AuthError, OAuthCredentials};
 use pi_ai::http::{MockHttpClient, MockResponse, json_response};
+use pi_ai::types::BoxedFuture;
+use pi_ai::utils::abort::AbortError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -67,11 +69,11 @@ fn stepped_clock() -> Arc<dyn pi_ai::auth::clock::AuthClock> {
 }
 
 /// A fresh uncancelled interaction bundle over `recording`.
-fn provider_interaction(recording: &RecordingInteraction) -> ProviderAuthInteraction {
-    ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: CancellationToken::new(),
-    }
+fn provider_interaction(recording: &RecordingInteraction) -> pi_ai::auth::types::ProviderAuthInteraction {
+    pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        CancellationToken::new(),
+    )
 }
 
 /// Wait for a condition the login task reaches without clock dependence,
@@ -317,7 +319,7 @@ async fn an_occupied_callback_port_surfaces_the_bind_error() {
     let error = outcome.expect_err("the occupied port fails login");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("could not bind the OAuth callback server"),
         "the bind error surfaces before login hands a URL to the user: {error:?}"
     );
@@ -344,7 +346,7 @@ async fn openrouter_manual_input_mints_the_key_without_a_callback() {
     let recording = RecordingInteraction::new();
     let for_answer = Arc::new(recording.clone());
     recording.set_dynamic(
-        move |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             // The paste is the captured callback URL plus the authorization
             // code, the headless path upstream's manual prompt takes.
             let callback_url = for_answer
@@ -385,15 +387,13 @@ async fn a_cancelled_openrouter_manual_prompt_fails_login_without_exchanging() {
             200,
             &serde_json::json!({ "key": "sk-or-unexpected" }),
         ));
-    let recording = RecordingInteraction::with_answers(vec![Err(pi_ai::auth::AuthError(
-        String::from("Login cancelled"),
-    ))]);
+    let recording = RecordingInteraction::with_answers(vec![Err(AbortError)]);
 
     let error = OpenRouterOAuth::new(Arc::new(mock.clone()))
         .login(provider_interaction(&recording))
         .await
         .expect_err("the cancelled prompt fails login");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), AbortError::MESSAGE);
     assert_eq!(mock.request_count(), 0, "no key exchange ran");
 }
 
@@ -411,7 +411,7 @@ async fn an_empty_openrouter_manual_input_rejects_without_exchanging() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("empty input fails login");
-    assert_eq!(error.0, "Missing authorization code");
+    assert_eq!(error.to_string(), "Missing authorization code");
     assert_eq!(mock.request_count(), 0, "no key exchange ran");
 }
 
@@ -435,7 +435,7 @@ async fn openai_codex_browser_login_mints_the_account_from_manual_input() {
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     let for_answer = Arc::new(recording.clone());
     recording.set_dynamic(
-        move |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             let state = for_answer
                 .auth_url()
                 .as_deref()
@@ -452,7 +452,7 @@ async fn openai_codex_browser_login_mints_the_account_from_manual_input() {
         .await
         .expect("the manual paste mints the credential");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
     assert_eq!(credential.refresh, "refresh-token");
     assert_eq!(credential.expires, EPOCH_MS + 3_600_000);
 
@@ -526,7 +526,7 @@ async fn the_openai_codex_device_flow_logs_in_through_pending_polls() {
         .expect("the login task joins")
         .expect("login resolves");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
 
     let AuthEvent::DeviceCode {
         user_code,
@@ -566,7 +566,7 @@ async fn a_disabled_openai_codex_device_auth_reports_the_not_enabled_error() {
         .await
         .expect_err("the disabled server fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL."
     );
 }
@@ -649,12 +649,12 @@ async fn an_unauthorized_kimi_refresh_reports_the_unauthorized_branch() {
 
     let error = KimiCodingOAuth::new(Arc::new(mock.clone()))
         .refresh(
-            &OAuthCredential::new("old-access", "old-refresh", 0),
+            oauth_credentials("old-access", "old-refresh", 0),
             CancellationToken::new(),
         )
         .await
         .expect_err("the dead credential fails refresh");
-    assert_eq!(error.0, "Kimi Code token refresh unauthorized (status 401)");
+    assert_eq!(error.to_string(), "Kimi Code token refresh unauthorized (status 401)");
 }
 
 #[tokio::test(start_paused = true)]
@@ -676,7 +676,7 @@ async fn the_kimi_refresh_retries_backoffs_then_succeeds() {
     let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
     let handle = tokio::spawn(async move {
         flow.refresh(
-            &OAuthCredential::new("old-access", "old-refresh", 0),
+            oauth_credentials("old-access", "old-refresh", 0),
             CancellationToken::new(),
         )
         .await
@@ -787,7 +787,7 @@ async fn the_openrouter_callback_error_page_fails_the_login_with_the_description
         .await
         .expect("the login task joins")
         .expect_err("the denial fails login");
-    assert_eq!(error.0, "OpenRouter authorization failed: Nope");
+    assert_eq!(error.to_string(), "OpenRouter authorization failed: Nope");
 }
 
 #[tokio::test]
@@ -915,7 +915,7 @@ async fn a_failed_openrouter_exchange_answers_the_bad_gateway_page() {
         .expect("the login task joins")
         .expect_err("the failed exchange fails login");
     assert_eq!(
-        error.0, "OpenRouter OAuth key exchange failed (HTTP 400): bad",
+        error.to_string(), "OpenRouter OAuth key exchange failed (HTTP 400): bad",
         "the error_description detail wins the precedence"
     );
 }
@@ -932,7 +932,7 @@ async fn an_openrouter_exchange_that_outlives_thirty_seconds_times_out() {
     let recording = RecordingInteraction::with_answers(vec![]);
     let for_answer = Arc::new(recording.clone());
     recording.set_dynamic(
-        move |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             let callback_url = for_answer
                 .events()
                 .into_iter()
@@ -962,7 +962,7 @@ async fn an_openrouter_exchange_that_outlives_thirty_seconds_times_out() {
         .await
         .expect("the login task joins")
         .expect_err("the stuck exchange times out");
-    assert_eq!(error.0, "OpenRouter OAuth token exchange timed out");
+    assert_eq!(error.to_string(), "OpenRouter OAuth token exchange timed out");
 }
 
 #[tokio::test(start_paused = true)]
@@ -978,7 +978,7 @@ async fn the_openrouter_login_times_out_after_five_minutes() {
         .await
         .expect("the login task joins")
         .expect_err("the abandoned login times out");
-    assert_eq!(error.0, "OpenRouter OAuth login timed out");
+    assert_eq!(error.to_string(), "OpenRouter OAuth login timed out");
 }
 
 #[tokio::test]
@@ -986,15 +986,15 @@ async fn an_already_cancelled_openrouter_login_rejects_before_binding() {
     let recording = RecordingInteraction::new();
     let signal = CancellationToken::new();
     signal.cancel();
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: signal.clone(),
-    };
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        signal.clone(),
+    );
     let error = OpenRouterOAuth::new(Arc::new(MockHttpClient::new()))
         .login(interaction)
         .await
         .expect_err("the cancelled login rejects");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
     assert!(
         recording.events().is_empty(),
         "the flow fails before announcing anything"
@@ -1005,10 +1005,10 @@ async fn an_already_cancelled_openrouter_login_rejects_before_binding() {
 async fn openrouter_login_with_paste(
     mock: MockHttpClient,
     paste: String,
-) -> Result<OAuthCredential, pi_ai::auth::AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let recording = RecordingInteraction::new();
     recording.set_dynamic(
-        move |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(paste.clone())))
         },
     );
@@ -1047,7 +1047,7 @@ async fn openrouter_exchange_failure_details_follow_the_wire_precedence() {
         let error = openrouter_login_with_paste(mock, String::from("code"))
             .await
             .expect_err("the failed exchange rejects");
-        assert_eq!(error.0, expected, "{body:?}");
+        assert_eq!(error.to_string(), expected, "{body:?}");
     }
 }
 
@@ -1059,7 +1059,7 @@ async fn openrouter_rejects_invalid_json_and_missing_keys_on_success_statuses() 
     let error = openrouter_login_with_paste(mock, String::from("code"))
         .await
         .expect_err("the invalid JSON fails");
-    assert_eq!(error.0, "OpenRouter OAuth returned invalid JSON");
+    assert_eq!(error.to_string(), "OpenRouter OAuth returned invalid JSON");
 
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == OPENROUTER_TOKEN_URL)
@@ -1067,14 +1067,14 @@ async fn openrouter_rejects_invalid_json_and_missing_keys_on_success_statuses() 
     let error = openrouter_login_with_paste(mock, String::from("code"))
         .await
         .expect_err("the keyless response fails");
-    assert_eq!(error.0, "OpenRouter OAuth response carries no \"key\"");
+    assert_eq!(error.to_string(), "OpenRouter OAuth response carries no \"key\"");
 }
 
 #[test]
 fn openrouter_debug_names_the_flow() {
     let flow = OpenRouterOAuth::new(Arc::new(MockHttpClient::new()));
     assert_eq!(format!("{flow:?}"), "OpenRouterOAuth");
-    assert_eq!(flow.name(), "OpenRouter OAuth");
+    assert_eq!(flow.auth().name, "OpenRouter OAuth");
 }
 
 // ---------------------------------------------------------------------------
@@ -1121,7 +1121,7 @@ async fn openai_codex_browser_login_completes_through_the_real_callback_port() {
         .expect("the login task joins")
         .expect("login resolves");
     assert_eq!(credential.access, codex_jwt("acc"));
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
 
     let exchange_pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(exchange_pairs.contains(&(String::from("code"), String::from("C"))));
@@ -1147,7 +1147,7 @@ async fn the_openai_codex_manual_paste_state_mismatch_rejects() {
         ));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from(
                 "http://localhost:1455/auth/callback?code=C&state=wrong",
             ))))
@@ -1157,7 +1157,7 @@ async fn the_openai_codex_manual_paste_state_mismatch_rejects() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the mismatched state fails login");
-    assert_eq!(error.0, "State mismatch");
+    assert_eq!(error.to_string(), "State mismatch");
 }
 
 #[tokio::test]
@@ -1167,7 +1167,7 @@ async fn the_openai_codex_manual_paste_without_a_code_rejects() {
     let mock = MockHttpClient::new();
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("   "))))
         },
     );
@@ -1175,7 +1175,7 @@ async fn the_openai_codex_manual_paste_without_a_code_rejects() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the empty paste fails login");
-    assert_eq!(error.0, "Missing authorization code");
+    assert_eq!(error.to_string(), "Missing authorization code");
 }
 
 #[tokio::test]
@@ -1186,7 +1186,7 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     let for_answer = Arc::new(recording.clone());
     recording.set_dynamic(
-        move |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             let state = for_answer
                 .auth_url()
                 .as_deref()
@@ -1212,14 +1212,14 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         .await
         .expect("the pasted url mints the credential");
     wait_port_free(1455).await;
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
     let pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(pairs.contains(&(String::from("code"), String::from("url-code"))));
 
     // A `code=` form body parses as the code.
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("code=form-code"))))
         },
     );
@@ -1238,14 +1238,14 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         .await
         .expect("the form paste mints the credential");
     wait_port_free(1455).await;
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
     let pairs = form_pairs(&mock, CODEX_TOKEN_URL);
     assert!(pairs.contains(&(String::from("code"), String::from("form-code"))));
 
     // A bare code falls back to itself with the flow's own state.
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("bare-code"))))
         },
     );
@@ -1263,7 +1263,7 @@ async fn the_openai_codex_paste_branch_table_drives_parse_authorization_input() 
         .login(provider_interaction(&recording))
         .await
         .expect("the bare paste mints the credential");
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
 }
 
 #[tokio::test]
@@ -1274,15 +1274,15 @@ async fn the_openai_codex_select_rejects_unknown_methods() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the unknown method fails login");
-    assert_eq!(error.0, "Unknown OpenAI Codex login method: telepathy");
+    assert_eq!(error.to_string(), "Unknown OpenAI Codex login method: telepathy");
 }
 
 #[test]
 fn openai_codex_debug_names_the_flow_and_reports_the_subscription() {
     let flow = OpenAICodexOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock());
     assert_eq!(format!("{flow:?}"), "OpenAICodexOAuth");
-    assert_eq!(flow.name(), "OpenAI (ChatGPT Plus/Pro)");
-    assert!(flow.is_subscription());
+    assert_eq!(flow.auth().name, "OpenAI (ChatGPT Plus/Pro)");
+    assert_eq!(flow.auth().is_subscription, Some(true));
 }
 
 #[tokio::test]
@@ -1290,11 +1290,11 @@ async fn the_openai_codex_refresh_reports_its_failure_shapes() {
     // Transport failure: the refresh error is re-reported with the prefix.
     let mock = MockHttpClient::new();
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the transport failure fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "OpenAI Codex token refresh error: no mock route matched POST https://auth.openai.com/oauth/token"
     );
 
@@ -1303,10 +1303,10 @@ async fn the_openai_codex_refresh_reports_its_failure_shapes() {
     mock.on(|request| request.url == CODEX_TOKEN_URL)
         .respond(MockResponse::status(400).with_body("denied"));
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the failure status fails refresh");
-    assert_eq!(error.0, "OpenAI Codex token refresh failed (400): denied");
+    assert_eq!(error.to_string(), "OpenAI Codex token refresh failed (400): denied");
 
     // Missing token fields: the response is echoed.
     let mock = MockHttpClient::new();
@@ -1316,12 +1316,12 @@ async fn the_openai_codex_refresh_reports_its_failure_shapes() {
             &serde_json::json!({"access_token": "a"}),
         ));
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the missing fields fail refresh");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("OpenAI Codex token refresh response missing fields: "),
         "the missing-fields message echoes the json: {error:?}"
     );
@@ -1344,7 +1344,7 @@ async fn an_unextractable_account_id_rejects_the_credential() {
         ));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("bare-code"))))
         },
     );
@@ -1352,7 +1352,7 @@ async fn an_unextractable_account_id_rejects_the_credential() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the unextractable account id fails login");
-    assert_eq!(error.0, "Failed to extract accountId from token");
+    assert_eq!(error.to_string(), "Failed to extract accountId from token");
     wait_port_free(1455).await;
 
     // A three-segment token whose payload is not base64 JSON.
@@ -1368,7 +1368,7 @@ async fn an_unextractable_account_id_rejects_the_credential() {
         ));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("bare-code"))))
         },
     );
@@ -1376,7 +1376,7 @@ async fn an_unextractable_account_id_rejects_the_credential() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the undecodable payload fails login");
-    assert_eq!(error.0, "Failed to extract accountId from token");
+    assert_eq!(error.to_string(), "Failed to extract accountId from token");
 }
 
 #[tokio::test]
@@ -1392,7 +1392,7 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         .await
         .expect_err("the failed start fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "OpenAI Codex device code request failed with status 500: kaput"
     );
 
@@ -1405,7 +1405,7 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         .await
         .expect_err("the failed start fails login");
     assert_eq!(
-        error.0, "OpenAI Codex device code request failed with status 502",
+        error.to_string(), "OpenAI Codex device code request failed with status 502",
         "an empty body leaves the message at the status"
     );
 
@@ -1423,7 +1423,7 @@ async fn the_openai_codex_device_start_rejects_malformed_shapes() {
         .expect_err("the incomplete response fails login");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("Invalid OpenAI Codex device code response: "),
         "the invalid-response message echoes the json: {error:?}"
     );
@@ -1497,7 +1497,7 @@ async fn the_openai_codex_device_flow_polls_failure_shapes() {
                 .await
                 .expect("the login task joins")
                 .expect_err("the failed poll fails login");
-            assert!(error.0.starts_with(prefix), "{error:?}");
+            assert!(error.to_string().starts_with(prefix), "{error:?}");
         } else {
             // The slow-down bump adds five seconds to the server interval.
             tokio::time::advance(Duration::from_secs(15)).await;
@@ -1505,7 +1505,7 @@ async fn the_openai_codex_device_flow_polls_failure_shapes() {
                 .await
                 .expect("the login task joins")
                 .expect("the slow-down poll resolves");
-            assert_eq!(credential.extra_string("accountId"), Some("acc"));
+            assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
         }
     }
 }
@@ -1540,7 +1540,7 @@ async fn the_openai_codex_device_flow_rejects_a_token_response_without_fields() 
         .expect_err("the incomplete token response fails login");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("Invalid OpenAI Codex device auth token response: "),
         "{error:?}"
     );
@@ -1587,7 +1587,7 @@ async fn the_openai_codex_device_flow_accepts_a_numeric_interval() {
         .await
         .expect("the login task joins")
         .expect("the numeric interval flow completes");
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,7 +1663,7 @@ async fn the_kimi_poll_failure_shapes_reject_with_their_wire_messages() {
             .expect("the login task joins")
             .expect_err("the failed poll fails login");
         assert!(
-            error.0.starts_with(expected),
+            error.to_string().starts_with(expected),
             "expected {expected:?}: {error:?}"
         );
     }
@@ -1703,7 +1703,7 @@ async fn the_kimi_poll_rejects_a_token_response_missing_fields() {
         .expect_err("the missing fields fail the poll");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("Kimi Code token poll response missing fields: "),
         "{error:?}"
     );
@@ -1731,10 +1731,10 @@ async fn the_kimi_poll_slow_down_parks_until_cancelled() {
         ));
     let signal = CancellationToken::new();
     let recording = RecordingInteraction::new();
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: signal.clone(),
-    };
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        signal.clone(),
+    );
     let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
     let handle = tokio::spawn(async move { flow.login(interaction).await });
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -1744,7 +1744,7 @@ async fn the_kimi_poll_slow_down_parks_until_cancelled() {
         .await
         .expect("the login task joins")
         .expect_err("the cancelled poll rejects");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1756,7 +1756,7 @@ async fn the_kimi_refresh_rejects_after_the_retries_are_exhausted() {
         let mock = mock.clone();
         tokio::spawn(async move {
             KimiCodingOAuth::new(Arc::new(mock))
-                .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+                .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
                 .await
         })
     };
@@ -1770,7 +1770,7 @@ async fn the_kimi_refresh_rejects_after_the_retries_are_exhausted() {
         .expect("the refresh task joins")
         .expect_err("the exhausted retries fail refresh");
     assert_eq!(
-        error.0, "no mock route matched POST https://auth.kimi.com/api/oauth/token",
+        error.to_string(), "no mock route matched POST https://auth.kimi.com/api/oauth/token",
         "the last transport error is the rejection"
     );
 
@@ -1782,11 +1782,11 @@ async fn the_kimi_refresh_rejects_after_the_retries_are_exhausted() {
             &serde_json::json!({"error": "bad_request", "error_description": "nope"}),
         ));
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the non-retryable failure fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Kimi Code token refresh failed with status 400: {\"error\":\"bad_request\",\"error_description\":\"nope\"}"
     );
 }
@@ -1810,7 +1810,7 @@ async fn the_kimi_refresh_retries_a_429_then_succeeds() {
         let mock = mock.clone();
         tokio::spawn(async move {
             KimiCodingOAuth::new(Arc::new(mock))
-                .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+                .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
                 .await
         })
     };
@@ -1835,10 +1835,10 @@ async fn the_kimi_refresh_reports_the_unauthorized_shapes() {
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond(json_response(403, &serde_json::json!({})));
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the 403 fails refresh");
-    assert_eq!(error.0, "Kimi Code token refresh unauthorized (status 403)");
+    assert_eq!(error.to_string(), "Kimi Code token refresh unauthorized (status 403)");
 
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == KIMI_TOKEN_URL)
@@ -1847,11 +1847,11 @@ async fn the_kimi_refresh_reports_the_unauthorized_shapes() {
             &serde_json::json!({"error": "invalid_grant", "error_description": "revoked"}),
         ));
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the invalid grant fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Kimi Code token refresh unauthorized (status 400): revoked"
     );
 }
@@ -1862,10 +1862,10 @@ async fn a_pre_cancelled_kimi_refresh_rejects_as_aborted() {
     let signal = CancellationToken::new();
     signal.cancel();
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), signal)
+        .refresh(oauth_credentials("a", "r", 0), signal)
         .await
         .expect_err("the cancelled refresh rejects");
-    assert_eq!(error.0, "Kimi Code token refresh aborted");
+    assert_eq!(error.to_string(), "Kimi Code token refresh aborted");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1877,7 +1877,7 @@ async fn a_kimi_refresh_cancelled_during_the_backoff_rejects_as_aborted() {
     let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
     let refresh_signal = signal.clone();
     let handle = tokio::spawn(async move {
-        flow.refresh(&OAuthCredential::new("a", "r", 0), refresh_signal)
+        flow.refresh(oauth_credentials("a", "r", 0), refresh_signal)
             .await
     });
 
@@ -1887,13 +1887,13 @@ async fn a_kimi_refresh_cancelled_during_the_backoff_rejects_as_aborted() {
         .await
         .expect("the refresh task joins")
         .expect_err("the cancelled backoff fails refresh");
-    assert_eq!(error.0, "Kimi Code token refresh aborted");
+    assert_eq!(error.to_string(), "Kimi Code token refresh aborted");
 }
 
 #[test]
 fn the_kimi_flow_reports_its_name() {
     let flow = KimiCodingOAuth::new(Arc::new(MockHttpClient::new()));
-    assert_eq!(flow.name(), "Kimi Code (subscription)");
+    assert_eq!(flow.auth().name, "Kimi Code (subscription)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1987,6 +1987,7 @@ async fn the_anthropic_callback_pages_reject_without_derailing_the_login() {
         .expect("the login task joins")
         .expect("login resolves");
     assert_eq!(credential.access, "access-token");
+    wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
 }
 
 /// Mount the token route a browser-path login exchanges against.
@@ -2006,7 +2007,7 @@ fn mount_anthropic_token_route(mock: &MockHttpClient) {
 async fn anthropic_login_with_paste(
     mock: MockHttpClient,
     paste: String,
-) -> Result<OAuthCredential, pi_ai::auth::AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let _port = ANTHROPIC_PORT.lock().await;
     let recording = RecordingInteraction::new();
     recording.set_dynamic(move |_prompt| Box::pin(std::future::ready(Ok(paste.clone()))));
@@ -2025,7 +2026,7 @@ async fn the_anthropic_manual_paste_state_mismatch_rejects() {
     )
     .await
     .expect_err("the mismatched state fails login");
-    assert_eq!(error.0, "OAuth state mismatch");
+    assert_eq!(error.to_string(), "OAuth state mismatch");
 
     // A `code#state` fragment paste parses both halves; the mismatching
     // state rejects the paste, upstream's parseAuthorizationInput branch.
@@ -2035,7 +2036,7 @@ async fn the_anthropic_manual_paste_state_mismatch_rejects() {
     )
     .await
     .expect_err("the mismatched fragment fails login");
-    assert_eq!(error.0, "OAuth state mismatch");
+    assert_eq!(error.to_string(), "OAuth state mismatch");
 
     // A `code=...` form paste with a state parses both halves too.
     let error = anthropic_login_with_paste(
@@ -2044,7 +2045,7 @@ async fn the_anthropic_manual_paste_state_mismatch_rejects() {
     )
     .await
     .expect_err("the mismatched form paste fails login");
-    assert_eq!(error.0, "OAuth state mismatch");
+    assert_eq!(error.to_string(), "OAuth state mismatch");
 }
 
 #[tokio::test]
@@ -2067,14 +2068,12 @@ async fn the_anthropic_manual_paste_without_a_state_uses_the_verifier() {
 async fn the_anthropic_manual_prompt_rejection_surfaces() {
     let _port = ANTHROPIC_PORT.lock().await;
     wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
-    let recording = RecordingInteraction::with_answers(vec![Err(pi_ai::auth::AuthError(
-        String::from("prompt refused"),
-    ))]);
+    let recording = RecordingInteraction::with_answers(vec![Err(AbortError)]);
     let error = AnthropicOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock())
         .login(provider_interaction(&recording))
         .await
         .expect_err("the rejected prompt fails login");
-    assert_eq!(error.0, "prompt refused");
+    assert_eq!(error.to_string(), AbortError::MESSAGE);
 }
 
 #[tokio::test]
@@ -2084,7 +2083,7 @@ async fn the_anthropic_exchange_reports_its_failure_shapes() {
         .await
         .expect_err("the transport failure fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Token exchange request failed. url=https://platform.claude.com/v1/oauth/token; \
          redirect_uri=http://localhost:53692/callback; response_type=authorization_code; \
          details=no mock route matched POST https://platform.claude.com/v1/oauth/token"
@@ -2098,7 +2097,7 @@ async fn the_anthropic_exchange_reports_its_failure_shapes() {
         .await
         .expect_err("the failure status fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Token exchange request failed. url=https://platform.claude.com/v1/oauth/token; \
          redirect_uri=http://localhost:53692/callback; response_type=authorization_code; \
          details=HTTP request failed. status=400; url=https://platform.claude.com/v1/oauth/token; \
@@ -2113,7 +2112,7 @@ async fn the_anthropic_exchange_reports_its_failure_shapes() {
         .await
         .expect_err("the invalid JSON fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Token exchange returned invalid JSON. url=https://platform.claude.com/v1/oauth/token; \
          body=not json; details=expected ident at line 1 column 2"
     );
@@ -2125,7 +2124,7 @@ async fn the_anthropic_exchange_reports_its_failure_shapes() {
     let error = anthropic_login_with_paste(mock, String::from("bare-code"))
         .await
         .expect_err("the array body fails login");
-    assert_eq!(error.0, "Token exchange returned invalid JSON");
+    assert_eq!(error.to_string(), "Token exchange returned invalid JSON");
 
     // Missing expires_in.
     let mock = MockHttpClient::new();
@@ -2138,7 +2137,7 @@ async fn the_anthropic_exchange_reports_its_failure_shapes() {
         .await
         .expect_err("the missing expiry fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Token exchange returned invalid JSON: missing expires_in"
     );
 }
@@ -2215,7 +2214,7 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
         .await
         .expect("the login task joins")
         .expect("login resolves");
-    assert_eq!(credential.extra_string("accountId"), Some("acc"));
+    assert_eq!(credential.extra.get("accountId").and_then(serde_json::Value::as_str), Some("acc"));
     wait_port_free(1455).await;
 }
 
@@ -2223,15 +2222,12 @@ async fn the_openai_codex_callback_pages_reject_without_derailing_the_login() {
 async fn the_openai_codex_manual_prompt_rejection_surfaces() {
     let _port = CODEX_PORT.lock().await;
     wait_port_free(1455).await;
-    let recording = RecordingInteraction::with_answers(vec![
-        Ok(String::from("browser")),
-        Err(pi_ai::auth::AuthError(String::from("prompt refused"))),
-    ]);
+    let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser")), Err(AbortError)]);
     let error = OpenAICodexOAuth::new(Arc::new(MockHttpClient::new()), stepped_clock())
         .login(provider_interaction(&recording))
         .await
         .expect_err("the rejected prompt fails login");
-    assert_eq!(error.0, "prompt refused");
+    assert_eq!(error.to_string(), AbortError::MESSAGE);
     wait_port_free(1455).await;
 }
 
@@ -2241,12 +2237,12 @@ async fn the_openai_codex_refresh_empty_failure_body_uses_the_status_reason() {
     mock.on(|request| request.url == CODEX_TOKEN_URL)
         .respond(MockResponse::status(400));
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the empty-body failure fails refresh");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("OpenAI Codex token refresh failed (400): "),
         "the empty body falls back to the status reason: {error:?}"
     );
@@ -2290,11 +2286,11 @@ async fn the_openai_codex_poll_error_shapes_without_error_objects() {
             .expect("the login task joins")
             .expect_err("the failed poll fails login");
         assert!(
-            error.0.starts_with(expected),
+            error.to_string().starts_with(expected),
             "expected {expected:?}: {error:?}"
         );
         assert!(
-            error.0.contains("boom") || error.0.contains("{}"),
+            error.to_string().contains("boom") || error.to_string().contains("{}"),
             "the body is echoed: {error:?}"
         );
     }
@@ -2319,7 +2315,7 @@ async fn a_jwt_with_an_unparseable_payload_rejects_the_credential() {
         ));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("bare-code"))))
         },
     );
@@ -2327,7 +2323,7 @@ async fn a_jwt_with_an_unparseable_payload_rejects_the_credential() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the unparseable payload fails login");
-    assert_eq!(error.0, "Failed to extract accountId from token");
+    assert_eq!(error.to_string(), "Failed to extract accountId from token");
     wait_port_free(1455).await;
 }
 
@@ -2353,7 +2349,7 @@ async fn a_jwt_without_the_auth_claim_rejects_the_credential() {
         ));
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("browser"))]);
     recording.set_dynamic(
-        |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             Box::pin(std::future::ready(Ok(String::from("bare-code"))))
         },
     );
@@ -2361,7 +2357,7 @@ async fn a_jwt_without_the_auth_claim_rejects_the_credential() {
         .login(provider_interaction(&recording))
         .await
         .expect_err("the claimless token fails login");
-    assert_eq!(error.0, "Failed to extract accountId from token");
+    assert_eq!(error.to_string(), "Failed to extract accountId from token");
     wait_port_free(1455).await;
 }
 
@@ -2376,7 +2372,7 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
     let error = openrouter_login_with_paste(mock, String::from("http://cb.example/done"))
         .await
         .expect_err("the codeless URL fails login");
-    assert_eq!(error.0, "Missing authorization code");
+    assert_eq!(error.to_string(), "Missing authorization code");
 
     // A `code=` form body parses as the code.
     let mock = MockHttpClient::new();
@@ -2393,7 +2389,7 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
         .await
         .expect_err("the transport failure fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "no mock route matched POST https://openrouter.ai/api/v1/auth/keys"
     );
 
@@ -2404,7 +2400,7 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
     let error = openrouter_login_with_paste(mock, String::from("some-code"))
         .await
         .expect_err("the array body fails login");
-    assert_eq!(error.0, "OpenRouter OAuth response carries no \"key\"");
+    assert_eq!(error.to_string(), "OpenRouter OAuth response carries no \"key\"");
 
     // A failure status with an unparseable body reports the bare status.
     let mock = MockHttpClient::new();
@@ -2414,7 +2410,7 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
         .await
         .expect_err("the unparseable failure fails login");
     assert_eq!(
-        error.0, "OpenRouter OAuth key exchange failed (HTTP 400)",
+        error.to_string(), "OpenRouter OAuth key exchange failed (HTTP 400)",
         "no detail survives an unparseable body"
     );
 }
@@ -2425,7 +2421,7 @@ async fn an_openrouter_answer_that_cancels_the_signal_fails_the_exchange() {
     let recording = RecordingInteraction::new();
     recording.set_dynamic({
         let signal = signal.clone();
-        move |_prompt| -> pi_ai::auth::BoxAuthFuture<Result<String, pi_ai::auth::AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, AbortError>> {
             let signal = signal.clone();
             Box::pin(async move {
                 signal.cancel();
@@ -2433,25 +2429,25 @@ async fn an_openrouter_answer_that_cancels_the_signal_fails_the_exchange() {
             })
         }
     });
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: signal.clone(),
-    };
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        signal.clone(),
+    );
     let error = OpenRouterOAuth::new(Arc::new(MockHttpClient::new()))
         .login(interaction)
         .await
         .expect_err("the cancelled exchange fails login");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test]
 async fn an_openrouter_login_cancelled_mid_flight_reports_the_cancellation() {
     let recording = Arc::new(RecordingInteraction::new());
     let signal = CancellationToken::new();
-    let interaction = ProviderAuthInteraction {
-        interaction: recording.clone(),
-        signal: signal.clone(),
-    };
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        signal.clone(),
+    );
     let handle = tokio::spawn(async move {
         OpenRouterOAuth::new(Arc::new(MockHttpClient::new()))
             .login(interaction)
@@ -2463,7 +2459,7 @@ async fn an_openrouter_login_cancelled_mid_flight_reports_the_cancellation() {
         .await
         .expect("the login task joins")
         .expect_err("the mid-flight cancel fails login");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test]
@@ -2477,8 +2473,8 @@ async fn a_pasted_fragment_code_parses_for_the_manual_race() {
     .await
     .expect_err("the fragment paste fails");
     assert!(
-        error.0.contains("no mock route matched")
-            || error.0 == "OpenRouter OAuth key exchange failed (HTTP 400)",
+        error.to_string().contains("no mock route matched")
+            || error.to_string() == "OpenRouter OAuth key exchange failed (HTTP 400)",
         "the fragment's code reached the exchange: {error:?}"
     );
 }
@@ -2510,7 +2506,7 @@ async fn the_kimi_device_start_rejects_untrusted_or_missing_verification_uris() 
             .expect_err("the untrusted uri fails login");
         assert!(
             error
-                .0
+                .to_string()
                 .starts_with("Invalid Kimi Code device authorization response: "),
             "the untrusted uri falls into the missing-field error: {error:?}"
         );
@@ -2532,7 +2528,7 @@ async fn the_kimi_device_start_failure_without_a_body_stops_at_the_status() {
         .await
         .expect_err("the empty-body failure fails login");
     assert_eq!(
-        error.0, "Kimi Code device authorization failed with status 500",
+        error.to_string(), "Kimi Code device authorization failed with status 500",
         "an empty body leaves the message at the status"
     );
 }
@@ -2566,7 +2562,7 @@ async fn the_kimi_device_start_rejects_each_missing_field() {
             .expect_err("the missing field fails login");
         assert!(
             error
-                .0
+                .to_string()
                 .starts_with("Invalid Kimi Code device authorization response: "),
             "{error:?}"
         );
@@ -2601,7 +2597,7 @@ async fn the_kimi_poll_transport_failure_propagates() {
         .expect("the login task joins")
         .expect_err("the unmatched token route fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "no mock route matched POST https://auth.kimi.com/api/oauth/token"
     );
 }
@@ -2623,10 +2619,10 @@ async fn the_kimi_login_cancels_during_the_first_poll_wait() {
         ));
     let signal = CancellationToken::new();
     let recording = RecordingInteraction::new();
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: signal.clone(),
-    };
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        signal.clone(),
+    );
     let flow = KimiCodingOAuth::new(Arc::new(mock));
     let handle = tokio::spawn(async move { flow.login(interaction).await });
 
@@ -2642,7 +2638,7 @@ async fn the_kimi_login_cancels_during_the_first_poll_wait() {
         .await
         .expect("the login task joins")
         .expect_err("the cancelled first wait fails login");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test(start_paused = true)]
@@ -2652,11 +2648,11 @@ async fn the_kimi_refresh_parse_and_body_shapes() {
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond(MockResponse::status(200).with_body("[1]"));
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the non-object body fails refresh");
     assert_eq!(
-        error.0, "Kimi Code token refresh response missing fields: {}",
+        error.to_string(), "Kimi Code token refresh response missing fields: {}",
         "the array body parses to an empty object: {error:?}"
     );
 
@@ -2665,11 +2661,11 @@ async fn the_kimi_refresh_parse_and_body_shapes() {
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond(MockResponse::status(400));
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the empty failure fails refresh");
     assert_eq!(
-        error.0, "Kimi Code token refresh failed with status 400",
+        error.to_string(), "Kimi Code token refresh failed with status 400",
         "no body, no suffix"
     );
 
@@ -2678,8 +2674,8 @@ async fn the_kimi_refresh_parse_and_body_shapes() {
     mock.on(|request| request.url == KIMI_TOKEN_URL)
         .respond(MockResponse::status(400));
     let error = KimiCodingOAuth::new(Arc::new(mock))
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the bodyless 400 fails refresh");
-    assert_eq!(error.0, "Kimi Code token refresh failed with status 400");
+    assert_eq!(error.to_string(), "Kimi Code token refresh failed with status 400");
 }

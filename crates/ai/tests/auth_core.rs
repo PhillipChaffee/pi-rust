@@ -29,23 +29,26 @@ use std::task::Poll;
 use std::time::Duration;
 
 use common::auth_fixtures::{
-    ApiKeyAuthStub, FailingStore, MapAuthContext, RecordingInteraction, StubOAuthAuth,
-    refresh_after_sleeping, refresh_failing, refresh_returning,
+    ApiKeyAuthStub, FailingStore, MapAuthContext, RecordingInteraction, StubLoginOutcome,
+    StubOAuthAuth, oauth_credentials, refresh_after_sleeping, refresh_failing, refresh_returning,
+    stub_error,
 };
 use pi_ai::auth::clock::{AuthClock as _, FixedClock, SteppedClock, SystemClock};
-use pi_ai::auth::env_api_keys::{
-    find_env_keys, find_env_keys_with_lookup, get_env_api_key, get_env_api_key_with_sources,
-};
+use pi_ai::auth::context::DefaultAuthContext;
+use pi_ai::auth::credential_store::{CredentialStore, InMemoryCredentialStore};
+use pi_ai::auth::helpers::env_api_key_auth;
 use pi_ai::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
-use pi_ai::auth::{
-    ApiKeyAuth, ApiKeyCredential, ApiKeyResolveInput, AuthContext, AuthError, AuthOperationOptions,
-    AuthPrompt, AuthPromptKind, AuthResolutionOverrides, AuthResult, AuthType, BoxAuthFuture,
-    CheckCancelled, Credential, CredentialInfo, CredentialStore, CredentialStoreError,
-    DefaultAuthContext, EnvApiKeyAuth, InMemoryCredentialStore, ModelAuth, ModelsError,
-    ModelsErrorCode, OAuthAuth, OAuthCredential, ProviderAuth, ProviderAuthInteraction, StoreError,
-    StoreModifyFn, resolve_provider_auth,
+use pi_ai::auth::resolve::{
+    AuthResolutionOverrides, ModelsError, ModelsErrorCode, ModelsFailure, resolve_provider_auth,
 };
+use pi_ai::auth::types::{
+    ApiKeyAuth, ApiKeyAuthInput, ApiKeyCredential, ApiKeyResolveFn, AuthContext, AuthOptions,
+    AuthPrompt, AuthPromptKind, AuthResult, AuthType, Credential, CredentialInfo,
+    CredentialModifyFn,
+    ModelAuth, OAuthCredentials, ProviderAuth, ProviderAuthInteraction,
+};
+use pi_ai::env_api_keys::{find_env_keys, get_env_api_key};
 use pi_ai::http::{MockHttpClient, MockResponse};
 use pi_ai::types::{BoxedFuture, ProviderEnv};
 use tokio_util::sync::CancellationToken;
@@ -54,8 +57,8 @@ const PROVIDER: &str = "stub-provider";
 
 /// The login outcome the resolve-driven stubs carry: resolution never logs
 /// in, so the stub fails if a case drives it.
-fn unused_login() -> Result<OAuthCredential, AuthError> {
-    Err(AuthError("login is not driven by resolution".to_owned()))
+fn unused_login() -> StubLoginOutcome {
+    Err(String::from("login is not driven by resolution"))
 }
 
 /// The wall clock the resolution and the credentials' expiries share.
@@ -64,9 +67,10 @@ fn now() -> i64 {
 }
 
 /// A modify closure storing `credential`, the write the suites drive.
-fn set_credential(credential: Credential) -> StoreModifyFn {
-    Arc::new(move |_| {
-        let next: Result<Option<Credential>, StoreError> = Ok(Some(credential.clone()));
+fn set_credential(credential: Credential) -> CredentialModifyFn {
+    Box::new(move |_| {
+        let next: Result<Option<Credential>, pi_ai::auth::types::AuthError> =
+            Ok(Some(credential.clone()));
         Box::pin(std::future::ready(next))
     })
 }
@@ -83,7 +87,7 @@ fn api_key_stored(key: &str) -> Credential {
 /// A stored OAuth credential valid for `valid_for_ms` from the wall clock,
 /// the expiry the resolution's five-minute window checks.
 fn oauth_stored(access: &str, valid_for_ms: i64) -> Credential {
-    Credential::OAuth(OAuthCredential::new(access, "r", now() + valid_for_ms))
+    Credential::OAuth(oauth_credentials(access, "r", now() + valid_for_ms))
 }
 
 /// The empty auth context: no ambient env values, no files.
@@ -92,17 +96,17 @@ fn context() -> Arc<dyn AuthContext> {
 }
 
 /// A provider offering only the OAuth flow under test.
-fn oauth_provider(oauth: Arc<impl OAuthAuth + 'static>) -> ProviderAuth {
+fn oauth_provider_of(oauth: impl FnOnce() -> pi_ai::auth::types::OAuthAuth) -> ProviderAuth {
     ProviderAuth {
         api_key: None,
-        oauth: Some(oauth),
+        oauth: Some(oauth()),
     }
 }
 
 /// A provider offering only api-key auth.
-fn api_key_provider(auth: Arc<impl ApiKeyAuth + 'static>) -> ProviderAuth {
+fn api_key_provider(auth: impl FnOnce() -> ApiKeyAuth) -> ProviderAuth {
     ProviderAuth {
-        api_key: Some(auth),
+        api_key: Some(auth()),
         oauth: None,
     }
 }
@@ -110,46 +114,12 @@ fn api_key_provider(auth: Arc<impl ApiKeyAuth + 'static>) -> ProviderAuth {
 /// Store `credential` under `provider_id`, the login-time write.
 async fn store_credential(store: &dyn CredentialStore, provider_id: &str, credential: Credential) {
     store
-        .modify(
-            provider_id,
-            set_credential(credential),
-            &AuthOperationOptions::default(),
-        )
+        .modify(provider_id, set_credential(credential), None)
         .await
         .expect("the credential stores");
 }
 
-/// A one-shot signal whose sender survives inside `Fn` modify closures
-/// through interior mutability.
-#[derive(Debug, Default)]
-struct OneShot<T> {
-    slot: Mutex<Option<tokio::sync::oneshot::Sender<T>>>,
-}
-
-fn one_shot<T>() -> (Arc<OneShot<T>>, tokio::sync::oneshot::Receiver<T>) {
-    let (sender, receiver) = tokio::sync::oneshot::channel();
-    (
-        Arc::new(OneShot {
-            slot: Mutex::new(Some(sender)),
-        }),
-        receiver,
-    )
-}
-
-impl<T> OneShot<T> {
-    /// Deliver `value` to the waiting receiver, once.
-    fn signal(&self, value: T) {
-        let sender = self
-            .slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(sender) = sender {
-            let _ = sender.send(value);
-        }
-    }
-}
-
+/// A one-shot sender the modify closures deliver their observation through.
 /// A store the resolution must never reach, standing in where a case pins a
 /// path that never touches credentials.
 fn empty_store() -> Arc<dyn CredentialStore> {
@@ -162,6 +132,17 @@ fn failing_store() -> Arc<dyn CredentialStore> {
     Arc::new(FailingStore)
 }
 
+/// The failure the resolution settles with, unwrapped to the
+/// [`ModelsError`] the assertions read.
+fn resolution_error(
+    outcome: Result<Option<AuthResult>, ModelsFailure>,
+) -> Result<Option<AuthResult>, ModelsError> {
+    outcome.map_err(|failure| match failure {
+        ModelsFailure::Models(error) => error,
+        ModelsFailure::Aborted(abort) => panic!("unexpected abort: {abort}"),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // InMemoryCredentialStore
 // ---------------------------------------------------------------------------
@@ -170,7 +151,7 @@ fn failing_store() -> Arc<dyn CredentialStore> {
 async fn reads_missing_entries_as_none() {
     let store = InMemoryCredentialStore::default();
     let read = store
-        .read(PROVIDER, &AuthOperationOptions::default())
+        .read(PROVIDER, None)
         .await
         .expect("read succeeds");
     assert_eq!(read, None);
@@ -181,18 +162,11 @@ async fn modify_stores_the_returned_credential() {
     let store = InMemoryCredentialStore::default();
     let credential = api_key_stored("stored-key");
     let posted = store
-        .modify(
-            PROVIDER,
-            set_credential(credential.clone()),
-            &AuthOperationOptions::default(),
-        )
+        .modify(PROVIDER, set_credential(credential.clone()), None)
         .await
         .expect("modify succeeds");
     assert_eq!(posted, Some(credential.clone()));
-    let read = store
-        .read(PROVIDER, &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
+    let read = store.read(PROVIDER, None).await.expect("read succeeds");
     assert_eq!(read, Some(credential));
 }
 
@@ -204,12 +178,13 @@ async fn modify_returning_none_leaves_the_entry_and_returns_the_current() {
     let posted = store
         .modify(
             PROVIDER,
-            Arc::new(|_| {
-                Box::pin(std::future::ready(Ok::<Option<Credential>, StoreError>(
-                    None,
-                )))
+            Box::new(|_| {
+                Box::pin(std::future::ready(Ok::<
+                    Option<Credential>,
+                    pi_ai::auth::types::AuthError,
+                >(None)))
             }),
-            &AuthOperationOptions::default(),
+            None,
         )
         .await
         .expect("modify succeeds");
@@ -218,10 +193,7 @@ async fn modify_returning_none_leaves_the_entry_and_returns_the_current() {
         Some(credential.clone()),
         "the current resolves back"
     );
-    let read = store
-        .read(PROVIDER, &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
+    let read = store.read(PROVIDER, None).await.expect("read succeeds");
     assert_eq!(read, Some(credential), "the entry is unchanged");
 }
 
@@ -235,10 +207,7 @@ async fn list_reports_provider_ids_and_auth_types() {
         oauth_stored("a", 3_600_000),
     )
     .await;
-    let mut infos = store
-        .list(&AuthOperationOptions::default())
-        .await
-        .expect("list succeeds");
+    let mut infos = store.list(None).await.expect("list succeeds");
     infos.sort_by(|left, right| left.provider_id.cmp(&right.provider_id));
     assert_eq!(
         infos,
@@ -259,14 +228,8 @@ async fn list_reports_provider_ids_and_auth_types() {
 async fn delete_removes_the_entry() {
     let store = InMemoryCredentialStore::default();
     store_credential(&store, PROVIDER, api_key_stored("k")).await;
-    store
-        .delete(PROVIDER, &AuthOperationOptions::default())
-        .await
-        .expect("delete succeeds");
-    let read = store
-        .read(PROVIDER, &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
+    store.delete(PROVIDER, None).await.expect("delete succeeds");
+    let read = store.read(PROVIDER, None).await.expect("read succeeds");
     assert_eq!(read, None);
 }
 
@@ -303,7 +266,7 @@ async fn concurrent_modifies_on_one_provider_serialize() {
     let gate = Arc::new(ModifyGate::default());
     let credential_a = api_key_stored("a");
     let credential_b = api_key_stored("b");
-    let (a_entered, a_entered_rx) = one_shot::<Option<Credential>>();
+    let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
     // A observes the empty entry, then holds the chain lock until B has
     // queued its own modify.
@@ -311,22 +274,21 @@ async fn concurrent_modifies_on_one_provider_serialize() {
         let store = Arc::clone(&store);
         let gate = Arc::clone(&gate);
         let credential = credential_a.clone();
-        let entered = a_entered;
         tokio::spawn(async move {
             store
                 .modify(
                     "shared",
-                    Arc::new(move |current| {
+                    Box::new(move |current| {
                         let gate = Arc::clone(&gate);
                         let credential = credential.clone();
-                        let entered = Arc::clone(&entered);
+                        let entered = a_entered;
                         Box::pin(async move {
-                            entered.signal(current.clone());
+                            let _ = entered.send(current.clone());
                             gate.wait_for_peer().await;
                             Ok(Some(credential))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -338,7 +300,7 @@ async fn concurrent_modifies_on_one_provider_serialize() {
     );
 
     // B queues behind A: its modify is issued while A still holds the lock.
-    let (b_seen, b_seen_rx) = one_shot::<Option<Credential>>();
+    let (b_seen, b_seen_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
     let task_b = {
         let store = Arc::clone(&store);
         let gate = Arc::clone(&gate);
@@ -348,15 +310,15 @@ async fn concurrent_modifies_on_one_provider_serialize() {
             store
                 .modify(
                     "shared",
-                    Arc::new(move |current| {
-                        let seen = Arc::clone(&b_seen);
+                    Box::new(move |current| {
+                        let seen = b_seen;
                         let credential = credential.clone();
                         Box::pin(async move {
-                            seen.signal(current);
+                            let _ = seen.send(current);
                             Ok(Some(credential))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -383,10 +345,7 @@ async fn concurrent_modifies_on_one_provider_serialize() {
             .expect("B's modify succeeds"),
         Some(credential_b.clone())
     );
-    let read = store
-        .read("shared", &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
+    let read = store.read("shared", None).await.expect("read succeeds");
     assert_eq!(read, Some(credential_b));
 }
 
@@ -395,28 +354,27 @@ async fn delete_serializes_behind_a_pending_modify() {
     let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
     let gate = Arc::new(ModifyGate::default());
     let credential = api_key_stored("a");
-    let (a_entered, a_entered_rx) = one_shot::<Option<Credential>>();
+    let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
     let task_a = {
         let store = Arc::clone(&store);
         let gate = Arc::clone(&gate);
         let credential = credential.clone();
-        let entered = a_entered;
         tokio::spawn(async move {
             store
                 .modify(
                     "shared",
-                    Arc::new(move |current| {
-                        let entered = Arc::clone(&entered);
+                    Box::new(move |current| {
+                        let entered = a_entered;
                         let gate = Arc::clone(&gate);
                         let credential = credential.clone();
                         Box::pin(async move {
-                            entered.signal(current);
+                            let _ = entered.send(current);
                             gate.wait_for_peer().await;
                             Ok(Some(credential))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -432,9 +390,7 @@ async fn delete_serializes_behind_a_pending_modify() {
         let gate = Arc::clone(&gate);
         tokio::spawn(async move {
             gate.announce_peer();
-            store
-                .delete("shared", &AuthOperationOptions::default())
-                .await
+            store.delete("shared", None).await
         })
     };
 
@@ -446,10 +402,7 @@ async fn delete_serializes_behind_a_pending_modify() {
     deleted
         .expect("task delete joins")
         .expect("delete succeeds");
-    let read = store
-        .read("shared", &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
+    let read = store.read("shared", None).await.expect("read succeeds");
     assert_eq!(read, None, "the delete ran after the modify's write");
 }
 
@@ -488,7 +441,10 @@ fn oauth_credentials_round_trip_with_extras() {
     assert_eq!(oauth.refresh, "r");
     assert_eq!(oauth.access, "a");
     assert_eq!(oauth.expires, 123);
-    assert_eq!(oauth.extra_string("enterpriseUrl"), Some("company.ghe.com"));
+    assert_eq!(
+        oauth.extra.get("enterpriseUrl").and_then(serde_json::Value::as_str),
+        Some("company.ghe.com")
+    );
     assert_eq!(serde_json::to_value(&credential).expect("serializes"), wire);
 }
 
@@ -497,9 +453,7 @@ fn unknown_credential_types_reject() {
     let error = serde_json::from_str::<Credential>(r#"{"type":"customer_key","key":"k"}"#)
         .expect_err("an unknown type rejects");
     assert!(
-        error
-            .to_string()
-            .contains("unknown credential type: customer_key"),
+        error.to_string().contains("unknown variant `customer_key`"),
         "the parse error names the type: {error}"
     );
 }
@@ -510,8 +464,8 @@ fn unknown_credential_types_reject() {
 
 #[tokio::test]
 async fn a_stored_oauth_credential_resolves_with_the_oauth_source() {
-    let oauth = Arc::new(StubOAuthAuth::new("Stub OAuth", unused_login()));
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login());
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     store_credential(
         store.as_ref(),
@@ -520,20 +474,20 @@ async fn a_stored_oauth_credential_resolves_with_the_oauth_source() {
     )
     .await;
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect("the resolution succeeds")
-        .expect("a stored credential resolves");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("a stored credential resolves");
     assert_eq!(resolved.source.as_deref(), Some("OAuth"));
     assert_eq!(resolved.auth.api_key.as_deref(), Some("stored-access"));
 }
 
 #[tokio::test]
 async fn a_stored_oauth_credential_without_an_oauth_handler_resolves_none() {
-    let provider = api_key_provider(Arc::new(ApiKeyAuthStub::new(
-        "Stub key",
-        ApiKeyAuthStub::resolving_none(),
-    )));
+    let provider = api_key_provider(|| {
+        ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth()
+    });
     let store = empty_store();
     store_credential(
         store.as_ref(),
@@ -542,9 +496,10 @@ async fn a_stored_oauth_credential_without_an_oauth_handler_resolves_none() {
     )
     .await;
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect("the resolution succeeds");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
+    )
+    .expect("the resolution succeeds");
     assert_eq!(
         resolved, None,
         "no silent env fallback for an unmatched credential type"
@@ -573,19 +528,13 @@ async fn override_env_merges_under_a_stored_api_key_credential() {
         env: Some(overrides_env),
         ..AuthResolutionOverrides::default()
     };
-    let provider = api_key_provider(Arc::new(EnvApiKeyAuth::new(
-        "Anthropic API key",
-        &["ANTHROPIC_API_KEY"],
-    )));
+    let provider = api_key_provider(|| {
+        env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"])
+    });
 
-    let resolved = resolve_provider_auth(
-        PROVIDER,
-        &provider,
-        Arc::clone(&store),
-        context(),
-        Some(overrides),
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
     )
-    .await
     .expect("the resolution succeeds")
     .expect("the stored credential resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("stored-key"));
@@ -597,24 +546,17 @@ async fn override_env_merges_under_a_stored_api_key_credential() {
 
 #[tokio::test]
 async fn the_api_key_override_short_circuits_resolution() {
-    let api_key = Arc::new(ApiKeyAuthStub::new(
-        "Stub key",
-        ApiKeyAuthStub::resolving_key("override-key"),
-    ));
-    let provider = api_key_provider(Arc::clone(&api_key));
+    let api_key = ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_key("override-key"));
+    let provider = api_key_provider(|| api_key.auth());
     let overrides = AuthResolutionOverrides {
         api_key: Some("override-key".to_owned()),
         ..AuthResolutionOverrides::default()
     };
 
-    let resolved = resolve_provider_auth(
-        PROVIDER,
-        &provider,
-        failing_store(),
-        context(),
-        Some(overrides),
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &failing_store(), &context(), Some(&overrides))
+            .await,
     )
-    .await
     .expect("the resolution succeeds")
     .expect("the override resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("override-key"));
@@ -626,17 +568,16 @@ async fn the_api_key_override_short_circuits_resolution() {
 
 #[tokio::test]
 async fn ambient_env_resolves_when_nothing_is_stored() {
-    let provider = api_key_provider(Arc::new(EnvApiKeyAuth::new(
-        "Anthropic API key",
-        &["ANTHROPIC_API_KEY"],
-    )));
+    let provider =
+        api_key_provider(|| env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"]));
     let ambient: Arc<dyn AuthContext> =
         Arc::new(MapAuthContext::new([("ANTHROPIC_API_KEY", "ambient-key")]));
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, empty_store(), ambient, None)
-        .await
-        .expect("the resolution succeeds")
-        .expect("the ambient env resolves");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &ambient, None).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("the ambient env resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("ambient-key"));
     assert_eq!(resolved.source.as_deref(), Some("ANTHROPIC_API_KEY"));
 }
@@ -644,12 +585,10 @@ async fn ambient_env_resolves_when_nothing_is_stored() {
 #[tokio::test]
 async fn an_expiring_oauth_credential_refreshes_under_the_lock_and_stores_the_rotation() {
     let expires = now() + 3_600_000;
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
-            OAuthCredential::new("new-access", "new-refresh", expires),
-        )),
-    );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
+        oauth_credentials("new-access", "new-refresh", expires),
+    ));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     store_credential(
         store.as_ref(),
@@ -658,18 +597,16 @@ async fn an_expiring_oauth_credential_refreshes_under_the_lock_and_stores_the_ro
     )
     .await;
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect("the resolution succeeds")
-        .expect("the refreshed credential resolves");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("the refreshed credential resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("new-access"));
-    let read = store
-        .read(PROVIDER, &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
+    let read = store.read(PROVIDER, None).await.expect("read succeeds");
     assert_eq!(
         read,
-        Some(Credential::OAuth(OAuthCredential::new(
+        Some(Credential::OAuth(oauth_credentials(
             "new-access",
             "new-refresh",
             expires
@@ -682,12 +619,10 @@ async fn an_expiring_oauth_credential_refreshes_under_the_lock_and_stores_the_ro
 #[tokio::test]
 async fn concurrent_resolutions_refresh_once_and_both_see_the_rotated_token() {
     let expires = now() + 3_600_000;
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
-            OAuthCredential::new("new-access", "new-refresh", expires),
-        )),
-    );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
+        oauth_credentials("new-access", "new-refresh", expires),
+    ));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     store_credential(
         store.as_ref(),
@@ -700,21 +635,21 @@ async fn concurrent_resolutions_refresh_once_and_both_see_the_rotated_token() {
         let provider = provider.clone();
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            resolve_provider_auth(PROVIDER, &provider, store, context(), None).await
+            resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await
         })
     };
     let task_b = {
         let provider = provider.clone();
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            resolve_provider_auth(PROVIDER, &provider, store, context(), None).await
+            resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await
         })
     };
     for joined in [
         task_a.await.expect("task A joins"),
         task_b.await.expect("task B joins"),
     ] {
-        let resolved = joined
+        let resolved = resolution_error(joined)
             .expect("the resolution succeeds")
             .expect("the credential resolves");
         assert_eq!(resolved.auth.api_key.as_deref(), Some("new-access"));
@@ -735,11 +670,11 @@ struct LoggedOutDuringRefreshStore {
 }
 
 impl CredentialStore for LoggedOutDuringRefreshStore {
-    fn read(
-        &self,
-        provider_id: &str,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Option<Credential>, CredentialStoreError>> {
+    fn read<'a>(
+        &'a self,
+        provider_id: &'a str,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Option<Credential>, pi_ai::auth::types::AuthError>> {
         let read = self
             .entries
             .lock()
@@ -749,10 +684,10 @@ impl CredentialStore for LoggedOutDuringRefreshStore {
         Box::pin(std::future::ready(Ok(read)))
     }
 
-    fn list(
-        &self,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Vec<CredentialInfo>, CredentialStoreError>> {
+    fn list<'a>(
+        &'a self,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, pi_ai::auth::types::AuthError>> {
         let infos = self
             .entries
             .lock()
@@ -766,12 +701,12 @@ impl CredentialStore for LoggedOutDuringRefreshStore {
         Box::pin(std::future::ready(Ok(infos)))
     }
 
-    fn modify(
-        &self,
-        provider_id: &str,
-        modify: StoreModifyFn,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Option<Credential>, StoreError>> {
+    fn modify<'a>(
+        &'a self,
+        provider_id: &'a str,
+        f: CredentialModifyFn,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Option<Credential>, pi_ai::auth::types::AuthError>> {
         // The logout happened before the modify ran: the entry is gone, so
         // the closure sees None and the store resolves None.
         let removed = self
@@ -781,15 +716,15 @@ impl CredentialStore for LoggedOutDuringRefreshStore {
             .remove(provider_id);
         Box::pin(async move {
             let _ = removed;
-            modify(None).await
+            f(None).await
         })
     }
 
-    fn delete(
-        &self,
-        provider_id: &str,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<(), CredentialStoreError>> {
+    fn delete<'a>(
+        &'a self,
+        provider_id: &'a str,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<(), pi_ai::auth::types::AuthError>> {
         self.entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -800,12 +735,10 @@ impl CredentialStore for LoggedOutDuringRefreshStore {
 
 #[tokio::test]
 async fn a_logout_during_refresh_resolves_none() {
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
-            OAuthCredential::new("late-access", "r", now() + 3_600_000),
-        )),
-    );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
+        oauth_credentials("late-access", "r", now() + 3_600_000),
+    ));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store: Arc<dyn CredentialStore> = Arc::new(LoggedOutDuringRefreshStore::default());
     store_credential(
         store.as_ref(),
@@ -814,7 +747,7 @@ async fn a_logout_during_refresh_resolves_none() {
     )
     .await;
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
+    let resolved = resolve_provider_auth(PROVIDER, &provider, &store, &context(), None)
         .await
         .expect("the resolution succeeds");
     assert_eq!(resolved, None, "the logged-out resolution resolves none");
@@ -823,11 +756,9 @@ async fn a_logout_during_refresh_resolves_none() {
 
 #[tokio::test]
 async fn a_failed_refresh_surfaces_the_oauth_models_error() {
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login())
-            .with_refresh(refresh_failing("invalid_grant")),
-    );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login())
+        .with_refresh(refresh_failing("invalid_grant"));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     store_credential(
         store.as_ref(),
@@ -836,24 +767,26 @@ async fn a_failed_refresh_surfaces_the_oauth_models_error() {
     )
     .await;
 
-    let error = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect_err("the refresh failure fails the resolution");
+    let ModelsFailure::Models(error) =
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None)
+            .await
+            .expect_err("the refresh failure fails the resolution")
+    else {
+        panic!("the refresh failure is a models failure");
+    };
     assert_eq!(error.code(), ModelsErrorCode::OAuth);
     assert_eq!(
-        error.message(),
+        error.to_string(),
         "OAuth refresh failed for stub-provider: invalid_grant"
     );
 }
 
 #[tokio::test]
 async fn a_refreshed_token_below_the_requested_validity_rejects() {
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
-            OAuthCredential::new("soon-access", "r", now() + 10 * 60_000),
-        )),
-    );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
+        oauth_credentials("soon-access", "r", now() + 10 * 60_000),
+    ));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     // Outside the five-minute default window, inside the one-hour request.
     store_credential(
@@ -867,31 +800,26 @@ async fn a_refreshed_token_below_the_requested_validity_rejects() {
         ..AuthResolutionOverrides::default()
     };
 
-    let error = resolve_provider_auth(
-        PROVIDER,
-        &provider,
-        Arc::clone(&store),
-        context(),
-        Some(overrides),
+    let error = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
     )
-    .await
     .expect_err("the too-soon expiry fails the resolution");
     assert_eq!(error.code(), ModelsErrorCode::OAuth);
     assert_eq!(
-        error.message(),
+        error.to_string(),
         "OAuth refresh returned a token that expires too soon for stub-provider"
     );
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_stuck_refresh_times_out_after_fifteen_seconds() {
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_after_sleeping(
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(
+        refresh_after_sleeping(
             30_000,
-            OAuthCredential::new("late-access", "r", 0),
-        )),
+            oauth_credentials("late-access", "r", 0),
+        ),
     );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     store_credential(
         store.as_ref(),
@@ -904,7 +832,7 @@ async fn a_stuck_refresh_times_out_after_fifteen_seconds() {
         let provider = provider.clone();
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            resolve_provider_auth(PROVIDER, &provider, store, context(), None).await
+            resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await
         })
     };
     let mut advanced_ms = 0_u64;
@@ -914,60 +842,56 @@ async fn a_stuck_refresh_times_out_after_fifteen_seconds() {
         advanced_ms += 100;
     }
     let outcome = handle.await.expect("the resolution task joins");
-    let error = outcome.expect_err("the refresh timeout fails the resolution");
+    let ModelsFailure::Models(error) =
+        outcome.expect_err("the refresh timeout fails the resolution")
+    else {
+        panic!("the refresh timeout is a models failure");
+    };
     assert_eq!(error.code(), ModelsErrorCode::OAuth);
-    assert!(
-        error
-            .message()
-            .starts_with("OAuth refresh failed for stub-provider"),
-        "the message names the provider: {error}"
-    );
-    assert!(
-        error.message().contains("request timed out"),
-        "the fifteen-second timeout is the cause: {error}"
+    assert_eq!(
+        error.to_string(),
+        "OAuth refresh timed out for stub-provider"
     );
 }
 
 #[tokio::test]
 async fn a_failed_api_key_resolution_surfaces_the_auth_models_error() {
-    let provider = api_key_provider(Arc::new(ApiKeyAuthStub::new(
-        "Stub key",
-        ApiKeyAuthStub::failing("ambient lookup exploded"),
-    )));
+    let provider = api_key_provider(|| {
+        ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::failing("ambient lookup exploded"))
+            .auth()
+    });
 
-    let error = resolve_provider_auth(PROVIDER, &provider, empty_store(), context(), None)
-        .await
-        .expect_err("the resolution failure surfaces");
+    let error = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &context(), None).await,
+    )
+    .expect_err("the resolution failure surfaces");
     assert_eq!(error.code(), ModelsErrorCode::Auth);
     assert_eq!(
-        error.message(),
+        error.to_string(),
         "API key auth failed for provider stub-provider: ambient lookup exploded"
     );
 }
 
 #[tokio::test]
 async fn a_failing_store_read_surfaces_the_auth_models_error() {
-    let provider = api_key_provider(Arc::new(ApiKeyAuthStub::new(
-        "Stub key",
-        ApiKeyAuthStub::resolving_none(),
-    )));
+    let provider =
+        api_key_provider(|| ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth());
 
-    let error = resolve_provider_auth(PROVIDER, &provider, failing_store(), context(), None)
-        .await
-        .expect_err("the store failure surfaces");
+    let error = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &failing_store(), &context(), None).await,
+    )
+    .expect_err("the store failure surfaces");
     assert_eq!(error.code(), ModelsErrorCode::Auth);
     assert_eq!(
-        error.message(),
+        error.to_string(),
         "Credential store read failed for stub-provider: storage backend exploded"
     );
 }
 
 #[tokio::test]
 async fn an_aborted_resolution_rejects() {
-    let provider = api_key_provider(Arc::new(ApiKeyAuthStub::new(
-        "Stub key",
-        ApiKeyAuthStub::resolving_none(),
-    )));
+    let provider =
+        api_key_provider(|| ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth());
     let signal = CancellationToken::new();
     signal.cancel();
     let overrides = AuthResolutionOverrides {
@@ -975,64 +899,28 @@ async fn an_aborted_resolution_rejects() {
         ..AuthResolutionOverrides::default()
     };
 
-    let error = resolve_provider_auth(
+    let failure = resolve_provider_auth(
         PROVIDER,
         &provider,
-        empty_store(),
-        context(),
-        Some(overrides),
+        &empty_store(),
+        &context(),
+        Some(&overrides),
     )
     .await
     .expect_err("the abort surfaces");
-    assert_eq!(error.code(), ModelsErrorCode::Auth);
-    assert!(
-        error.message().starts_with("auth resolution aborted"),
-        "the message names the abort: {error}"
+    let ModelsFailure::Aborted(abort) = failure else {
+        panic!("the abort surfaces as the aborted failure");
+    };
+    assert_eq!(
+        abort.to_string(),
+        "The operation was aborted",
+        "the abort is the standard reason: {abort}"
     );
 }
 
 // ---------------------------------------------------------------------------
 // types.rs: Debug redaction, Display/serde vocabulary
 // ---------------------------------------------------------------------------
-
-#[test]
-fn credential_debug_redacts_key_material() {
-    let api_key = ApiKeyCredential {
-        key: Some("sk-ant-secret".to_owned()),
-        env: None,
-    };
-    let api_key_debug = format!("{api_key:?}");
-    assert!(
-        !api_key_debug.contains("sk-ant-secret"),
-        "the api-key debug never prints the key: {api_key_debug:?}"
-    );
-    assert!(
-        api_key_debug.contains("[redacted]"),
-        "the redaction marker is visible: {api_key_debug:?}"
-    );
-
-    let oauth = OAuthCredential::new("access-secret", "refresh-secret", 42);
-    let oauth_debug = format!("{oauth:?}");
-    assert!(
-        !oauth_debug.contains("access-secret") && !oauth_debug.contains("refresh-secret"),
-        "the oauth debug never prints tokens: {oauth_debug:?}"
-    );
-    assert!(
-        oauth_debug.contains("[redacted]") && oauth_debug.contains("42"),
-        "the expiry stays visible: {oauth_debug:?}"
-    );
-
-    let api_key_debug = format!("{:?}", Credential::ApiKey(api_key));
-    assert!(
-        api_key_debug.contains("Credential::ApiKey"),
-        "the tagged debug names the variant: {api_key_debug:?}"
-    );
-    let oauth_debug = format!("{:?}", Credential::OAuth(oauth));
-    assert!(
-        oauth_debug.contains("Credential::OAuth"),
-        "the tagged debug names the variant: {oauth_debug:?}"
-    );
-}
 
 #[test]
 fn the_api_key_env_field_round_trips_through_the_wire() {
@@ -1061,18 +949,8 @@ fn an_oauth_credential_without_expires_rejects() {
         serde_json::from_str::<Credential>(r#"{"type":"oauth","refresh":"r","access":"a"}"#)
             .expect_err("a missing expiry rejects");
     assert!(
-        error.to_string().contains("missing \"expires\""),
+        error.to_string().contains("missing field `expires`"),
         "the parse error names the field: {error}"
-    );
-}
-
-#[test]
-fn credential_store_errors_display_their_reason() {
-    let storage = CredentialStoreError::Storage("disk full".to_owned());
-    assert_eq!(storage.to_string(), "disk full");
-    assert_eq!(
-        CredentialStoreError::Aborted.to_string(),
-        "The operation was aborted"
     );
 }
 
@@ -1098,52 +976,49 @@ fn auth_types_render_and_round_trip() {
 
 #[test]
 fn prompts_carry_placeholders_and_events_render() {
-    let prompt = AuthPrompt::new(AuthPromptKind::Text, "Paste the code").with_placeholder("pi-…");
-    assert_eq!(prompt.placeholder.as_deref(), Some("pi-…"));
+    let prompt = AuthPrompt {
+        signal: None,
+        kind: AuthPromptKind::Text {
+            message: "Paste the code".to_owned(),
+            placeholder: Some("pi-…".to_owned()),
+        },
+    };
+    let AuthPromptKind::Text { placeholder, .. } = &prompt.kind else {
+        panic!("the prompt keeps its kind");
+    };
+    assert_eq!(placeholder.as_deref(), Some("pi-…"));
 
     let info = format!(
         "{:?}",
-        pi_ai::auth::AuthEvent::Info {
+        pi_ai::auth::types::AuthEvent::Info {
             message: "m".to_owned(),
-            links: vec![],
+            links: None,
         }
     );
     assert!(info.contains('m'), "the info event debugs: {info:?}");
 }
 
 #[test]
-fn trait_defaults_report_ambient_only_auth() {
-    let api_key: Arc<dyn ApiKeyAuth> = Arc::new(ApiKeyAuthStub::new(
-        "Stub key",
-        ApiKeyAuthStub::resolving_none(),
-    ));
-    assert_eq!(api_key.name(), "Stub key");
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(RecordingInteraction::new()),
-        signal: CancellationToken::new(),
-    };
+fn struct_defaults_report_ambient_only_auth() {
+    let api_key = ApiKeyAuthStub::new("Stub key", ApiKeyAuthStub::resolving_none()).auth();
+    assert_eq!(api_key.name, "Stub key");
     assert!(
-        ApiKeyAuth::login(api_key.as_ref(), interaction).is_none(),
-        "a handler without a login override is ambient-only"
+        api_key.login.is_none(),
+        "a handler without a login closure is ambient-only"
     );
-    let input = ApiKeyResolveInput {
-        ctx: Arc::new(MapAuthContext::default()),
-        credential: None,
-        signal: CancellationToken::new(),
-    };
     assert!(
-        ApiKeyAuth::check(api_key.as_ref(), &input).is_none(),
-        "a handler without a check override resolves by resolving"
+        api_key.check.is_none(),
+        "a handler without a check closure resolves by resolving"
     );
 
-    let oauth: Arc<dyn OAuthAuth> = Arc::new(StubOAuthAuth::new("Stub OAuth", unused_login()));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login());
     assert!(
-        OAuthAuth::login_label(oauth.as_ref()).is_none(),
+        oauth.auth().login_label.is_none(),
         "the default login label is unset"
     );
     let provider = ProviderAuth {
-        api_key: Some(Arc::clone(&api_key)),
-        oauth: Some(Arc::clone(&oauth)),
+        api_key: Some(api_key),
+        oauth: Some(oauth.auth()),
     };
     let provider_debug = format!("{provider:?}");
     assert!(
@@ -1163,33 +1038,36 @@ fn models_error_codes_display_their_wire_names() {
         (ModelsErrorCode::OAuth, "oauth"),
     ];
     for (code, name) in codes {
-        assert_eq!(code.to_string(), name, "{code:?} renders {name:?}");
+        assert_eq!(code.wire(), name, "{code:?} renders {name:?}");
+        assert_eq!(code.to_string(), name);
     }
 }
 
 #[test]
 fn models_error_folds_the_cause_into_the_message_once() {
-    let folded = ModelsError::new("invalid_grant", ModelsErrorCode::OAuth, "refresh failed");
-    assert_eq!(folded.message(), "refresh failed: invalid_grant");
-    assert_eq!(
-        folded.to_string(),
-        folded.message(),
-        "Display is the message"
+    let folded = ModelsError::with_cause(
+        ModelsErrorCode::OAuth,
+        "refresh failed",
+        stub_error("invalid_grant"),
     );
+    assert_eq!(folded.to_string(), "refresh failed: invalid_grant");
 
-    let already_carried =
-        ModelsError::new("invalid_grant", ModelsErrorCode::OAuth, "invalid_grant");
+    let already_carried = ModelsError::with_cause(
+        ModelsErrorCode::OAuth,
+        "invalid_grant",
+        stub_error("invalid_grant"),
+    );
     assert_eq!(
-        already_carried.message(),
+        already_carried.to_string(),
         "invalid_grant",
         "a detail already in the message does not fold twice"
     );
 
-    let blank = ModelsError::new("", ModelsErrorCode::Auth, "resolution failed");
+    let blank = ModelsError::new(ModelsErrorCode::Auth, "resolution failed");
     assert_eq!(
-        blank.message(),
+        blank.to_string(),
         "resolution failed",
-        "a blank cause folds nothing"
+        "no cause folds nothing"
     );
 }
 
@@ -1452,17 +1330,11 @@ fn the_process_env_readers_serve_the_probe_modes() {
     let file = dir.join("probe.txt");
     std::fs::write(&file, b"x").expect("the probe file writes");
     assert!(
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("the runtime builds")
-            .block_on(context.file_exists(&file.to_string_lossy())),
+        context.file_exists(&file.to_string_lossy()),
         "an absolute path stats directly"
     );
     assert!(
-        !tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("the runtime builds")
-            .block_on(context.file_exists(&dir.join("missing").to_string_lossy())),
+        !context.file_exists(&dir.join("missing").to_string_lossy()),
         "a missing file reports false"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -1473,29 +1345,24 @@ fn the_process_env_readers_serve_the_probe_modes() {
 /// environment and asserts the contract.
 fn run_env_probe_mode(mode: &str) {
     let context = DefaultAuthContext;
-    let runtime = || {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("the runtime builds")
-    };
     match mode {
         "context-env-set" => {
             assert_eq!(
-                runtime().block_on(context.env("PI_AI_AUTH_CORE_CONTEXT_ENV")),
+                context.env("PI_AI_AUTH_CORE_CONTEXT_ENV"),
                 Some("probe-value".to_owned()),
                 "a set variable resolves"
             );
         }
         "context-env-blank" => {
             assert_eq!(
-                runtime().block_on(context.env("PI_AI_AUTH_CORE_CONTEXT_ENV")),
+                context.env("PI_AI_AUTH_CORE_CONTEXT_ENV"),
                 None,
                 "blank values drop, upstream's falsy-string semantics"
             );
         }
         "context-env-unset" => {
             assert_eq!(
-                runtime().block_on(context.env("PI_AI_AUTH_CORE_CONTEXT_ENV")),
+                context.env("PI_AI_AUTH_CORE_CONTEXT_ENV"),
                 None,
                 "an unset variable resolves to none"
             );
@@ -1504,55 +1371,60 @@ fn run_env_probe_mode(mode: &str) {
             let home = std::env::home_dir().expect("the overridden home");
             std::fs::write(home.join("probe"), b"x").expect("the probe file writes");
             assert!(
-                runtime().block_on(context.file_exists("~probe")),
+                context.file_exists("~probe"),
                 "the tilde path expands into $HOME"
             );
             assert!(
-                !runtime().block_on(context.file_exists("~/missing")),
+                !context.file_exists("~/missing"),
                 "a missing tilde path reports false"
             );
         }
         "env-keys-set" => {
             assert_eq!(
-                find_env_keys("nvidia"),
+                find_env_keys("nvidia", None),
                 Some(vec!["NVIDIA_API_KEY".to_owned()]),
                 "the process env discovery finds the configured key"
             );
-            assert_eq!(get_env_api_key("openai"), Some("probe-openai".to_owned()));
+            assert_eq!(
+                get_env_api_key("openai", None),
+                Some("probe-openai".to_owned())
+            );
         }
         "env-keys-unset" => {
-            assert_eq!(find_env_keys("nvidia"), None, "unset vars do not resolve");
-            assert_eq!(get_env_api_key("openai"), None);
-            assert_eq!(find_env_keys("unknown-provider"), None);
+            assert_eq!(find_env_keys("nvidia", None), None, "unset vars do not resolve");
+            assert_eq!(get_env_api_key("openai", None), None);
+            assert_eq!(find_env_keys("unknown-provider", None), None);
         }
         "anthropic-bearer" => {
             // ANTHROPIC_AUTH_TOKEN alone resolves nothing: it rides the
             // Authorization header, not the x-api-key slot.
-            assert_eq!(get_env_api_key("anthropic"), None);
+            assert_eq!(get_env_api_key("anthropic", None), None);
             assert_eq!(
-                find_env_keys("anthropic"),
+                find_env_keys("anthropic", None),
                 Some(vec!["ANTHROPIC_AUTH_TOKEN".to_owned()])
             );
         }
         "anthropic-api-key" => {
             assert_eq!(
-                get_env_api_key("anthropic"),
+                get_env_api_key("anthropic", None),
                 Some("probe-anthropic".to_owned())
             );
         }
         "adc-default" => {
             let home = std::env::home_dir().expect("the overridden home");
             std::fs::create_dir_all(home.join(".config/gcloud")).expect("the gcloud dir creates");
-            // Upstream resolves the default ADC path under the home directory
-            // (`os.homedir() + path.slice(1)`); the port's `expand_tilde`
-            // hands the absolute remainder to `PathBuf::join`, which replaces
-            // the home prefix, so the default path resolves at the filesystem
-            // root and the check misses the file. Reported for a src fix;
-            // this pins the port's current resolution.
-            assert_eq!(get_env_api_key("google-vertex"), None);
+            assert_eq!(
+                get_env_api_key("google-vertex", None),
+                None,
+                "no ADC file exists yet, so the ambient branch stays unauthenticated"
+            );
         }
         "adc-missing" => {
-            assert_eq!(get_env_api_key("google-vertex"), None, "no ADC file yet");
+            assert_eq!(
+                get_env_api_key("google-vertex", None),
+                None,
+                "no ADC file yet"
+            );
         }
         "vertex-explicit" => {
             let path = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
@@ -1564,7 +1436,7 @@ fn run_env_probe_mode(mode: &str) {
             // The explicit path short-circuits the tilde default, upstream's
             // GOOGLE_APPLICATION_CREDENTIALS branch.
             assert_eq!(
-                get_env_api_key("google-vertex"),
+                get_env_api_key("google-vertex", None),
                 Some("<authenticated>".to_owned()),
                 "the explicit ADC file authenticates"
             );
@@ -1592,17 +1464,17 @@ async fn run_kimi_host_probe(mode: &str) {
     mock.on(move |request| request.url == device_url)
         .respond(MockResponse::status(500));
     let recording = RecordingInteraction::new();
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: CancellationToken::new(),
-    };
+    let interaction = ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        CancellationToken::new(),
+    );
     let error = KimiCodingOAuth::new(Arc::new(mock.clone()))
         .login(interaction)
         .await
         .expect_err("the failed device authorization fails login");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("Kimi Code device authorization failed with status 500"),
         "the failure carries the wire status: {error:?}"
     );
@@ -1618,57 +1490,54 @@ async fn run_kimi_host_probe(mode: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// helpers.rs: EnvApiKeyAuth login and resolve branches
+// helpers.rs: env_api_key_auth login and resolve branches
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn the_standard_api_key_login_prompts_for_the_key() {
     let recording = RecordingInteraction::with_answers(vec![Ok(String::from("sk-ambient"))]);
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: CancellationToken::new(),
-    };
-    let auth = EnvApiKeyAuth::new("Anthropic API key", &["ANTHROPIC_API_KEY"]);
-    assert_eq!(auth.name(), "Anthropic API key");
+    let interaction = ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        CancellationToken::new(),
+    );
+    let auth = env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"]);
+    let login = auth.login.as_ref().expect("the standard login exists");
 
-    let credential = auth
-        .login(interaction)
-        .expect("the standard login exists")
+    let credential = (Arc::clone(login))(interaction)
         .await
         .expect("the prompted key stores");
     assert_eq!(credential.key.as_deref(), Some("sk-ambient"));
     assert_eq!(credential.env, None);
 
     let prompt = &recording.prompts()[0];
-    assert_eq!(prompt.kind, AuthPromptKind::Secret);
-    assert_eq!(prompt.message, "Enter Anthropic API key");
+    let AuthPromptKind::Secret { message, .. } = &prompt.kind else {
+        panic!("the login prompts for a secret");
+    };
+    assert_eq!(message, "Enter Anthropic API key");
 
     // An already-cancelled signal rejects before prompting.
     let signal = CancellationToken::new();
     signal.cancel();
-    let aborted = ProviderAuthInteraction {
-        interaction: Arc::new(RecordingInteraction::new()),
-        signal: signal.clone(),
-    };
-    let error = auth
-        .login(aborted)
-        .expect("the standard login exists")
+    let aborted = ProviderAuthInteraction::from_interaction(
+        RecordingInteraction::new().interaction(),
+        signal,
+    );
+    let error = (login)(aborted)
         .await
         .expect_err("a cancelled login rejects");
-    assert_eq!(error.0, "The operation was aborted");
+    assert_eq!(error.to_string(), "The operation was aborted");
 }
 
 #[tokio::test]
 async fn the_standard_resolve_reports_ambient_misses_as_none() {
-    let auth = EnvApiKeyAuth::new("Stub key", &["MISSING_A", "MISSING_B"]);
-    let resolved = auth
-        .resolve(ApiKeyResolveInput {
-            ctx: Arc::new(MapAuthContext::default()),
-            credential: None,
-            signal: CancellationToken::new(),
-        })
-        .await
-        .expect("the resolution succeeds");
+    let auth = env_api_key_auth("Stub key", &["MISSING_A", "MISSING_B"]);
+    let resolved = (auth.resolve)(ApiKeyAuthInput {
+        ctx: Arc::new(MapAuthContext::default()),
+        credential: None,
+        signal: CancellationToken::new(),
+    })
+    .await
+    .expect("the resolution succeeds");
     assert_eq!(resolved, None, "no ambient source resolves to none");
 }
 
@@ -1678,22 +1547,20 @@ async fn the_standard_resolve_reports_ambient_misses_as_none() {
 struct CancelOnFirstEnv(Mutex<Option<CancellationToken>>);
 
 impl AuthContext for CancelOnFirstEnv {
-    fn env(&self, _name: &str) -> BoxedFuture<'static, Option<String>> {
+    fn env(&self, _name: &str) -> Option<String> {
         let token = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        Box::pin(async move {
-            if let Some(token) = token {
-                token.cancel();
-            }
-            None
-        })
+        if let Some(token) = token {
+            token.cancel();
+        }
+        None
     }
 
-    fn file_exists(&self, _path: &str) -> BoxedFuture<'static, bool> {
-        Box::pin(std::future::ready(false))
+    fn file_exists(&self, _path: &str) -> bool {
+        false
     }
 }
 
@@ -1701,27 +1568,15 @@ impl AuthContext for CancelOnFirstEnv {
 async fn an_abort_between_env_lookups_fails_the_resolution() {
     let signal = CancellationToken::new();
     let context = CancelOnFirstEnv(Mutex::new(Some(signal.clone())));
-    let auth = EnvApiKeyAuth::new("Stub key", &["MISSING_A", "MISSING_B"]);
-    let error = auth
-        .resolve(ApiKeyResolveInput {
-            ctx: Arc::new(context),
-            credential: None,
-            signal: signal.clone(),
-        })
-        .await
-        .expect_err("the mid-loop abort fails the resolution");
-    assert_eq!(error.0, "The operation was aborted");
-}
-
-#[test]
-fn a_cancelled_token_rejects_through_the_check_helper() {
-    let signal = CancellationToken::new();
-    assert!(signal.check_cancelled().is_ok(), "a live token passes");
-    signal.cancel();
-    let error = signal
-        .check_cancelled()
-        .expect_err("a cancelled token rejects");
-    assert_eq!(error.0, "The operation was aborted");
+    let auth = env_api_key_auth("Stub key", &["MISSING_A", "MISSING_B"]);
+    let error = (auth.resolve)(ApiKeyAuthInput {
+        ctx: Arc::new(context),
+        credential: None,
+        signal: signal.clone(),
+    })
+    .await
+    .expect_err("the mid-loop abort fails the resolution");
+    assert_eq!(error.to_string(), "The operation was aborted");
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,15 +1597,14 @@ async fn stored_env_wins_when_the_override_carries_no_env() {
         }),
     )
     .await;
-    let provider = api_key_provider(Arc::new(EnvApiKeyAuth::new(
-        "Stub key",
-        &["ANTHROPIC_API_KEY"],
-    )));
+    let provider =
+        api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect("the resolution succeeds")
-        .expect("the stored credential resolves");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("the stored credential resolves");
     assert_eq!(resolved.env, Some(stored_env), "the stored env survives");
 }
 
@@ -1772,19 +1626,12 @@ async fn the_override_env_applies_when_the_stored_credential_has_none() {
         env: Some(override_env.clone()),
         ..AuthResolutionOverrides::default()
     };
-    let provider = api_key_provider(Arc::new(EnvApiKeyAuth::new(
-        "Stub key",
-        &["ANTHROPIC_API_KEY"],
-    )));
+    let provider =
+        api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
 
-    let resolved = resolve_provider_auth(
-        PROVIDER,
-        &provider,
-        Arc::clone(&store),
-        context(),
-        Some(overrides),
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
     )
-    .await
     .expect("the resolution succeeds")
     .expect("the stored credential resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("stored-key"));
@@ -1793,30 +1640,24 @@ async fn the_override_env_applies_when_the_stored_credential_has_none() {
 
 /// An api-key handler that reports the context's file check as its key, the
 /// probe for the overlay context's `file_exists` delegation.
-#[derive(Debug)]
-struct FileProbeAuth {
-    path: String,
-}
-
-impl ApiKeyAuth for FileProbeAuth {
-    fn name(&self) -> &'static str {
-        "File probe"
-    }
-
-    fn resolve(
-        &self,
-        input: ApiKeyResolveInput,
-    ) -> BoxedFuture<'static, Result<Option<AuthResult>, AuthError>> {
-        let path = self.path.clone();
-        Box::pin(async move {
-            let exists = input.ctx.file_exists(&path).await;
-            let result = AuthResult {
-                auth: ModelAuth::api_key(exists.to_string()),
-                env: None,
-                source: Some("file probe".to_owned()),
-            };
-            Ok(Some(result))
-        })
+fn file_probe_auth(path: String) -> ApiKeyAuth {
+    let resolve: ApiKeyResolveFn = Arc::new(move |input: ApiKeyAuthInput| {
+        let exists = input.ctx.file_exists(&path);
+        let result = AuthResult {
+            auth: ModelAuth {
+                api_key: Some(exists.to_string()),
+                ..ModelAuth::default()
+            },
+            env: None,
+            source: Some("file probe".to_owned()),
+        };
+        Box::pin(std::future::ready(Ok(Some(result))))
+    });
+    ApiKeyAuth {
+        name: "File probe".to_owned(),
+        login: None,
+        check: None,
+        resolve,
     }
 }
 
@@ -1833,15 +1674,16 @@ async fn the_overlay_context_delegates_file_checks_to_the_base_context() {
         env: Some(env),
         ..AuthResolutionOverrides::default()
     };
-    let provider = api_key_provider(Arc::new(FileProbeAuth {
-        path: dir.join("probe").to_string_lossy().into_owned(),
-    }));
+    let provider = api_key_provider(|| {
+        file_probe_auth(dir.join("probe").to_string_lossy().into_owned())
+    });
     let base: Arc<dyn AuthContext> = Arc::new(DefaultAuthContext);
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, empty_store(), base, Some(overrides))
-        .await
-        .expect("the resolution succeeds")
-        .expect("the override resolves");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &base, Some(&overrides)).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("the override resolves");
     assert_eq!(
         resolved.auth.api_key.as_deref(),
         Some("true"),
@@ -1860,13 +1702,14 @@ async fn the_overlay_context_overlays_env_values_over_the_base() {
         env: Some(env),
         ..AuthResolutionOverrides::default()
     };
-    let provider = api_key_provider(Arc::new(EnvApiKeyAuth::new("Stub key", &["OVERLAY_ONLY"])));
+    let provider = api_key_provider(|| env_api_key_auth("Stub key", &["OVERLAY_ONLY"]));
     let base: Arc<dyn AuthContext> = Arc::new(MapAuthContext::new([("BASE_ONLY", "base")]));
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, empty_store(), base, Some(overrides))
-        .await
-        .expect("the resolution succeeds")
-        .expect("the ambient resolution runs");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &base, Some(&overrides)).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("the ambient resolution runs");
     assert_eq!(
         resolved.auth.api_key.as_deref(),
         Some("overlay"),
@@ -1874,7 +1717,7 @@ async fn the_overlay_context_overlays_env_values_over_the_base() {
     );
 
     // ...and falls through to the base context for an overlay miss.
-    let provider = api_key_provider(Arc::new(EnvApiKeyAuth::new("Stub key", &["BASE_ONLY"])));
+    let provider = api_key_provider(|| env_api_key_auth("Stub key", &["BASE_ONLY"]));
     let mut env = ProviderEnv::new();
     env.insert("OVERLAY_ONLY".to_owned(), "overlay".to_owned());
     let overrides = AuthResolutionOverrides {
@@ -1882,10 +1725,11 @@ async fn the_overlay_context_overlays_env_values_over_the_base() {
         ..AuthResolutionOverrides::default()
     };
     let base: Arc<dyn AuthContext> = Arc::new(MapAuthContext::new([("BASE_ONLY", "base")]));
-    let resolved = resolve_provider_auth(PROVIDER, &provider, empty_store(), base, Some(overrides))
-        .await
-        .expect("the resolution succeeds")
-        .expect("the ambient resolution runs");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &base, Some(&overrides)).await,
+    )
+    .expect("the resolution succeeds")
+    .expect("the ambient resolution runs");
     assert_eq!(
         resolved.auth.api_key.as_deref(),
         Some("base"),
@@ -1894,16 +1738,16 @@ async fn the_overlay_context_overlays_env_values_over_the_base() {
 }
 
 /// A store whose modify rejects with a storage failure after the read, the
-/// branch `resolve.ts` wraps as `Credential store modify failed`.
+/// branch the resolution wraps as `Credential store modify failed`.
 #[derive(Debug, Default)]
 struct ReadOkModifyFailsStore;
 
 impl CredentialStore for ReadOkModifyFailsStore {
-    fn read(
-        &self,
-        provider_id: &str,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Option<Credential>, CredentialStoreError>> {
+    fn read<'a>(
+        &'a self,
+        provider_id: &'a str,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Option<Credential>, pi_ai::auth::types::AuthError>> {
         assert_eq!(provider_id, PROVIDER);
         Box::pin(std::future::ready(Ok(Some(oauth_stored(
             "old-access",
@@ -1911,50 +1755,48 @@ impl CredentialStore for ReadOkModifyFailsStore {
         )))))
     }
 
-    fn list(
-        &self,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Vec<CredentialInfo>, CredentialStoreError>> {
+    fn list<'a>(
+        &'a self,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, pi_ai::auth::types::AuthError>> {
         Box::pin(std::future::ready(Ok(Vec::new())))
     }
 
-    fn modify(
-        &self,
-        _provider_id: &str,
-        _modify: StoreModifyFn,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Option<Credential>, StoreError>> {
-        let error: StoreError = Box::new(CredentialStoreError::Storage(
-            "storage backend exploded".to_owned(),
-        ));
-        Box::pin(std::future::ready(Err(error)))
+    fn modify<'a>(
+        &'a self,
+        _provider_id: &'a str,
+        _f: CredentialModifyFn,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Option<Credential>, pi_ai::auth::types::AuthError>> {
+        Box::pin(std::future::ready(Err(stub_error(
+            "storage backend exploded",
+        ))))
     }
 
-    fn delete(
-        &self,
-        _provider_id: &str,
-        _options: &AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<(), CredentialStoreError>> {
+    fn delete<'a>(
+        &'a self,
+        _provider_id: &'a str,
+        _options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<(), pi_ai::auth::types::AuthError>> {
         Box::pin(std::future::ready(Ok(())))
     }
 }
 
 #[tokio::test]
 async fn a_failing_store_modify_surfaces_the_auth_models_error() {
-    let oauth = Arc::new(
-        StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
-            OAuthCredential::new("new-access", "r", now() + 3_600_000),
-        )),
-    );
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
+        oauth_credentials("new-access", "r", now() + 3_600_000),
+    ));
+    let provider = oauth_provider_of(|| oauth.auth());
     let store: Arc<dyn CredentialStore> = Arc::new(ReadOkModifyFailsStore);
 
-    let error = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect_err("the modify failure fails the resolution");
+    let error = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
+    )
+    .expect_err("the modify failure fails the resolution");
     assert_eq!(error.code(), ModelsErrorCode::Auth);
     assert_eq!(
-        error.message(),
+        error.to_string(),
         "Credential store modify failed for stub-provider: storage backend exploded"
     );
 }
@@ -1964,51 +1806,41 @@ async fn a_failing_store_modify_surfaces_the_auth_models_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_cloned_store_shares_the_credential_map() {
-    let store = InMemoryCredentialStore::default();
-    store_credential(&store, PROVIDER, api_key_stored("k")).await;
-    let clone = store.clone();
-    let read = clone
-        .read(PROVIDER, &AuthOperationOptions::default())
-        .await
-        .expect("read succeeds");
-    assert_eq!(read, Some(api_key_stored("k")), "the clone shares entries");
-}
-
-#[tokio::test]
 async fn pre_cancelled_store_operations_reject_as_aborted() {
     let store = InMemoryCredentialStore::default();
     let signal = CancellationToken::new();
     signal.cancel();
-    let options = AuthOperationOptions::with_signal(signal);
+    let options = AuthOptions {
+        signal: Some(signal),
+    };
 
-    let read = store
-        .read(PROVIDER, &options)
+    let error = store
+        .read(PROVIDER, Some(&options))
         .await
         .expect_err("read aborts");
-    assert_eq!(read, CredentialStoreError::Aborted);
-    let list = store.list(&options).await.expect_err("list aborts");
-    assert_eq!(list, CredentialStoreError::Aborted);
-    let error: StoreError = store
-        .modify(PROVIDER, set_credential(api_key_stored("k")), &options)
+    assert_eq!(error.to_string(), "The operation was aborted");
+    let error = store.list(Some(&options)).await.expect_err("list aborts");
+    assert_eq!(error.to_string(), "The operation was aborted");
+    let error: pi_ai::auth::types::AuthError = store
+        .modify(PROVIDER, set_credential(api_key_stored("k")), Some(&options))
         .await
         .expect_err("modify aborts");
     assert!(
         error.to_string().contains("The operation was aborted"),
         "the abort surfaces through the store error: {error:?}"
     );
-    let delete = store
-        .delete(PROVIDER, &options)
+    let error = store
+        .delete(PROVIDER, Some(&options))
         .await
         .expect_err("delete aborts");
-    assert_eq!(delete, CredentialStoreError::Aborted);
+    assert_eq!(error.to_string(), "The operation was aborted");
 }
 
 #[tokio::test]
 async fn a_modify_cancelled_while_queued_rejects_without_touching_the_entry() {
     let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
     let gate = Arc::new(ModifyGate::default());
-    let (a_entered, a_entered_rx) = one_shot::<Option<Credential>>();
+    let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
     let task_a = {
         let store = Arc::clone(&store);
@@ -2018,16 +1850,16 @@ async fn a_modify_cancelled_while_queued_rejects_without_touching_the_entry() {
             store
                 .modify(
                     "queued",
-                    Arc::new(move |current| {
+                    Box::new(move |current| {
                         let gate = Arc::clone(&gate);
-                        let entered = Arc::clone(&entered);
+                        let entered = entered;
                         Box::pin(async move {
-                            entered.signal(current);
+                            let _ = entered.send(current);
                             gate.wait_for_peer().await;
                             Ok(Some(api_key_stored("a")))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -2043,12 +1875,15 @@ async fn a_modify_cancelled_while_queued_rejects_without_touching_the_entry() {
             store
                 .modify(
                     "queued",
-                    Arc::new(|_| {
-                        Box::pin(std::future::ready(Ok::<Option<Credential>, StoreError>(
-                            None,
-                        )))
+                    Box::new(|_| {
+                        Box::pin(std::future::ready(Ok::<
+                            Option<Credential>,
+                            pi_ai::auth::types::AuthError,
+                        >(None)))
                     }),
-                    &AuthOperationOptions::with_signal(signal),
+                    Some(&AuthOptions {
+                        signal: Some(signal),
+                    }),
                 )
                 .await
         })
@@ -2076,7 +1911,7 @@ async fn a_delete_cancelled_while_queued_rejects_as_aborted() {
     let store = Arc::new(InMemoryCredentialStore::default());
     store_credential(store.as_ref(), "queued", api_key_stored("k")).await;
     let gate = Arc::new(ModifyGate::default());
-    let (a_entered, a_entered_rx) = one_shot::<Option<Credential>>();
+    let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
     let task_a = {
         let store = Arc::clone(&store);
@@ -2086,16 +1921,16 @@ async fn a_delete_cancelled_while_queued_rejects_as_aborted() {
             store
                 .modify(
                     "queued",
-                    Arc::new(move |current| {
+                    Box::new(move |current| {
                         let gate = Arc::clone(&gate);
-                        let entered = Arc::clone(&entered);
+                        let entered = entered;
                         Box::pin(async move {
-                            entered.signal(current);
+                            let _ = entered.send(current);
                             gate.wait_for_peer().await;
                             Ok(Some(api_key_stored("k")))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -2108,7 +1943,12 @@ async fn a_delete_cancelled_while_queued_rejects_as_aborted() {
         let signal = signal.clone();
         tokio::spawn(async move {
             store
-                .delete("queued", &AuthOperationOptions::with_signal(signal))
+                .delete(
+                    "queued",
+                    Some(&AuthOptions {
+                        signal: Some(signal),
+                    }),
+                )
                 .await
         })
     };
@@ -2120,7 +1960,7 @@ async fn a_delete_cancelled_while_queued_rejects_as_aborted() {
         .await
         .expect("the queued delete joins")
         .expect_err("the queued delete aborts");
-    assert_eq!(error, CredentialStoreError::Aborted);
+    assert_eq!(error.to_string(), "The operation was aborted");
     task_a
         .await
         .expect("task A joins")
@@ -2130,15 +1970,15 @@ async fn a_delete_cancelled_while_queued_rejects_as_aborted() {
 #[tokio::test]
 async fn a_rejecting_modify_closure_propagates_through_the_store() {
     let store = InMemoryCredentialStore::default();
-    let error: StoreError = store
+    let error = store
         .modify(
             PROVIDER,
-            Arc::new(|_| {
-                let error: StoreError =
-                    Box::new(CredentialStoreError::Storage("modify refused".to_owned()));
-                Box::pin(std::future::ready(Err(error)))
+            Box::new(|_| {
+                Box::pin(std::future::ready(Err(
+                    stub_error("modify refused"),
+                )))
             }),
-            &AuthOperationOptions::default(),
+            None,
         )
         .await
         .expect_err("the modify rejection propagates");
@@ -2151,8 +1991,8 @@ async fn a_rejecting_modify_closure_propagates_through_the_store() {
 #[tokio::test]
 async fn modifies_on_different_providers_run_concurrently() {
     let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let (a_seen, a_seen_rx) = one_shot::<Option<Credential>>();
-    let (b_seen, b_seen_rx) = one_shot::<Option<Credential>>();
+    let (a_seen, a_seen_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
+    let (b_seen, b_seen_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
     // Each modify signals entry, then waits for its peer to enter; the pair
     // only completes when both hold their own provider's chain at once.
@@ -2163,14 +2003,14 @@ async fn modifies_on_different_providers_run_concurrently() {
             store
                 .modify(
                     "provider-a",
-                    Arc::new(move |current| {
-                        let seen = Arc::clone(&seen);
+                    Box::new(move |current| {
+                        let seen = seen;
                         Box::pin(async move {
-                            seen.signal(current.clone());
+                            let _ = seen.send(current.clone());
                             Ok(Some(api_key_stored("a")))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -2182,14 +2022,14 @@ async fn modifies_on_different_providers_run_concurrently() {
             store
                 .modify(
                     "provider-b",
-                    Arc::new(move |current| {
-                        let seen = Arc::clone(&seen);
+                    Box::new(move |current| {
+                        let seen = seen;
                         Box::pin(async move {
-                            seen.signal(current);
+                            let _ = seen.send(current);
                             Ok(Some(api_key_stored("b")))
                         })
                     }),
-                    &AuthOperationOptions::default(),
+                    None,
                 )
                 .await
         })
@@ -2221,33 +2061,22 @@ fn bedrock_authenticates_through_every_declared_credential_source() {
         vec![("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/token")],
     ];
     for env_pairs in cases {
-        let env: std::collections::BTreeMap<String, String> = env_pairs
+        let env: ProviderEnv = env_pairs
             .iter()
             .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
             .collect();
         assert_eq!(
-            get_env_api_key_with_sources(
-                "amazon-bedrock",
-                &|name: &str| env.get(name).cloned(),
-                &|_: &str| false
-            ),
+            get_env_api_key("amazon-bedrock", Some(&env)),
             Some("<authenticated>".to_owned()),
             "{env_pairs:?} authenticates"
         );
     }
     // A half IAM pair does not authenticate.
-    let env: std::collections::BTreeMap<String, String> =
+    let env: ProviderEnv =
         std::iter::once(("AWS_ACCESS_KEY_ID", "only"))
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
             .collect();
-    assert_eq!(
-        get_env_api_key_with_sources(
-            "amazon-bedrock",
-            &|name: &str| env.get(name).cloned(),
-            &|_: &str| false
-        ),
-        None
-    );
+    assert_eq!(get_env_api_key("amazon-bedrock", Some(&env)), None);
 }
 
 /// Vertex's ADC path requires project and location together: each half
@@ -2258,39 +2087,33 @@ fn vertex_adc_auth_requires_project_and_location() {
     std::fs::write(&adc, b"{}").expect("the ADC fixture writes");
 
     // The explicit credentials file exists, but no project is configured.
-    let projectless = get_env_api_key_with_sources(
+    let projectless = get_env_api_key(
         "google-vertex",
-        &|name: &str| {
-            if name == "GOOGLE_APPLICATION_CREDENTIALS" {
-                Some(adc.to_string_lossy().into_owned())
-            } else {
-                None
-            }
-        },
-        &|_: &str| true,
+        Some(&ProviderEnv::from_iter([(
+            "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+            adc.to_string_lossy().into_owned(),
+        )])),
     );
     assert_eq!(projectless, None, "a missing project fails the ADC check");
 
     // Project and location both configured, but the ADC file is missing.
-    let fileless = get_env_api_key_with_sources(
+    let fileless = get_env_api_key(
         "google-vertex",
-        &|name: &str| match name {
-            "GOOGLE_CLOUD_PROJECT" | "GOOGLE_CLOUD_LOCATION" => Some("v".to_owned()),
-            _ => None,
-        },
-        &|_: &str| false,
+        Some(&ProviderEnv::from_iter([
+            ("GOOGLE_CLOUD_PROJECT".to_owned(), "v".to_owned()),
+            ("GOOGLE_CLOUD_LOCATION".to_owned(), "v".to_owned()),
+        ])),
     );
     assert_eq!(fileless, None, "a missing credentials file fails the check");
 
     // The complete shape authenticates through the explicit file.
-    let complete = get_env_api_key_with_sources(
+    let complete = get_env_api_key(
         "google-vertex",
-        &|name: &str| match name {
-            "GOOGLE_APPLICATION_CREDENTIALS" => Some(adc.to_string_lossy().into_owned()),
-            "GOOGLE_CLOUD_PROJECT" | "GOOGLE_CLOUD_LOCATION" => Some("v".to_owned()),
-            _ => None,
-        },
-        &|_: &str| true,
+        Some(&ProviderEnv::from_iter([
+            ("GOOGLE_APPLICATION_CREDENTIALS".to_owned(), adc.to_string_lossy().into_owned()),
+            ("GOOGLE_CLOUD_PROJECT".to_owned(), "v".to_owned()),
+            ("GOOGLE_CLOUD_LOCATION".to_owned(), "v".to_owned()),
+        ])),
     );
     let _ = std::fs::remove_file(&adc);
     assert_eq!(complete, Some("<authenticated>".to_owned()));
@@ -2326,18 +2149,21 @@ fn only_completed_poll_outcomes_complete() {
     assert_eq!(PollOutcome::<i64>::Failed("no".to_owned()).complete(), None);
 
     // The credential-typed instantiations the flows poll for.
-    let oauth = OAuthCredential::new("a", "r", 1);
-    assert_eq!(PollOutcome::Complete(oauth.clone()).complete(), Some(oauth));
-    assert_eq!(PollOutcome::<OAuthCredential>::Pending.complete(), None);
+    let oauth = oauth_credentials("a", "r", 1);
     assert_eq!(
-        PollOutcome::<OAuthCredential>::SlowDown {
+        PollOutcome::Complete(oauth.clone()).complete(),
+        Some(oauth)
+    );
+    assert_eq!(PollOutcome::<OAuthCredentials>::Pending.complete(), None);
+    assert_eq!(
+        PollOutcome::<OAuthCredentials>::SlowDown {
             interval_seconds: None
         }
         .complete(),
         None
     );
     assert_eq!(
-        PollOutcome::<OAuthCredential>::Failed("no".to_owned()).complete(),
+        PollOutcome::<OAuthCredentials>::Failed("no".to_owned()).complete(),
         None
     );
 }
@@ -2371,21 +2197,23 @@ fn poll_flow<F: Future>(flow: std::pin::Pin<&mut F>) -> Poll<F::Output> {
 /// A poll script serving canned outcomes then parking.
 fn scripted_poll<T: Send + 'static>(
     outcomes: Vec<PollOutcome<T>>,
-) -> Arc<dyn Fn() -> BoxAuthFuture<Result<PollOutcome<T>, AuthError>> + Send + Sync> {
+) -> Arc<dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<T>, pi_ai::auth::types::AuthError>> + Send + Sync>
+{
     let outcomes = Arc::new(Mutex::new(outcomes));
     Arc::new(move || {
         let next = outcomes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop();
-        let parked: BoxAuthFuture<Result<PollOutcome<T>, AuthError>> = Box::pin(async move {
-            if let Some(outcome) = next {
-                Ok(outcome)
-            } else {
-                std::future::pending::<()>().await;
-                unreachable!("the parked poll never resolves")
-            }
-        });
+        let parked: BoxedFuture<'static, Result<PollOutcome<T>, pi_ai::auth::types::AuthError>> =
+            Box::pin(async move {
+                if let Some(outcome) = next {
+                    Ok(outcome)
+                } else {
+                    std::future::pending::<()>().await;
+                    unreachable!("the parked poll never resolves")
+                }
+            });
         parked
     })
 }
@@ -2402,7 +2230,7 @@ async fn a_first_poll_skipped_when_the_lifetime_is_already_spent_times_out() {
     let error = poll_oauth_device_code_flow(options)
         .await
         .expect_err("the spent lifetime times out");
-    assert_eq!(error.0, "Device flow timed out");
+    assert_eq!(error.to_string(), "Device flow timed out");
 }
 
 #[tokio::test(start_paused = true)]
@@ -2432,7 +2260,7 @@ async fn the_deadline_timeout_carries_the_slow_down_flavour_after_a_slow_down() 
     };
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("Device flow timed out after one or more slow_down responses."),
         "the slow-down flavour is the deadline message: {error:?}"
     );
@@ -2442,7 +2270,9 @@ async fn the_deadline_timeout_carries_the_slow_down_flavour_after_a_slow_down() 
 async fn a_poll_that_cancels_the_signal_is_seen_at_the_top_of_the_loop() {
     let signal = CancellationToken::new();
     let canceller: Arc<
-        dyn Fn() -> BoxAuthFuture<Result<PollOutcome<String>, AuthError>> + Send + Sync,
+        dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<String>, pi_ai::auth::types::AuthError>>
+            + Send
+            + Sync,
     > = {
         let signal = signal.clone();
         Arc::new(move || {
@@ -2464,7 +2294,8 @@ async fn a_poll_that_cancels_the_signal_is_seen_at_the_top_of_the_loop() {
         .await
         .expect_err("the cancelled loop rejects");
     assert_eq!(
-        error.0, "Login cancelled",
+        error.to_string(),
+        "Login cancelled",
         "the cancellation is honoured before the next poll: {error:?}"
     );
 }
@@ -2515,12 +2346,9 @@ fn every_provider_resolves_its_declared_api_key_env_var() {
         ("xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
     ];
     for (provider, env_var) in cases {
+        let env: ProviderEnv = std::iter::once(((*env_var).to_owned(), "v".to_owned())).collect();
         assert_eq!(
-            find_env_keys_with_lookup(provider, |name| if name == *env_var {
-                Some("v".to_owned())
-            } else {
-                None
-            }),
+            find_env_keys(provider, Some(&env)),
             Some(vec![(*env_var).to_owned()]),
             "{provider} resolves {env_var}"
         );
@@ -2535,16 +2363,15 @@ fn every_provider_resolves_its_declared_api_key_env_var() {
 async fn a_pre_cancelled_signal_fails_the_standard_resolve_before_any_lookup() {
     let signal = CancellationToken::new();
     signal.cancel();
-    let auth = EnvApiKeyAuth::new("Stub key", &["ANTHROPIC_API_KEY"]);
-    let error = auth
-        .resolve(ApiKeyResolveInput {
-            ctx: Arc::new(MapAuthContext::default()),
-            credential: None,
-            signal: signal.clone(),
-        })
-        .await
-        .expect_err("the cancelled resolve rejects");
-    assert_eq!(error.0, "The operation was aborted");
+    let auth = env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]);
+    let error = (auth.resolve)(ApiKeyAuthInput {
+        ctx: Arc::new(MapAuthContext::default()),
+        credential: None,
+        signal: signal.clone(),
+    })
+    .await
+    .expect_err("the cancelled resolve rejects");
+    assert_eq!(error.to_string(), "The operation was aborted");
 }
 
 #[tokio::test]
@@ -2553,27 +2380,26 @@ async fn an_abort_between_the_prompt_and_the_key_check_fails_the_login() {
     let recording = RecordingInteraction::new();
     recording.set_dynamic({
         let signal = signal.clone();
-        move |prompt| -> BoxAuthFuture<Result<String, AuthError>> {
+        move |_prompt| -> BoxedFuture<'static, Result<String, pi_ai::utils::abort::AbortError>> {
             let signal = signal.clone();
-            let _ = prompt;
-            let hung: BoxAuthFuture<Result<String, AuthError>> = Box::pin(async move {
-                signal.cancel();
-                Ok(String::from("sk-late"))
-            });
+            let hung: BoxedFuture<'static, Result<String, pi_ai::utils::abort::AbortError>> =
+                Box::pin(async move {
+                    signal.cancel();
+                    Ok(String::from("sk-late"))
+                });
             hung
         }
     });
-    let interaction = ProviderAuthInteraction {
-        interaction: Arc::new(recording.clone()),
-        signal: signal.clone(),
-    };
-    let auth = EnvApiKeyAuth::new("Anthropic API key", &["ANTHROPIC_API_KEY"]);
-    let error = auth
-        .login(interaction)
-        .expect("the standard login exists")
+    let interaction = ProviderAuthInteraction::from_interaction(
+        recording.interaction(),
+        signal.clone(),
+    );
+    let auth = env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"]);
+    let login = auth.login.expect("the standard login exists");
+    let error = (login)(interaction)
         .await
         .expect_err("the post-prompt abort fails login");
-    assert_eq!(error.0, "The operation was aborted");
+    assert_eq!(error.to_string(), "The operation was aborted");
 }
 
 // ---------------------------------------------------------------------------
@@ -2582,14 +2408,15 @@ async fn an_abort_between_the_prompt_and_the_key_check_fails_the_login() {
 
 #[tokio::test]
 async fn a_stored_api_key_credential_without_an_api_key_handler_resolves_none() {
-    let oauth = Arc::new(StubOAuthAuth::new("Stub OAuth", unused_login()));
-    let provider = oauth_provider(Arc::clone(&oauth));
+    let oauth = StubOAuthAuth::new("Stub OAuth", unused_login());
+    let provider = oauth_provider_of(|| oauth.auth());
     let store = empty_store();
     store_credential(store.as_ref(), PROVIDER, api_key_stored("k")).await;
 
-    let resolved = resolve_provider_auth(PROVIDER, &provider, Arc::clone(&store), context(), None)
-        .await
-        .expect("the resolution succeeds");
+    let resolved = resolution_error(
+        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
+    )
+    .expect("the resolution succeeds");
     assert_eq!(
         resolved, None,
         "no silent env fallback for an unmatched credential type"
@@ -2602,28 +2429,37 @@ async fn a_stored_api_key_credential_without_an_api_key_handler_resolves_none() 
 
 #[tokio::test]
 async fn a_modify_that_cancels_mid_operation_rejects_as_aborted() {
+    // The closure cancels the signal and settles; the store's post-settle
+    // signal check rejects the result, so the aborted mutation never lands.
     let store = InMemoryCredentialStore::default();
+    store_credential(&store, PROVIDER, api_key_stored("k")).await;
     let signal = CancellationToken::new();
     let inner = signal.clone();
-    let error: StoreError = store
+    let error = store
         .modify(
             PROVIDER,
-            Arc::new(move |_| {
-                let signal = inner.clone();
-                let hung: BoxAuthFuture<Result<Option<Credential>, StoreError>> =
-                    Box::pin(async move {
-                        signal.cancel();
-                        std::future::pending().await
-                    });
-                hung
+            Box::new(move |_| {
+                let signal = inner;
+                Box::pin(async move {
+                    signal.cancel();
+                    Ok(Some(api_key_stored("cancelled")))
+                })
             }),
-            &AuthOperationOptions::with_signal(signal.clone()),
+            Some(&AuthOptions {
+                signal: Some(signal.clone()),
+            }),
         )
         .await
         .expect_err("the mid-operation abort fails the modify");
     assert!(
         error.to_string().contains("The operation was aborted"),
         "the abort surfaces: {error:?}"
+    );
+    let read = store.read(PROVIDER, None).await.expect("read succeeds");
+    assert_eq!(
+        read,
+        Some(api_key_stored("k")),
+        "the aborted mutation never persisted"
     );
 }
 
@@ -2649,7 +2485,7 @@ async fn a_poll_that_overshoots_the_deadline_breaks_to_the_timeout() {
     let error = poll_oauth_device_code_flow(options)
         .await
         .expect_err("the overshoot times out");
-    assert_eq!(error.0, "Device flow timed out");
+    assert_eq!(error.to_string(), "Device flow timed out");
 }
 
 // ---------------------------------------------------------------------------
@@ -2661,9 +2497,7 @@ fn credential_serde_error_paths_pin_their_messages() {
     // A missing tag.
     let error = serde_json::from_str::<Credential>("{}").expect_err("a missing tag rejects");
     assert!(
-        error
-            .to_string()
-            .contains("credential is missing its \"type\" tag"),
+        error.to_string().contains("missing field `type`"),
         "{error}"
     );
 
@@ -2679,17 +2513,13 @@ fn credential_serde_error_paths_pin_their_messages() {
     let error = serde_json::from_str::<Credential>(r#"{"type":"oauth","access":"a","expires":1}"#)
         .expect_err("a missing refresh rejects");
     assert!(
-        error
-            .to_string()
-            .contains("credential is missing \"refresh\""),
+        error.to_string().contains("missing field `refresh`"),
         "{error}"
     );
     let error = serde_json::from_str::<Credential>(r#"{"type":"oauth","refresh":"r","expires":1}"#)
         .expect_err("a missing access rejects");
     assert!(
-        error
-            .to_string()
-            .contains("credential is missing \"access\""),
+        error.to_string().contains("missing field `access`"),
         "{error}"
     );
 

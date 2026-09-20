@@ -28,7 +28,7 @@
 
 mod common;
 
-use common::auth_fixtures::RecordingInteraction;
+use common::auth_fixtures::{RecordingInteraction, oauth_credentials};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,15 +37,16 @@ use pi_ai::auth::clock::{FixedClock, SteppedClock};
 use pi_ai::auth::oauth::anthropic::AnthropicOAuth;
 use pi_ai::auth::oauth::github_copilot::GitHubCopilotOAuth;
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
-use pi_ai::auth::oauth::load::{
-    load_anthropic_oauth, load_github_copilot_oauth, load_kimi_coding_oauth,
+use pi_ai::auth::oauth::{
+    RadiusOAuthOptions, load_anthropic_oauth, load_github_copilot_oauth, load_kimi_coding_oauth,
     load_openai_codex_oauth, load_openrouter_oauth, load_radius_oauth, load_xai_oauth,
 };
 use pi_ai::auth::oauth::openai_codex::OpenAICodexOAuth;
 use pi_ai::auth::oauth::openrouter::OpenRouterOAuth;
 use pi_ai::auth::oauth::xai::XaiOAuth;
-use pi_ai::auth::{ModelAuth, OAuthAuth, OAuthCredential};
+use pi_ai::auth::types::{AuthError, OAuthCredentials};
 use pi_ai::http::{HttpClient, MockHttpClient, MockResponse, json_response};
+use pi_ai::auth::types::ModelAuth;
 use tokio_util::sync::CancellationToken;
 
 /// The epoch the stepped clocks fix, so refresh arithmetic asserts exactly.
@@ -80,20 +81,22 @@ fn identifies_only_subscription_backed_oauth_flows_as_subscriptions() {
         GitHubCopilotOAuth::new(Arc::clone(&client), clock(), Arc::new(|_: &str| true));
     let kimi_coding = KimiCodingOAuth::new(Arc::clone(&client));
     let xai = XaiOAuth::new(Arc::clone(&client), clock());
-    for (flow_name, is_subscription) in [
-        (anthropic.is_subscription(), "anthropic"),
-        (openai_codex.is_subscription(), "openai-codex"),
-        (github_copilot.is_subscription(), "github-copilot"),
-        (kimi_coding.is_subscription(), "kimi-coding"),
-        (xai.is_subscription(), "xai"),
+    for (is_subscription, flow_name) in [
+        (anthropic.auth().is_subscription, "anthropic"),
+        (openai_codex.auth().is_subscription, "openai-codex"),
+        (github_copilot.auth().is_subscription, "github-copilot"),
+        (kimi_coding.auth().is_subscription, "kimi-coding"),
+        (xai.auth().is_subscription, "xai"),
     ] {
-        assert!(
-            flow_name,
-            "{is_subscription}: expected a subscription-backed flow"
+        assert_eq!(
+            is_subscription,
+            Some(true),
+            "{flow_name}: expected a subscription-backed flow"
         );
     }
-    assert!(
-        !OpenRouterOAuth::new(Arc::clone(&client)).is_subscription(),
+    assert_ne!(
+        OpenRouterOAuth::new(Arc::clone(&client)).auth().is_subscription,
+        Some(true),
         "openrouter's permanent key is not a subscription"
     );
 }
@@ -101,26 +104,44 @@ fn identifies_only_subscription_backed_oauth_flows_as_subscriptions() {
 #[test]
 fn anthropic_to_auth_derives_the_api_key_from_the_access_token() {
     let flow = AnthropicOAuth::new(Arc::new(mock()), clock());
-    let auth = flow.to_auth(&OAuthCredential::new("token", "r", 0));
-    assert_eq!(auth, ModelAuth::api_key("token"));
+    let auth = flow.to_auth(&oauth_credentials("token", "r", 0));
+    assert_eq!(
+        auth,
+        ModelAuth {
+            api_key: Some("token".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
 }
 
 #[test]
 fn openai_codex_to_auth_derives_the_api_key_from_the_access_token() {
     let flow = OpenAICodexOAuth::new(Arc::new(mock()), clock());
-    let auth = flow.to_auth(&OAuthCredential::new("token", "r", 0));
-    assert_eq!(auth, ModelAuth::api_key("token"));
+    let auth = flow.to_auth(&oauth_credentials("token", "r", 0));
+    assert_eq!(
+        auth,
+        ModelAuth {
+            api_key: Some("token".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
 }
 
 #[tokio::test]
 async fn openrouter_keeps_the_permanent_credential_on_refresh() {
     let flow = OpenRouterOAuth::new(Arc::new(mock()));
-    let credential = OAuthCredential::new("token", "", MAX_SAFE_INTEGER_MS);
-    assert_eq!(flow.to_auth(&credential), ModelAuth::api_key("token"));
+    let credential = oauth_credentials("token", "", MAX_SAFE_INTEGER_MS);
+    assert_eq!(
+        flow.to_auth(&credential),
+        ModelAuth {
+            api_key: Some("token".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
     // Upstream asserts identity (`toBe`); the port's refresh clones, so the
     // adapter contract is value equality with the credential unchanged.
     let refreshed = flow
-        .refresh(&credential, never_aborted())
+        .refresh(credential.clone(), never_aborted())
         .await
         .expect("openrouter refresh resolves");
     assert_eq!(refreshed, credential);
@@ -129,15 +150,21 @@ async fn openrouter_keeps_the_permanent_credential_on_refresh() {
 #[test]
 fn xai_to_auth_derives_the_api_key_from_the_access_token() {
     let flow = XaiOAuth::new(Arc::new(mock()), clock());
-    let auth = flow.to_auth(&OAuthCredential::new("token", "r", 0));
-    assert_eq!(auth, ModelAuth::api_key("token"));
+    let auth = flow.to_auth(&oauth_credentials("token", "r", 0));
+    assert_eq!(
+        auth,
+        ModelAuth {
+            api_key: Some("token".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
 }
 
 #[test]
 fn github_copilot_to_auth_derives_base_url_from_the_token_proxy_endpoint() {
     let flow = GitHubCopilotOAuth::new(Arc::new(mock()), clock(), Arc::new(|_: &str| true));
     let access = "tid=abc;exp=123;proxy-ep=proxy.enterprise.example;rest";
-    let auth = flow.to_auth(&OAuthCredential::new(access, "r", 0));
+    let auth = flow.to_auth(&oauth_credentials(access, "r", 0));
     assert_eq!(
         auth,
         ModelAuth {
@@ -151,14 +178,17 @@ fn github_copilot_to_auth_derives_base_url_from_the_token_proxy_endpoint() {
 #[test]
 fn github_copilot_to_auth_falls_back_to_the_enterprise_domain_then_the_individual_endpoint() {
     let flow = GitHubCopilotOAuth::new(Arc::new(mock()), clock(), Arc::new(|_: &str| true));
-    let mut enterprise = OAuthCredential::new("no-proxy-ep", "r", 0);
-    enterprise.set_extra_string("enterpriseUrl", "https://company.ghe.com");
+    let mut enterprise = oauth_credentials("no-proxy-ep", "r", 0);
+    enterprise.extra.insert(
+        "enterpriseUrl".to_owned(),
+        serde_json::Value::String("https://company.ghe.com".to_owned()),
+    );
     assert_eq!(
         flow.to_auth(&enterprise).base_url.as_deref(),
         Some("https://copilot-api.company.ghe.com")
     );
     assert_eq!(
-        flow.to_auth(&OAuthCredential::new("no-proxy-ep", "r", 0))
+        flow.to_auth(&oauth_credentials("no-proxy-ep", "r", 0))
             .base_url
             .as_deref(),
         Some("https://api.individual.githubcopilot.com")
@@ -181,7 +211,7 @@ async fn anthropic_refresh_exchanges_the_refresh_token_and_returns_a_typed_crede
     let flow = AnthropicOAuth::new(Arc::new(client), clock());
 
     let refreshed = flow
-        .refresh(&OAuthCredential::new("old", "old-r", 0), never_aborted())
+        .refresh(oauth_credentials("old", "old-r", 0), never_aborted())
         .await
         .expect("refresh resolves");
     let now = clock().now_ms();
@@ -208,15 +238,18 @@ async fn github_copilot_refresh_preserves_the_enterprise_domain() {
         .respond(json_response(200, &serde_json::json!({ "data": [] })));
     let flow = GitHubCopilotOAuth::new(Arc::new(client.clone()), clock(), Arc::new(|_: &str| true));
 
-    let mut credential = OAuthCredential::new("old", "gh-token", 0);
-    credential.set_extra_string("enterpriseUrl", "company.ghe.com");
+    let mut credential = oauth_credentials("old", "gh-token", 0);
+    credential.extra.insert(
+        "enterpriseUrl".to_owned(),
+        serde_json::Value::String("company.ghe.com".to_owned()),
+    );
     let refreshed = flow
-        .refresh(&credential, never_aborted())
+        .refresh(credential, never_aborted())
         .await
         .expect("refresh resolves");
 
     assert_eq!(refreshed.access, "new-token");
-    assert_eq!(refreshed.enterprise_url(), Some("company.ghe.com"));
+    assert_eq!(refreshed.extra.get("enterpriseUrl").and_then(serde_json::Value::as_str), Some("company.ghe.com"));
     let fetched_urls: Vec<String> = client
         .recorded()
         .iter()
@@ -232,39 +265,45 @@ async fn github_copilot_refresh_preserves_the_enterprise_domain() {
 // load.rs: the statically-linked flow constructors
 // ---------------------------------------------------------------------------
 
-#[test]
-fn the_flow_constructors_wire_the_process_defaults() {
-    let anthropic = load_anthropic_oauth().expect("the anthropic flow loads");
-    assert_eq!(anthropic.name(), "Anthropic (Claude Pro/Max)");
-    assert!(anthropic.is_subscription());
+#[tokio::test]
+async fn the_flow_constructors_wire_the_process_defaults() {
+    let anthropic = load_anthropic_oauth().await;
+    assert_eq!(anthropic.name, "Anthropic (Claude Pro/Max)");
+    assert_eq!(anthropic.is_subscription, Some(true));
 
-    let openai_codex = load_openai_codex_oauth().expect("the codex flow loads");
-    assert_eq!(openai_codex.name(), "OpenAI (ChatGPT Plus/Pro)");
-    assert!(openai_codex.is_subscription());
+    let openai_codex = load_openai_codex_oauth().await;
+    assert_eq!(openai_codex.name, "OpenAI (ChatGPT Plus/Pro)");
+    assert_eq!(openai_codex.is_subscription, Some(true));
 
-    let github_copilot =
-        load_github_copilot_oauth(Arc::new(|_: &str| true)).expect("the copilot flow loads");
-    assert!(github_copilot.is_subscription());
+    let github_copilot = load_github_copilot_oauth().await;
+    assert_eq!(github_copilot.is_subscription, Some(true));
 
-    let openrouter = load_openrouter_oauth();
-    assert_eq!(openrouter.name(), "OpenRouter OAuth");
-    assert!(!openrouter.is_subscription());
-    assert_eq!(openrouter.login_label(), Some("Sign in with OpenRouter"));
-
-    let kimi = load_kimi_coding_oauth();
-    assert_eq!(kimi.name(), "Kimi Code (subscription)");
-    assert_eq!(kimi.login_label(), Some("Sign in with Kimi Code"));
-
-    let xai = load_xai_oauth();
-    assert_eq!(xai.name(), "xAI (Grok/X subscription)");
+    let openrouter = load_openrouter_oauth().await;
+    assert_eq!(openrouter.name, "OpenRouter OAuth");
+    assert_ne!(openrouter.is_subscription, Some(true));
     assert_eq!(
-        xai.login_label(),
-        Some("Sign in with SuperGrok or X Premium")
+        openrouter.login_label,
+        Some("Sign in with OpenRouter".to_owned())
     );
 
-    let radius = load_radius_oauth("Radius", "radius.example/").expect("the radius flow loads");
-    assert_eq!(radius.name(), "Radius");
-    assert!(!radius.is_subscription());
+    let kimi = load_kimi_coding_oauth().await;
+    assert_eq!(kimi.name, "Kimi Code (subscription)");
+    assert_eq!(kimi.login_label, Some("Sign in with Kimi Code".to_owned()));
+
+    let xai = load_xai_oauth().await;
+    assert_eq!(xai.name, "xAI (Grok/X subscription)");
+    assert_eq!(
+        xai.login_label,
+        Some("Sign in with SuperGrok or X Premium".to_owned())
+    );
+
+    let radius = load_radius_oauth(&RadiusOAuthOptions {
+        name: "Radius".to_owned(),
+        gateway: "radius.example/".to_owned(),
+    })
+    .await;
+    assert_eq!(radius.name, "Radius");
+    assert_ne!(radius.is_subscription, Some(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +313,7 @@ fn the_flow_constructors_wire_the_process_defaults() {
 #[test]
 fn anthropic_debug_names_the_flow() {
     let flow = AnthropicOAuth::new(Arc::new(mock()), clock());
-    assert_eq!(flow.name(), "Anthropic (Claude Pro/Max)");
+    assert_eq!(flow.auth().name, "Anthropic (Claude Pro/Max)");
     assert_eq!(format!("{flow:?}"), "AnthropicOAuth");
 }
 
@@ -282,11 +321,11 @@ fn anthropic_debug_names_the_flow() {
 async fn anthropic_refresh_transport_failure_carries_the_refresh_prefix() {
     let flow = AnthropicOAuth::new(Arc::new(mock()), clock());
     let error = flow
-        .refresh(&OAuthCredential::new("a", "r", 0), never_aborted())
+        .refresh(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the transport failure fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Anthropic token refresh request failed. url=https://platform.claude.com/v1/oauth/token; \
          details=no mock route matched POST https://platform.claude.com/v1/oauth/token"
     );
@@ -300,11 +339,11 @@ async fn anthropic_refresh_invalid_json_names_the_url_body_and_details() {
         .respond(MockResponse::status(200).with_body("not json at all"));
     let flow = AnthropicOAuth::new(Arc::new(client), clock());
     let error = flow
-        .refresh(&OAuthCredential::new("a", "r", 0), never_aborted())
+        .refresh(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the invalid JSON fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Anthropic token refresh returned invalid JSON. \
          url=https://platform.claude.com/v1/oauth/token; body=not json at all; \
          details=expected ident at line 1 column 2"
@@ -319,11 +358,11 @@ async fn anthropic_refresh_rejects_a_non_object_body_and_missing_fields() {
         .respond(MockResponse::status(200).with_body("[1,2]"));
     let flow = AnthropicOAuth::new(Arc::new(client), clock());
     let error = flow
-        .refresh(&OAuthCredential::new("a", "r", 0), never_aborted())
+        .refresh(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the array body fails refresh");
     assert_eq!(
-        error.0, "Anthropic token refresh returned invalid JSON",
+        error.to_string(), "Anthropic token refresh returned invalid JSON",
         "a non-object body rejects"
     );
 
@@ -336,11 +375,11 @@ async fn anthropic_refresh_rejects_a_non_object_body_and_missing_fields() {
         ));
     let flow = AnthropicOAuth::new(Arc::new(client), clock());
     let error = flow
-        .refresh(&OAuthCredential::new("a", "r", 0), never_aborted())
+        .refresh(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the missing expiry fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Anthropic token refresh returned invalid JSON: missing expires_in"
     );
 }
@@ -353,11 +392,11 @@ async fn anthropic_refresh_surfaces_the_http_failure_status() {
         .respond(MockResponse::status(400).with_body("denied"));
     let flow = AnthropicOAuth::new(Arc::new(client), clock());
     let error = flow
-        .refresh(&OAuthCredential::new("a", "r", 0), never_aborted())
+        .refresh(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the failure status fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Anthropic token refresh request failed. \
          url=https://platform.claude.com/v1/oauth/token; details=HTTP request failed. status=400; \
          url=https://platform.claude.com/v1/oauth/token; body=denied"
@@ -377,7 +416,7 @@ fn kimi_debug_names_the_flow() {
 #[test]
 fn kimi_to_auth_carries_the_bearer_header() {
     let flow = KimiCodingOAuth::new(Arc::new(mock()));
-    let auth = flow.to_auth(&OAuthCredential::new("tok", "r", 0));
+    let auth = flow.to_auth(&oauth_credentials("tok", "r", 0));
     assert_eq!(auth.api_key, None, "kimi authenticates through headers");
     let headers = auth.headers.expect("the bearer header set");
     assert_eq!(
@@ -408,15 +447,16 @@ fn xai_device_response() -> serde_json::Value {
 fn xai_login(
     flow: XaiOAuth,
 ) -> (
-    tokio::task::JoinHandle<Result<OAuthCredential, pi_ai::auth::AuthError>>,
+    tokio::task::JoinHandle<Result<OAuthCredentials, AuthError>>,
     Arc<RecordingInteraction>,
 ) {
     let recording: Arc<RecordingInteraction> = Arc::new(RecordingInteraction::new());
-    let interaction = pi_ai::auth::ProviderAuthInteraction {
-        interaction: recording.clone(),
-        signal: never_aborted(),
-    };
-    let handle = tokio::spawn(async move { OAuthAuth::login(&flow, interaction).await });
+    let interaction =
+        pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+            recording.interaction(),
+            never_aborted(),
+        );
+    let handle = tokio::spawn(async move { flow.login(interaction).await });
     (handle, recording)
 }
 
@@ -437,10 +477,10 @@ async fn advance_until(condition: impl Fn() -> bool, what: &str) {
 fn xai_debug_names_the_flow() {
     let flow = XaiOAuth::new(Arc::new(mock()), clock());
     assert_eq!(format!("{flow:?}"), "XaiOAuth");
-    assert_eq!(flow.name(), "xAI (Grok/X subscription)");
+    assert_eq!(flow.auth().name, "xAI (Grok/X subscription)");
     assert_eq!(
-        flow.login_label(),
-        Some("Sign in with SuperGrok or X Premium")
+        flow.auth().login_label,
+        Some("Sign in with SuperGrok or X Premium".to_owned())
     );
 }
 
@@ -449,15 +489,15 @@ async fn xai_login_with_a_cancelled_signal_reports_login_cancelled() {
     let flow = XaiOAuth::new(Arc::new(mock()), clock());
     let signal = CancellationToken::new();
     signal.cancel();
-    let interaction = pi_ai::auth::ProviderAuthInteraction {
-        interaction: Arc::new(RecordingInteraction::new()),
-        signal: signal.clone(),
-    };
+    let interaction = pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+        RecordingInteraction::new().interaction(),
+        signal.clone(),
+    );
     let error = flow
         .login(interaction)
         .await
         .expect_err("the cancelled login rejects");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test]
@@ -476,7 +516,7 @@ async fn xai_device_start_failures_carry_the_status_and_error_detail() {
         .expect("the login task joins")
         .expect_err("the failed start fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "xAI OAuth device authorization failed (HTTP 400): invalid_client: nope"
     );
 
@@ -492,7 +532,7 @@ async fn xai_device_start_failures_carry_the_status_and_error_detail() {
         .expect("the login task joins")
         .expect_err("the failed start fails login");
     assert_eq!(
-        error.0, "xAI OAuth device authorization failed (HTTP 400)",
+        error.to_string(), "xAI OAuth device authorization failed (HTTP 400)",
         "the detail is empty"
     );
 }
@@ -510,7 +550,7 @@ async fn xai_device_start_rejects_malformed_fields() {
         .expect("the login task joins")
         .expect_err("the non-object body fails login");
     assert_eq!(
-        error.0, "Invalid xAI OAuth response field: device_code",
+        error.to_string(), "Invalid xAI OAuth response field: device_code",
         "a non-object body leaves every field missing"
     );
 
@@ -527,7 +567,7 @@ async fn xai_device_start_rejects_malformed_fields() {
         .await
         .expect("the login task joins")
         .expect_err("the non-positive expiry fails login");
-    assert_eq!(error.0, "Invalid xAI OAuth response field: expires_in");
+    assert_eq!(error.to_string(), "Invalid xAI OAuth response field: expires_in");
 
     // A missing user_code rejects with its field's name.
     let client = mock();
@@ -542,7 +582,7 @@ async fn xai_device_start_rejects_malformed_fields() {
         .await
         .expect("the login task joins")
         .expect_err("the empty user code fails login");
-    assert_eq!(error.0, "Invalid xAI OAuth response field: user_code");
+    assert_eq!(error.to_string(), "Invalid xAI OAuth response field: user_code");
 }
 
 #[tokio::test]
@@ -561,7 +601,7 @@ async fn xai_device_start_rejects_untrusted_verification_uris() {
             .expect("the login task joins")
             .expect_err("the untrusted uri fails login");
         assert_eq!(
-            error.0, "Untrusted verification URI in xAI OAuth response",
+            error.to_string(), "Untrusted verification URI in xAI OAuth response",
             "{field} must be https: {error:?}"
         );
     }
@@ -603,7 +643,7 @@ async fn xai_poll_failures_reject_with_the_wire_message() {
             .await
             .expect("the login task joins")
             .expect_err("the failed poll fails login");
-        assert_eq!(error.0, expected, "{error_body:?}");
+        assert_eq!(error.to_string(), expected, "{error_body:?}");
     }
 }
 
@@ -670,7 +710,7 @@ async fn xai_poll_rejects_a_token_response_without_a_refresh_token() {
         .expect("the login task joins")
         .expect_err("the missing refresh token fails login");
     assert_eq!(
-        error.0, "Invalid xAI OAuth response field: refresh_token",
+        error.to_string(), "Invalid xAI OAuth response field: refresh_token",
         "a first poll without rotation carries no previous token to reuse"
     );
 }
@@ -686,7 +726,7 @@ async fn xai_refresh_preserves_the_previous_refresh_token_when_the_wire_omits_it
         ));
     let flow = XaiOAuth::new(Arc::new(client), clock());
     let refreshed = flow
-        .refresh(&OAuthCredential::new("a1", "prev-r", 0), never_aborted())
+        .refresh(oauth_credentials("a1", "prev-r", 0), never_aborted())
         .await
         .expect("refresh resolves");
     assert_eq!(refreshed.access, "a2");
@@ -700,11 +740,11 @@ async fn xai_refresh_preserves_the_previous_refresh_token_when_the_wire_omits_it
 async fn xai_refresh_transport_failures_propagate_the_seam_message() {
     let flow = XaiOAuth::new(Arc::new(mock()), clock());
     let error = flow
-        .refresh(&OAuthCredential::new("a", "r", 0), never_aborted())
+        .refresh(oauth_credentials("a", "r", 0), never_aborted())
         .await
         .expect_err("the transport failure fails refresh");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "no mock route matched POST https://auth.x.ai/oauth2/token"
     );
 }
@@ -726,7 +766,7 @@ async fn xai_poll_transport_failures_propagate_the_seam_message() {
         .expect("the login task joins")
         .expect_err("the unmatched token route fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "no mock route matched POST https://auth.x.ai/oauth2/token"
     );
 }
@@ -746,7 +786,7 @@ async fn xai_device_start_rejects_a_missing_verification_uri() {
         .expect("the login task joins")
         .expect_err("the missing verification uri fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Invalid xAI OAuth response field: verification_uri"
     );
 }
@@ -782,6 +822,6 @@ async fn xai_poll_rejects_an_empty_or_invalid_refresh_token_and_expiry() {
             .await
             .expect("the login task joins")
             .expect_err("the malformed token response fails login");
-        assert_eq!(error.0, expected, "{body:?}");
+        assert_eq!(error.to_string(), expected, "{body:?}");
     }
 }

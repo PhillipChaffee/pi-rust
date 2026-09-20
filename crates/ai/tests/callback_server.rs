@@ -439,7 +439,7 @@ async fn a_bound_port_rejects_a_second_bind_with_the_bind_error() {
         .expect_err("the occupied port fails the bind");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("could not bind the OAuth callback server on 127.0.0.1"),
         "the bind error names the host and port: {error:?}"
     );

@@ -21,15 +21,15 @@ mod common;
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use common::auth_fixtures::StubOAuthAuth;
-use pi_ai::auth::{ApiKeyCredential, AuthSelectOption, Credential, OAuthCredential};
+use common::auth_fixtures::{StubOAuthAuth, oauth_credentials};
+use pi_ai::auth::types::{ApiKeyCredential, AuthPromptOption, Credential};
 use pi_ai::cli::{
-    CliProvider, find_provider, help_text, list_output, load_credentials, prompt_line, run,
-    save_credentials, select_choice,
+    CliProvider, cli_interaction, find_provider, help_text, list_output, load_credentials,
+    prompt_line, run, save_credentials, select_choice,
 };
+use pi_ai::utils::abort::AbortError;
 
 /// The environment guard the stdout probe sets on its child run.
 const PRINT_PROBE: &str = "PI_AI_CLI_PRINT_PROBE";
@@ -40,10 +40,11 @@ fn cli_provider(id: &str, name: &str) -> CliProvider {
     CliProvider {
         id: id.to_owned(),
         name: name.to_owned(),
-        oauth: Arc::new(StubOAuthAuth::new(
+        oauth: StubOAuthAuth::new(
             format!("{name} OAuth"),
-            Ok(OAuthCredential::new("cli-access", "cli-refresh", 123_456)),
-        )),
+            Ok(oauth_credentials("cli-access", "cli-refresh", 123_456)),
+        )
+        .auth(),
     }
 }
 
@@ -99,22 +100,28 @@ fn find_provider_matches_by_id() {
 #[test]
 fn select_choice_returns_the_selected_option_id() {
     let options = vec![
-        AuthSelectOption {
+        AuthPromptOption {
             id: "browser".to_owned(),
             label: "Browser login".to_owned(),
             description: None,
         },
-        AuthSelectOption {
+        AuthPromptOption {
             id: "device_code".to_owned(),
             label: "Device code login".to_owned(),
             description: None,
         },
     ];
-    assert_eq!(select_choice(&options, "1").as_deref(), Ok("browser"));
-    assert_eq!(select_choice(&options, " 2 ").as_deref(), Ok("device_code"));
+    assert_eq!(
+        select_choice(&options, "1").map_err(|error| error.to_string()),
+        Ok("browser".to_owned())
+    );
+    assert_eq!(
+        select_choice(&options, " 2 ").map_err(|error| error.to_string()),
+        Ok("device_code".to_owned())
+    );
     for raw in ["0", "3", "abc", ""] {
         let error = select_choice(&options, raw).expect_err("an invalid line rejects");
-        assert_eq!(error.0, "Invalid selection");
+        assert_eq!(error.to_string(), "Invalid selection");
     }
 }
 
@@ -131,8 +138,11 @@ fn prompt_line_appends_the_question_colon_and_the_placeholder() {
 fn credentials_round_trip_with_owner_only_permissions() {
     let dir = unique_temp_dir("round-trip");
     let auth_path = dir.join("auth.json");
-    let mut oauth = OAuthCredential::new("access", "refresh", 12_345);
-    oauth.set_extra_string("enterpriseUrl", "company.ghe.com");
+    let mut oauth = oauth_credentials("access", "refresh", 12_345);
+    oauth.extra.insert(
+        "enterpriseUrl".to_owned(),
+        serde_json::Value::String("company.ghe.com".to_owned()),
+    );
     save_credentials(
         &auth_path,
         "github-copilot",
@@ -237,7 +247,9 @@ async fn run_login_unknown_provider_fails() {
     )
     .await;
     assert_eq!(
-        outcome.expect_err("an unknown provider fails").0,
+        outcome
+            .expect_err("an unknown provider fails")
+            .to_string(),
         "Unknown provider: ghost"
     );
 }
@@ -248,7 +260,7 @@ async fn run_unknown_command_fails_and_help_variants_succeed() {
     let error = run(&[String::from("wat")], &providers, "unused-auth.json")
         .await
         .expect_err("an unknown command fails");
-    assert_eq!(error.0, "Unknown command: wat");
+    assert_eq!(error.to_string(), "Unknown command: wat");
 
     let dir = unique_temp_dir("help");
     let auth_path = dir.join("auth.json");
@@ -267,8 +279,8 @@ async fn run_unknown_command_fails_and_help_variants_succeed() {
 async fn run_login_with_an_explicit_id_persists_the_credential_without_input() {
     let dir = unique_temp_dir("login");
     let auth_path = dir.join("auth.json");
-    let credential = OAuthCredential::new("cli-access", "cli-refresh", 123_456);
-    let oauth = Arc::new(StubOAuthAuth::new("Stub OAuth", Ok(credential.clone())));
+    let credential = oauth_credentials("cli-access", "cli-refresh", 123_456);
+    let oauth = StubOAuthAuth::new("Stub OAuth", Ok(credential.clone())).auth();
     let providers = vec![CliProvider {
         id: "stub".to_owned(),
         name: "Stub Provider".to_owned(),
@@ -422,33 +434,38 @@ fn run_interaction_probe_mode(mode: &str) {
 }
 
 fn run_interaction_probe(mode: &str) {
-    use pi_ai::auth::{AuthEvent, AuthInfoLink, AuthInteraction as _, AuthPrompt, AuthPromptKind};
-    use pi_ai::cli::CliInteraction;
+    use pi_ai::auth::types::{AuthEvent, AuthPrompt, AuthPromptKind, AuthPromptOption};
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("the runtime builds");
+    let prompt = |prompt: AuthPrompt| {
+        let interaction = cli_interaction();
+        let prompt_fn = interaction.prompt;
+        runtime.block_on((prompt_fn)(prompt))
+    };
     match mode {
         "select" => {
             let options = vec![
-                AuthSelectOption {
+                AuthPromptOption {
                     id: "browser".to_owned(),
                     label: "Browser login".to_owned(),
                     description: None,
                 },
-                AuthSelectOption {
+                AuthPromptOption {
                     id: "device_code".to_owned(),
                     label: "Device code login".to_owned(),
                     description: None,
                 },
             ];
-            let selected = runtime.block_on(CliInteraction.prompt(AuthPrompt {
-                kind: AuthPromptKind::Select(options),
-                message: "Pick a login method:".to_owned(),
-                placeholder: None,
+            let selected = prompt(AuthPrompt {
                 signal: None,
-            }));
+                kind: AuthPromptKind::Select {
+                    message: "Pick a login method:".to_owned(),
+                    options,
+                },
+            });
             assert_eq!(
                 selected.expect("the select reads"),
                 "device_code",
@@ -456,12 +473,13 @@ fn run_interaction_probe(mode: &str) {
             );
         }
         "question" => {
-            let entered = runtime.block_on(CliInteraction.prompt(AuthPrompt {
-                kind: AuthPromptKind::Text,
-                message: "Paste the redirect".to_owned(),
-                placeholder: Some("http://localhost:1/cb".to_owned()),
+            let entered = prompt(AuthPrompt {
                 signal: None,
-            }));
+                kind: AuthPromptKind::Text {
+                    message: "Paste the redirect".to_owned(),
+                    placeholder: Some("http://localhost:1/cb".to_owned()),
+                },
+            });
             assert_eq!(
                 entered.expect("the question reads"),
                 "pasted-url",
@@ -470,54 +488,60 @@ fn run_interaction_probe(mode: &str) {
         }
         "eof" => {
             // The parent's pipe closes without a line; the pending prompt
-            // fails as the closed-terminal rejection.
-            let error = runtime
-                .block_on(CliInteraction.prompt(AuthPrompt::new(AuthPromptKind::Text, "Pick:")))
-                .expect_err("the eof prompt rejects");
-            assert_eq!(error.0, "Login cancelled");
+            // fails as the abort the prompt contract carries.
+            let error = prompt(AuthPrompt {
+                signal: None,
+                kind: AuthPromptKind::Text {
+                    message: "Pick:".to_owned(),
+                    placeholder: None,
+                },
+            })
+            .expect_err("the eof prompt rejects");
+            assert_eq!(error, AbortError);
         }
         "select-eof" => {
-            let options = vec![AuthSelectOption {
+            let options = vec![AuthPromptOption {
                 id: "browser".to_owned(),
                 label: "Browser login".to_owned(),
                 description: None,
             }];
-            let error = runtime
-                .block_on(CliInteraction.prompt(AuthPrompt {
-                    kind: AuthPromptKind::Select(options),
+            let error = prompt(AuthPrompt {
+                signal: None,
+                kind: AuthPromptKind::Select {
                     message: "Pick:".to_owned(),
-                    placeholder: None,
-                    signal: None,
-                }))
-                .expect_err("the eof select rejects");
-            assert_eq!(error.0, "Login cancelled");
+                    options,
+                },
+            })
+            .expect_err("the eof select rejects");
+            assert_eq!(error, AbortError);
         }
         "notify" => {
-            let interaction = CliInteraction;
-            interaction.notify(AuthEvent::AuthUrl {
+            let interaction = cli_interaction();
+            let notify = interaction.notify;
+            notify(AuthEvent::AuthUrl {
                 url: "https://authorize.example".to_owned(),
                 instructions: Some("Continue in your browser.".to_owned()),
             });
             // An event without instructions skips the instruction line,
             // upstream's optional-instructions switch arm.
-            interaction.notify(AuthEvent::AuthUrl {
+            notify(AuthEvent::AuthUrl {
                 url: "https://authorize-bare.example".to_owned(),
                 instructions: None,
             });
-            interaction.notify(AuthEvent::DeviceCode {
+            notify(AuthEvent::DeviceCode {
                 user_code: "ABCD-1234".to_owned(),
                 verification_uri: "https://verify.example".to_owned(),
                 interval_seconds: Some(5),
                 expires_in_seconds: Some(600),
             });
-            interaction.notify(AuthEvent::Info {
+            notify(AuthEvent::Info {
                 message: "an info message".to_owned(),
-                links: vec![AuthInfoLink {
+                links: Some(vec![pi_ai::auth::types::AuthInfoLink {
                     url: "https://docs.example".to_owned(),
                     label: None,
-                }],
+                }]),
             });
-            interaction.notify(AuthEvent::Progress {
+            notify(AuthEvent::Progress {
                 message: "a progress message".to_owned(),
             });
         }
@@ -615,11 +639,11 @@ fn run_login_picker_rejects_invalid_and_eof_input() {
             // rejection carries the empty id upstream sends.
             "picker-invalid" => {
                 let error = outcome.expect_err("the invalid pick fails");
-                assert_eq!(error.0, "", "the invalid pick carries the empty id");
+                assert_eq!(error.to_string(), "", "the invalid pick carries the empty id");
             }
             "picker-eof" => {
                 let error = outcome.expect_err("the closed stdin fails the picker");
-                assert_eq!(error.0, "Login cancelled");
+                assert_eq!(error.to_string(), "Login cancelled");
             }
             other => panic!("unknown probe mode: {other:?}"),
         }
@@ -684,7 +708,7 @@ fn save_credentials_fails_loudly_when_the_store_cannot_be_written() {
     )
     .expect_err("the blocked create fails");
     assert!(
-        error.0.starts_with("Failed to create "),
+        error.to_string().starts_with("Failed to create "),
         "the create failure names the action and path: {error:?}"
     );
 
@@ -703,7 +727,7 @@ fn save_credentials_fails_loudly_when_the_store_cannot_be_written() {
     )
     .expect_err("the read-only write fails");
     assert!(
-        error.0.starts_with("Failed to write "),
+        error.to_string().starts_with("Failed to write "),
         "the write failure names the action and path: {error:?}"
     );
     std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700))
@@ -722,10 +746,7 @@ fn run_login_surfaces_the_flow_and_persistence_failures() {
         let providers = vec![CliProvider {
             id: "stub".to_owned(),
             name: "Stub Provider".to_owned(),
-            oauth: Arc::new(StubOAuthAuth::new(
-                "Stub OAuth",
-                Err(pi_ai::auth::AuthError(String::from("flow refused"))),
-            )),
+            oauth: StubOAuthAuth::new("Stub OAuth", Err(String::from("flow refused"))).auth(),
         }];
         let outcome = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -737,7 +758,7 @@ fn run_login_surfaces_the_flow_and_persistence_failures() {
                 "unused-auth.json",
             ));
         let error = outcome.expect_err("the flow failure surfaces");
-        assert_eq!(error.0, "flow refused");
+        assert_eq!(error.to_string(), "flow refused");
 
         // A persistence failure under a blocked path surfaces too.
         let dir = unique_temp_dir("login-io");
@@ -758,7 +779,7 @@ fn run_login_surfaces_the_flow_and_persistence_failures() {
                     .expect("utf-8 path"),
             ));
         let error = outcome.expect_err("the persistence failure surfaces");
-        assert!(error.0.starts_with("Failed to create "), "{error:?}");
+        assert!(error.to_string().starts_with("Failed to create "), "{error:?}");
         std::fs::remove_dir_all(&dir).ok();
         return;
     }
@@ -799,7 +820,7 @@ fn save_credentials_reports_a_chmod_failure_on_the_store_file() {
     .expect_err("the chmod failure surfaces");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("Failed to set permissions on /dev/null"),
         "{error:?}"
     );

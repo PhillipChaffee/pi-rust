@@ -2,11 +2,13 @@
 //! pin `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
 //! Upstream mutates `process.env` and restores it in `afterEach`; the port
-//! drives the injectable `find_env_keys_with_lookup` /
-//! `get_env_api_key_with_sources` seams over a `BTreeMap` so no case touches
-//! the process environment. The two trailing cases are Rust-native coverage
-//! for the ambient `<authenticated>` branches upstream's file leaves to its
-//! provider-specific suites.
+//! drives [`find_env_keys`] and [`get_env_api_key`] with a `ProviderEnv`
+//! overlay, which wins over the process environment. The two trailing cases
+//! are Rust-native coverage for the ambient `<authenticated>` branches
+//! upstream's file leaves to its provider-specific suites. The Adapter
+//! cases pass an empty overlay only because the lookup consults the process
+//! environment after it: the CI runners these suites run on set none of the
+//! discovery variables.
 
 #![expect(
     clippy::expect_used,
@@ -15,10 +17,11 @@
 
 use std::collections::BTreeMap;
 
-use pi_ai::auth::env_api_keys::{find_env_keys_with_lookup, get_env_api_key_with_sources};
+use pi_ai::env_api_keys::{find_env_keys, get_env_api_key};
+use pi_ai::types::ProviderEnv;
 
 /// A fixture environment standing in for `process.env`.
-fn env_fixture(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+fn env_fixture(pairs: &[(&str, &str)]) -> ProviderEnv {
     pairs
         .iter()
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
@@ -27,16 +30,12 @@ fn env_fixture(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// The discovery path over the fixture environment.
 fn find_keys(env: &BTreeMap<String, String>, provider: &str) -> Option<Vec<String>> {
-    find_env_keys_with_lookup(provider, |name| env.get(name).cloned())
+    find_env_keys(provider, Some(env))
 }
 
-/// The api-key lookup over the fixture environment, with no ambient files.
+/// The api-key lookup over the fixture environment.
 fn env_api_key(env: &BTreeMap<String, String>, provider: &str) -> Option<String> {
-    get_env_api_key_with_sources(
-        provider,
-        &|name: &str| env.get(name).cloned(),
-        &|_: &str| false,
-    )
+    get_env_api_key(provider, Some(env))
 }
 
 #[test]
@@ -148,11 +147,7 @@ fn google_vertex_authenticates_through_application_default_credentials() {
         ("GCLOUD_PROJECT", "pi-test-project"),
         ("GOOGLE_CLOUD_LOCATION", "us-central1"),
     ]);
-    let key = get_env_api_key_with_sources(
-        "google-vertex",
-        &|name: &str| env.get(name).cloned(),
-        &|path: &str| std::path::Path::new(path).exists(),
-    );
+    let key = env_api_key(&env, "google-vertex");
     let _ = std::fs::remove_file(&adc);
 
     assert_eq!(key, Some("<authenticated>".to_owned()));

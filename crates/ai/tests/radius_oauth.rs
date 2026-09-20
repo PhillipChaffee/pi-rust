@@ -14,10 +14,11 @@ use std::sync::Arc;
 
 use pi_ai::auth::clock::FixedClock;
 use pi_ai::auth::oauth::radius::RadiusOAuth;
-use pi_ai::auth::types::{AuthEvent, OAuthAuth as _, OAuthCredential, ProviderAuthInteraction};
+use pi_ai::auth::types::AuthEvent;
 use pi_ai::http::{MockHttpClient, json_response};
 use tokio_util::sync::CancellationToken;
 
+use common::auth_fixtures::oauth_credentials;
 use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
 use common::seam_forms::{form_field, form_fields};
 
@@ -43,7 +44,12 @@ fn radius_oauth(mock: &MockHttpClient, clock: Arc<FixedClock>) -> RadiusOAuth {
 
 /// The scripted interaction answering `login_method`, upstream's
 /// `interaction(loginMethod, events)` helper.
-fn interaction(login_method: &str) -> (ProviderAuthInteraction, Arc<ScriptedAuthInteraction>) {
+fn interaction(
+    login_method: &str,
+) -> (
+    pi_ai::auth::types::ProviderAuthInteraction,
+    Arc<ScriptedAuthInteraction>,
+) {
     let scripted = Arc::new(ScriptedAuthInteraction::answering(login_method));
     (
         provider_interaction(Arc::clone(&scripted), CancellationToken::new()),
@@ -92,7 +98,7 @@ async fn uses_gateway_endpoints_directly_for_device_login() {
         "the expiry carries the one-minute skew off the pinned clock"
     );
     assert_eq!(
-        credential.extra_string("scope"),
+        credential.extra.get("scope").and_then(serde_json::Value::as_str),
         Some("gateway offline_access")
     );
 
@@ -139,7 +145,7 @@ async fn refreshes_directly_through_the_gateway_without_discovery() {
     let oauth = radius_oauth(&mock, Arc::new(FixedClock::new(0)));
     let refreshed = oauth
         .refresh(
-            &OAuthCredential::new("old-access", "old-refresh", 0),
+            oauth_credentials("old-access", "old-refresh", 0),
             CancellationToken::new(),
         )
         .await

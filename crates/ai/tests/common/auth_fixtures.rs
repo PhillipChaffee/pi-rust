@@ -10,9 +10,9 @@
 //! signal when the script is empty, the manual-prompt race the browser flows
 //! drive), [`StubOAuthAuth`] and [`ApiKeyAuthStub`] script the
 //! `refresh`/`to_auth`/`resolve` outcomes with call counters, and
-//! [`FailingStore`] reproduces the storage-failure branch `resolve.ts` wraps.
+//! [`FailingStore`] reproduces the storage-failure branch the resolution wraps.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -20,30 +20,49 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio_util::sync::CancellationToken;
 
-use pi_ai::auth::{
-    ApiKeyAuth, ApiKeyCredential, ApiKeyResolveInput, AuthContext, AuthError, AuthEvent,
-    AuthInteraction, AuthPrompt, AuthResult, BoxAuthFuture, Credential, CredentialInfo,
-    CredentialStore, CredentialStoreError, ModelAuth, OAuthAuth, OAuthCredential,
-    ProviderAuthInteraction, StoreError,
+use pi_ai::auth::types::{
+    ApiKeyAuth, ApiKeyAuthInput, ApiKeyCredential, ApiKeyResolveFn, AuthContext, AuthError,
+    AuthEvent, AuthInteraction, AuthPrompt, AuthResult, Credential, CredentialInfo,
+    CredentialModifyFn, ModelAuth, OAuthAuth, OAuthCredentials, OAuthLoginFn, OAuthRefreshFn,
+    OAuthToAuthFn, PromptFn,
 };
 use pi_ai::types::BoxedFuture;
+use pi_ai::utils::abort::AbortError;
+
+/// The failure the scripted doubles reject with: the message is the contract,
+/// the shape upstream's thrown `Error`s carry.
+#[must_use]
+pub fn stub_error(message: impl Into<String>) -> AuthError {
+    Box::new(StubError(message.into()))
+}
+
+#[derive(Debug)]
+struct StubError(String);
+
+impl std::fmt::Display for StubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StubError {}
 
 /// The refresh implementation a [`StubOAuthAuth`] scripts: the credential
 /// under refresh and the operation's signal, resolving the replacement.
 pub type StubRefreshFn = Arc<
-    dyn Fn(&OAuthCredential, CancellationToken) -> BoxAuthFuture<Result<OAuthCredential, AuthError>>
+    dyn Fn(OAuthCredentials, CancellationToken) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>>
         + Send
         + Sync,
 >;
 
 /// A `to_auth` derivation a [`StubOAuthAuth`] scripts, keyed by the stored
 /// credential.
-pub type StubToAuthFn = Arc<dyn Fn(&OAuthCredential) -> ModelAuth + Send + Sync>;
+pub type StubToAuthFn = Arc<dyn Fn(&OAuthCredentials) -> ModelAuth + Send + Sync>;
 
 /// A `resolve` implementation an [`ApiKeyAuthStub`] scripts, resolving from
 /// the input upstream's `ApiKeyAuth` handlers receive.
 pub type StubResolveFn = Arc<
-    dyn Fn(ApiKeyResolveInput) -> BoxAuthFuture<Result<Option<AuthResult>, AuthError>>
+    dyn Fn(ApiKeyAuthInput) -> BoxedFuture<'static, Result<Option<AuthResult>, AuthError>>
         + Send
         + Sync,
 >;
@@ -52,14 +71,14 @@ pub type StubResolveFn = Arc<
 /// installs: consulted when the scripted answers are exhausted, so an answer
 /// may depend on events the flow has already reported.
 type DynamicAnswer =
-    Arc<dyn Fn(&AuthPrompt) -> BoxAuthFuture<Result<String, AuthError>> + Send + Sync>;
+    Arc<dyn Fn(&AuthPrompt) -> BoxedFuture<'static, Result<String, AbortError>> + Send + Sync>;
 
 /// The shared state of [`RecordingInteraction`].
 #[derive(Default)]
 struct RecordingInner {
     prompts: Mutex<Vec<AuthPrompt>>,
     events: Mutex<Vec<AuthEvent>>,
-    answers: Mutex<VecDeque<Result<String, AuthError>>>,
+    answers: Mutex<VecDeque<Result<String, AbortError>>>,
     dynamic: Mutex<Option<DynamicAnswer>>,
 }
 
@@ -78,7 +97,7 @@ impl RecordingInner {
 /// installed, otherwise it waits on the prompt's own cancellation signal —
 /// the manual-prompt race the browser flows drive — and fails as aborted
 /// when the flow cancels it. A prompt without a signal and without an answer
-/// fails as "Login cancelled". `notify` records every event in order.
+/// fails as aborted too. `notify` records every event in order.
 #[derive(Clone, Default)]
 pub struct RecordingInteraction {
     inner: Arc<RecordingInner>,
@@ -104,7 +123,7 @@ impl RecordingInteraction {
     #[must_use]
     pub fn with_answers<I>(answers: I) -> Self
     where
-        I: IntoIterator<Item = Result<String, AuthError>>,
+        I: IntoIterator<Item = Result<String, AbortError>>,
     {
         let interaction = Self::new();
         *RecordingInner::lock(&interaction.inner.answers) = answers.into_iter().collect();
@@ -116,7 +135,10 @@ impl RecordingInteraction {
     /// built from the URL an earlier `AuthUrl` event carried).
     pub fn set_dynamic(
         &self,
-        answer: impl Fn(&AuthPrompt) -> BoxAuthFuture<Result<String, AuthError>> + Send + Sync + 'static,
+        answer: impl Fn(&AuthPrompt) -> BoxedFuture<'static, Result<String, AbortError>>
+            + Send
+            + Sync
+            + 'static,
     ) {
         *RecordingInner::lock(&self.inner.dynamic) = Some(Arc::new(answer));
     }
@@ -126,7 +148,10 @@ impl RecordingInteraction {
     /// built from the URL an earlier `AuthUrl` event carried).
     #[must_use]
     pub fn with_dynamic(
-        answer: impl Fn(&AuthPrompt) -> BoxAuthFuture<Result<String, AuthError>> + Send + Sync + 'static,
+        answer: impl Fn(&AuthPrompt) -> BoxedFuture<'static, Result<String, AbortError>>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         let interaction = Self::new();
         *RecordingInner::lock(&interaction.inner.dynamic) = Some(Arc::new(answer));
@@ -154,42 +179,78 @@ impl RecordingInteraction {
             _ => None,
         })
     }
-}
 
-impl AuthInteraction for RecordingInteraction {
-    fn prompt(&self, prompt: AuthPrompt) -> BoxAuthFuture<Result<String, AuthError>> {
-        let inner = Arc::clone(&self.inner);
-        Box::pin(async move {
-            RecordingInner::lock(&inner.prompts).push(prompt.clone());
-            let scripted = RecordingInner::lock(&inner.answers).pop_front();
-            if let Some(answer) = scripted {
-                return answer;
-            }
-            let dynamic = RecordingInner::lock(&inner.dynamic).clone();
-            if let Some(answer) = dynamic {
-                return answer(&prompt).await;
-            }
-            match prompt.signal {
-                Some(signal) => {
-                    signal.cancelled().await;
-                    Err(AuthError(
-                        pi_ai::utils::abort::AbortError::MESSAGE.to_owned(),
-                    ))
-                }
-                None => Err(AuthError("Login cancelled".to_owned())),
-            }
-        })
+    /// The recording double as the interaction the flows take: the merged
+    /// core's [`AuthInteraction`] with the prompt and notify closures bound
+    /// to this recorder.
+    #[must_use]
+    pub fn interaction(&self) -> AuthInteraction {
+        let prompt: PromptFn = {
+            let recorder = self.clone();
+            Arc::new(move |prompt: AuthPrompt| {
+                let recorder = recorder.clone();
+                Box::pin(async move { recorder.answer(prompt).await })
+            })
+        };
+        let notify = {
+            let recorder = self.clone();
+            Arc::new(move |event: AuthEvent| {
+                RecordingInner::lock(&recorder.inner.events).push(event);
+            })
+        };
+        AuthInteraction {
+            signal: None,
+            prompt,
+            notify,
+        }
     }
 
-    fn notify(&self, event: AuthEvent) {
-        RecordingInner::lock(&self.inner.events).push(event);
+    /// Answer one prompt: record, then serve the script, then the dynamic
+    /// answerer, then hang on the prompt's own signal.
+    async fn answer(&self, prompt: AuthPrompt) -> Result<String, AbortError> {
+        RecordingInner::lock(&self.inner.prompts).push(prompt.clone());
+        let scripted = RecordingInner::lock(&self.inner.answers).pop_front();
+        if let Some(answer) = scripted {
+            return answer;
+        }
+        let dynamic = RecordingInner::lock(&self.inner.dynamic).clone();
+        if let Some(answer) = dynamic {
+            return answer(&prompt).await;
+        }
+        match prompt.signal {
+            Some(signal) => {
+                signal.cancelled().await;
+                Err(AbortError)
+            }
+            None => Err(AbortError),
+        }
     }
 }
+
+/// An [`OAuthCredentials`] with the three wire fields set, the shape the
+/// suites' fixtures mint.
+#[must_use]
+pub fn oauth_credentials(
+    access: impl Into<String>,
+    refresh: impl Into<String>,
+    expires: i64,
+) -> OAuthCredentials {
+    OAuthCredentials {
+        refresh: refresh.into(),
+        access: access.into(),
+        expires,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// The login outcome a [`StubOAuthAuth`] scripts: a credential, or the error
+/// message the login rejects with.
+pub type StubLoginOutcome = Result<OAuthCredentials, String>;
 
 /// The shared state of [`StubOAuthAuth`].
 struct StubOAuthInner {
     name: String,
-    login: Result<OAuthCredential, AuthError>,
+    login: StubLoginOutcome,
     refresh: StubRefreshFn,
     refresh_calls: AtomicUsize,
     to_auth: Option<StubToAuthFn>,
@@ -207,7 +268,7 @@ pub struct StubOAuthAuth {
 impl std::fmt::Debug for StubOAuthAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StubOAuthAuth")
-            .field("name", &self.inner.name)
+            .field("name", &self.name())
             .field("refresh_calls", &self.refresh_calls())
             .finish_non_exhaustive()
     }
@@ -217,7 +278,7 @@ impl StubOAuthAuth {
     /// A flow named `name` whose login resolves `login` and whose refresh
     /// echoes the credential under refresh back unchanged.
     #[must_use]
-    pub fn new(name: impl Into<String>, login: Result<OAuthCredential, AuthError>) -> Self {
+    pub fn new(name: impl Into<String>, login: StubLoginOutcome) -> Self {
         Self {
             inner: Arc::new(StubOAuthInner {
                 name: name.into(),
@@ -230,8 +291,8 @@ impl StubOAuthAuth {
     }
 
     /// Script the refresh outcome. Builders rebuild the inner state, so
-    /// configure the stub before wrapping it in an `Arc<dyn OAuthAuth>`; a
-    /// builder call after that keeps the shared copy untouched.
+    /// configure the stub before taking `auth()`; a builder call after that
+    /// keeps the shared copy untouched.
     #[must_use]
     pub fn with_refresh(self, refresh: StubRefreshFn) -> Self {
         Self {
@@ -264,35 +325,55 @@ impl StubOAuthAuth {
     pub fn refresh_calls(&self) -> usize {
         self.inner.refresh_calls.load(Ordering::Relaxed)
     }
-}
 
-impl OAuthAuth for StubOAuthAuth {
-    fn name(&self) -> &str {
+    /// The display name the auth method carries.
+    #[must_use]
+    pub fn name(&self) -> &str {
         &self.inner.name
     }
 
-    fn login(
-        &self,
-        _interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let login = self.inner.login.clone();
-        Box::pin(std::future::ready(login))
-    }
-
-    fn refresh(
-        &self,
-        credential: &OAuthCredential,
-        signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        self.inner.refresh_calls.fetch_add(1, Ordering::Relaxed);
-        (Arc::clone(&self.inner.refresh))(credential, signal)
-    }
-
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        self.inner.to_auth.as_ref().map_or_else(
-            || ModelAuth::api_key(credential.access.clone()),
-            |to_auth| to_auth(credential),
-        )
+    /// The stub wired into the merged core's callback-based [`OAuthAuth`]:
+    /// a fixed login outcome, the counted refresh, and the derivation.
+    #[must_use]
+    pub fn auth(&self) -> OAuthAuth {
+        let login: OAuthLoginFn = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |_interaction| {
+                let outcome = match &inner.login {
+                    Ok(credential) => Ok(credential.clone()),
+                    Err(message) => Err(stub_error(message.clone())),
+                };
+                Box::pin(std::future::ready(outcome))
+            })
+        };
+        let refresh: OAuthRefreshFn = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |credential, signal| {
+                inner.refresh_calls.fetch_add(1, Ordering::Relaxed);
+                (Arc::clone(&inner.refresh))(credential, signal)
+            })
+        };
+        let to_auth: OAuthToAuthFn = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |credential| {
+                let auth = inner.to_auth.as_ref().map_or_else(
+                    || ModelAuth {
+                        api_key: Some(credential.access.clone()),
+                        ..ModelAuth::default()
+                    },
+                    |to_auth| to_auth(&credential),
+                );
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        OAuthAuth {
+            name: self.inner.name.clone(),
+            is_subscription: Some(true),
+            login_label: None,
+            login,
+            refresh,
+            to_auth,
+        }
     }
 }
 
@@ -300,24 +381,24 @@ impl OAuthAuth for StubOAuthAuth {
 /// the double refresh cases drive.
 #[must_use]
 pub fn refresh_echo() -> StubRefreshFn {
-    refresh_returning_oauth(OAuthCredential::clone)
+    refresh_returning_oauth(OAuthCredentials::clone)
 }
 
 /// A refresh that resolves the OAuth credential `build` derives from the
 /// credential under refresh.
 #[must_use]
 pub fn refresh_returning_oauth(
-    build: impl Fn(&OAuthCredential) -> OAuthCredential + Send + Sync + 'static,
+    build: impl Fn(&OAuthCredentials) -> OAuthCredentials + Send + Sync + 'static,
 ) -> StubRefreshFn {
     Arc::new(move |credential, _signal| {
-        let refreshed = build(credential);
+        let refreshed = build(&credential);
         Box::pin(std::future::ready(Ok(refreshed)))
     })
 }
 
 /// A refresh that resolves the prebuilt `credential`.
 #[must_use]
-pub fn refresh_returning(credential: OAuthCredential) -> StubRefreshFn {
+pub fn refresh_returning(credential: OAuthCredentials) -> StubRefreshFn {
     refresh_returning_oauth(move |_| credential.clone())
 }
 
@@ -326,7 +407,7 @@ pub fn refresh_returning(credential: OAuthCredential) -> StubRefreshFn {
 pub fn refresh_failing(message: impl Into<String>) -> StubRefreshFn {
     let message = message.into();
     Arc::new(move |_credential, _signal| {
-        Box::pin(std::future::ready(Err(AuthError(message.clone()))))
+        Box::pin(std::future::ready(Err(stub_error(message.clone()))))
     })
 }
 
@@ -334,7 +415,7 @@ pub fn refresh_failing(message: impl Into<String>) -> StubRefreshFn {
 /// `credential` — the paused-clock timeout cases drive it past the
 /// resolution's 15-second refresh timeout.
 #[must_use]
-pub fn refresh_after_sleeping(ms: u64, credential: OAuthCredential) -> StubRefreshFn {
+pub fn refresh_after_sleeping(ms: u64, credential: OAuthCredentials) -> StubRefreshFn {
     Arc::new(move |_credential, _signal| {
         let credential = credential.clone();
         Box::pin(async move {
@@ -362,7 +443,7 @@ pub struct ApiKeyAuthStub {
 impl std::fmt::Debug for ApiKeyAuthStub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiKeyAuthStub")
-            .field("name", &self.inner.name)
+            .field("name", &self.name())
             .finish_non_exhaustive()
     }
 }
@@ -387,7 +468,10 @@ impl ApiKeyAuthStub {
         let key = key.into();
         Arc::new(move |_input| {
             let result = AuthResult {
-                auth: ModelAuth::api_key(key.clone()),
+                auth: ModelAuth {
+                    api_key: Some(key.clone()),
+                    ..ModelAuth::default()
+                },
                 env: None,
                 source: Some("stub".to_owned()),
             };
@@ -406,7 +490,13 @@ impl ApiKeyAuthStub {
     #[must_use]
     pub fn failing(message: impl Into<String>) -> StubResolveFn {
         let message = message.into();
-        Arc::new(move |_input| Box::pin(std::future::ready(Err(AuthError(message.clone())))))
+        Arc::new(move |_input| Box::pin(std::future::ready(Err(stub_error(message.clone())))))
+    }
+
+    /// The display name the auth method carries.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.inner.name
     }
 
     /// The credential the last `resolve` call received, `None` before any
@@ -419,79 +509,78 @@ impl ApiKeyAuthStub {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-}
 
-impl ApiKeyAuth for ApiKeyAuthStub {
-    fn name(&self) -> &str {
-        &self.inner.name
-    }
-
-    fn resolve(
-        &self,
-        input: ApiKeyResolveInput,
-    ) -> BoxAuthFuture<Result<Option<AuthResult>, AuthError>> {
-        // Record before the scripted resolve runs; the guard drops with the
-        // block so the recorded value never rides the handler call.
-        {
-            let mut last_credential = self
-                .inner
-                .last_credential
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            last_credential.clone_from(&input.credential);
+    /// The double wired into the merged core's [`ApiKeyAuth`] struct: the
+    /// resolve closure records the credential it received, then delegates to
+    /// the scripted implementation. No `login` and no `check`, so the
+    /// handler reports ambient-only.
+    #[must_use]
+    pub fn auth(&self) -> ApiKeyAuth {
+        let resolve: ApiKeyResolveFn = {
+            let inner = Arc::clone(&self.inner);
+            Arc::new(move |input: ApiKeyAuthInput| {
+                {
+                    let mut last_credential = inner
+                        .last_credential
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    last_credential.clone_from(&input.credential);
+                }
+                (Arc::clone(&inner.resolve))(input)
+            })
+        };
+        ApiKeyAuth {
+            name: self.inner.name.clone(),
+            login: None,
+            check: None,
+            resolve,
         }
-        (Arc::clone(&self.inner.resolve))(input)
     }
 }
 
 /// A credential store whose every operation rejects with the same storage
-/// failure, the store-error branch `resolve.ts` wraps as
+/// failure, the store-error branch the resolution wraps as
 /// `Credential store read failed for {provider}`.
 #[derive(Debug, Default)]
 pub struct FailingStore;
 
 const FAILING_STORE_MESSAGE: &str = "storage backend exploded";
 
-impl CredentialStore for FailingStore {
-    fn read(
-        &self,
-        _provider_id: &str,
-        _options: &pi_ai::auth::AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Option<Credential>, CredentialStoreError>> {
-        Box::pin(std::future::ready(Err(CredentialStoreError::Storage(
-            FAILING_STORE_MESSAGE.to_owned(),
-        ))))
+fn failing_store_error() -> AuthError {
+    stub_error(FAILING_STORE_MESSAGE)
+}
+
+impl pi_ai::auth::credential_store::CredentialStore for FailingStore {
+    fn read<'a>(
+        &'a self,
+        _provider_id: &'a str,
+        _options: Option<&'a pi_ai::auth::types::AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Option<Credential>, AuthError>> {
+        Box::pin(std::future::ready(Err(failing_store_error())))
     }
 
-    fn list(
-        &self,
-        _options: &pi_ai::auth::AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Vec<CredentialInfo>, CredentialStoreError>> {
-        Box::pin(std::future::ready(Err(CredentialStoreError::Storage(
-            FAILING_STORE_MESSAGE.to_owned(),
-        ))))
+    fn list<'a>(
+        &'a self,
+        _options: Option<&'a pi_ai::auth::types::AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
+        Box::pin(std::future::ready(Err(failing_store_error())))
     }
 
-    fn modify(
-        &self,
-        _provider_id: &str,
-        _modify: pi_ai::auth::StoreModifyFn,
-        _options: &pi_ai::auth::AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<Option<Credential>, StoreError>> {
-        let error: StoreError = Box::new(CredentialStoreError::Storage(
-            FAILING_STORE_MESSAGE.to_owned(),
-        ));
-        Box::pin(std::future::ready(Err(error)))
+    fn modify<'a>(
+        &'a self,
+        _provider_id: &'a str,
+        _f: CredentialModifyFn,
+        _options: Option<&'a pi_ai::auth::types::AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Option<Credential>, AuthError>> {
+        Box::pin(std::future::ready(Err(failing_store_error())))
     }
 
-    fn delete(
-        &self,
-        _provider_id: &str,
-        _options: &pi_ai::auth::AuthOperationOptions,
-    ) -> BoxedFuture<'static, Result<(), CredentialStoreError>> {
-        Box::pin(std::future::ready(Err(CredentialStoreError::Storage(
-            FAILING_STORE_MESSAGE.to_owned(),
-        ))))
+    fn delete<'a>(
+        &'a self,
+        _provider_id: &'a str,
+        _options: Option<&'a pi_ai::auth::types::AuthOptions>,
+    ) -> BoxedFuture<'a, Result<(), AuthError>> {
+        Box::pin(std::future::ready(Err(failing_store_error())))
     }
 }
 
@@ -522,15 +611,15 @@ impl MapAuthContext {
 }
 
 impl AuthContext for MapAuthContext {
-    fn env(&self, name: &str) -> BoxedFuture<'static, Option<String>> {
-        let value = self.env.get(name).cloned();
-        Box::pin(async move {
-            // Blank values fall through, upstream's falsy-string semantics.
-            value.filter(|value| !value.trim().is_empty())
-        })
+    fn env(&self, name: &str) -> Option<String> {
+        // Blank values fall through, upstream's falsy-string semantics.
+        self.env
+            .get(name)
+            .filter(|value| !value.trim().is_empty())
+            .cloned()
     }
 
-    fn file_exists(&self, _path: &str) -> BoxedFuture<'static, bool> {
-        Box::pin(std::future::ready(false))
+    fn file_exists(&self, _path: &str) -> bool {
+        false
     }
 }

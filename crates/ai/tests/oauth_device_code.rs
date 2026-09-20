@@ -20,7 +20,8 @@ use std::task::{Context, Poll, Waker};
 
 use pi_ai::auth::clock::{AuthClock as _, FixedClock};
 use pi_ai::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
-use pi_ai::auth::types::{AuthError, BoxAuthFuture};
+use pi_ai::auth::types::AuthError;
+use pi_ai::types::BoxedFuture;
 use tokio_util::sync::CancellationToken;
 
 use common::paused_clock::advance;
@@ -44,7 +45,7 @@ fn recording_poll(
     clock: &Arc<FixedClock>,
     poll_times: &Arc<Mutex<Vec<i64>>>,
     outcomes: &[PollOutcome<String>],
-) -> Arc<dyn Fn() -> BoxAuthFuture<Result<PollOutcome<String>, AuthError>> + Send + Sync> {
+) -> Arc<dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<String>, AuthError>> + Send + Sync> {
     let clock = Arc::clone(clock);
     let poll_times = Arc::clone(poll_times);
     let outcomes = Arc::new(Mutex::new(outcomes.to_vec()));
@@ -100,11 +101,10 @@ async fn polls_immediately_and_returns_the_completed_value() {
     assert_eq!(*poll_times.lock().expect("poll times"), vec![START]);
 
     advance(&clock, 1).await;
-    assert_eq!(
-        poll(&mut flow),
-        Poll::Ready(Ok("token".to_owned())),
-        "the second poll completes the flow"
-    );
+    let Poll::Ready(Ok(value)) = poll(&mut flow) else {
+        panic!("the second poll completes the flow");
+    };
+    assert_eq!(value, "token");
     assert_eq!(
         *poll_times.lock().expect("poll times"),
         vec![START, START + 2_000]
@@ -144,11 +144,10 @@ async fn can_wait_before_the_first_poll() {
     );
 
     advance(&clock, 1).await;
-    assert_eq!(
-        poll(&mut flow),
-        Poll::Ready(Ok("token".to_owned())),
-        "the first poll completes the flow"
-    );
+    let Poll::Ready(Ok(value)) = poll(&mut flow) else {
+        panic!("the first poll completes the flow");
+    };
+    assert_eq!(value, "token");
     assert_eq!(*poll_times.lock().expect("poll times"), vec![START + 2_000]);
 }
 
@@ -188,11 +187,10 @@ async fn increases_the_interval_by_5_seconds_after_slow_down_without_a_server_in
     assert_eq!(*poll_times.lock().expect("poll times"), vec![START]);
 
     advance(&clock, 1).await;
-    assert_eq!(
-        poll(&mut flow),
-        Poll::Ready(Ok("token".to_owned())),
-        "the second poll completes the flow"
-    );
+    let Poll::Ready(Ok(value)) = poll(&mut flow) else {
+        panic!("the second poll completes the flow");
+    };
+    assert_eq!(value, "token");
     assert_eq!(
         *poll_times.lock().expect("poll times"),
         vec![START, START + 7_000]
@@ -235,11 +233,10 @@ async fn honors_a_server_provided_slow_down_interval() {
     assert_eq!(*poll_times.lock().expect("poll times"), vec![START]);
 
     advance(&clock, 1).await;
-    assert_eq!(
-        poll(&mut flow),
-        Poll::Ready(Ok("token".to_owned())),
-        "the second poll completes the flow"
-    );
+    let Poll::Ready(Ok(value)) = poll(&mut flow) else {
+        panic!("the second poll completes the flow");
+    };
+    assert_eq!(value, "token");
     assert_eq!(
         *poll_times.lock().expect("poll times"),
         vec![START, START + 30_000]
@@ -265,9 +262,12 @@ async fn cancels_an_in_flight_wait() {
         "the flow parks inside its wait"
     );
     signal.cancel();
+    let Poll::Ready(Err(error)) = poll(&mut flow) else {
+        panic!("the cancel ends the flow");
+    };
     assert_eq!(
-        poll(&mut flow),
-        Poll::Ready(Err(AuthError("Login cancelled".to_owned()))),
+        error.to_string(),
+        "Login cancelled",
         "the abort surfaces as the cancelled login"
     );
 }

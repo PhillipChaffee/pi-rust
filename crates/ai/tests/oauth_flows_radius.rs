@@ -18,11 +18,12 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::auth_fixtures::oauth_credentials;
 use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
 use common::seam_forms::{form_field, form_fields};
-use pi_ai::auth::clock::{AuthClock as _, FixedClock};
+use pi_ai::auth::clock::{AuthClock as _, FixedClock, SteppedClock};
 use pi_ai::auth::oauth::radius::{RadiusOAuth, normalize_radius_gateway_url};
-use pi_ai::auth::types::{AuthEvent, ModelAuth, OAuthAuth as _, OAuthCredential};
+use pi_ai::auth::types::{AuthEvent, ModelAuth};
 use pi_ai::http::{MockHttpClient, MockResponse, json_response};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -46,11 +47,14 @@ static CALLBACK_PORT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_ne
 /// `createRadiusOAuth({ name: "Radius", gateway: GATEWAY })` over the fixed
 /// epoch.
 fn radius_oauth(mock: &MockHttpClient, clock: &FixedClock) -> RadiusOAuth {
+    // The stepped clock freezes the epoch the login reads: the browser path
+    // spends real time waiting for the loopback callback, and a riding clock
+    // would drift the pinned expiry by the callback delay.
     RadiusOAuth::new(
         "Radius".to_owned(),
         GATEWAY.to_owned(),
         Arc::new(mock.clone()),
-        Arc::new(FixedClock::new(clock.now_ms())),
+        Arc::new(SteppedClock::new(clock.now_ms())),
     )
 }
 
@@ -233,7 +237,7 @@ async fn browser_login_completes_through_a_real_loopback_callback() {
         "the expiry carries the one-minute skew off the pinned clock"
     );
     assert_eq!(
-        credential.extra_string("scope"),
+        credential.extra.get("scope").and_then(serde_json::Value::as_str),
         Some("gateway offline_access")
     );
 
@@ -308,7 +312,7 @@ async fn a_state_mismatched_callback_is_rejected_and_the_login_can_be_cancelled(
         .await
         .expect("the login task joins")
         .expect_err("the cancelled login rejects");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test]
@@ -347,7 +351,7 @@ async fn the_callback_error_and_missing_code_pages_keep_the_login_waiting() {
         .expect("the login task joins")
         .expect_err("the error-param callback fails login");
     assert_eq!(
-        error.0, "OAuth callback did not complete.",
+        error.to_string(), "OAuth callback did not complete.",
         "a settled-but-empty wait without cancellation reports the incomplete callback"
     );
 }
@@ -420,7 +424,7 @@ async fn an_aborted_transport_cancels_the_browser_login() {
         .await
         .expect("the login task joins")
         .expect_err("the cancelled login rejects");
-    assert_eq!(error.0, "Login cancelled", "the abort settles the wait");
+    assert_eq!(error.to_string(), "Login cancelled", "the abort settles the wait");
 }
 
 #[tokio::test]
@@ -436,7 +440,7 @@ async fn a_failed_discovery_reports_the_gateway_status() {
         .await
         .expect_err("the failed discovery fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         format!("Could not load Radius OAuth config from {GATEWAY}: 500 boom")
     );
 }
@@ -482,7 +486,7 @@ async fn a_failed_token_exchange_reports_the_structured_oauth_error() {
             .expect("the login task joins")
             .expect_err("the failed exchange fails login");
         assert_eq!(
-            error.0,
+            error.to_string(),
             format!("Radius OAuth token request failed: {expected_detail}"),
             "{body:?}"
         );
@@ -504,7 +508,7 @@ async fn a_failed_device_authorization_reports_the_gateway_status() {
         .await
         .expect_err("the failed device authorization fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Radius OAuth device authorization failed: server_error: kaput"
     );
 }
@@ -528,7 +532,7 @@ async fn an_incomplete_device_response_rejects_with_the_missing_fields_message()
         .await
         .expect_err("the incomplete response fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Radius OAuth device authorization response is missing required fields"
     );
 }
@@ -542,18 +546,21 @@ async fn an_unknown_sign_in_method_rejects_with_the_method_error() {
         .login(interaction)
         .await
         .expect_err("the unknown method fails login");
-    assert_eq!(error.0, "Unknown Radius sign-in method: telepathy");
+    assert_eq!(error.to_string(), "Unknown Radius sign-in method: telepathy");
 }
 
 #[tokio::test]
 async fn the_flow_reports_its_name_and_derives_the_api_key_auth() {
     let mock = MockHttpClient::new();
     let oauth = radius_oauth(&mock, &FixedClock::new(START));
-    assert_eq!(oauth.name(), "Radius");
+    assert_eq!(oauth.auth().name, "Radius");
     assert_eq!(format!("{oauth:?}"), "RadiusOAuth");
     assert_eq!(
-        oauth.to_auth(&OAuthCredential::new("tok", "r", 0)),
-        ModelAuth::api_key("tok")
+        oauth.to_auth(&oauth_credentials("tok", "r", 0)),
+        ModelAuth {
+            api_key: Some("tok".to_owned()),
+            ..ModelAuth::default()
+        }
     );
 }
 
@@ -568,13 +575,13 @@ async fn refresh_failures_report_the_structured_oauth_error() {
     let oauth = radius_oauth(&mock, &FixedClock::new(START));
     let error = oauth
         .refresh(
-            &OAuthCredential::new("old", "old-refresh", 0),
+            oauth_credentials("old", "old-refresh", 0),
             CancellationToken::new(),
         )
         .await
         .expect_err("the failed refresh rejects");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "Radius OAuth token request failed: invalid_grant: expired"
     );
 }
@@ -630,7 +637,7 @@ async fn the_device_poll_keeps_parking_on_pending_until_cancellation() {
         .await
         .expect("the login task joins")
         .expect_err("the cancelled poll rejects");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test(start_paused = true)]
@@ -659,7 +666,7 @@ async fn the_device_poll_parks_on_slow_down_until_cancellation() {
         .await
         .expect("the login task joins")
         .expect_err("the cancelled poll rejects");
-    assert_eq!(error.0, "Login cancelled");
+    assert_eq!(error.to_string(), "Login cancelled");
 }
 
 #[tokio::test(start_paused = true)]
@@ -686,7 +693,7 @@ async fn terminal_poll_errors_reject_with_their_wire_messages() {
             .login(interaction)
             .await
             .expect_err("the terminal poll outcome fails login");
-        assert_eq!(error.0, expected, "{token_body:?}");
+        assert_eq!(error.to_string(), expected, "{token_body:?}");
     }
 
     // A transport failure propagates as its own message.
@@ -709,7 +716,7 @@ async fn terminal_poll_errors_reject_with_their_wire_messages() {
         .await
         .expect_err("the unmatched token route fails login");
     assert!(
-        error.0.contains("no mock route matched"),
+        error.to_string().contains("no mock route matched"),
         "the transport failure propagates: {error:?}"
     );
 }
@@ -734,18 +741,18 @@ async fn an_unparseable_gateway_rejects_every_request_path() {
         .expect_err("the unparseable gateway fails login");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("invalid Radius gateway URL https://ht tp://bad"),
         "the gateway parse failure names the gateway: {error:?}"
     );
 
     // The refresh path reports the same parse failure.
     let error = oauth
-        .refresh(&OAuthCredential::new("a", "r", 0), CancellationToken::new())
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
         .expect_err("the unparseable gateway fails refresh");
     assert!(
-        error.0.starts_with("invalid Radius gateway URL"),
+        error.to_string().starts_with("invalid Radius gateway URL"),
         "the refresh fails on the gateway: {error:?}"
     );
 }
@@ -761,7 +768,7 @@ async fn the_discovery_transport_and_json_failures_report_the_seam() {
         .await
         .expect_err("the transport failure fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "no mock route matched GET https://radius.example/v1/oauth"
     );
 
@@ -776,7 +783,7 @@ async fn the_discovery_transport_and_json_failures_report_the_seam() {
         .await
         .expect_err("the invalid discovery JSON fails login");
     assert!(
-        error.0.starts_with("invalid JSON response: "),
+        error.to_string().starts_with("invalid JSON response: "),
         "the discovery JSON failure propagates: {error:?}"
     );
 }
@@ -802,7 +809,7 @@ async fn an_occupied_callback_port_fails_the_radius_browser_login_before_prompti
         .expect_err("the occupied port fails login");
     assert!(
         error
-            .0
+            .to_string()
             .starts_with("could not bind the OAuth callback server on 127.0.0.1"),
         "the bind error surfaces before the browser is sent anywhere: {error:?}"
     );
@@ -841,7 +848,7 @@ async fn the_token_request_transport_failure_surfaces_through_the_browser_path()
         .expect("the login task joins")
         .expect_err("the token transport failure fails login");
     assert_eq!(
-        error.0, "no mock route matched POST https://radius.example/v1/oauth/token",
+        error.to_string(), "no mock route matched POST https://radius.example/v1/oauth/token",
         "the exchange's transport failure passes through: {error:?}"
     );
 }
@@ -871,7 +878,7 @@ async fn the_token_exchange_failure_body_shapes_reach_the_error_message() {
         .await
         .expect("the login task joins")
         .expect_err("the non-JSON failure fails login");
-    assert_eq!(error.0, "Radius OAuth token request failed: oops");
+    assert_eq!(error.to_string(), "Radius OAuth token request failed: oops");
 
     // An empty body falls back to the status.
     let mock = MockHttpClient::new();
@@ -896,7 +903,7 @@ async fn the_token_exchange_failure_body_shapes_reach_the_error_message() {
         .expect("the login task joins")
         .expect_err("the empty failure fails login");
     assert_eq!(
-        error.0, "Radius OAuth token request failed: 400",
+        error.to_string(), "Radius OAuth token request failed: 400",
         "the empty body falls back to the status: {error:?}"
     );
 }
@@ -912,7 +919,7 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
         .await
         .expect_err("the transport failure fails login");
     assert_eq!(
-        error.0,
+        error.to_string(),
         "no mock route matched POST https://radius.example/v1/oauth/device"
     );
 
@@ -926,7 +933,7 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
         .login(device_interaction)
         .await
         .expect_err("the invalid device JSON fails login");
-    assert!(error.0.starts_with("invalid JSON response: "), "{error:?}");
+    assert!(error.to_string().starts_with("invalid JSON response: "), "{error:?}");
 
     // A device failure without a body stops at the status.
     let mock = MockHttpClient::new();
@@ -939,7 +946,7 @@ async fn the_device_request_transport_and_parse_failures_propagate() {
         .await
         .expect_err("the empty failure fails login");
     assert_eq!(
-        error.0, "Radius OAuth device authorization failed: 500",
+        error.to_string(), "Radius OAuth device authorization failed: 500",
         "the empty body falls back to the status"
     );
 }

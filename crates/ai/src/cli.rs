@@ -231,8 +231,8 @@ fn prompt_fn() -> PromptFn {
     Arc::new(move |auth_prompt: AuthPrompt| {
         Box::pin(async move {
             match auth_prompt.kind {
-                AuthPromptKind::Select { options, .. } => {
-                    println!();
+                AuthPromptKind::Select { message, options } => {
+                    println!("\n{message}");
                     for (index, option) in options.iter().enumerate() {
                         println!("  {}. {}", index + 1, option.label);
                     }
