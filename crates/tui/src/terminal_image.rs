@@ -2,20 +2,28 @@
 //! `packages/tui/src/terminal-image.ts` in earendil-works/pi at commit
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
-//! Only the pieces the TUI core and the layout engine touch land here
-//! ([#43](https://github.com/PhillipChaffee/pi-rust/issues/43),
-//! [#44](https://github.com/PhillipChaffee/pi-rust/issues/44)): the
-//! process-global cell-dimension store the `CSI 6 ; h ; w t` response
-//! feeds, [`is_image_line`], and the Kitty placement metadata registry
-//! with its crop helper the compositor consults. The rest of the file —
-//! capability probes, image rendering, placement extraction — is the
-//! image ticket's scope ([#51](https://github.com/PhillipChaffee/pi-rust/issues/51)) and lands there.
+//! The pieces land as their consumers need them: the process-global
+//! cell-dimension store the `CSI 6 ; h ; w t` response feeds,
+//! [`is_image_line`], the Kitty placement metadata registry with its crop
+//! helper the compositor consults, and — with the alternate-screen renderer
+//! ([#46](https://github.com/PhillipChaffee/pi-rust/issues/46)) — the
+//! capability cache ([`get_capabilities`]/[`set_capabilities`]), the Kitty
+//! placement extraction ([`get_kitty_image_placement`]) the placement
+//! cache drives, and the batch deletion sequences. The rest of the file —
+//! the environment capability detection and probes, `renderImage`, the
+//! image-size parsers, and the `Image` component — is the image ticket's
+//! scope ([#51](https://github.com/PhillipChaffee/pi-rust/issues/51)) and
+//! lands there.
 //!
 //! Restatement: upstream stores cell dimensions and Kitty image metadata
 //! in module globals read across TUI instances; the workspace forbids the
 //! `unsafe` a naked `static mut` would need, so the stores sit behind
 //! mutexes with the same process-wide visibility and the upstream
-//! defaults.
+//! defaults. `getCapabilities` upstream runs the environment detection on
+//! an empty cache; the detection is #51's scope, so the empty-cache answer
+//! here is the neutral default (`images: null`, no true color, no
+//! hyperlinks) — every consumer in this slice reads the cache the tests
+//! seed.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -92,10 +100,6 @@ pub struct KittyImageMetadata {
 #[derive(Debug, Clone, Copy)]
 struct RegisteredKittyImageMetadata {
     metadata: KittyImageMetadata,
-    #[expect(
-        dead_code,
-        reason = "the transmission generation rides for #46's placement extraction"
-    )]
     transmission_generation: u64,
 }
 
@@ -169,12 +173,16 @@ fn image_id_of(controls: &str) -> Option<u64> {
 /// `getKittyImageMetadata`: the `i=` control's registered entry.
 #[must_use]
 pub fn get_kitty_image_metadata(line: &str) -> Option<KittyImageMetadata> {
+    registered_of(line).map(|registered| registered.metadata)
+}
+
+/// The full registry entry behind a line's first Kitty sequence, upstream's
+/// private `getRegisteredKittyImageMetadata`: the `i=` control's registered
+/// entry, carrying its transmission generation.
+fn registered_of(line: &str) -> Option<RegisteredKittyImageMetadata> {
     let image_id = controls_of(line).and_then(image_id_of)?;
     let registry = lock_registry();
-    registry
-        .by_id
-        .get(&image_id)
-        .map(|registered| registered.metadata)
+    registry.by_id.get(&image_id).copied()
 }
 
 /// Rewrite a Kitty placement for a cropped row range, upstream
@@ -301,4 +309,179 @@ pub struct EncodeKittyOptions {
     /// placement; `Some(false)` emits the `C=1` suppression, upstream
     /// `moveCursor` defaulting to true.
     pub move_cursor: Option<bool>,
+}
+
+/// Which inline-image protocol a terminal understands, upstream
+/// `ImageProtocol`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageProtocol {
+    /// Upstream `"kitty"`.
+    Kitty,
+    /// Upstream `"iterm2"`.
+    Iterm2,
+}
+
+/// The terminal capability matrix, upstream `TerminalCapabilities`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TerminalCapabilities {
+    /// The inline-image protocol, upstream `images` (`null` upstream when
+    /// absent).
+    pub images: Option<ImageProtocol>,
+    /// Upstream `trueColor`.
+    pub true_color: bool,
+    /// Upstream `hyperlinks`.
+    pub hyperlinks: bool,
+}
+
+struct CapabilityCache {
+    cached: Option<TerminalCapabilities>,
+}
+
+/// The cached terminal capabilities, upstream `getCapabilities`.
+///
+/// Upstream runs the environment detection on an empty cache; the detection
+/// is the image ticket's scope (#51), so an empty cache answers the neutral
+/// default here.
+///
+/// # Panics
+///
+/// Never: a poisoned lock falls back to the pre-poison value, matching the
+/// module-global semantics upstream reads.
+#[must_use]
+pub fn get_capabilities() -> TerminalCapabilities {
+    lock_capabilities().cached.unwrap_or_default()
+}
+
+fn lock_capabilities() -> std::sync::MutexGuard<'static, CapabilityCache> {
+    static CACHE: std::sync::LazyLock<Mutex<CapabilityCache>> =
+        std::sync::LazyLock::new(|| Mutex::new(CapabilityCache { cached: None }));
+    CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Override the cached capabilities wholesale, upstream `setCapabilities` —
+/// a test seam upstream used to exercise both code paths.
+///
+/// # Panics
+///
+/// Never: a poisoned lock falls back to writing through it.
+pub fn set_capabilities(caps: TerminalCapabilities) {
+    *lock_capabilities() = CapabilityCache { cached: Some(caps) };
+}
+
+/// Clear the cached capabilities, upstream `resetCapabilitiesCache`.
+///
+/// # Panics
+///
+/// Never: a poisoned lock falls back to writing through it.
+pub fn reset_capabilities_cache() {
+    *lock_capabilities() = CapabilityCache { cached: None };
+}
+
+/// Delete every visible Kitty graphics image, freeing the uploaded image
+/// data, upstream `deleteAllKittyImages` (`d=A`).
+#[must_use]
+pub fn delete_all_kitty_images() -> String {
+    "\x1b_Ga=d,d=A,q=2\x1b\\".to_string()
+}
+
+/// Delete every visible Kitty placement while retaining the uploaded image
+/// data, upstream `deleteAllKittyPlacements` (`d=a`).
+#[must_use]
+pub fn delete_all_kitty_placements() -> String {
+    "\x1b_Ga=d,d=a,q=2\x1b\\".to_string()
+}
+
+/// Wrap text in an OSC 8 hyperlink sequence, upstream `hyperlink`: the
+/// sequences are ignored by terminals without OSC 8 support, leaving the
+/// plain text.
+#[must_use]
+pub fn hyperlink(text: &str, url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// The placement metadata [`get_kitty_image_placement`] derives from a
+/// rendered image line, upstream `KittyImagePlacement`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KittyImagePlacement {
+    /// The placement's image id, upstream `imageId`.
+    pub image_id: u64,
+    /// The registry generation the placement's metadata was registered
+    /// under, upstream `transmissionGeneration`: a placement-only
+    /// replacement is valid only against the same generation.
+    pub transmission_generation: u64,
+    /// The transmission's length in bytes, upstream `transmissionBytes`.
+    pub transmission_bytes: usize,
+    /// `widthPx * heightPx * 4`, upstream `estimatedDecodedBytes`.
+    pub estimated_decoded_bytes: u64,
+    /// The placement-only command, upstream `sequence`.
+    pub sequence: String,
+    /// The image line with the transmission replaced by
+    /// [`Self::sequence`], upstream `replacementLine`.
+    pub replacement_line: String,
+}
+
+/// The placement control keys the placement-only command carries, upstream
+/// `KITTY_PLACEMENT_CONTROL_KEYS`.
+const KITTY_PLACEMENT_CONTROL_KEYS: [&str; 17] = [
+    "i", "p", "x", "y", "w", "h", "X", "Y", "c", "r", "C", "U", "z", "P", "Q", "H", "V",
+];
+
+/// Build a placement-only command for an image line a transmission
+/// produced, upstream `getKittyImagePlacement`.
+///
+/// The walk follows the chunked transmission to its terminator, filters the
+/// first chunk's controls to the placement keys, and splices the `a=p`
+/// command in place of the transmission. The registry must know the image
+/// id: placement extraction answers `None` for lines whose metadata was
+/// never registered.
+#[must_use]
+pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
+    let registered = registered_of(line)?;
+    let sequence_start = line.find(KITTY_PREFIX)?;
+    let first_controls_start = sequence_start + KITTY_PREFIX.len();
+    let first_controls_end = first_controls_start + line[first_controls_start..].find(';')?;
+    let first_controls = &line[first_controls_start..first_controls_end];
+
+    let mut command_start = sequence_start;
+    let mut command_controls = first_controls;
+    let transmission_end = loop {
+        let window_start = command_start + KITTY_PREFIX.len();
+        let terminator = window_start + line[window_start..].find("\x1b\\")?;
+        let transmission_end = terminator + 2;
+        if !command_controls.split(',').any(|control| control == "m=1") {
+            break transmission_end;
+        }
+        command_start = transmission_end;
+        if !line[command_start..].starts_with(KITTY_PREFIX) {
+            return None;
+        }
+        let controls_start = command_start + KITTY_PREFIX.len();
+        let controls_end = controls_start + line[controls_start..].find(';')?;
+        command_controls = &line[controls_start..controls_end];
+    };
+
+    let controls: Vec<&str> = first_controls
+        .split(',')
+        .filter(|control| {
+            let key = control.split('=').next().unwrap_or_default();
+            KITTY_PLACEMENT_CONTROL_KEYS.contains(&key)
+        })
+        .collect();
+    let sequence = format!("\x1b_Ga=p,q=2,{}\x1b\\", controls.join(","));
+    Some(KittyImagePlacement {
+        image_id: registered.metadata.image_id,
+        transmission_generation: registered.transmission_generation,
+        transmission_bytes: transmission_end - sequence_start,
+        estimated_decoded_bytes: registered
+            .metadata
+            .width_px
+            .saturating_mul(registered.metadata.height_px)
+            .saturating_mul(4),
+        replacement_line: format!(
+            "{}{sequence}{}",
+            &line[..sequence_start],
+            &line[transmission_end..]
+        ),
+        sequence,
+    })
 }

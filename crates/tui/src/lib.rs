@@ -83,6 +83,7 @@
 //! modifier table entries, the write log, the UTF-8 decoder, the progress
 //! keepalive) so the 95% coverage gate binds.
 
+pub mod alt_screen_search;
 pub mod components;
 pub mod fuzzy;
 pub mod keybindings;
@@ -94,5 +95,6 @@ pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
 pub mod tui;
+pub mod tui_alt_screen;
 pub mod tui_main_screen;
 pub mod utils;

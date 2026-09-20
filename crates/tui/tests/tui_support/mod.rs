@@ -52,12 +52,15 @@ use pi_tui::tui::{
 };
 
 /// One screen cell: the grapheme it starts, its visible width (zero for
-/// wide-char placeholders), and whether italic is active.
+/// wide-char placeholders), whether italic is active, and whether anything
+/// was ever written into it — upstream xterm's `translateToString(true)`
+/// trims only unwritten trailing cells, so a printed space survives.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ScreenCell {
     ch: char,
     width: u8,
     italic: bool,
+    written: bool,
 }
 
 impl ScreenCell {
@@ -65,6 +68,7 @@ impl ScreenCell {
         ch: ' ',
         width: 1,
         italic: false,
+        written: false,
     };
 }
 
@@ -152,6 +156,7 @@ impl Screen {
             ch: c,
             width: u8::try_from(width).unwrap_or(u8::MAX),
             italic: self.italic,
+            written: true,
         };
         let (row, col) = (self.cursor_row, self.cursor_col);
         self.grid[row][col] = cell;
@@ -160,6 +165,7 @@ impl Screen {
                 ch: '\u{0}',
                 width: 0,
                 italic: cell.italic,
+                written: true,
             };
         }
         self.cursor_col += width;
@@ -197,12 +203,15 @@ impl Screen {
 }
 
 fn render_row(row: &[ScreenCell]) -> String {
-    row.iter()
+    let last_written = row
+        .iter()
+        .rposition(|cell| cell.written)
+        .map_or(0, |position| position + 1);
+    row[..last_written]
+        .iter()
         .filter(|cell| cell.width > 0)
         .map(|cell| cell.ch)
-        .collect::<String>()
-        .trim_end()
-        .to_string()
+        .collect()
 }
 
 /// The cell-size suite's SGR tracking with the extended-color groups

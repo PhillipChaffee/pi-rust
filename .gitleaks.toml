@@ -1,5 +1,9 @@
 # gitleaks configuration. The default ruleset runs as-is; this repository has
-# no allowlist entries. Add one only with a reason (for example, a test
-# fixture that carries a fake credential on purpose).
+# no allowlist entries beyond the one below. Add one only with a reason (for
+# example, a test fixture that carries a fake credential on purpose).
 [extend]
 useDefault = true
+
+[allowlist]
+description = "cargo build/doc artifacts under target/ are machine-generated, gitignored, and never committed; rustdoc's compressed search-index blobs trip the default token rules"
+paths = ['''^target/''']
