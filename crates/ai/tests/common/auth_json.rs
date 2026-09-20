@@ -24,12 +24,11 @@
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
 use pi_ai::auth::clock::{AuthClock, SystemClock};
-use pi_ai::auth::{Credential, OAuthAuth};
+use pi_ai::auth::types::{Credential, OAuthAuth};
 
 /// The auth file's name, the tail of upstream's `homedir()`-joined
 /// `~/.pi/agent/auth.json` path.
@@ -48,11 +47,10 @@ pub struct AuthJsonStore {
 /// `.pi/agent/auth.json` relative to the process working directory.
 #[must_use]
 pub fn default_path() -> PathBuf {
-    if let Some(home) = home_dir() {
-        home.join(".pi").join("agent").join(AUTH_FILE_NAME)
-    } else {
-        PathBuf::from(".pi").join("agent").join(AUTH_FILE_NAME)
-    }
+    home_dir().map_or_else(
+        || PathBuf::from(".pi").join("agent").join(AUTH_FILE_NAME),
+        |home| home.join(".pi").join("agent").join(AUTH_FILE_NAME),
+    )
 }
 
 /// The user's home directory, upstream's `homedir()` join root; `None` when
@@ -110,7 +108,7 @@ impl AuthJsonStore {
 pub async fn resolve_api_key(
     store: &AuthJsonStore,
     provider: &str,
-    oauth: Option<&Arc<dyn OAuthAuth>>,
+    oauth: Option<&OAuthAuth>,
 ) -> Option<String> {
     let mut storage = store.load();
     let entry = storage.get(provider)?.clone();
@@ -122,12 +120,16 @@ pub async fn resolve_api_key(
             let oauth = oauth?;
             let mut credential = stored;
             if SystemClock.now_ms() >= credential.expires {
-                credential = match oauth.refresh(&credential, CancellationToken::new()).await {
-                    Ok(refreshed) => refreshed,
-                    Err(_) => return None,
-                };
+                credential =
+                    match (oauth.refresh)(credential.clone(), CancellationToken::new()).await {
+                        Ok(refreshed) => refreshed,
+                        Err(_) => return None,
+                    };
             }
-            let api_key = oauth.to_auth(&credential).api_key;
+            let api_key = (oauth.to_auth)(credential.clone())
+                .await
+                .expect("to_auth derives the api key")
+                .api_key;
             storage.insert(provider.to_owned(), Credential::OAuth(credential));
             store.save(&storage);
             api_key

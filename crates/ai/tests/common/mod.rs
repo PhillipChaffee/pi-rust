@@ -16,7 +16,9 @@
 )]
 
 pub mod auth_fixtures;
+pub mod auth_guards;
 pub mod auth_interaction;
+pub mod auth_json;
 pub mod oauth_fixtures;
 pub mod paused_clock;
 pub mod radius_fixtures;

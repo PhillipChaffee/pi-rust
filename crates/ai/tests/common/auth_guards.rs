@@ -60,9 +60,7 @@ pub fn resolve_azure_deployment_name(
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
     let map_value = env("AZURE_OPENAI_DEPLOYMENT_NAME_MAP")?;
-    parse_deployment_name_map(&map_value)
-        .get(model_id)
-        .cloned()
+    parse_deployment_name_map(&map_value).get(model_id).cloned()
 }
 
 /// Check if any valid AWS credentials are configured for Bedrock. Returns
