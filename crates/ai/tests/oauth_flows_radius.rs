@@ -736,7 +736,7 @@ async fn terminal_poll_errors_reject_with_their_wire_messages() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn an_unparseable_gateway_rejects_every_request_path() {
+async fn an_unparsable_gateway_rejects_every_request_path() {
     let mock = MockHttpClient::new();
     let oauth = RadiusOAuth::new(
         "Radius".to_owned(),
@@ -749,7 +749,7 @@ async fn an_unparseable_gateway_rejects_every_request_path() {
     let error = oauth
         .login(interaction)
         .await
-        .expect_err("the unparseable gateway fails login");
+        .expect_err("the unparsable gateway fails login");
     assert!(
         error
             .to_string()
@@ -761,7 +761,7 @@ async fn an_unparseable_gateway_rejects_every_request_path() {
     let error = oauth
         .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
-        .expect_err("the unparseable gateway fails refresh");
+        .expect_err("the unparsable gateway fails refresh");
     assert!(
         error.to_string().starts_with("invalid Radius gateway URL"),
         "the refresh fails on the gateway: {error:?}"

@@ -940,7 +940,7 @@ async fn the_kimi_auth_closures_drive_the_flow() {
         never_aborted(),
     )))
     .await
-    .expect_err("the unparseable device response fails login");
+    .expect_err("the unparsable device response fails login");
     assert!(
         error.to_string().starts_with("invalid JSON response"),
         "{error}"

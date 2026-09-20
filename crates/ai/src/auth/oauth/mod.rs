@@ -19,10 +19,11 @@
 //! - `PI_OAUTH_CALLBACK_HOST` and `KIMI_CODE_OAUTH_HOST`/`KIMI_OAUTH_HOST`
 //!   still resolve through [`crate::utils::provider_env`], like upstream's
 //!   `getProviderEnvValue` reads.
-//! - The flows build the closure-based [`OAuthAuth`](crate::auth::types::OAuthAuth)
-//!   the merged auth core resolves through: each flow type keeps its
-//!   `login`/`refresh`/`to_auth` logic as inherent methods and
-//!   [`FlowType::auth`] wires them into the callback fields.
+//! - The flows build the closure-based `OAuthAuth`
+//!   (`crate::auth::types::OAuthAuth`) the merged auth core resolves
+//!   through: each flow type keeps its `login`/`refresh`/`to_auth` logic as
+//!   inherent methods and its `auth()` constructor wires them into the
+//!   callback fields.
 
 pub mod anthropic;
 pub mod callback;

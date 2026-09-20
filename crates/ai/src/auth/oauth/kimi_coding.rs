@@ -23,7 +23,7 @@ const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 const REQUEST_TIMEOUT_MS: u64 = 30 * 1000;
 const REFRESH_MAX_RETRIES: u32 = 3;
 
-/// The Kimi Code OAuth device-code flow, wired with its [`HttpClient`]
+/// The Kimi Code OAuth device-code flow, wired with its `HttpClient`
 /// seam.
 pub struct KimiCodingOAuth {
     client: Arc<dyn crate::http::HttpClient>,

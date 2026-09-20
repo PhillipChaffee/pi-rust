@@ -377,7 +377,7 @@ async fn malformed_request_lines_yield_the_internal_error_page() {
         .expect("the ephemeral bind succeeds");
     let port = server.local_addr().expect("the bound address").port();
 
-    // No target after the method, then an unparseable target.
+    // No target after the method, then an unparsable target.
     for request in ["GARBAGE\r\n\r\n", "GET %zz HTTP/1.1\r\n\r\n"] {
         let response = send_request(port, request).await;
         assert!(
@@ -498,7 +498,7 @@ async fn garbage_flushed_at_eof_yields_the_internal_error_page() {
     let response = String::from_utf8_lossy(&raw).into_owned();
     assert!(
         response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
-        "the unparseable EOF buffer fails the parse: {response:?}"
+        "the unparsable EOF buffer fails the parse: {response:?}"
     );
 }
 

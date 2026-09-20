@@ -2397,7 +2397,7 @@ async fn the_openai_codex_poll_error_shapes_without_error_objects() {
 }
 
 #[tokio::test]
-async fn a_jwt_with_an_unparseable_payload_rejects_the_credential() {
+async fn a_jwt_with_an_unparsable_payload_rejects_the_credential() {
     use base64::Engine as _;
     let _port = CODEX_PORT.lock().await;
     wait_port_free(1455).await;
@@ -2422,7 +2422,7 @@ async fn a_jwt_with_an_unparseable_payload_rejects_the_credential() {
     let error = OpenAICodexOAuth::new(Arc::new(mock), stepped_clock())
         .login(provider_interaction(&recording))
         .await
-        .expect_err("the unparseable payload fails login");
+        .expect_err("the unparsable payload fails login");
     assert_eq!(error.to_string(), "Failed to extract accountId from token");
     wait_port_free(1455).await;
 }
@@ -2505,17 +2505,17 @@ async fn the_openrouter_paste_branch_table_drives_parse_authorization_input() {
         "OpenRouter OAuth response carries no \"key\""
     );
 
-    // A failure status with an unparseable body reports the bare status.
+    // A failure status with an unparsable body reports the bare status.
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == OPENROUTER_TOKEN_URL)
         .respond(MockResponse::status(400).with_body("not json"));
     let error = openrouter_login_with_paste(mock, String::from("some-code"))
         .await
-        .expect_err("the unparseable failure fails login");
+        .expect_err("the unparsable failure fails login");
     assert_eq!(
         error.to_string(),
         "OpenRouter OAuth key exchange failed (HTTP 400)",
-        "no detail survives an unparseable body"
+        "no detail survives an unparsable body"
     );
 }
 

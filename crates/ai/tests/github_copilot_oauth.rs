@@ -568,7 +568,7 @@ async fn a_429_retry_after_http_date_waits_out_the_date_delta() {
 }
 
 #[tokio::test]
-async fn a_429_with_an_unparseable_retry_after_stops_the_retry() {
+async fn a_429_with_an_unparsable_retry_after_stops_the_retry() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url == COPILOT_TOKEN_URL)
         .respond(json_response(200, &copilot_token_response()));
@@ -582,7 +582,7 @@ async fn a_429_with_an_unparseable_retry_after_stops_the_retry() {
     let error = oauth
         .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
         .await
-        .expect_err("the unparseable retry-after keeps the 429, which fails refresh");
+        .expect_err("the unparsable retry-after keeps the 429, which fails refresh");
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
     assert_eq!(mock.request_count(), 2, "no retry ran");
 }
@@ -1072,7 +1072,7 @@ async fn refresh_surfaces_the_exchange_status_reason() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_429_with_an_unparseable_date_and_headerless_replies_stop_the_retry() {
+async fn a_429_with_an_unparsable_date_and_headerless_replies_stop_the_retry() {
     // A Retry-After that parses as neither seconds nor an HTTP date returns
     // the response; covered together with the date-shaped arm above it.
     let mock = MockHttpClient::new();
@@ -1098,7 +1098,7 @@ async fn a_429_with_an_unparseable_date_and_headerless_replies_stop_the_retry() 
     let oauth = flow(&mock);
     let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
     let outcome = oauth.login(provider_interaction(&scripted, CancellationToken::new()));
-    let error = outcome.await.expect_err("the unparseable date fails login");
+    let error = outcome.await.expect_err("the unparsable date fails login");
     assert_eq!(error.to_string(), "429 Too Many Requests: ");
 }
 

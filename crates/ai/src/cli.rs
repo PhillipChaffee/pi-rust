@@ -28,7 +28,7 @@
 //!   material stays owner-only. Nothing prints key material.
 //! - `node:readline`'s question promise becomes a blocking stdin read
 //!   inside [`tokio::task::spawn_blocking`]; stdin EOF fails the pending
-//!   prompt as the abort rejection [`PromptFn`](crate::auth::types::PromptFn)
+//!   prompt as the abort rejection `PromptFn` (`crate::auth::types::PromptFn`)
 //!   carries (upstream's readline never resolves and the process exits), so
 //!   driving one needs a tokio runtime context.
 //! - The per-prompt signal on [`AuthPrompt`] is accepted but not observed:
