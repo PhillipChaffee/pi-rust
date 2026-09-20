@@ -241,34 +241,24 @@ fn prompt_fn() -> PromptFn {
                     let raw = read_line(&format!("Enter number (1-{}): ", options.len())).await?;
                     select_choice(&options, &raw).map_err(|_| crate::utils::abort::AbortError)
                 }
-                ref kind => {
-                    let (message, placeholder) = prompt_fields(kind);
+                AuthPromptKind::Text {
+                    message,
+                    placeholder,
+                }
+                | AuthPromptKind::Secret {
+                    message,
+                    placeholder,
+                }
+                | AuthPromptKind::ManualCode {
+                    message,
+                    placeholder,
+                } => {
                     let question = prompt_line(&message, placeholder.as_deref());
                     read_line(&question).await
                 }
             }
         })
     })
-}
-
-/// The message and placeholder a non-select prompt kind carries, the fields
-/// the question line renders.
-fn prompt_fields(kind: &AuthPromptKind) -> (String, Option<String>) {
-    match kind {
-        AuthPromptKind::Text {
-            message,
-            placeholder,
-        }
-        | AuthPromptKind::Secret {
-            message,
-            placeholder,
-        }
-        | AuthPromptKind::ManualCode {
-            message,
-            placeholder,
-        } => (message.clone(), placeholder.clone()),
-        AuthPromptKind::Select { .. } => unreachable!("handled by the select branch"),
-    }
 }
 
 /// The notify half of [`cli_interaction`], upstream's event switch.

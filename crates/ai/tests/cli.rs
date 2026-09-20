@@ -379,6 +379,19 @@ fn the_cli_interaction_drives_piped_stdin() {
         "the question renders with its placeholder: {stdout:?}"
     );
 
+    // The secret prompt renders through the same question line.
+    let output = run_probe("secret", b"sk-ambient\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the secret probe passes: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Enter key (masked): "),
+        "the secret prompt renders: {stdout:?}"
+    );
+
     // stdin EOF fails the pending prompt as the closed-terminal rejection.
     let output = run_probe("eof", b"");
     assert!(
@@ -486,6 +499,20 @@ fn run_interaction_probe(mode: &str) {
                 entered.expect("the question reads"),
                 "pasted-url",
                 "the entered line answers the prompt"
+            );
+        }
+        "secret" => {
+            let entered = prompt(AuthPrompt {
+                signal: None,
+                kind: AuthPromptKind::Secret {
+                    message: "Enter key".to_owned(),
+                    placeholder: Some("masked".to_owned()),
+                },
+            });
+            assert_eq!(
+                entered.expect("the secret reads"),
+                "sk-ambient",
+                "the entered line answers the secret prompt"
             );
         }
         "eof" => {

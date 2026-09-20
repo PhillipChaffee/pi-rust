@@ -29,6 +29,7 @@
 mod common;
 
 use common::auth_fixtures::{RecordingInteraction, oauth_credentials};
+use common::auth_interaction::{ScriptedAuthInteraction, provider_interaction};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,7 @@ use pi_ai::auth::oauth::github_copilot::GitHubCopilotOAuth;
 use pi_ai::auth::oauth::kimi_coding::KimiCodingOAuth;
 use pi_ai::auth::oauth::openai_codex::OpenAICodexOAuth;
 use pi_ai::auth::oauth::openrouter::OpenRouterOAuth;
+use pi_ai::auth::oauth::radius::RadiusOAuth;
 use pi_ai::auth::oauth::xai::XaiOAuth;
 use pi_ai::auth::oauth::{
     RadiusOAuthOptions, load_anthropic_oauth, load_github_copilot_oauth, load_kimi_coding_oauth,
@@ -842,4 +844,328 @@ async fn xai_poll_rejects_an_empty_or_invalid_refresh_token_and_expiry() {
             .expect_err("the malformed token response fails login");
         assert_eq!(error.to_string(), expected, "{body:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The auth() wiring: the closures the merged core resolves through
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_xai_auth_closures_drive_the_flow() {
+    // The login closure over a pre-cancelled signal aborts at the first
+    // wire call, offline.
+    let mock = MockHttpClient::new();
+    let flow = XaiOAuth::new(Arc::new(mock.clone()), clock());
+    let auth = flow.auth();
+    let signal = CancellationToken::new();
+    signal.cancel();
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let error = ((auth.login)(provider_interaction(&scripted, signal)))
+        .await
+        .expect_err("the aborted login rejects");
+    assert_eq!(error.to_string(), "Login cancelled");
+    assert_eq!(mock.request_count(), 0, "no wire call ran");
+
+    // The refresh and derivation closures run against the mock.
+    mock.on(|request| request.url == "https://auth.x.ai/oauth2/token")
+        .respond(json_response(
+            200,
+            &serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+            }),
+        ));
+    let refreshed = (auth.refresh)(oauth_credentials("a", "r", 0), never_aborted())
+        .await
+        .expect("the refresh closure resolves");
+    assert_eq!(refreshed.access, "new-access");
+    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
+        .await
+        .expect("the derivation resolves");
+    assert_eq!(
+        derived,
+        ModelAuth {
+            api_key: Some("tok".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_kimi_auth_closures_drive_the_flow() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://auth.kimi.com/api/oauth/device_authorization")
+        .respond(json_response(200, &serde_json::json!({ "nope": true })));
+    mock.on(|request| request.url == "https://auth.kimi.com/api/oauth/token")
+        .respond(json_response(401, &serde_json::json!({})));
+
+    let flow = KimiCodingOAuth::new(Arc::new(mock.clone()));
+    let auth = flow.auth();
+
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let error = ((auth.login)(provider_interaction(
+        &scripted,
+        never_aborted(),
+    )))
+    .await
+    .expect_err("the malformed device authorization fails login");
+    assert!(
+        error
+            .to_string()
+            .starts_with("Invalid Kimi Code device authorization response"),
+        "{error}"
+    );
+
+    let error = (auth.refresh)(
+        oauth_credentials("a", "r", 0),
+        never_aborted(),
+    )
+    .await
+    .expect_err("the dead credential fails refresh");
+    assert_eq!(
+        error.to_string(),
+        "Kimi Code token refresh unauthorized (status 401)"
+    );
+
+    let auth_model = (auth.to_auth)(oauth_credentials("tok", "r", 0))
+        .await
+        .expect("the derivation resolves");
+    assert_eq!(auth_model.api_key, None, "kimi authenticates through headers");
+    let headers = auth_model.headers.expect("the bearer header set");
+    assert_eq!(
+        headers.get("Authorization").and_then(Option::as_deref),
+        Some("Bearer tok")
+    );
+}
+
+#[tokio::test]
+async fn the_radius_auth_closures_drive_the_flow() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://radius.example/v1/oauth/device")
+        .respond(json_response(
+            200,
+            &serde_json::json!({
+                "device_code": "device-code",
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://radius-ui.example/pair",
+                "expires_in": 600,
+                "interval": 1,
+            }),
+        ));
+    mock.on(|request| request.url == "https://radius.example/v1/oauth/token")
+        .respond(json_response(
+            200,
+            &serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+                "scope": "gateway offline_access",
+            }),
+        ));
+
+    let flow = RadiusOAuth::new(
+        "Radius".to_owned(),
+        "https://radius.example".to_owned(),
+        Arc::new(mock.clone()),
+        clock(),
+    );
+    let auth = flow.auth();
+    assert_eq!(auth.name, "Radius");
+    assert_eq!(auth.is_subscription, None);
+
+    // The login closure answers the device-code path and completes through
+    // the gateway routes.
+    let scripted = Arc::new(ScriptedAuthInteraction::answering("device-code"));
+    let credential = ((auth.login)(provider_interaction(
+        &scripted,
+        never_aborted(),
+    )))
+    .await
+    .expect("the device login resolves");
+    assert_eq!(credential.access, "new-access");
+    assert_eq!(
+        credential.extra.get("scope").and_then(serde_json::Value::as_str),
+        Some("gateway offline_access")
+    );
+
+    let refreshed = (auth.refresh)(
+        oauth_credentials("old", "old-refresh", 0),
+        never_aborted(),
+    )
+    .await
+    .expect("the refresh closure resolves");
+    assert_eq!(refreshed.access, "new-access");
+
+    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
+        .await
+        .expect("the derivation resolves");
+    assert_eq!(
+        derived,
+        ModelAuth {
+            api_key: Some("tok".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_openrouter_auth_closures_drive_the_flow() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://openrouter.ai/api/v1/auth/keys")
+        .respond(json_response(200, &serde_json::json!({ "key": "sk-or" })));
+
+    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
+    let auth = flow.auth();
+
+    // The login closure races the manual paste against the ephemeral-port
+    // callback; the paste answers with the code.
+    let recording = RecordingInteraction::new();
+    recording.set_dynamic({
+        move |_prompt| {
+            Box::pin(std::future::ready(Ok(String::from(
+                "http://cb.example/oauth/callback/x?code=C",
+            ))))
+        }
+    });
+    let credential = ((auth.login)(
+        pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+            recording.interaction(),
+            never_aborted(),
+        ),
+    ))
+    .await
+    .expect("the pasted login mints the key");
+    assert_eq!(credential.access, "sk-or");
+
+    // Refresh echoes the permanent credential through the closure.
+    let credential = oauth_credentials("sk-or", "", 9_007_199_254_740_991);
+    let refreshed = (auth.refresh)(credential.clone(), never_aborted())
+        .await
+        .expect("the refresh closure resolves");
+    assert_eq!(refreshed, credential);
+
+    let derived = (auth.to_auth)(credential).await.expect("derives");
+    assert_eq!(
+        derived,
+        ModelAuth {
+            api_key: Some("sk-or".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_openrouter_login_closure_reports_the_cancelled_exchange() {
+    // The paste answer cancels the signal; the exchange start sees the
+    // cancellation and reports the cancelled login.
+    let mock = MockHttpClient::new();
+    let flow = OpenRouterOAuth::new(Arc::new(mock.clone()));
+    let auth = flow.auth();
+    let signal = CancellationToken::new();
+    let recording = RecordingInteraction::new();
+    recording.set_dynamic({
+        let signal = signal.clone();
+        move |_prompt| {
+            let signal = signal.clone();
+            Box::pin(async move {
+                signal.cancel();
+                Ok(String::from("http://cb.example?code=C"))
+            })
+        }
+    });
+    let error = ((auth.login)(
+        pi_ai::auth::types::ProviderAuthInteraction::from_interaction(
+            recording.interaction(),
+            signal,
+        ),
+    ))
+    .await
+    .expect_err("the cancelled exchange fails login");
+    assert_eq!(error.to_string(), "Login cancelled");
+    assert_eq!(mock.request_count(), 0, "no key exchange ran");
+}
+
+#[tokio::test]
+async fn the_codex_auth_closures_drive_the_flow() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://auth.openai.com/oauth/token")
+        .respond(json_response(
+            200,
+            &serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+            }),
+        ));
+
+    let flow = OpenAICodexOAuth::new(Arc::new(mock.clone()), clock());
+    let auth = flow.auth();
+
+    // The login closure prompts for the method first; an unknown answer
+    // rejects before any wire call.
+    let scripted = Arc::new(ScriptedAuthInteraction::answering("telepathy"));
+    let error = ((auth.login)(provider_interaction(
+        &scripted,
+        never_aborted(),
+    )))
+    .await
+    .expect_err("the unknown method fails login");
+    assert_eq!(
+        error.to_string(),
+        "Unknown OpenAI Codex login method: telepathy"
+    );
+    assert_eq!(mock.request_count(), 0);
+
+    let error = (auth.refresh)(oauth_credentials("a", "r", 0), never_aborted())
+        .await
+        .expect_err("the unextractable account id fails the refresh closure");
+    assert_eq!(
+        error.to_string(),
+        "Failed to extract accountId from token"
+    );
+
+    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
+        .await
+        .expect("the derivation resolves");
+    assert_eq!(
+        derived,
+        ModelAuth {
+            api_key: Some("tok".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn the_anthropic_auth_closures_drive_the_flow() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://platform.claude.com/v1/oauth/token")
+        .respond(json_response(
+            200,
+            &serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+            }),
+        ));
+
+    let flow = AnthropicOAuth::new(Arc::new(mock.clone()), clock());
+    let auth = flow.auth();
+
+    let refreshed = (auth.refresh)(oauth_credentials("a", "r", 0), never_aborted())
+        .await
+        .expect("the refresh closure resolves");
+    assert_eq!(refreshed.access, "new-access");
+
+    let derived = (auth.to_auth)(oauth_credentials("tok", "r", 0))
+        .await
+        .expect("the derivation resolves");
+    assert_eq!(
+        derived,
+        ModelAuth {
+            api_key: Some("tok".to_owned()),
+            ..ModelAuth::default()
+        }
+    );
 }

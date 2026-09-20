@@ -2090,6 +2090,28 @@ async fn anthropic_login_with_paste(
 }
 
 #[tokio::test]
+async fn the_anthropic_login_closure_drives_the_flow_through_the_paste() {
+    // The loader seam wires the merged core's login closure over this flow;
+    // the paste path drives it under the fixed callback port.
+    let _port = ANTHROPIC_PORT.lock().await;
+    let mock = MockHttpClient::new();
+    mount_anthropic_token_route(&mock);
+    let recording = RecordingInteraction::new();
+    recording.set_dynamic({
+        let _ = &recording;
+        move |_prompt| Box::pin(std::future::ready(Ok(String::from("bare-code"))))
+    });
+    let flow = AnthropicOAuth::new(Arc::new(mock.clone()), stepped_clock());
+    let credential = ((flow.auth().login)(provider_interaction(&recording)))
+        .await
+        .expect("the login closure mints the credential");
+    wait_port_free(ANTHROPIC_CALLBACK_PORT).await;
+    assert_eq!(credential.access, "access-token");
+    let exchange = json_body(&mock, ANTHROPIC_TOKEN_URL);
+    assert_eq!(exchange["code"], "bare-code");
+}
+
+#[tokio::test]
 async fn the_anthropic_manual_paste_state_mismatch_rejects() {
     let error = anthropic_login_with_paste(
         MockHttpClient::new(),
