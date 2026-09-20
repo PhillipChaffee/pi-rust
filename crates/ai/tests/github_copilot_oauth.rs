@@ -637,6 +637,9 @@ fn the_catalog_filters_disabled_tool_calls_and_gates_by_picker() {
         },
         "not-an-object",
         3,
+        {
+            "model_picker_enabled": true,
+        },
     ]});
     let catalog = parse_github_copilot_model_catalog(&raw, false, &known)
         .expect("the catalog parses");
@@ -1213,4 +1216,40 @@ async fn the_models_fetch_reports_each_status_reason() {
             "reason phrase for {status}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_429_with_a_non_finite_retry_header_stops_the_retry() {
+    // "nan" parses as a float but not a finite one: the response returns
+    // without a retry, upstream's `Number.isFinite` guard.
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+    mock.on(|request| request.url.ends_with("/models"))
+        .respond_sequence(vec![
+            MockResponse::status(429).with_header("Retry-After", "nan"),
+            json_response(200, &serde_json::json!({ "data": [] })),
+        ]);
+
+    let oauth = flow(&mock);
+    let error = oauth
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
+        .await
+        .expect_err("the non-finite retry-after keeps the 429");
+    assert_eq!(error.to_string(), "429 Too Many Requests: ");
+    assert_eq!(mock.request_count(), 2, "no retry ran");
+}
+
+#[tokio::test]
+async fn an_unknown_status_reports_the_empty_reason() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(MockResponse::status(418).with_body("teapot"));
+
+    let oauth = flow(&mock);
+    let error = oauth
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
+        .await
+        .expect_err("the unknown status fails refresh");
+    assert_eq!(error.to_string(), "418 : teapot");
 }
