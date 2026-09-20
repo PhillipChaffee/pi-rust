@@ -19,10 +19,6 @@
     reason = "test failures panic by design, mirroring expect!'s failure mode"
 )]
 #![expect(
-    clippy::too_many_lines,
-    reason = "the long tests mirror upstream's one-it-per-behavior suite shape"
-)]
-#![expect(
     clippy::missing_const_for_fn,
     reason = "fixture constructors wrap runtime state that cannot be const"
 )]
@@ -37,9 +33,9 @@ use pi_ai::auth::types::{
     AuthResult, AuthType, Credential, ModelAuth, OAuthAuth, OAuthCredentials, ProviderAuth,
 };
 use pi_ai::models::{
-    CatalogPersist, CreateProviderOptions, ModelsPublication, ModelsRefreshOptions, Provider,
-    ProviderApi, ProviderError, RefreshModelsContext, calculate_cost, create_models,
-    create_provider, has_api,
+    CatalogPersist, CreateProviderOptions, ModelsPublication, ModelsRefreshOptions,
+    ModelsRefreshResult, Provider, ProviderApi, ProviderError, RefreshModelsContext,
+    calculate_cost, create_models, create_provider, has_api,
 };
 use pi_ai::models_store::{InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOptions};
 use pi_ai::types::{
@@ -50,6 +46,14 @@ use pi_ai::types::{
 use pi_ai::utils::abort::AbortError;
 use pi_ai::utils::event_stream::assistant_message_event_stream;
 use tokio_util::sync::CancellationToken;
+
+/// The poisoned-mutex-tolerant lock every fixture counter and recording
+/// cell reads through.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn test_model(provider: &str, id: &str) -> Model {
     Model {
@@ -153,6 +157,21 @@ struct TestProviderInput {
     get_models: Option<GetModelsFn>,
 }
 
+/// The all-default [`TestProviderInput`]: ambient auth, the default
+/// listing, no refresh, no recorded calls. Tests override single fields
+/// with `..default_input(id)` at the call site.
+fn default_input(id: &'static str) -> TestProviderInput {
+    TestProviderInput {
+        id,
+        models: None,
+        broken_models: false,
+        auth: None,
+        refresh: None,
+        calls: None,
+        get_models: None,
+    }
+}
+
 /// The custom-listing closure of [`TestProviderInput`], upstream's
 /// `getModels: () => list`.
 type GetModelsFn = Arc<dyn Fn() -> Result<Vec<Model>, ProviderError> + Send + Sync>;
@@ -160,6 +179,30 @@ type GetModelsFn = Arc<dyn Fn() -> Result<Vec<Model>, ProviderError> + Send + Sy
 type RefreshFn = Arc<
     dyn Fn(&RefreshModelsContext) -> BoxedFuture<'static, Result<(), ProviderError>> + Send + Sync,
 >;
+
+/// Adapts a test's owned-context refresh body into a [`RefreshFn`]: clones
+/// the context per call and hands the body a `'static` future over it, the
+/// shape upstream's `async (context) => {}` refresh handlers take.
+fn refresh_future(
+    refresh: impl Fn(RefreshModelsContext) -> BoxedFuture<'static, Result<(), ProviderError>>
+    + Send
+    + Sync
+    + 'static,
+) -> RefreshFn {
+    Arc::new(move |context: &RefreshModelsContext| {
+        let context = context.clone();
+        refresh(context)
+    })
+}
+
+/// Registers a dynamic provider whose refresh runs `refresh`, the setup
+/// every refresh-lifecycle test drives.
+fn register_refreshing(models: &pi_ai::models::Models, id: &'static str, refresh: RefreshFn) {
+    models.set_provider(test_provider(TestProviderInput {
+        refresh: Some(refresh),
+        ..default_input(id)
+    }));
+}
 
 struct TestProvider {
     id: &'static str,
@@ -191,11 +234,7 @@ impl Provider for TestProvider {
         if self.broken_models {
             return Err(std::io::Error::other("boom").into());
         }
-        Ok(self
-            .models
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone())
+        Ok(lock(&self.models).clone())
     }
 
     fn refresh_models(
@@ -219,13 +258,10 @@ impl Provider for TestProvider {
         options: Option<&StreamOptions>,
     ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
         if let Some(calls) = &self.calls {
-            calls
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(ProviderCall {
-                    model: model.clone(),
-                    options: options.cloned(),
-                });
+            lock(calls).push(ProviderCall {
+                model: model.clone(),
+                options: options.cloned(),
+            });
         }
         let stream = assistant_message_event_stream();
         let message = done_message(model, "ok");
@@ -279,6 +315,110 @@ fn context() -> Context {
     }
 }
 
+/// Creates the collection over a credential store, the setup every
+/// auth-flow test drives through `get_auth`.
+fn models_with_credentials(credentials: Arc<dyn CredentialStore>) -> pi_ai::models::Models {
+    create_models(Some(pi_ai::models::CreateModelsOptions {
+        credentials: Some(credentials),
+        ..pi_ai::models::CreateModelsOptions::default()
+    }))
+}
+
+/// The counting-refresh workspace the refresh-counting tests share: an
+/// in-memory store, its collection, and the rotation counter.
+fn counting_workspace() -> (
+    pi_ai::models::Models,
+    Arc<dyn CredentialStore>,
+    Arc<Mutex<u32>>,
+) {
+    let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
+    let refreshes = Arc::new(Mutex::new(0));
+    let models = models_with_credentials(Arc::clone(&credentials));
+    (models, credentials, refreshes)
+}
+
+/// Creates the collection over a models store, the persistence setup the
+/// store-backed tests share.
+fn models_with_store(store: Arc<dyn ModelsStore>) -> pi_ai::models::Models {
+    create_models(Some(pi_ai::models::CreateModelsOptions {
+        models_store: Some(store),
+        ..pi_ai::models::CreateModelsOptions::default()
+    }))
+}
+
+/// Writes one fixed credential through the store's modify path, the setup
+/// write every auth-flow test performs; any stored entry is replaced.
+async fn store_credential(store: &dyn CredentialStore, provider_id: &str, credential: Credential) {
+    store
+        .modify(
+            provider_id,
+            Box::new(move |_current| Box::pin(async move { Ok(Some(credential)) })),
+            None,
+        )
+        .await
+        .expect("write");
+}
+
+/// The expired stored credential the refresh-lifecycle tests seed, with
+/// the remaining validity each scenario drives.
+fn old_token_credential(expires: i64) -> OAuthCredentials {
+    OAuthCredentials {
+        refresh: "r".to_owned(),
+        access: "old-token".to_owned(),
+        expires,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// The spent stored credential the refresh-failure tests seed, the state
+/// the failure paths must preserve.
+fn old_credential() -> OAuthCredentials {
+    OAuthCredentials {
+        refresh: "r".to_owned(),
+        access: "old".to_owned(),
+        expires: 0,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// Spawns the refresh so it starts polling before the caller cancels: a
+/// Rust future starts on first poll, the interleaving the abort tests
+/// race against.
+fn spawn_refresh(
+    models: &pi_ai::models::Models,
+    options: ModelsRefreshOptions,
+) -> tokio::task::JoinHandle<ModelsRefreshResult> {
+    let models = models.clone();
+    tokio::spawn(async move { models.refresh(Some(&options)).await })
+}
+
+/// Drives the abort race with the given refresh body: registers the
+/// dynamic provider, spawns, cancels the controller, joins, and pins the
+/// aborted-without-errors outcome, the shape both abort tests check.
+async fn expect_aborted_refresh(refresh: RefreshFn) {
+    let controller = CancellationToken::new();
+    let models = create_models(None);
+    register_refreshing(&models, "dynamic", refresh);
+    let pending = spawn_refresh(
+        &models,
+        ModelsRefreshOptions {
+            signal: Some(controller.clone()),
+            ..ModelsRefreshOptions::default()
+        },
+    );
+    controller.cancel();
+    let result = pending.await.expect("joined");
+    assert!(result.aborted);
+    assert_eq!(result.errors.len(), 0);
+}
+
+/// Publishes through the refresh context to completion and discards the
+/// accepted flag; the publication tests observe the update side effect,
+/// not the generation check.
+async fn publish_now(context: &RefreshModelsContext, publication: ModelsPublication) {
+    let _ = (context.publish)(publication).await.expect("publish");
+}
+
 fn env_key_auth(key: Option<&str>) -> ApiKeyAuth {
     let env_key = key.map(ToOwned::to_owned);
     let resolve: ApiKeyResolveFn = Arc::new(move |input: ApiKeyAuthInput| {
@@ -316,8 +456,35 @@ fn env_key_auth(key: Option<&str>) -> ApiKeyAuth {
     }
 }
 
+/// The auth block carrying only an api-key resolve against the ambient
+/// env, the setup most credential-path tests register.
+fn env_key_auth_only(key: Option<&str>) -> ProviderAuth {
+    ProviderAuth {
+        api_key: Some(env_key_auth(key)),
+        oauth: None,
+    }
+}
+
 fn test_oauth() -> OAuthAuth {
     test_oauth_with_refresh(None)
+}
+
+/// The auth block carrying only the OAuth flow, the shape every
+/// oauth-lifecycle test registers.
+fn oauth_auth_only(oauth: OAuthAuth) -> ProviderAuth {
+    ProviderAuth {
+        api_key: None,
+        oauth: Some(oauth),
+    }
+}
+
+/// Registers the p1 provider whose only auth is `oauth`, the registration
+/// every oauth-lifecycle test performs.
+fn register_oauth_p1(models: &pi_ai::models::Models, oauth: OAuthAuth) {
+    models.set_provider(test_provider(TestProviderInput {
+        auth: Some(oauth_auth_only(oauth)),
+        ..default_input("p1")
+    }));
 }
 
 /// The boxed auth failure an auth callback reports, matching the error type
@@ -368,41 +535,63 @@ fn test_oauth_with_refresh(refresh: Option<OAuthRefreshFn>) -> OAuthAuth {
         }),
     }
 }
+
+/// The OAuth refresh that counts rotations and issues a fresh one-hour
+/// token from the credential it receives, the probe the refresh-lifecycle
+/// tests assert against.
+fn counting_oauth_refresh(count: Arc<Mutex<u32>>) -> OAuthRefreshFn {
+    Arc::new(move |credential| {
+        let count = Arc::clone(&count);
+        Box::pin(async move {
+            *lock(&count) += 1;
+            Ok(OAuthCredentials {
+                refresh: credential.refresh,
+                access: "new-token".to_owned(),
+                expires: now_ms() + 60 * 60_000,
+                extra: credential.extra,
+            })
+        })
+    })
+}
+
+/// The counting-refresh setup the refresh-counting tests share: a p1
+/// provider whose oauth rotates a fresh one-hour token over an in-memory
+/// store, seeded with a credential of the given remaining validity.
+async fn setup_counting_oauth(seed_expires: i64) -> (pi_ai::models::Models, Arc<Mutex<u32>>) {
+    let (models, credentials, refreshes) = counting_workspace();
+    let oauth = test_oauth_with_refresh(Some(counting_oauth_refresh(Arc::clone(&refreshes))));
+    register_oauth_p1(&models, oauth);
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(old_token_credential(seed_expires)),
+    )
+    .await;
+    (models, refreshes)
+}
 #[tokio::test]
 async fn enumerates_credential_metadata_without_exposing_secrets() {
     let credentials = InMemoryCredentialStore::default();
-    credentials
-        .modify(
-            "api-provider",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::ApiKey(ApiKeyCredential {
-                        key: Some("secret".to_owned()),
-                        env: None,
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
-    credentials
-        .modify(
-            "oauth-provider",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "refresh".to_owned(),
-                        access: "access".to_owned(),
-                        expires: now_ms() + 60_000,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(
+        &credentials,
+        "api-provider",
+        Credential::ApiKey(ApiKeyCredential {
+            key: Some("secret".to_owned()),
+            env: None,
+        }),
+    )
+    .await;
+    store_credential(
+        &credentials,
+        "oauth-provider",
+        Credential::OAuth(OAuthCredentials {
+            refresh: "refresh".to_owned(),
+            access: "access".to_owned(),
+            expires: now_ms() + 60_000,
+            extra: BTreeMap::new(),
+        }),
+    )
+    .await;
 
     let listed = credentials.list(None).await.expect("list");
     expect_credential_list(
@@ -424,6 +613,29 @@ fn expect_credential_list(
         .map(|(provider_id, auth_type)| format!("{provider_id}={auth_type}"))
         .collect();
     assert_eq!(rendered, expected);
+}
+
+/// The model ids a listing returns, the shape the listing tests pin.
+fn listed_model_ids(listed: &[Model]) -> Vec<String> {
+    listed.iter().map(|model| model.id.clone()).collect()
+}
+
+/// The api key a provider-level auth resolution carries, the outcome the
+/// oauth-lifecycle tests pin.
+async fn resolved_api_key(models: &pi_ai::models::Models, provider_id: &str) -> Option<String> {
+    models
+        .get_auth(provider_id, None)
+        .await
+        .expect("auth")
+        .and_then(|result| result.auth.api_key)
+}
+
+/// Asserts the resolution failed with the wrapped auth [`ModelsError`],
+/// the outcome the wrapped-store-failure tests pin.
+fn expect_wrapped_auth_error(auth: Result<Option<AuthResult>, ModelsFailure>) {
+    assert!(
+        matches!(auth, Err(ModelsFailure::Models(error)) if error.code() == ModelsErrorCode::Auth)
+    );
 }
 
 #[tokio::test]
@@ -475,24 +687,8 @@ async fn applies_request_wide_pricing_tiers_above_the_configured_input_threshold
 #[tokio::test]
 async fn registers_replaces_and_deletes_providers() {
     let models = create_models(None);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p2",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    models.set_provider(test_provider(default_input("p1")));
+    models.set_provider(test_provider(default_input("p2")));
     assert_eq!(
         models
             .providers()
@@ -502,15 +698,7 @@ async fn registers_replaces_and_deletes_providers() {
         ["p1", "p2"]
     );
 
-    let replacement = test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
-    });
+    let replacement = test_provider(default_input("p1"));
     models.set_provider(Arc::clone(&replacement));
     assert!(Arc::ptr_eq(
         &replacement,
@@ -529,40 +717,16 @@ async fn registers_replaces_and_deletes_providers() {
 async fn lists_and_finds_models_per_provider() {
     let models = create_models(None);
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
         models: Some(vec![test_model("p1", "m1"), test_model("p1", "m2")]),
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("p1")
     }));
     models.set_provider(test_provider(TestProviderInput {
-        id: "p2",
         models: Some(vec![test_model("p2", "m3")]),
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("p2")
     }));
 
-    assert_eq!(
-        models
-            .models(None)
-            .iter()
-            .map(|model| model.id.clone())
-            .collect::<Vec<_>>(),
-        ["m1", "m2", "m3"]
-    );
-    assert_eq!(
-        models
-            .models(Some("p1"))
-            .iter()
-            .map(|model| model.id.clone())
-            .collect::<Vec<_>>(),
-        ["m1", "m2"]
-    );
+    assert_eq!(listed_model_ids(&models.models(None)), ["m1", "m2", "m3"]);
+    assert_eq!(listed_model_ids(&models.models(Some("p1"))), ["m1", "m2"]);
     assert_eq!(models.models(Some("nope")).len(), 0);
     assert_eq!(
         models.model("p2", "m3").map(|model| model.id),
@@ -588,32 +752,15 @@ async fn lists_and_finds_models_per_provider() {
 async fn swallows_provider_source_failures_for_both_listings() {
     let models = create_models(None);
     models.set_provider(test_provider(TestProviderInput {
-        id: "broken",
-        models: None,
         broken_models: true,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("broken")
     }));
     models.set_provider(test_provider(TestProviderInput {
-        id: "ok",
         models: Some(vec![test_model("ok", "m1")]),
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("ok")
     }));
 
-    assert_eq!(
-        models
-            .models(None)
-            .iter()
-            .map(|model| model.id.clone())
-            .collect::<Vec<_>>(),
-        ["m1"]
-    );
+    assert_eq!(listed_model_ids(&models.models(None)), ["m1"]);
     assert_eq!(models.models(Some("broken")), Vec::<Model>::new());
     // precise failures come from the provider directly
     let error = models.provider("broken").expect("registered").get_models();
@@ -632,84 +779,55 @@ async fn refresh_updates_dynamic_providers_and_reports_failures() {
     let refreshes_for_provider = Arc::clone(&refreshes);
     let list_for_get = Arc::clone(&list);
     models.set_provider(test_provider(TestProviderInput {
-        id: "dyn",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+        refresh: Some(refresh_future(move |context| {
             let list = Arc::clone(&list_for_refresh);
             let refreshes = Arc::clone(&refreshes_for_provider);
-            let context = context.clone();
             Box::pin(async move {
                 if !context.allow_network {
                     return Ok(());
                 }
-                *refreshes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-                let published = (context.publish)(ModelsPublication {
-                    persist: CatalogPersist::Omit,
-                    update: Some(Box::new(move || {
-                        *list
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            vec![test_model("dyn", "after")];
-                    })),
-                })
-                .await
-                .expect("publish");
-                let _ = published;
+                *lock(&refreshes) += 1;
+                publish_now(
+                    &context,
+                    ModelsPublication {
+                        persist: CatalogPersist::Omit,
+                        update: Some(Box::new(move || {
+                            *lock(&list) = vec![test_model("dyn", "after")];
+                        })),
+                    },
+                )
+                .await;
                 Ok(())
             })
         })),
-        calls: None,
-        get_models: Some(Arc::new(move || {
-            Ok(list_for_get
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone())
-        })),
+        get_models: Some(Arc::new(move || Ok(lock(&list_for_get).clone()))),
+        ..default_input("dyn")
     }));
     models.set_provider(test_provider(TestProviderInput {
-        id: "static",
         models: Some(vec![test_model("static", "s1")]),
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("static")
     }));
 
     assert!(models.model("dyn", "before").is_some());
     let first = models.refresh(None).await;
     assert_eq!(first.errors.len(), 0);
-    assert_eq!(
-        *refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        1
-    );
+    assert_eq!(*lock(&refreshes), 1);
     assert!(models.model("dyn", "after").is_some());
     assert!(models.model("dyn", "before").is_none());
 
     let models = create_models(None);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "flaky",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(|context: &RefreshModelsContext| {
-            let context = context.clone();
+    register_refreshing(
+        &models,
+        "flaky",
+        refresh_future(|context| {
             Box::pin(async move {
                 if context.allow_network {
                     return Err(std::io::Error::other("fetch failed").into());
                 }
                 Ok(())
             })
-        })),
-        calls: None,
-        get_models: None,
-    }));
+        }),
+    );
     let second = models.refresh(None).await;
     assert_eq!(
         second.errors.get("flaky").map(ToString::to_string),
@@ -724,32 +842,24 @@ async fn restricts_refresh_work_to_selected_providers() {
     for id in ["one", "two"] {
         let calls_for_provider = Arc::clone(&calls);
         let id_owned = id;
-        models.set_provider(test_provider(TestProviderInput {
-            id: id_owned,
-            models: None,
-            broken_models: false,
-            auth: None,
-            refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+        register_refreshing(
+            &models,
+            id_owned,
+            refresh_future(move |context| {
                 let calls = Arc::clone(&calls_for_provider);
-                let context = context.clone();
                 Box::pin(async move {
-                    calls
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(format!(
-                            "{id_owned}:{}",
-                            if context.allow_network {
-                                "network"
-                            } else {
-                                "cache"
-                            }
-                        ));
+                    lock(&calls).push(format!(
+                        "{id_owned}:{}",
+                        if context.allow_network {
+                            "network"
+                        } else {
+                            "cache"
+                        }
+                    ));
                     Ok(())
                 })
-            })),
-            calls: None,
-            get_models: None,
-        }));
+            }),
+        );
     }
 
     let result = models
@@ -760,12 +870,7 @@ async fn restricts_refresh_work_to_selected_providers() {
         .await;
 
     assert_eq!(result.errors.len(), 0);
-    assert_eq!(
-        *calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ["two:cache", "two:network"]
-    );
+    assert_eq!(*lock(&calls), ["two:cache", "two:network"]);
 }
 #[tokio::test]
 async fn restores_cached_models_before_waiting_for_network_auth() {
@@ -790,17 +895,11 @@ async fn restores_cached_models_before_waiting_for_network_auth() {
         let auth_started = Arc::clone(&auth_started);
         let finish_auth_holder = Arc::clone(&finish_auth_holder);
         Box::pin(async move {
-            let sender = auth_started
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let sender = lock(&auth_started).take();
             if let Some(sender) = sender {
                 let _ = sender.send(());
             }
-            let finish_auth = finish_auth_holder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let finish_auth = lock(&finish_auth_holder).take();
             if let Some(finish_auth) = finish_auth {
                 let _ = finish_auth.await;
             }
@@ -835,27 +934,19 @@ async fn restores_cached_models_before_waiting_for_network_auth() {
         api: ProviderApi::Single(unreachable_streams()),
         filter_models: None,
     });
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        models_store: Some(Arc::new(store)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_store(Arc::new(store));
     models.set_provider(Arc::new(provider));
     let controller = CancellationToken::new();
     // Porting restatement: upstream's promise starts eagerly; a Rust future
     // starts on first poll, so the interleaving needs a spawned task.
-    let pending = {
-        let models = models.clone();
-        let signal = controller.clone();
-        tokio::spawn(async move {
-            models
-                .refresh(Some(&ModelsRefreshOptions {
-                    providers: Some(vec!["dynamic".to_owned()]),
-                    signal: Some(signal),
-                    ..ModelsRefreshOptions::default()
-                }))
-                .await
-        })
-    };
+    let pending = spawn_refresh(
+        &models,
+        ModelsRefreshOptions {
+            providers: Some(vec!["dynamic".to_owned()]),
+            signal: Some(controller.clone()),
+            ..ModelsRefreshOptions::default()
+        },
+    );
     auth_started_receiver.await.expect("auth started");
 
     assert!(models.model("dynamic", "cached").is_some());
@@ -877,21 +968,15 @@ async fn lets_providers_choose_persistent_deletion_and_ephemeral_publication() {
         })));
     let store = shared_store(Arc::clone(&entry));
     let state: Arc<Mutex<String>> = Arc::new(Mutex::new("initial".to_owned()));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        models_store: Some(Arc::new(store)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_store(Arc::new(store));
     let state_for_refresh = Arc::clone(&state);
     let entry_for_refresh = Arc::clone(&entry);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "dynamic",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+    register_refreshing(
+        &models,
+        "dynamic",
+        refresh_future(move |context| {
             let state = Arc::clone(&state_for_refresh);
             let entry = Arc::clone(&entry_for_refresh);
-            let context = context.clone();
             Box::pin(async move {
                 assert_eq!(
                     context
@@ -901,49 +986,38 @@ async fn lets_providers_choose_persistent_deletion_and_ephemeral_publication() {
                         .map(|model| model.id.clone()),
                     Some("stored".to_owned())
                 );
-                let published = (context.publish)(ModelsPublication {
-                    persist: CatalogPersist::Delete,
-                    update: Some(Box::new({
-                        let entry = Arc::clone(&entry);
-                        let state = Arc::clone(&state);
-                        move || {
-                            assert!(
-                                entry
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .is_none()
-                            );
-                            *state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                "deleted".to_owned();
-                        }
-                    })),
-                })
-                .await
-                .expect("publish");
-                let _ = published;
-                let published = (context.publish)(ModelsPublication {
-                    persist: CatalogPersist::Omit,
-                    update: Some(Box::new({
-                        let state = Arc::clone(&state);
-                        move || {
-                            *state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                "ephemeral".to_owned();
-                        }
-                    })),
-                })
-                .await
-                .expect("publish");
-                let _ = published;
+                publish_now(
+                    &context,
+                    ModelsPublication {
+                        persist: CatalogPersist::Delete,
+                        update: Some(Box::new({
+                            let entry = Arc::clone(&entry);
+                            let state = Arc::clone(&state);
+                            move || {
+                                assert!(lock(&entry).is_none());
+                                *lock(&state) = "deleted".to_owned();
+                            }
+                        })),
+                    },
+                )
+                .await;
+                publish_now(
+                    &context,
+                    ModelsPublication {
+                        persist: CatalogPersist::Omit,
+                        update: Some(Box::new({
+                            let state = Arc::clone(&state);
+                            move || {
+                                *lock(&state) = "ephemeral".to_owned();
+                            }
+                        })),
+                    },
+                )
+                .await;
                 Ok(())
             })
-        })),
-        calls: None,
-        get_models: None,
-    }));
+        }),
+    );
 
     let result = models
         .refresh(Some(&ModelsRefreshOptions {
@@ -953,18 +1027,8 @@ async fn lets_providers_choose_persistent_deletion_and_ephemeral_publication() {
         .await;
 
     assert_eq!(result.errors.len(), 0);
-    assert!(
-        entry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_none()
-    );
-    assert_eq!(
-        *state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        "ephemeral"
-    );
+    assert!(lock(&entry).is_none());
+    assert_eq!(*lock(&state), "ephemeral");
 }
 
 /// A [`ModelsStore`] backed by a shared entry cell, upstream's inline
@@ -983,12 +1047,7 @@ impl ModelsStore for SharedModelsStore {
     ) -> BoxedFuture<'a, Result<Option<ModelsStoreEntry>, pi_ai::models_store::ModelsStoreError>>
     {
         let entry = Arc::clone(&self.0);
-        Box::pin(async move {
-            Ok(entry
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone())
-        })
+        Box::pin(async move { Ok(lock(&entry).clone()) })
     }
 
     fn write<'a>(
@@ -999,9 +1058,7 @@ impl ModelsStore for SharedModelsStore {
     ) -> BoxedFuture<'a, Result<(), pi_ai::models_store::ModelsStoreError>> {
         let slot = Arc::clone(&self.0);
         Box::pin(async move {
-            *slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry);
+            *lock(&slot) = Some(entry);
             Ok(())
         })
     }
@@ -1013,9 +1070,7 @@ impl ModelsStore for SharedModelsStore {
     ) -> BoxedFuture<'a, Result<(), pi_ai::models_store::ModelsStoreError>> {
         let slot = Arc::clone(&self.0);
         Box::pin(async move {
-            *slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *lock(&slot) = None;
             Ok(())
         })
     }
@@ -1023,21 +1078,15 @@ impl ModelsStore for SharedModelsStore {
 #[tokio::test]
 async fn persists_dynamic_catalogs_and_restores_them_without_network() {
     let credentials = InMemoryCredentialStore::default();
-    credentials
-        .modify(
-            "dynamic",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::ApiKey(ApiKeyCredential {
-                        key: Some("key".to_owned()),
-                        env: None,
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(
+        &credentials,
+        "dynamic",
+        Credential::ApiKey(ApiKeyCredential {
+            key: Some("key".to_owned()),
+            env: None,
+        }),
+    )
+    .await;
     let models_store: Arc<dyn ModelsStore> = Arc::new(InMemoryModelsStore::default());
 
     let create_dynamic_provider = |fetch: Option<FetchModelsGuard>| -> Arc<dyn Provider> {
@@ -1046,10 +1095,7 @@ async fn persists_dynamic_catalogs_and_restores_them_without_network() {
             name: None,
             base_url: None,
             headers: None,
-            auth: ProviderAuth {
-                api_key: Some(env_key_auth(None)),
-                oauth: None,
-            },
+            auth: env_key_auth_only(None),
             models: Vec::new(),
             fetch_models: fetch.map(|fetch| fetch.into_fetch_fn()),
             api: ProviderApi::Single(unreachable_streams()),
@@ -1070,10 +1116,7 @@ async fn persists_dynamic_catalogs_and_restores_them_without_network() {
     assert_eq!(fetched.count(), 1);
 
     // A fresh collection over the same store restores offline.
-    let offline = create_models(Some(pi_ai::models::CreateModelsOptions {
-        models_store: Some(Arc::clone(&models_store)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let offline = models_with_store(Arc::clone(&models_store));
     let never = FetchModelsGuard::default();
     offline.set_provider(create_dynamic_provider(Some(never.clone())));
     let offline_result = offline
@@ -1093,19 +1136,14 @@ struct FetchModelsGuard(Arc<Mutex<u32>>);
 
 impl FetchModelsGuard {
     fn count(&self) -> u32 {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        *lock(&self.0)
     }
 
     fn into_fetch_fn(self) -> pi_ai::models::FetchModelsFn {
         Arc::new(move |_context| {
             let guard = Arc::clone(&self.0);
             Box::pin(async move {
-                *guard
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                *lock(&guard) += 1;
                 Ok(vec![test_model("dynamic", "fetched")])
             })
         })
@@ -1121,57 +1159,34 @@ async fn passes_effective_credentials_and_skips_unconfigured_providers() {
     let credential_holder = Arc::clone(&effective_credential);
     let force_holder = Arc::clone(&force_refresh);
     models.set_provider(test_provider(TestProviderInput {
-        id: "configured",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(Some("ambient-key"))),
-            oauth: None,
-        }),
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+        auth: Some(env_key_auth_only(Some("ambient-key"))),
+        refresh: Some(refresh_future(move |context| {
             let credential_holder = Arc::clone(&credential_holder);
             let force_holder = Arc::clone(&force_holder);
-            let context = context.clone();
             Box::pin(async move {
                 if !context.allow_network {
                     return Ok(());
                 }
-                *credential_holder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    context.credential.clone();
-                *force_holder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = context.force;
+                *lock(&credential_holder) = context.credential.clone();
+                *lock(&force_holder) = context.force;
                 Ok(())
             })
         })),
-        calls: None,
-        get_models: None,
+        ..default_input("configured")
     }));
     let unconfigured_counter = Arc::clone(&unconfigured_refreshes);
     models.set_provider(test_provider(TestProviderInput {
-        id: "unconfigured",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(None)),
-            oauth: None,
-        }),
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+        auth: Some(env_key_auth_only(None)),
+        refresh: Some(refresh_future(move |context| {
             let counter = Arc::clone(&unconfigured_counter);
-            let context = context.clone();
             Box::pin(async move {
                 if context.allow_network {
-                    *counter
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                    *lock(&counter) += 1;
                 }
                 Ok(())
             })
         })),
-        calls: None,
-        get_models: None,
+        ..default_input("unconfigured")
     }));
 
     let result = models
@@ -1181,55 +1196,33 @@ async fn passes_effective_credentials_and_skips_unconfigured_providers() {
         }))
         .await;
     assert_eq!(result.errors.len(), 0);
-    let effective = effective_credential
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let effective = lock(&effective_credential).clone();
     assert!(matches!(
         effective,
         Some(Credential::ApiKey(ApiKeyCredential { key: Some(key), env: None }))
             if key == "ambient-key"
     ));
-    assert_eq!(
-        *force_refresh
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        Some(true)
-    );
-    assert_eq!(
-        *unconfigured_refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        0
-    );
+    assert_eq!(*lock(&force_refresh), Some(true));
+    assert_eq!(*lock(&unconfigured_refreshes), 0);
 }
 
 #[tokio::test]
 async fn refreshes_expired_oauth_before_refreshing_models() {
     let credentials = InMemoryCredentialStore::default();
-    credentials
-        .modify(
-            "oauth-dynamic",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "refresh".to_owned(),
-                        access: "expired".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(
+        &credentials,
+        "oauth-dynamic",
+        Credential::OAuth(OAuthCredentials {
+            refresh: "refresh".to_owned(),
+            access: "expired".to_owned(),
+            expires: 0,
+            extra: BTreeMap::new(),
+        }),
+    )
+    .await;
     let model_refresh_credential: Arc<Mutex<Option<Credential>>> = Arc::new(Mutex::new(None));
     let credential_holder = Arc::clone(&model_refresh_credential);
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::new(credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::new(credentials));
     let oauth = test_oauth_with_refresh(Some(Arc::new(|_credential| {
         Box::pin(async move {
             Ok(OAuthCredentials {
@@ -1241,36 +1234,22 @@ async fn refreshes_expired_oauth_before_refreshing_models() {
         })
     })));
     models.set_provider(test_provider(TestProviderInput {
-        id: "oauth-dynamic",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+        auth: Some(oauth_auth_only(oauth)),
+        refresh: Some(refresh_future(move |context| {
             let holder = Arc::clone(&credential_holder);
-            let context = context.clone();
             Box::pin(async move {
                 if context.allow_network {
-                    *holder
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        context.credential.clone();
+                    *lock(&holder) = context.credential.clone();
                 }
                 Ok(())
             })
         })),
-        calls: None,
-        get_models: None,
+        ..default_input("oauth-dynamic")
     }));
 
     let result = models.refresh(None).await;
     assert_eq!(result.errors.len(), 0);
-    let recorded = model_refresh_credential
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let recorded = lock(&model_refresh_credential).clone();
     let Some(Credential::OAuth(recorded)) = recorded else {
         panic!("expected the refreshed oauth credential to reach the model refresh");
     };
@@ -1283,32 +1262,21 @@ async fn always_gives_providers_a_concrete_signal() {
     let received: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
     let holder = Arc::clone(&received);
     let models = create_models(None);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "dynamic",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+    register_refreshing(
+        &models,
+        "dynamic",
+        refresh_future(move |context| {
             let holder = Arc::clone(&holder);
-            let context = context.clone();
             Box::pin(async move {
-                *holder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(context.signal.clone());
+                *lock(&holder) = Some(context.signal.clone());
                 Ok(())
             })
-        })),
-        calls: None,
-        get_models: None,
-    }));
+        }),
+    );
 
     let result = models.refresh(None).await;
     assert!(!result.aborted);
-    let received_signal = received
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let received_signal = lock(&received).clone();
     assert!(received_signal.is_some());
     assert!(!received_signal.unwrap().is_cancelled());
 }
@@ -1323,44 +1291,31 @@ async fn binds_model_store_waits_to_the_provider_refresh_signal() {
     });
     let provider_signal: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
     let signal_holder = Arc::clone(&provider_signal);
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        models_store: Some(Arc::clone(&store)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_store(Arc::clone(&store));
     models.set_provider(test_provider(TestProviderInput {
-        id: "dynamic",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(Some("key"))),
-            oauth: None,
-        }),
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+        auth: Some(env_key_auth_only(Some("key"))),
+        refresh: Some(refresh_future(move |context| {
             let holder = Arc::clone(&signal_holder);
-            let context = context.clone();
             Box::pin(async move {
-                *holder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(context.signal.clone());
+                *lock(&holder) = Some(context.signal.clone());
                 if !context.allow_network {
                     return Ok(());
                 }
-                let published = (context.publish)(ModelsPublication {
-                    persist: CatalogPersist::Write(ModelsStoreEntry {
-                        models: vec![test_model("dynamic", "fresh")],
-                        ..ModelsStoreEntry::default()
-                    }),
-                    update: None,
-                })
-                .await
-                .expect("publish");
-                let _ = published;
+                publish_now(
+                    &context,
+                    ModelsPublication {
+                        persist: CatalogPersist::Write(ModelsStoreEntry {
+                            models: vec![test_model("dynamic", "fresh")],
+                            ..ModelsStoreEntry::default()
+                        }),
+                        update: None,
+                    },
+                )
+                .await;
                 Ok(())
             })
         })),
-        calls: None,
-        get_models: None,
+        ..default_input("dynamic")
     }));
 
     let result = models
@@ -1371,15 +1326,9 @@ async fn binds_model_store_waits_to_the_provider_refresh_signal() {
         .await;
 
     assert_eq!(result.errors.len(), 0);
-    let recorded = storage_signals
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let recorded = lock(&storage_signals).clone();
     assert_eq!(recorded.len(), 3);
-    let provider_signal = provider_signal
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let provider_signal = lock(&provider_signal).clone();
     let Some(provider_signal) = provider_signal else {
         panic!("the provider refresh always carries a signal");
     };
@@ -1392,6 +1341,18 @@ struct RecordingStore {
     inner: Arc<InMemoryModelsStore>,
 }
 
+impl RecordingStore {
+    /// Records the signal each operation receives; the test asserts all
+    /// three ops share the refresh signal.
+    fn record(&self, options: Option<&ModelsStoreOptions>) {
+        if let Some(options) = options
+            && let Some(signal) = &options.signal
+        {
+            lock(&self.signals).push(signal.clone());
+        }
+    }
+}
+
 impl ModelsStore for RecordingStore {
     fn read<'a>(
         &'a self,
@@ -1399,14 +1360,7 @@ impl ModelsStore for RecordingStore {
         options: Option<&'a ModelsStoreOptions>,
     ) -> BoxedFuture<'a, Result<Option<ModelsStoreEntry>, pi_ai::models_store::ModelsStoreError>>
     {
-        if let Some(options) = options
-            && let Some(signal) = &options.signal
-        {
-            self.signals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(signal.clone());
-        }
+        self.record(options);
         self.inner.read(provider_id, options)
     }
 
@@ -1416,14 +1370,7 @@ impl ModelsStore for RecordingStore {
         entry: ModelsStoreEntry,
         options: Option<&'a ModelsStoreOptions>,
     ) -> BoxedFuture<'a, Result<(), pi_ai::models_store::ModelsStoreError>> {
-        if let Some(options) = options
-            && let Some(signal) = &options.signal
-        {
-            self.signals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(signal.clone());
-        }
+        self.record(options);
         self.inner.write(provider_id, entry, options)
     }
 
@@ -1432,179 +1379,93 @@ impl ModelsStore for RecordingStore {
         provider_id: &'a str,
         options: Option<&'a ModelsStoreOptions>,
     ) -> BoxedFuture<'a, Result<(), pi_ai::models_store::ModelsStoreError>> {
-        if let Some(options) = options
-            && let Some(signal) = &options.signal
-        {
-            self.signals
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(signal.clone());
-        }
+        self.record(options);
         self.inner.delete(provider_id, options)
     }
 }
 #[tokio::test]
 async fn returns_aborted_state_without_reporting_cancellation_as_error() {
-    let controller = CancellationToken::new();
-    let models = create_models(None);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "dynamic",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(|context: &RefreshModelsContext| {
-            let context = context.clone();
-            Box::pin(async move {
-                if context.signal.is_cancelled() {
-                    return Ok(());
-                }
-                Ok(())
-            })
-        })),
-        calls: None,
-        get_models: None,
-    }));
-
-    let pending = {
-        let models = models.clone();
-        let signal = controller.clone();
-        tokio::spawn(async move {
-            models
-                .refresh(Some(&ModelsRefreshOptions {
-                    signal: Some(signal),
-                    ..ModelsRefreshOptions::default()
-                }))
-                .await
+    expect_aborted_refresh(refresh_future(|context| {
+        Box::pin(async move {
+            if context.signal.is_cancelled() {
+                return Ok(());
+            }
+            Ok(())
         })
-    };
-    controller.cancel();
-    let result = pending.await.expect("joined");
-    assert!(result.aborted);
-    assert_eq!(result.errors.len(), 0);
+    }))
+    .await;
 }
 
 #[tokio::test]
 async fn stops_waiting_on_abort_when_a_provider_ignores_its_signal() {
-    let controller = CancellationToken::new();
-    let models = create_models(None);
     let calls = Arc::new(Mutex::new(0));
     let calls_holder = Arc::clone(&calls);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "dynamic",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
-            let calls = Arc::clone(&calls_holder);
-            let context = context.clone();
-            Box::pin(async move {
-                *calls
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-                // A non-cooperative provider parks on its own work; the
-                // runtime's drop-on-abort stops waiting regardless.
-                let _ = context;
-                Ok(())
-            })
-        })),
-        calls: None,
-        get_models: None,
-    }));
-
-    let pending = {
-        let models = models.clone();
-        let signal = controller.clone();
-        tokio::spawn(async move {
-            models
-                .refresh(Some(&ModelsRefreshOptions {
-                    signal: Some(signal),
-                    ..ModelsRefreshOptions::default()
-                }))
-                .await
+    expect_aborted_refresh(refresh_future(move |context| {
+        let calls = Arc::clone(&calls_holder);
+        Box::pin(async move {
+            *lock(&calls) += 1;
+            // A non-cooperative provider parks on its own work; the
+            // runtime's drop-on-abort stops waiting regardless.
+            let _ = context;
+            Ok(())
         })
-    };
-    controller.cancel();
-    let result = pending.await.expect("joined");
-    assert!(result.aborted);
-    assert_eq!(result.errors.len(), 0);
+    }))
+    .await;
 }
 
 #[tokio::test]
 async fn rejects_late_publication_from_a_superseded_provider() {
     let store = InMemoryModelsStore::default();
     let state: Arc<Mutex<String>> = Arc::new(Mutex::new("initial".to_owned()));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        models_store: Some(Arc::new(store)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_store(Arc::new(store));
     let state_for_refresh = Arc::clone(&state);
     let calls = Arc::new(Mutex::new(0));
     let calls_for_provider = Arc::clone(&calls);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "dynamic",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: Some(Arc::new(move |context: &RefreshModelsContext| {
+    register_refreshing(
+        &models,
+        "dynamic",
+        refresh_future(move |context| {
             let state = Arc::clone(&state_for_refresh);
             let calls = Arc::clone(&calls_for_provider);
-            let context = context.clone();
             Box::pin(async move {
                 if !context.allow_network {
                     return Ok(());
                 }
                 let current = {
-                    let mut calls = calls
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *calls += 1;
-                    *calls
+                    *lock(&calls) += 1;
+                    *lock(&calls)
                 };
                 let value = format!("generation-{current}");
-                let published = (context.publish)(ModelsPublication {
-                    persist: CatalogPersist::Write(ModelsStoreEntry {
-                        models: vec![test_model("dynamic", &value)],
-                        ..ModelsStoreEntry::default()
-                    }),
-                    update: Some(Box::new({
-                        let state = Arc::clone(&state);
-                        move || {
-                            *state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = value.clone();
-                        }
-                    })),
-                })
-                .await
-                .expect("publish");
-                let _ = published;
+                publish_now(
+                    &context,
+                    ModelsPublication {
+                        persist: CatalogPersist::Write(ModelsStoreEntry {
+                            models: vec![test_model("dynamic", &value)],
+                            ..ModelsStoreEntry::default()
+                        }),
+                        update: Some(Box::new({
+                            let state = Arc::clone(&state);
+                            move || {
+                                *lock(&state) = value.clone();
+                            }
+                        })),
+                    },
+                )
+                .await;
                 Ok(())
             })
-        })),
-        calls: None,
-        get_models: None,
-    }));
+        }),
+    );
 
-    let first = {
-        let models = models.clone();
-        tokio::spawn(async move { models.refresh(None).await })
-    };
+    let first = spawn_refresh(&models, ModelsRefreshOptions::default());
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    let second = {
-        let models = models.clone();
-        tokio::spawn(async move { models.refresh(None).await })
-    };
+    let second = spawn_refresh(&models, ModelsRefreshOptions::default());
     let second = second.await.expect("joined");
     let first = first.await.expect("joined");
     assert_eq!(second.errors.len(), 0);
     assert_eq!(first.errors.len(), 0);
 
-    assert_eq!(
-        *state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        "generation-2"
-    );
+    assert_eq!(*lock(&state), "generation-2");
 }
 
 #[tokio::test]
@@ -1614,16 +1475,11 @@ async fn passes_caller_signals_to_provider_auth_callbacks() {
     let holder = Arc::clone(&received);
     let models = create_models(None);
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
         auth: Some(ProviderAuth {
             api_key: Some(signal_auth(holder)),
             oauth: None,
         }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("p1")
     }));
 
     let options = AuthOptions {
@@ -1649,10 +1505,7 @@ async fn passes_caller_signals_to_provider_auth_callbacks() {
         .await
         .expect("login");
 
-    let signals = received
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
+    let signals = lock(&received).clone();
     assert_eq!(signals.len(), 3);
     assert!(signals.iter().all(|signal| signal == &controller));
 }
@@ -1666,10 +1519,7 @@ fn signal_auth(holder: Arc<Mutex<Vec<CancellationToken>>>) -> ApiKeyAuth {
             move |interaction: pi_ai::auth::types::ProviderAuthInteraction| {
                 let holder = Arc::clone(&login_holder);
                 Box::pin(async move {
-                    holder
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(interaction.signal.clone());
+                    lock(&holder).push(interaction.signal.clone());
                     Ok(ApiKeyCredential {
                         key: Some("saved".to_owned()),
                         env: None,
@@ -1682,10 +1532,7 @@ fn signal_auth(holder: Arc<Mutex<Vec<CancellationToken>>>) -> ApiKeyAuth {
             move |input: ApiKeyAuthInput| {
                 let holder = Arc::clone(&holder);
                 Box::pin(async move {
-                    holder
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(input.signal.clone());
+                    lock(&holder).push(input.signal.clone());
                     Ok(Some(pi_ai::auth::types::AuthCheck {
                         source: None,
                         auth_type: AuthType::ApiKey,
@@ -1696,10 +1543,7 @@ fn signal_auth(holder: Arc<Mutex<Vec<CancellationToken>>>) -> ApiKeyAuth {
         resolve: Arc::new(move |input: ApiKeyAuthInput| {
             let holder = Arc::clone(&holder);
             Box::pin(async move {
-                holder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(input.signal.clone());
+                lock(&holder).push(input.signal.clone());
                 Ok(Some(AuthResult {
                     auth: ModelAuth {
                         api_key: Some("resolved".to_owned()),
@@ -1735,10 +1579,7 @@ async fn cancels_queued_credential_mutations_without_running_them_later() {
         Box::new(move |_current| {
             let finish_holder = Arc::clone(&finish_holder);
             Box::pin(async move {
-                let sender = finish_holder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
+                let sender = lock(&finish_holder).take();
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
@@ -1758,10 +1599,7 @@ async fn cancels_queued_credential_mutations_without_running_them_later() {
     let second = credentials.modify(
         "p1",
         Box::new(move |_current| {
-            let done = second_holder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let done = lock(&second_holder).take();
             Box::pin(async move {
                 if let Some(done) = done {
                     let _ = done.send(true);
@@ -1799,23 +1637,10 @@ async fn passes_cancellation_to_oauth_refresh_and_preserves_the_previous_credent
         expires: 0,
         extra: BTreeMap::new(),
     };
-    let stored_previous = previous.clone();
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move { Ok(Some(Credential::OAuth(stored_previous))) })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(credentials.as_ref(), "p1", Credential::OAuth(previous)).await;
     let received_signal: Arc<Mutex<Option<CancellationToken>>> = Arc::new(Mutex::new(None));
     let signal_holder = Arc::clone(&received_signal);
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::clone(&credentials));
     let oauth = test_oauth_with_refresh(Some(Arc::new(move |_credential| {
         let signal_holder = Arc::clone(&signal_holder);
         Box::pin(async move {
@@ -1825,18 +1650,7 @@ async fn passes_cancellation_to_oauth_refresh_and_preserves_the_previous_credent
             pending_refresh().await
         })
     })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    register_oauth_p1(&models, oauth);
     let controller = CancellationToken::new();
     let pending = {
         let models = models.clone();
@@ -1877,21 +1691,13 @@ async fn pending_refresh() -> Result<OAuthCredentials, Box<dyn std::error::Error
 #[tokio::test]
 async fn resolves_auth_stored_credential_owns_the_provider() {
     let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::clone(&credentials));
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
         auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(Some("env-key"))),
             oauth: Some(test_oauth()),
+            ..env_key_auth_only(Some("env-key"))
         }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("p1")
     }));
     let model = test_model("p1", "model-a");
 
@@ -1905,11 +1711,7 @@ async fn resolves_auth_stored_credential_owns_the_provider() {
         Some("env-key".to_owned())
     );
     assert_eq!(
-        models
-            .get_auth("p1", None)
-            .await
-            .expect("auth")
-            .and_then(|result| result.auth.api_key),
+        resolved_api_key(&models, "p1").await,
         Some("env-key".to_owned())
     );
     assert_eq!(
@@ -1929,26 +1731,19 @@ async fn resolves_auth_stored_credential_owns_the_provider() {
 
     // stored oauth credential (persisted via the single write path): beats
     // ambient env
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "oauth-token".to_owned(),
-                        expires: now_ms() + 10 * 60_000,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
-    let resolution = models.get_auth("p1", None).await.expect("auth");
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(OAuthCredentials {
+            refresh: "r".to_owned(),
+            access: "oauth-token".to_owned(),
+            expires: now_ms() + 10 * 60_000,
+            extra: BTreeMap::new(),
+        }),
+    )
+    .await;
     assert_eq!(
-        resolution.and_then(|result| result.auth.api_key),
+        resolved_api_key(&models, "p1").await,
         Some("oauth-token".to_owned())
     );
 
@@ -1957,74 +1752,39 @@ async fn resolves_auth_stored_credential_owns_the_provider() {
 }
 #[tokio::test]
 async fn checks_provider_auth_without_refreshing_and_filters_available() {
-    let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let refreshes = Arc::new(Mutex::new(0));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let (models, credentials, refreshes) = counting_workspace();
     let refresh_count = Arc::clone(&refreshes);
     models.set_provider(test_provider(TestProviderInput {
-        id: "ambient",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(Some("env-key"))),
-            oauth: None,
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        auth: Some(env_key_auth_only(Some("env-key"))),
+        ..default_input("ambient")
     }));
     models.set_provider(test_provider(TestProviderInput {
-        id: "missing",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(None)),
-            oauth: None,
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        auth: Some(env_key_auth_only(None)),
+        ..default_input("missing")
     }));
     models.set_provider(test_provider(TestProviderInput {
-        id: "oauth",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(test_oauth_with_refresh(Some(Arc::new(move |credential| {
+        auth: Some(oauth_auth_only(test_oauth_with_refresh(Some(Arc::new(
+            move |credential| {
                 let count = Arc::clone(&refresh_count);
                 Box::pin(async move {
-                    *count
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+                    *lock(&count) += 1;
                     Ok(credential)
                 })
-            })))),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+            },
+        ))))),
+        ..default_input("oauth")
     }));
-    credentials
-        .modify(
-            "oauth",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "refresh".to_owned(),
-                        access: "expired".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(
+        credentials.as_ref(),
+        "oauth",
+        Credential::OAuth(OAuthCredentials {
+            refresh: "refresh".to_owned(),
+            access: "expired".to_owned(),
+            expires: 0,
+            extra: BTreeMap::new(),
+        }),
+    )
+    .await;
 
     let ambient = models.check_auth("ambient", None).await.expect("check");
     assert_eq!(
@@ -2043,12 +1803,7 @@ async fn checks_provider_auth_without_refreshing_and_filters_available() {
         oauth.map(|check| (check.source, check.auth_type)),
         Some((Some("OAuth".to_owned()), AuthType::OAuth))
     );
-    assert_eq!(
-        *refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        0
-    );
+    assert_eq!(*lock(&refreshes), 0);
 
     let available = models.available(None, None).await.expect("available");
     assert_eq!(
@@ -2076,10 +1831,7 @@ async fn runs_provider_login_and_logout_through_the_credential_store() {
     let credentials = InMemoryCredentialStore::default();
     let login_resolve: ApiKeyResolveFn =
         Arc::new(|_input: ApiKeyAuthInput| Box::pin(async move { Ok(None) }));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::new(credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::new(credentials));
     let logged_in_key = env_key_auth(None);
     let logged_in = {
         let mut logged_in = logged_in_key.clone();
@@ -2095,16 +1847,11 @@ async fn runs_provider_login_and_logout_through_the_credential_store() {
     };
     let _ = login_resolve;
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
         auth: Some(ProviderAuth {
             api_key: Some(logged_in),
             oauth: None,
         }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("p1")
     }));
 
     let credential = models
@@ -2127,40 +1874,23 @@ async fn runs_provider_login_and_logout_through_the_credential_store() {
 #[tokio::test]
 async fn stored_credential_without_a_matching_handler_blocks_ambient_fallback() {
     let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::clone(&credentials));
     // provider has only apiKey auth, but an oauth credential is stored
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(Some("env-key"))),
-            oauth: None,
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        auth: Some(env_key_auth_only(Some("env-key"))),
+        ..default_input("p1")
     }));
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "a".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(OAuthCredentials {
+            refresh: "r".to_owned(),
+            access: "a".to_owned(),
+            expires: 0,
+            extra: BTreeMap::new(),
+        }),
+    )
+    .await;
 
     assert!(models.get_auth("p1", None).await.expect("auth").is_none());
 }
@@ -2181,39 +1911,16 @@ async fn refreshes_expired_oauth_and_persists_the_rotated_credential() {
             })
         })
     })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "old-token".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    register_oauth_p1(&models, oauth);
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(old_token_credential(0)),
+    )
+    .await;
 
-    let resolution = models.get_auth("p1", None).await.expect("auth");
     assert_eq!(
-        resolution.and_then(|result| result.auth.api_key),
+        resolved_api_key(&models, "p1").await,
         Some("new-token".to_owned())
     );
     let stored = credentials.read("p1", None).await.expect("read");
@@ -2225,122 +1932,18 @@ async fn refreshes_expired_oauth_and_persists_the_rotated_credential() {
 
 #[tokio::test]
 async fn refreshes_oauth_with_less_than_five_minutes_remaining() {
-    let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let refreshes = Arc::new(Mutex::new(0));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
-    let refresh_count = Arc::clone(&refreshes);
-    let oauth = test_oauth_with_refresh(Some(Arc::new(move |credential| {
-        let count = Arc::clone(&refresh_count);
-        Box::pin(async move {
-            *count
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-            Ok(OAuthCredentials {
-                refresh: credential.refresh,
-                access: "new-token".to_owned(),
-                expires: now_ms() + 60 * 60_000,
-                extra: credential.extra,
-            })
-        })
-    })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "old-token".to_owned(),
-                        expires: now_ms() + 60_000,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    let (models, refreshes) = setup_counting_oauth(now_ms() + 60_000).await;
 
-    let resolution = models.get_auth("p1", None).await.expect("auth");
     assert_eq!(
-        resolution.and_then(|result| result.auth.api_key),
+        resolved_api_key(&models, "p1").await,
         Some("new-token".to_owned())
     );
-    assert_eq!(
-        *refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        1
-    );
+    assert_eq!(*lock(&refreshes), 1);
 }
 
 #[tokio::test]
 async fn honors_a_callers_longer_oauth_minimum_validity() {
-    let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let refreshes = Arc::new(Mutex::new(0));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
-    let refresh_count = Arc::clone(&refreshes);
-    let oauth = test_oauth_with_refresh(Some(Arc::new(move |credential| {
-        let count = Arc::clone(&refresh_count);
-        Box::pin(async move {
-            *count
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-            Ok(OAuthCredentials {
-                refresh: credential.refresh,
-                access: "new-token".to_owned(),
-                expires: now_ms() + 60 * 60_000,
-                extra: credential.extra,
-            })
-        })
-    })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "old-token".to_owned(),
-                        expires: now_ms() + 10 * 60_000,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    let (models, refreshes) = setup_counting_oauth(now_ms() + 10 * 60_000).await;
 
     let resolution = models
         .get_auth(
@@ -2356,53 +1959,23 @@ async fn honors_a_callers_longer_oauth_minimum_validity() {
         resolution.and_then(|result| result.auth.api_key),
         Some("new-token".to_owned())
     );
-    assert_eq!(
-        *refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        1
-    );
+    assert_eq!(*lock(&refreshes), 1);
 }
 
 #[tokio::test]
 async fn rejects_with_oauth_code_when_refresh_fails_and_preserves_the_credential() {
     let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::clone(&credentials));
     let oauth = test_oauth_with_refresh(Some(Arc::new(|_credential| {
         Box::pin(async move { Err(fail_error("invalid_grant")) })
     })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "old".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    register_oauth_p1(&models, oauth);
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(old_credential()),
+    )
+    .await;
 
     let auth = models.get_auth("p1", None).await;
     let Err(ModelsFailure::Models(error)) = auth else {
@@ -2420,36 +1993,25 @@ async fn rejects_with_oauth_code_when_refresh_fails_and_preserves_the_credential
 #[tokio::test]
 async fn serializes_concurrent_oauth_refreshes_through_store_modify() {
     let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r1".to_owned(),
-                        access: "old".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(OAuthCredentials {
+            refresh: "r1".to_owned(),
+            access: "old".to_owned(),
+            expires: 0,
+            extra: BTreeMap::new(),
+        }),
+    )
+    .await;
 
     let refreshes = Arc::new(Mutex::new(0));
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(Arc::clone(&credentials));
     let refresh_count = Arc::clone(&refreshes);
     let oauth = test_oauth_with_refresh(Some(Arc::new(move |_credential| {
         let count = Arc::clone(&refresh_count);
         Box::pin(async move {
-            *count
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *lock(&count) += 1;
             // Mirror upstream's 10ms pause inside the refresh: the second
             // caller must wait under the store lock.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2461,30 +2023,14 @@ async fn serializes_concurrent_oauth_refreshes_through_store_modify() {
             })
         })
     })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    register_oauth_p1(&models, oauth);
     let model = test_model("p1", "model-a");
 
     let (a, b) = tokio::join!(
         models.get_auth_for_model(&model, None),
         models.get_auth_for_model(&model, None),
     );
-    assert_eq!(
-        *refreshes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        1
-    );
+    assert_eq!(*lock(&refreshes), 1);
     assert_eq!(
         a.expect("auth").and_then(|result| result.auth.api_key),
         Some("new-1".to_owned())
@@ -2499,56 +2045,31 @@ async fn valid_oauth_tokens_resolve_without_touching_modify() {
     // The setup write lands on the inner store so the counting wrapper sees
     // only the calls the resolution makes, upstream's `base` split.
     let base: Arc<InMemoryCredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    base.modify(
+    store_credential(
+        base.as_ref(),
         "p1",
-        Box::new(move |_current| {
-            Box::pin(async move {
-                Ok(Some(Credential::OAuth(OAuthCredentials {
-                    refresh: "r".to_owned(),
-                    access: "valid".to_owned(),
-                    expires: now_ms() + 10 * 60_000,
-                    extra: BTreeMap::new(),
-                })))
-            })
+        Credential::OAuth(OAuthCredentials {
+            refresh: "r".to_owned(),
+            access: "valid".to_owned(),
+            expires: now_ms() + 10 * 60_000,
+            extra: BTreeMap::new(),
         }),
-        None,
     )
-    .await
-    .expect("write");
+    .await;
     let modifies = Arc::new(Mutex::new(0));
     let modifies_count = Arc::clone(&modifies);
     let credentials: Arc<dyn CredentialStore> = Arc::new(CountingStore {
         inner: Arc::clone(&base),
         modifies: modifies_count,
     });
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(test_oauth()),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    let models = models_with_credentials(Arc::clone(&credentials));
+    register_oauth_p1(&models, test_oauth());
 
-    let resolution = models.get_auth("p1", None).await.expect("auth");
     assert_eq!(
-        resolution.and_then(|result| result.auth.api_key),
+        resolved_api_key(&models, "p1").await,
         Some("valid".to_owned())
     );
-    assert_eq!(
-        *modifies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        0
-    );
+    assert_eq!(*lock(&modifies), 0);
 }
 
 /// The credential store that counts `modify` calls, upstream's inline
@@ -2583,10 +2104,7 @@ impl CredentialStore for CountingStore {
         f: pi_ai::auth::types::CredentialModifyFn,
         options: Option<&'a AuthOptions>,
     ) -> BoxedFuture<'a, Result<Option<Credential>, Box<dyn std::error::Error + Send + Sync>>> {
-        *self
-            .modifies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        *lock(&self.modifies) += 1;
         self.inner.modify(provider_id, f, options)
     }
 
@@ -2602,50 +2120,21 @@ impl CredentialStore for CountingStore {
 #[tokio::test]
 async fn wraps_credential_store_failures_in_models_error() {
     // read failure
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(read_fail_store()),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    let models = models_with_credentials(read_fail_store());
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: Some(env_key_auth(Some("env-key"))),
-            oauth: None,
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        auth: Some(env_key_auth_only(Some("env-key"))),
+        ..default_input("p1")
     }));
     let auth = models.get_auth("p1", None).await;
-    assert!(
-        matches!(auth, Err(ModelsFailure::Models(error)) if error.code() == ModelsErrorCode::Auth)
-    );
+    expect_wrapped_auth_error(auth);
 
     // modify failure during refresh
-    let oauth_models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::new(FailingCredentialStore {
-            fail_on: FailureKind::Modify,
-        })),
-        ..pi_ai::models::CreateModelsOptions::default()
+    let oauth_models = models_with_credentials(Arc::new(FailingCredentialStore {
+        fail_on: FailureKind::Modify,
     }));
-    oauth_models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(test_oauth()),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    register_oauth_p1(&oauth_models, test_oauth());
     let auth = oauth_models.get_auth("p1", None).await;
-    assert!(
-        matches!(auth, Err(ModelsFailure::Models(error)) if error.code() == ModelsErrorCode::Auth)
-    );
+    expect_wrapped_auth_error(auth);
 }
 
 fn read_fail_store() -> Arc<dyn CredentialStore> {
@@ -2728,42 +2217,17 @@ impl CredentialStore for FailingCredentialStore {
 #[tokio::test]
 async fn keeps_the_underlying_reason_in_wrapped_oauth_refresh_errors() {
     let credentials: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    credentials
-        .modify(
-            "p1",
-            Box::new(move |_current| {
-                Box::pin(async move {
-                    Ok(Some(Credential::OAuth(OAuthCredentials {
-                        refresh: "r".to_owned(),
-                        access: "old".to_owned(),
-                        expires: 0,
-                        extra: BTreeMap::new(),
-                    })))
-                })
-            }),
-            None,
-        )
-        .await
-        .expect("write");
-    let models = create_models(Some(pi_ai::models::CreateModelsOptions {
-        credentials: Some(Arc::clone(&credentials)),
-        ..pi_ai::models::CreateModelsOptions::default()
-    }));
+    store_credential(
+        credentials.as_ref(),
+        "p1",
+        Credential::OAuth(old_credential()),
+    )
+    .await;
+    let models = models_with_credentials(Arc::clone(&credentials));
     let oauth = test_oauth_with_refresh(Some(Arc::new(|_credential| {
         Box::pin(async move { Err(fail_error("token refresh failed (400): invalid_grant")) })
     })));
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: Some(ProviderAuth {
-            api_key: None,
-            oauth: Some(oauth),
-        }),
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    register_oauth_p1(&models, oauth);
 
     let auth = models.get_auth("p1", None).await;
     let Err(ModelsFailure::Models(error)) = auth else {
@@ -2787,21 +2251,14 @@ async fn wraps_api_key_auth_failures_in_models_error() {
     };
     let models = create_models(None);
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
         auth: Some(ProviderAuth {
             api_key: Some(failing),
             oauth: None,
         }),
-        refresh: None,
-        calls: None,
-        get_models: None,
+        ..default_input("p1")
     }));
     let auth = models.get_auth("p1", None).await;
-    assert!(
-        matches!(auth, Err(ModelsFailure::Models(error)) if error.code() == ModelsErrorCode::Auth)
-    );
+    expect_wrapped_auth_error(auth);
 }
 
 #[tokio::test]
@@ -2836,9 +2293,6 @@ async fn uses_explicit_request_api_key_and_env_during_resolution() {
     });
     let models = create_models(None);
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
         auth: Some(ProviderAuth {
             api_key: Some(ApiKeyAuth {
                 name: "Scoped".to_owned(),
@@ -2848,9 +2302,8 @@ async fn uses_explicit_request_api_key_and_env_during_resolution() {
             }),
             oauth: None,
         }),
-        refresh: None,
         calls: Some(Arc::clone(&calls_holder)),
-        get_models: None,
+        ..default_input("p1")
     }));
     let model = test_model("p1", "model-a");
 
@@ -2866,9 +2319,7 @@ async fn uses_explicit_request_api_key_and_env_during_resolution() {
         .await;
     assert_eq!(complete.stop_reason, StopReason::Stop);
 
-    let recorded = calls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recorded = lock(&calls);
     assert_eq!(recorded[0].model.base_url, "https://example.test/acct");
     assert_eq!(
         recorded[0]
@@ -2915,9 +2366,6 @@ async fn merges_resolved_auth_into_stream_options() {
     });
     let models = create_models(None);
     models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
         auth: Some(ProviderAuth {
             api_key: Some(ApiKeyAuth {
                 name: "Test".to_owned(),
@@ -2927,9 +2375,8 @@ async fn merges_resolved_auth_into_stream_options() {
             }),
             oauth: None,
         }),
-        refresh: None,
         calls: Some(Arc::clone(&calls_holder)),
-        get_models: None,
+        ..default_input("p1")
     }));
     let model = test_model("p1", "model-a");
 
@@ -2955,9 +2402,7 @@ async fn merges_resolved_auth_into_stream_options() {
         .await;
     assert_eq!(result.stop_reason, StopReason::Stop);
     let recorded = {
-        let recorded = calls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let recorded = lock(&calls);
         (
             recorded.len(),
             recorded[0]
@@ -2983,9 +2428,7 @@ async fn merges_resolved_auth_into_stream_options() {
     // without explicit options, resolved auth applies
     let result2 = models.complete_simple(&model, &context(), None).await;
     assert_eq!(result2.stop_reason, StopReason::Stop);
-    let recorded2 = calls
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let recorded2 = lock(&calls);
     assert_eq!(
         recorded2[1]
             .options
@@ -3016,15 +2459,7 @@ fn error_message(message: &AssistantMessage) -> String {
 #[tokio::test]
 async fn streams_through_the_provider() {
     let models = create_models(None);
-    models.set_provider(test_provider(TestProviderInput {
-        id: "p1",
-        models: None,
-        broken_models: false,
-        auth: None,
-        refresh: None,
-        calls: None,
-        get_models: None,
-    }));
+    models.set_provider(test_provider(default_input("p1")));
     let model = test_model("p1", "model-a");
 
     let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -3034,31 +2469,20 @@ async fn streams_through_the_provider() {
         while let Some(event) = stream.next().await {
             match event {
                 pi_ai::types::AssistantMessageEvent::Start { .. } => {
-                    events_holder_lock(&events_holder).push("start".to_owned());
+                    lock(&events_holder).push("start".to_owned());
                 }
                 pi_ai::types::AssistantMessageEvent::Done { .. } => {
-                    events_holder_lock(&events_holder).push("done".to_owned());
+                    lock(&events_holder).push("done".to_owned());
                 }
                 pi_ai::types::AssistantMessageEvent::Error { .. } => {
-                    events_holder_lock(&events_holder).push("error".to_owned());
+                    lock(&events_holder).push("error".to_owned());
                 }
                 _ => {}
             }
         }
     });
     drain.await.expect("drain");
-    assert_eq!(
-        *events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        ["start", "done"]
-    );
-}
-
-fn events_holder_lock(events: &Arc<Mutex<Vec<String>>>) -> std::sync::MutexGuard<'_, Vec<String>> {
-    events
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    assert_eq!(*lock(&events), ["start", "done"]);
 }
 
 use pi_ai::models::ModelsSimpleStreamOptions;
