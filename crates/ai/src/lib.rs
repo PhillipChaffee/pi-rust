@@ -44,6 +44,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod cli;
 pub mod env_api_keys;
 pub mod http;
 pub mod image_models;
