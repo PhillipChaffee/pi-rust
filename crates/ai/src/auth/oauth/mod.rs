@@ -1,5 +1,6 @@
-//! The OAuth flows, ported from `packages/ai/src/auth/oauth/` at commit
-//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
+//! The OAuth flow loader seam and the per-provider flows, ported from
+//! `packages/ai/src/auth/oauth/load.ts` and `packages/ai/src/auth/oauth/` at
+//! commit `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
 //! One flow per provider subscription login: PKCE-with-callback for
 //! Anthropic, OpenAI Codex, OpenRouter, and Radius; device-code for xAI,
@@ -10,20 +11,24 @@
 //! Porting restatements this module tree records:
 //!
 //! - `load.ts`'s bundler-opaque dynamic imports have no Rust counterpart —
-//!   the flows are statically linked, so [`load`] exposes direct
-//!   constructors and the `registerBundledOAuthFlowLoaders` hook collapses.
+//!   the flows are statically linked, so the loaders are direct constructors
+//!   and the `registerBundledOAuthFlowLoaders` hook collapses with the
+//!   providers' `lazyOAuth` wrappers.
 //! - The per-flow `node:http` callback servers share [`callback`]'s
 //!   hand-rolled responder; each flow keeps its routing and settle rules.
 //! - `PI_OAUTH_CALLBACK_HOST` and `KIMI_CODE_OAUTH_HOST`/`KIMI_OAUTH_HOST`
 //!   still resolve through [`crate::utils::provider_env`], like upstream's
 //!   `getProviderEnvValue` reads.
+//! - The flows build the closure-based [`OAuthAuth`](crate::auth::types::OAuthAuth)
+//!   the merged auth core resolves through: each flow type keeps its
+//!   `login`/`refresh`/`to_auth` logic as inherent methods and
+//!   [`FlowType::auth`] wires them into the callback fields.
 
 pub mod anthropic;
 pub mod callback;
 pub mod device_code;
 pub mod github_copilot;
 pub mod kimi_coding;
-pub mod load;
 pub mod oauth_page;
 pub mod openai_codex;
 pub mod openrouter;
@@ -31,10 +36,149 @@ pub mod pkce;
 pub mod radius;
 pub mod xai;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::auth::types::AuthError;
+use crate::auth::clock::SystemClock;
+use crate::auth::oauth::anthropic::AnthropicOAuth;
+use crate::auth::oauth::github_copilot::{GitHubCopilotOAuth, KnownModels};
+use crate::auth::oauth::kimi_coding::KimiCodingOAuth;
+use crate::auth::oauth::openai_codex::OpenAICodexOAuth;
+use crate::auth::oauth::openrouter::OpenRouterOAuth;
+use crate::auth::oauth::radius::RadiusOAuth;
+use crate::auth::oauth::xai::XaiOAuth;
+use crate::auth::types::{AuthError, OAuthAuth, OAuthCredentials};
 use crate::http::{HttpError, HttpMethod, HttpRequest};
+use crate::types::{BoxedFuture, JsonValue};
+
+/// The failure an OAuth flow step reports, upstream's thrown plain `Error`s:
+/// the message is the contract the flows' rejections carry.
+#[derive(Debug)]
+pub(crate) struct FlowError(String);
+
+impl std::fmt::Display for FlowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlowError {}
+
+/// The auth error a flow step rejects with: a boxed message error whose
+/// `Display` is the reason.
+pub(crate) fn auth_error(message: impl Into<String>) -> AuthError {
+    Box::new(FlowError(message.into()))
+}
+
+/// An OAuth credential with the three wire fields set, the shape every flow
+/// mints and rotates.
+#[must_use]
+pub(crate) fn oauth_credentials(
+    access: impl Into<String>,
+    refresh: impl Into<String>,
+    expires: i64,
+) -> OAuthCredentials {
+    OAuthCredentials {
+        refresh: refresh.into(),
+        access: access.into(),
+        expires,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// An extra field held as a JSON string, the shape flows store and read
+/// `scope`, `enterpriseUrl`, and `accountId` with.
+pub(crate) fn extra_string<'a>(
+    extra: &'a BTreeMap<String, JsonValue>,
+    key: &str,
+) -> Option<&'a str> {
+    extra.get(key).and_then(JsonValue::as_str)
+}
+
+/// The options of [`load_radius_oauth`], upstream's loadRadiusOAuth argument.
+#[derive(Debug)]
+pub struct RadiusOAuthOptions {
+    /// Display name.
+    pub name: String,
+    /// Gateway URL the flow authenticates against.
+    pub gateway: String,
+}
+
+/// Loads the Anthropic (Claude Pro/Max) OAuth flow, upstream's
+/// `loadAnthropicOAuth`.
+#[must_use]
+pub fn load_anthropic_oauth() -> BoxedFuture<'static, OAuthAuth> {
+    Box::pin(async move {
+        AnthropicOAuth::new(crate::http::default_http_client(), Arc::new(SystemClock)).auth()
+    })
+}
+
+/// Loads the OpenAI (`ChatGPT` Plus/Pro) OAuth flow, upstream's
+/// `loadOpenAICodexOAuth`.
+#[must_use]
+pub fn load_openai_codex_oauth() -> BoxedFuture<'static, OAuthAuth> {
+    Box::pin(async move {
+        OpenAICodexOAuth::new(crate::http::default_http_client(), Arc::new(SystemClock)).auth()
+    })
+}
+
+/// Loads the GitHub Copilot OAuth flow, upstream's `loadGitHubCopilotOAuth`,
+/// with the known-model membership its policy updates check derived from the
+/// committed `github-copilot` catalog.
+#[must_use]
+pub fn load_github_copilot_oauth() -> BoxedFuture<'static, OAuthAuth> {
+    Box::pin(async move {
+        GitHubCopilotOAuth::new(
+            crate::http::default_http_client(),
+            Arc::new(SystemClock),
+            copilot_known_models(),
+        )
+        .auth()
+    })
+}
+
+/// The known-model membership from the generated `github-copilot` catalog,
+/// upstream's `Object.hasOwn(GITHUB_COPILOT_MODELS, id)` test: a model id is
+/// known when the builtin catalog lists it under any API group.
+fn copilot_known_models() -> KnownModels {
+    Arc::new(|model_id: &str| {
+        crate::providers::catalog::get_builtin_model("github-copilot", model_id).is_some()
+    })
+}
+
+/// Loads the OpenRouter OAuth flow, upstream's `loadOpenRouterOAuth`.
+#[must_use]
+pub fn load_openrouter_oauth() -> BoxedFuture<'static, OAuthAuth> {
+    Box::pin(async move {
+        OpenRouterOAuth::new(crate::http::default_http_client()).auth()
+    })
+}
+
+/// Loads the Kimi Code (subscription) OAuth flow, upstream's
+/// `loadKimiCodingOAuth`.
+#[must_use]
+pub fn load_kimi_coding_oauth() -> BoxedFuture<'static, OAuthAuth> {
+    Box::pin(async move { KimiCodingOAuth::new(crate::http::default_http_client()).auth() })
+}
+
+/// Loads the xAI (Grok/X subscription) OAuth flow, upstream's `loadXaiOAuth`.
+#[must_use]
+pub fn load_xai_oauth() -> BoxedFuture<'static, OAuthAuth> {
+    Box::pin(async move {
+        XaiOAuth::new(crate::http::default_http_client(), Arc::new(SystemClock)).auth()
+    })
+}
+
+/// Loads the Radius OAuth flow, upstream's `loadRadiusOAuth`.
+#[must_use]
+pub fn load_radius_oauth(options: &RadiusOAuthOptions) -> BoxedFuture<'static, OAuthAuth> {
+    let name = options.name.clone();
+    let gateway = options.gateway.clone();
+    Box::pin(async move {
+        RadiusOAuth::new(name, gateway, crate::http::default_http_client(), Arc::new(SystemClock))
+            .auth()
+    })
+}
 
 /// Build a form-encoded POST request, upstream's
 /// `fetch(url, { method: "POST", headers, body: new URLSearchParams(..) })`.
@@ -105,7 +249,7 @@ pub(crate) async fn execute(
     request: HttpRequest,
 ) -> Result<crate::http::HttpResponse, AuthError> {
     client.execute(request).await.map_err(|error| {
-        AuthError(match &error {
+        auth_error(match &error {
             HttpError::Aborted => device_code::LOGIN_CANCELLED_MESSAGE.to_owned(),
             other => other.to_string(),
         })
@@ -124,12 +268,12 @@ pub(crate) async fn read_json(
         .body
         .next_chunk()
         .await
-        .map_err(|error| AuthError(error.to_string()))?
+        .map_err(|error| auth_error(error.to_string()))?
     {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes)
-        .map_err(|error| AuthError(format!("invalid JSON response: {error}")))
+        .map_err(|error| auth_error(format!("invalid JSON response: {error}")))
 }
 
 /// Read one response body to a string, swallowing read failures with an
@@ -153,7 +297,7 @@ pub(crate) fn json_object(
 ) -> Result<serde_json::Map<String, serde_json::Value>, AuthError> {
     match value {
         serde_json::Value::Object(map) => Ok(map),
-        _ => Err(AuthError(message.to_owned())),
+        _ => Err(auth_error(message.to_owned())),
     }
 }
 
@@ -168,7 +312,7 @@ pub(crate) fn required_string(
 ) -> Result<String, AuthError> {
     match body.get(field) {
         Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(value.clone()),
-        _ => Err(AuthError(format!("Invalid OAuth response field: {field}"))),
+        _ => Err(auth_error(format!("Invalid OAuth response field: {field}"))),
     }
 }
 
@@ -244,7 +388,7 @@ fn query_value(url: &url::Url, name: &str) -> Option<String> {
 /// A random RFC 4122 version-4 UUID, upstream's `crypto.randomUUID`.
 pub(crate) fn random_uuid_v4() -> Result<String, AuthError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| AuthError(format!("getrandom failed: {error}")))?;
+    getrandom::fill(&mut bytes).map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(format!(

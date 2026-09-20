@@ -23,12 +23,12 @@ use crate::auth::oauth::callback::{
 };
 use crate::auth::oauth::oauth_page::{oauth_error_html, oauth_success_html};
 use crate::auth::oauth::pkce::generate_pkce;
-use crate::auth::oauth::{execute, json_post_request, random_uuid_v4};
-use crate::auth::types::{
-    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, BoxAuthFuture, ModelAuth,
-    OAuthAuth, OAuthCredential, ProviderAuthInteraction,
+use crate::auth::oauth::{
+    auth_error, execute, json_post_request, oauth_credentials, random_uuid_v4,
 };
+use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, AuthPromptKind, ModelAuth, OAuthCredentials};
 use crate::http::HttpClient;
+use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
 const AUTHORIZE_URL: &str = "https://openrouter.ai/auth";
@@ -121,9 +121,9 @@ async fn exchange_authorization_code(
     code: &str,
     verifier: &str,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     if signal.is_cancelled() {
-        return Err(AuthError(CANCELLED_MESSAGE.to_owned()));
+        return Err(auth_error(CANCELLED_MESSAGE.to_owned()));
     }
     let body = serde_json::json!({
         "code": code,
@@ -141,13 +141,13 @@ async fn exchange_authorization_code(
         Ok(response) => response,
         Err(error) => {
             if signal.is_cancelled() {
-                return Err(AuthError(CANCELLED_MESSAGE.to_owned()));
+                return Err(auth_error(CANCELLED_MESSAGE.to_owned()));
             }
-            return Err(AuthError(
-                if error.0 == crate::http::HttpError::Timeout.to_string() {
+            return Err(auth_error(
+                if error.to_string() == crate::http::HttpError::Timeout.to_string() {
                     EXCHANGE_TIMEOUT_MESSAGE.to_owned()
                 } else {
-                    error.0
+                    error.to_string()
                 },
             ));
         }
@@ -160,10 +160,10 @@ async fn exchange_authorization_code(
         Ok(_) => serde_json::Map::new(),
         Err(_) => {
             if signal.is_cancelled() {
-                return Err(AuthError(CANCELLED_MESSAGE.to_owned()));
+                return Err(auth_error(CANCELLED_MESSAGE.to_owned()));
             }
             if (200..300).contains(&status) {
-                return Err(AuthError(
+                return Err(auth_error(
                     "OpenRouter OAuth returned invalid JSON".to_owned(),
                 ));
             }
@@ -173,7 +173,7 @@ async fn exchange_authorization_code(
 
     if !(200..300).contains(&status) {
         let detail = error_detail(&body);
-        return Err(AuthError(detail.map_or_else(
+        return Err(auth_error(detail.map_or_else(
             || format!("OpenRouter OAuth key exchange failed (HTTP {status})"),
             |detail| format!("OpenRouter OAuth key exchange failed (HTTP {status}): {detail}"),
         )));
@@ -184,11 +184,11 @@ async fn exchange_authorization_code(
         .and_then(Value::as_str)
         .filter(|key| !key.is_empty())
     else {
-        return Err(AuthError(
+        return Err(auth_error(
             "OpenRouter OAuth response carries no \"key\"".to_owned(),
         ));
     };
-    Ok(OAuthCredential::new(key, "", MAX_SAFE_INTEGER_MS))
+    Ok(oauth_credentials(key, "", MAX_SAFE_INTEGER_MS))
 }
 
 /// The shared handler state: whether a callback claimed the exchange and
@@ -203,8 +203,8 @@ struct CallbackState {
 /// `finish`.
 async fn finish(
     state: &tokio::sync::Mutex<CallbackState>,
-    wait_cell: &WaitCell<Result<OAuthCredential, AuthError>>,
-    result: Option<Result<OAuthCredential, AuthError>>,
+    wait_cell: &WaitCell<Result<OAuthCredentials, AuthError>>,
+    result: Option<Result<OAuthCredentials, AuthError>>,
 ) {
     let mut state = state.lock().await;
     if state.settled {
@@ -234,14 +234,14 @@ async fn start_callback_server(
     (
         OAuthCallbackServer,
         Arc<tokio::sync::Mutex<CallbackState>>,
-        WaitCell<Result<OAuthCredential, AuthError>>,
-        tokio::sync::oneshot::Receiver<Option<Result<OAuthCredential, AuthError>>>,
+        WaitCell<Result<OAuthCredentials, AuthError>>,
+        tokio::sync::oneshot::Receiver<Option<Result<OAuthCredentials, AuthError>>>,
         String,
     ),
     AuthError,
 > {
     let callback_host = callback_host();
-    let (wait_cell, receiver) = WaitCell::<Result<OAuthCredential, AuthError>>::new();
+    let (wait_cell, receiver) = WaitCell::<Result<OAuthCredentials, AuthError>>::new();
     let state = Arc::new(tokio::sync::Mutex::new(CallbackState::default()));
     let callback_path = callback_path.to_owned();
     let verifier = verifier.to_owned();
@@ -282,7 +282,7 @@ async fn start_callback_server(
                     state.settled = true;
                     drop(state);
                     wait_cell
-                        .settle(Some(Err(AuthError(format!(
+                        .settle(Some(Err(auth_error(format!(
                             "OpenRouter authorization failed: {description}"
                         )))))
                         .await;
@@ -314,7 +314,7 @@ async fn start_callback_server(
                         }
                     }
                     Err(error) => {
-                        let message = error.0.clone();
+                        let message = error.to_string();
                         wait_cell.settle(Some(Err(error))).await;
                         CallbackResponse {
                             status: 502,
@@ -343,10 +343,10 @@ async fn start_callback_server(
 /// errors.
 async fn login_openrouter(
     client: &Arc<dyn HttpClient>,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
     if interaction.signal.is_cancelled() {
-        return Err(AuthError(CANCELLED_MESSAGE.to_owned()));
+        return Err(auth_error(CANCELLED_MESSAGE.to_owned()));
     }
     let pkce = generate_pkce()?;
     let callback_path = format!("/oauth/callback/{}", random_uuid_v4()?);
@@ -355,15 +355,16 @@ async fn login_openrouter(
 
     let manual_abort = CancellationToken::new();
     let manual_prompt = AuthPrompt {
-        kind: AuthPromptKind::ManualCode,
-        message:
-            "Complete sign-in in your browser, or paste the authorization code / redirect URL here:"
-                .to_owned(),
-        placeholder: Some(callback_url.clone()),
         signal: Some(manual_abort.clone()),
+        kind: AuthPromptKind::ManualCode {
+            message:
+                "Complete sign-in in your browser, or paste the authorization code / redirect URL here:"
+                    .to_owned(),
+            placeholder: Some(callback_url.clone()),
+        },
     };
 
-    interaction.notify(AuthEvent::Progress {
+    (interaction.notify)(AuthEvent::Progress {
         message: format!("Listening for OpenRouter OAuth callback on {callback_url}"),
     });
     let authorize_query = url::form_urlencoded::Serializer::new(String::new())
@@ -371,7 +372,7 @@ async fn login_openrouter(
         .append_pair("code_challenge", &pkce.challenge)
         .append_pair("code_challenge_method", "S256")
         .finish();
-    interaction.notify(AuthEvent::AuthUrl {
+    (interaction.notify)(AuthEvent::AuthUrl {
         url: format!("{AUTHORIZE_URL}?{authorize_query}"),
         instructions: Some(
             "Complete sign-in in your browser. If the browser is on another machine, paste the final redirect URL here."
@@ -387,7 +388,7 @@ async fn login_openrouter(
         let state = Arc::clone(&state);
         let wait_cell = wait_cell.clone();
         async move {
-            let result = interaction.prompt(manual_prompt).await;
+            let result = (interaction.prompt)(manual_prompt).await;
             if !state.lock().await.claimed {
                 finish(&state, &wait_cell, None).await;
             }
@@ -395,29 +396,29 @@ async fn login_openrouter(
         }
     });
 
-    let result: Result<OAuthCredential, AuthError> = tokio::select! {
+    let result: Result<OAuthCredentials, AuthError> = tokio::select! {
         () = interaction.signal.cancelled() => {
             mark_settled(&state).await;
-            Err(AuthError(CANCELLED_MESSAGE.to_owned()))
+            Err(auth_error(CANCELLED_MESSAGE.to_owned()))
         }
         () = tokio::time::sleep(Duration::from_millis(LOGIN_TIMEOUT_MS)) => {
             mark_settled(&state).await;
-            Err(AuthError("OpenRouter OAuth login timed out".to_owned()))
+            Err(auth_error("OpenRouter OAuth login timed out".to_owned()))
         }
         callback_outcome = receiver => match callback_outcome.unwrap_or(None) {
             Some(outcome) => outcome,
             None => match manual.await {
                 Ok(Ok(input)) => match parse_authorization_input(&input) {
                     Some(code) => {
-                        interaction.notify(AuthEvent::Progress {
+                        (interaction.notify)(AuthEvent::Progress {
                             message: "Exchanging authorization code for an API key...".to_owned(),
                         });
                         exchange_authorization_code(client, &code, &pkce.verifier, &interaction.signal).await
                     }
-                    None => Err(AuthError("Missing authorization code".to_owned())),
+                    None => Err(auth_error("Missing authorization code".to_owned())),
                 },
-                Ok(Err(error)) => Err(error),
-                Err(join_error) => Err(AuthError(join_error.to_string())),
+                Ok(Err(error)) => Err(AuthError::from(error)),
+                Err(join_error) => Err(auth_error(join_error.to_string())),
             },
         },
     };
@@ -426,37 +427,63 @@ async fn login_openrouter(
     result
 }
 
-impl OAuthAuth for OpenRouterOAuth {
-    #[expect(
-        clippy::unnecessary_literal_bound,
-        reason = "the trait signature ties the returned str to &self; the name is a constant"
-    )]
-    fn name(&self) -> &str {
-        "OpenRouter OAuth"
-    }
-
-    fn login_label(&self) -> Option<&str> {
-        Some("Sign in with OpenRouter")
-    }
-
-    fn login(
+impl OpenRouterOAuth {
+    /// Run the interactive login flow.
+    pub fn login(
         &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = Arc::clone(&self.client);
         Box::pin(async move { login_openrouter(&client, &interaction).await })
     }
 
-    fn refresh(
+    /// Refresh is a no-op: the credential is a permanent, user-controlled API
+    /// key.
+    pub fn refresh(
         &self,
-        credential: &OAuthCredential,
+        credential: OAuthCredentials,
         _signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let credential = credential.clone();
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         Box::pin(async move { Ok(credential) })
     }
 
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        ModelAuth::api_key(credential.access.clone())
+    /// Derive the request auth from the permanent key.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
+        ModelAuth {
+            api_key: Some(credential.access.clone()),
+            ..ModelAuth::default()
+        }
+    }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own client. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let client = Arc::clone(&self.client);
+            Arc::new(move |interaction| {
+                let flow = Self::new(Arc::clone(&client));
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn =
+            Arc::new(|credential, _signal| Box::pin(async move { Ok(credential) }));
+        let to_auth: crate::auth::types::OAuthToAuthFn = Arc::new(|credential| {
+            let auth = ModelAuth {
+                api_key: Some(credential.access.clone()),
+                ..ModelAuth::default()
+            };
+            Box::pin(async move { Ok(auth) })
+        });
+        crate::auth::types::OAuthAuth {
+            name: "OpenRouter OAuth".to_owned(),
+            is_subscription: None,
+            login_label: Some("Sign in with OpenRouter".to_owned()),
+            login,
+            refresh,
+            to_auth,
+        }
     }
 }

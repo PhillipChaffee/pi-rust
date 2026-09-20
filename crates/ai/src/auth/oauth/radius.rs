@@ -19,12 +19,15 @@ use crate::auth::oauth::callback::{
 use crate::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
 use crate::auth::oauth::oauth_page::{oauth_error_html, oauth_success_html};
 use crate::auth::oauth::pkce::generate_pkce;
-use crate::auth::oauth::{execute, form_post_request, random_uuid_v4, read_body_lossy, read_json};
+use crate::auth::oauth::{
+    auth_error, execute, form_post_request, oauth_credentials, random_uuid_v4, read_body_lossy,
+    read_json,
+};
 use crate::auth::types::{
-    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
-    BoxAuthFuture, ModelAuth, OAuthAuth, OAuthCredential, ProviderAuthInteraction,
+    AuthError, AuthEvent, AuthPrompt, AuthPromptKind, ModelAuth, OAuthCredentials,
 };
 use crate::http::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
+use crate::types::BoxedFuture;
 
 const CALLBACK_HOST: &str = "127.0.0.1";
 const CALLBACK_PORT: u16 = 1456;
@@ -92,10 +95,10 @@ impl RadiusOAuth {
 /// `new URL(path, gateway)`.
 fn gateway_url(gateway: &str, path: &str) -> Result<String, AuthError> {
     let base = url::Url::parse(gateway)
-        .map_err(|error| AuthError(format!("invalid Radius gateway URL {gateway}: {error}")))?;
+        .map_err(|error| auth_error(format!("invalid Radius gateway URL {gateway}: {error}")))?;
     let joined = base
         .join(path)
-        .map_err(|error| AuthError(format!("invalid Radius gateway path {path}: {error}")))?;
+        .map_err(|error| auth_error(format!("invalid Radius gateway path {path}: {error}")))?;
     Ok(joined.to_string())
 }
 
@@ -118,7 +121,7 @@ async fn load_radius_oauth_discovery(
     let status = response.status;
     if !(200..300).contains(&status) {
         let text = read_body_lossy(&mut response).await;
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "Could not load Radius OAuth config from {gateway}: {status} {text}"
         )));
     }
@@ -127,7 +130,7 @@ async fn load_radius_oauth_discovery(
         .get("authorizationEndpoint")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| AuthError(format!("Invalid Radius OAuth config from {gateway}")))
+        .ok_or_else(|| auth_error(format!("Invalid Radius OAuth config from {gateway}")))
 }
 
 /// A structured OAuth error response, upstream's `OAuthResponseError`: the
@@ -146,7 +149,7 @@ struct OAuthResponseError {
 
 impl std::fmt::Display for OAuthResponseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message.0)
+        write!(f, "{}", self.message)
     }
 }
 
@@ -167,7 +170,7 @@ impl OAuthResponseError {
         Self {
             status,
             oauth_error,
-            message: AuthError(format!("{message}: {detail}")),
+            message: auth_error(format!("{message}: {detail}")),
         }
     }
 }
@@ -219,7 +222,7 @@ async fn request_oauth_token(
     gateway: &str,
     fields: Vec<(String, String)>,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, RadiusTokenError> {
+) -> Result<OAuthCredentials, RadiusTokenError> {
     let request = form_post_request(
         &gateway_url(gateway, "/v1/oauth/token").map_err(RadiusTokenError::Other)?,
         &[("Accept", "application/json")],
@@ -240,7 +243,7 @@ async fn request_oauth_token(
     let data = read_json(&mut response)
         .await
         .map_err(RadiusTokenError::Other)?;
-    let mut credential = OAuthCredential::new(
+    let mut credential = oauth_credentials(
         data.get("access_token")
             .and_then(Value::as_str)
             .unwrap_or_default(),
@@ -256,9 +259,11 @@ async fn request_oauth_token(
             .saturating_mul(1000)
             - TOKEN_EXPIRY_SKEW_MS,
     );
-    data.get("scope")
-        .and_then(Value::as_str)
-        .inspect(|scope| credential.set_extra_string("scope", *scope));
+    if let Some(scope) = data.get("scope").and_then(Value::as_str) {
+        credential
+            .extra
+            .insert("scope".to_owned(), Value::String(scope.to_owned()));
+    }
     Ok(credential)
 }
 
@@ -321,8 +326,8 @@ async fn login_with_browser(
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
     gateway: &str,
     authorization_endpoint: &str,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
     let pkce = generate_pkce()?;
     let state = random_uuid_v4()?;
     let authorize_query = url::form_urlencoded::Serializer::new(String::new())
@@ -348,10 +353,10 @@ async fn login_with_browser(
             wait_cell.settle(None).await;
         }
     });
-    interaction.notify(AuthEvent::Progress {
+    (interaction.notify)(AuthEvent::Progress {
         message: format!("Listening for OAuth callback on {REDIRECT_URI}"),
     });
-    interaction.notify(AuthEvent::AuthUrl {
+    (interaction.notify)(AuthEvent::AuthUrl {
         url: authorize_url,
         instructions: Some("Continue in your browser.".to_owned()),
     });
@@ -361,9 +366,9 @@ async fn login_with_browser(
     server.close();
     let Some(code) = code else {
         if interaction.signal.is_cancelled() {
-            return Err(AuthError("Login cancelled".to_owned()));
+            return Err(auth_error("Login cancelled".to_owned()));
         }
-        return Err(AuthError("OAuth callback did not complete.".to_owned()));
+        return Err(auth_error("OAuth callback did not complete.".to_owned()));
     };
 
     request_oauth_token(
@@ -381,7 +386,7 @@ async fn login_with_browser(
     )
     .await
     .map_err(|error| match error {
-        RadiusTokenError::Response(response_error) => AuthError(response_error.to_string()),
+        RadiusTokenError::Response(response_error) => auth_error(response_error.to_string()),
         RadiusTokenError::Other(auth_error) => auth_error,
     })
 }
@@ -420,7 +425,7 @@ async fn request_device_authorization(
     let mut response = execute(client, request).await?;
     let status = response.status;
     if !(200..300).contains(&status) {
-        return Err(AuthError(
+        return Err(auth_error(
             read_oauth_response_error(&mut response, "Radius OAuth device authorization failed")
                 .await
                 .to_string(),
@@ -451,7 +456,7 @@ async fn request_device_authorization(
     let (Some(device_code), Some(user_code), Some(verification_uri), Some(expires_in_seconds)) =
         (device_code, user_code, verification_uri, expires_in_seconds)
     else {
-        return Err(AuthError(
+        return Err(auth_error(
             "Radius OAuth device authorization response is missing required fields".to_owned(),
         ));
     };
@@ -472,17 +477,17 @@ async fn login_with_device_code(
     client: &Arc<dyn HttpClient>,
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
     gateway: &str,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
     let device = request_device_authorization(client, gateway, &interaction.signal).await?;
-    interaction.notify(AuthEvent::DeviceCode {
+    (interaction.notify)(AuthEvent::DeviceCode {
         user_code: device.user_code.clone(),
         verification_uri: device.verification_uri.clone(),
         interval_seconds: device.interval_seconds,
         expires_in_seconds: Some(device.expires_in_seconds),
     });
 
-    poll_oauth_device_code_flow::<OAuthCredential>(PollOptions {
+    poll_oauth_device_code_flow::<OAuthCredentials>(PollOptions {
         interval_seconds: device.interval_seconds,
         expires_in_seconds: Some(device.expires_in_seconds),
         wait_before_first_poll: false,
@@ -529,7 +534,7 @@ async fn login_with_device_code(
                                 Some("access_denied") => Ok(PollOutcome::Failed(
                                     "Device authorization was denied.".to_owned(),
                                 )),
-                                _ => Err(AuthError(error.to_string())),
+                                _ => Err(auth_error(error.to_string())),
                             }
                         }
                         Err(RadiusTokenError::Other(error)) => Err(error),
@@ -541,38 +546,39 @@ async fn login_with_device_code(
     .await
 }
 
-impl OAuthAuth for RadiusOAuth {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn login(
+impl RadiusOAuth {
+    /// Run the interactive login flow: pick the browser or device-code path.
+    pub fn login(
         &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let name = self.name.clone();
         let gateway = self.gateway.clone();
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
         Box::pin(async move {
-            let login_method = interaction
-                .prompt(AuthPrompt::new(
-                    AuthPromptKind::Select(vec![
-                        AuthSelectOption {
+            let login_method = (interaction
+                .prompt)(AuthPrompt {
+                signal: None,
+                kind: AuthPromptKind::Select {
+                    message: format!("Sign in to {name}:"),
+                    options: vec![
+                        crate::auth::types::AuthPromptOption {
                             id: LOGIN_METHOD_BROWSER.to_owned(),
                             label: "Sign in with browser (recommended)".to_owned(),
                             description: None,
                         },
-                        AuthSelectOption {
+                        crate::auth::types::AuthPromptOption {
                             id: LOGIN_METHOD_DEVICE_CODE.to_owned(),
                             label: "Sign in with device code (when signing in from another device)"
                                 .to_owned(),
                             description: None,
                         },
-                    ]),
-                    format!("Sign in to {name}:"),
-                ))
-                .await?;
+                    ],
+                },
+            })
+            .await
+            .map_err(AuthError::from)?;
             if login_method == LOGIN_METHOD_DEVICE_CODE {
                 return login_with_device_code(&client, &clock, &gateway, &interaction).await;
             }
@@ -588,17 +594,18 @@ impl OAuthAuth for RadiusOAuth {
                 )
                 .await;
             }
-            Err(AuthError(format!(
+            Err(auth_error(format!(
                 "Unknown {name} sign-in method: {login_method}"
             )))
         })
     }
 
-    fn refresh(
+    /// Exchange the refresh token directly through the gateway.
+    pub fn refresh(
         &self,
-        credential: &OAuthCredential,
+        credential: OAuthCredentials,
         signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = Arc::clone(&self.client);
         let clock = Arc::clone(&self.clock);
         let gateway = self.gateway.clone();
@@ -617,13 +624,73 @@ impl OAuthAuth for RadiusOAuth {
             )
             .await
             .map_err(|error| match error {
-                RadiusTokenError::Response(response_error) => AuthError(response_error.to_string()),
-                RadiusTokenError::Other(auth_error) => auth_error,
+                RadiusTokenError::Response(response_error) => {
+                    auth_error(response_error.to_string())
+                }
+                RadiusTokenError::Other(token_error) => token_error,
             })
         })
     }
 
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        ModelAuth::api_key(credential.access.clone())
+    /// Derive the request auth from a valid credential.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
+        ModelAuth {
+            api_key: Some(credential.access.clone()),
+            ..ModelAuth::default()
+        }
+    }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own gateway, client, and clock. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let name = self.name.clone();
+            let gateway = self.gateway.clone();
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |interaction| {
+                let flow = Self::new(
+                    name.clone(),
+                    gateway.clone(),
+                    Arc::clone(&client),
+                    Arc::clone(&clock),
+                );
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn = {
+            let gateway = self.gateway.clone();
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |credential, signal| {
+                let flow = Self::new(
+                    "Radius".to_owned(),
+                    gateway.clone(),
+                    Arc::clone(&client),
+                    Arc::clone(&clock),
+                );
+                flow.refresh(credential, signal)
+            })
+        };
+        let to_auth: crate::auth::types::OAuthToAuthFn = {
+            Arc::new(|credential| {
+                let auth = ModelAuth {
+                    api_key: Some(credential.access.clone()),
+                    ..ModelAuth::default()
+                };
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        crate::auth::types::OAuthAuth {
+            name: self.name.clone(),
+            is_subscription: None,
+            login_label: None,
+            login,
+            refresh,
+            to_auth,
+        }
     }
 }

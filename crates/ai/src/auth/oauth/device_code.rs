@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::types::{AuthError, BoxAuthFuture};
+use super::auth_error;
+use crate::auth::types::AuthError;
+use crate::types::BoxedFuture;
 
 const CANCEL_MESSAGE: &str = "Login cancelled";
 const TIMEOUT_MESSAGE: &str = "Device flow timed out";
@@ -73,7 +75,7 @@ pub struct PollOptions<T> {
     /// immediate poll against the user.
     pub wait_before_first_poll: bool,
     /// The poll step itself; its rejections propagate out of the flow.
-    pub poll: Arc<dyn Fn() -> BoxAuthFuture<Result<PollOutcome<T>, AuthError>> + Send + Sync>,
+    pub poll: Arc<dyn Fn() -> BoxedFuture<'static, Result<PollOutcome<T>, AuthError>> + Send + Sync>,
     /// Cancels the whole flow.
     pub signal: CancellationToken,
 }
@@ -91,7 +93,7 @@ impl<T> std::fmt::Debug for PollOptions<T> {
 /// Sleep for `ms`, stopping with the cancel message when the token aborts.
 async fn abortable_sleep(ms: u64, signal: &CancellationToken) -> Result<(), AuthError> {
     tokio::select! {
-        () = signal.cancelled() => Err(AuthError(CANCEL_MESSAGE.to_owned())),
+        () = signal.cancelled() => Err(auth_error(CANCEL_MESSAGE.to_owned())),
         () = tokio::time::sleep(Duration::from_millis(ms)) => Ok(()),
     }
 }
@@ -118,7 +120,7 @@ pub async fn poll_oauth_device_code_flow<T>(options: PollOptions<T>) -> Result<T
 
     let mut slow_down_responses = 0_u64;
     if options.signal.is_cancelled() {
-        return Err(AuthError(CANCEL_MESSAGE.to_owned()));
+        return Err(auth_error(CANCEL_MESSAGE.to_owned()));
     }
     // waitBeforeFirstPoll: some servers count an immediate poll as a strike.
     if options.wait_before_first_poll {
@@ -130,13 +132,13 @@ pub async fn poll_oauth_device_code_flow<T>(options: PollOptions<T>) -> Result<T
 
     while deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline) {
         if options.signal.is_cancelled() {
-            return Err(AuthError(CANCEL_MESSAGE.to_owned()));
+            return Err(auth_error(CANCEL_MESSAGE.to_owned()));
         }
 
         let result = (options.poll)().await?;
         match result {
             PollOutcome::Complete(value) => return Ok(value),
-            PollOutcome::Failed(message) => return Err(AuthError(message)),
+            PollOutcome::Failed(message) => return Err(auth_error(message)),
             PollOutcome::SlowDown { interval_seconds } => {
                 slow_down_responses += 1;
                 // Use the server-provided interval when given (GitHub reports
@@ -161,7 +163,7 @@ pub async fn poll_oauth_device_code_flow<T>(options: PollOptions<T>) -> Result<T
         abortable_sleep(interval_ms.min(remaining_ms), &options.signal).await?;
     }
 
-    Err(AuthError(
+    Err(auth_error(
         if slow_down_responses > 0 {
             SLOW_DOWN_TIMEOUT_MESSAGE
         } else {

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+use super::auth_error;
 use crate::auth::types::AuthError;
 
 /// One parsed callback request, the slice of the HTTP request the flows
@@ -80,12 +81,12 @@ impl OAuthCallbackServer {
     /// before login hands a URL to the user.
     pub async fn bind(host: &str, port: u16, handler: CallbackHandler) -> Result<Self, AuthError> {
         let listener = TcpListener::bind((host, port)).await.map_err(|error| {
-            AuthError(format!(
+            auth_error(format!(
                 "could not bind the OAuth callback server on {host}:{port}: {error}"
             ))
         })?;
         let local_addr = listener.local_addr().map_err(|error| {
-            AuthError(format!(
+            auth_error(format!(
                 "could not determine the OAuth callback port: {error}"
             ))
         })?;

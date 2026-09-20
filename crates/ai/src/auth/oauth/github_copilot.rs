@@ -23,13 +23,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
 use crate::auth::oauth::{
-    execute, form_post_request, json_post_request, read_body_lossy, read_json,
+    auth_error, execute, form_post_request, json_post_request, oauth_credentials, read_body_lossy,
+    read_json,
 };
-use crate::auth::types::{
-    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, BoxAuthFuture, ModelAuth,
-    OAuthAuth, OAuthCredential, ProviderAuthInteraction,
-};
+use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, OAuthCredentials};
 use crate::http::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
+use crate::auth::types::ModelAuth;
+use crate::types::BoxedFuture;
 use crate::utils::sleep::sleep;
 
 const CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
@@ -82,6 +82,113 @@ impl GitHubCopilotOAuth {
             client,
             clock,
             known_models,
+        }
+    }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own client, clock, and
+    /// known-model membership. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            let known_models = Arc::clone(&self.known_models);
+            Arc::new(move |interaction| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                    known_models: Arc::clone(&known_models),
+                };
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            let known_models = Arc::clone(&self.known_models);
+            Arc::new(move |credential, signal| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                    known_models: Arc::clone(&known_models),
+                };
+                flow.refresh(credential, signal)
+            })
+        };
+        let to_auth: crate::auth::types::OAuthToAuthFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            let known_models = Arc::clone(&self.known_models);
+            Arc::new(move |credential| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                    known_models: Arc::clone(&known_models),
+                };
+                let auth = flow.to_auth(&credential);
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        crate::auth::types::OAuthAuth {
+            name: "GitHub Copilot".to_owned(),
+            is_subscription: Some(true),
+            login_label: None,
+            login,
+            refresh,
+            to_auth,
+        }
+    }
+
+    /// Run the interactive login flow.
+    pub fn login(
+        &self,
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
+        let client = Arc::clone(&self.client);
+        let clock = Arc::clone(&self.clock);
+        let known_models = Arc::clone(&self.known_models);
+        Box::pin(
+            async move { login_github_copilot(&client, &clock, &known_models, &interaction).await },
+        )
+    }
+
+    /// Exchange the refresh token for a rotated credential.
+    pub fn refresh(
+        &self,
+        credential: OAuthCredentials,
+        signal: CancellationToken,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
+        let client = Arc::clone(&self.client);
+        let clock = Arc::clone(&self.clock);
+        let known_models = Arc::clone(&self.known_models);
+        let refresh_token = credential.refresh.clone();
+        let enterprise_domain = copilot_enterprise_domain(&credential);
+        Box::pin(async move {
+            refresh_github_copilot_token(
+                &client,
+                clock.as_ref(),
+                &known_models,
+                &refresh_token,
+                enterprise_domain.as_deref(),
+                &signal,
+            )
+            .await
+        })
+    }
+
+    /// Derive the request auth from a valid credential: the bearer token plus
+    /// the per-token proxy endpoint.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
+        ModelAuth {
+            api_key: Some(credential.access.clone()),
+            headers: None,
+            base_url: Some(get_github_copilot_base_url(
+                Some(&credential.access),
+                copilot_enterprise_domain(credential).as_deref(),
+            )),
         }
     }
 }
@@ -199,7 +306,7 @@ pub fn parse_github_copilot_model_catalog(
     known_models: &KnownModels,
 ) -> Result<CopilotModelCatalog, AuthError> {
     let Some(data) = raw.get("data").and_then(Value::as_array) else {
-        return Err(AuthError("Invalid Copilot models response".to_owned()));
+        return Err(auth_error("Invalid Copilot models response".to_owned()));
     };
 
     // (id, picker_enabled, policy_state) — the state is any wire value; only
@@ -330,7 +437,7 @@ async fn fetch_with_rate_limit_retry(
         drop(response);
         sleep(delay_ms, signal)
             .await
-            .map_err(|_| AuthError(crate::utils::abort::AbortError::MESSAGE.to_owned()))?;
+            .map_err(|_| auth_error(crate::utils::abort::AbortError::MESSAGE.to_owned()))?;
         retry += 1;
     }
 }
@@ -426,7 +533,7 @@ async fn fetch_json(
     let status = response.status;
     if !(200..300).contains(&status) {
         let text = read_body_lossy(&mut response).await;
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "{status} {}: {text}",
             status_reason(status)
         )));
@@ -463,7 +570,7 @@ async fn start_device_flow(
         // letting arrays pass to the field check.
         Value::Object(map) => map.clone(),
         Value::Array(_) => serde_json::Map::new(),
-        _ => return Err(AuthError("Invalid device code response".to_owned())),
+        _ => return Err(auth_error("Invalid device code response".to_owned())),
     };
 
     let device_code = map.get("device_code").and_then(Value::as_str);
@@ -478,15 +585,15 @@ async fn start_device_flow(
         interval_valid,
         expires_in,
     ) else {
-        return Err(AuthError("Invalid device code response fields".to_owned()));
+        return Err(auth_error("Invalid device code response fields".to_owned()));
     };
 
     // The verification URI is opened in the user's browser; a non-http(s)
     // value could make `open` launch something else.
     let parsed_uri = url::Url::parse(verification_uri)
-        .map_err(|_| AuthError(UNTRUSTED_VERIFICATION_URI.to_owned()))?;
+        .map_err(|_| auth_error(UNTRUSTED_VERIFICATION_URI.to_owned()))?;
     if parsed_uri.scheme() != "https" && parsed_uri.scheme() != "http" {
-        return Err(AuthError(UNTRUSTED_VERIFICATION_URI.to_owned()));
+        return Err(auth_error(UNTRUSTED_VERIFICATION_URI.to_owned()));
     }
 
     Ok(DeviceCodeResponse {
@@ -602,7 +709,7 @@ async fn refresh_github_copilot_access_token(
     refresh_token: &str,
     enterprise_domain: Option<&str>,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let domain = enterprise_domain.unwrap_or("github.com");
     let urls = get_urls(domain);
     let request = HttpRequest {
@@ -616,22 +723,24 @@ async fn refresh_github_copilot_access_token(
     let raw = fetch_json(client, request).await?;
     let map = raw
         .as_object()
-        .ok_or_else(|| AuthError("Invalid Copilot token response".to_owned()))?;
+        .ok_or_else(|| auth_error("Invalid Copilot token response".to_owned()))?;
     let token = map.get("token").and_then(Value::as_str);
     let expires_at = map.get("expires_at").and_then(Value::as_f64);
     let (Some(token), Some(expires_at)) = (token, expires_at) else {
-        return Err(AuthError(
+        return Err(auth_error(
             "Invalid Copilot token response fields".to_owned(),
         ));
     };
 
-    let mut credential = OAuthCredential::new(
+    let mut credential = oauth_credentials(
         token,
         refresh_token,
         wire_milliseconds(expires_at).saturating_mul(1000) - ACCESS_TOKEN_SKEW_MS,
     );
     if let Some(enterprise_domain) = enterprise_domain {
-        credential.set_extra_string("enterpriseUrl", enterprise_domain);
+        credential
+            .extra
+            .insert("enterpriseUrl".to_owned(), Value::String(enterprise_domain.to_owned()));
     }
     Ok(credential)
 }
@@ -648,7 +757,7 @@ async fn refresh_github_copilot_token(
     refresh_token: &str,
     enterprise_domain: Option<&str>,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let mut credentials =
         refresh_github_copilot_access_token(client, refresh_token, enterprise_domain, signal)
             .await?;
@@ -718,7 +827,7 @@ async fn fetch_github_copilot_models(
         fetch_with_rate_limit_retry(client, clock, request, signal, &retry_policy).await?;
     if !(200..300).contains(&response.status) {
         let text = read_body_lossy(&mut response).await;
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "{} {}: {text}",
             response.status,
             status_reason(response.status)
@@ -779,7 +888,7 @@ async fn enable_github_copilot_model(
     if response.status == RATE_LIMIT_STATUS {
         let mut response = response;
         let text = read_body_lossy(&mut response).await;
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "{} {}: {text}",
             response.status,
             status_reason(response.status)
@@ -824,8 +933,8 @@ async fn enable_github_copilot_models(
 /// The enterprise domain a credential carries, upstream's
 /// `copilotEnterpriseDomain`.
 #[must_use]
-fn copilot_enterprise_domain(credential: &OAuthCredential) -> Option<String> {
-    let enterprise_url = credential.enterprise_url()?;
+fn copilot_enterprise_domain(credential: &OAuthCredentials) -> Option<String> {
+    let enterprise_url = crate::auth::oauth::extra_string(&credential.extra, "enterpriseUrl")?;
     if enterprise_url.is_empty() {
         return None;
     }
@@ -841,32 +950,32 @@ async fn login_github_copilot(
     client: &Arc<dyn HttpClient>,
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
     known_models: &KnownModels,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
-    let input = interaction
-        .prompt(
-            AuthPrompt::new(
-                AuthPromptKind::Text,
-                "GitHub Enterprise URL/domain (blank for github.com)",
-            )
-            .with_placeholder("company.ghe.com"),
-        )
-        .await?;
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
+    let input = (interaction.prompt)(AuthPrompt {
+        signal: None,
+        kind: crate::auth::types::AuthPromptKind::Text {
+            message: "GitHub Enterprise URL/domain (blank for github.com)".to_owned(),
+            placeholder: Some("company.ghe.com".to_owned()),
+        },
+    })
+    .await
+    .map_err(AuthError::from)?;
     if interaction.signal.is_cancelled() {
-        return Err(AuthError("Login cancelled".to_owned()));
+        return Err(auth_error("Login cancelled".to_owned()));
     }
 
     let trimmed = input.trim();
     let enterprise_domain = normalize_domain(&input);
     if !trimmed.is_empty() && enterprise_domain.is_none() {
-        return Err(AuthError("Invalid GitHub Enterprise URL/domain".to_owned()));
+        return Err(auth_error("Invalid GitHub Enterprise URL/domain".to_owned()));
     }
     let domain = enterprise_domain
         .clone()
         .unwrap_or_else(|| "github.com".to_owned());
 
     let device = start_device_flow(client, &domain, &interaction.signal).await?;
-    interaction.notify(AuthEvent::DeviceCode {
+    (interaction.notify)(AuthEvent::DeviceCode {
         user_code: device.user_code.clone(),
         verification_uri: device.verification_uri.clone(),
         interval_seconds: device.interval_seconds,
@@ -899,7 +1008,7 @@ async fn login_github_copilot(
     let enabled_model_ids: Vec<String> = if models.policy_model_ids.is_empty() {
         Vec::new()
     } else {
-        interaction.notify(AuthEvent::Progress {
+        (interaction.notify)(AuthEvent::Progress {
             message: "Enabling models...".to_owned(),
         });
         enable_github_copilot_models(
@@ -925,64 +1034,4 @@ async fn login_github_copilot(
         Value::Array(available_model_ids.into_iter().map(Value::String).collect()),
     );
     Ok(credential)
-}
-
-impl OAuthAuth for GitHubCopilotOAuth {
-    #[expect(
-        clippy::unnecessary_literal_bound,
-        reason = "the trait signature ties the returned str to &self; the name is a constant"
-    )]
-    fn name(&self) -> &str {
-        "GitHub Copilot"
-    }
-
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    fn login(
-        &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let client = Arc::clone(&self.client);
-        let clock = Arc::clone(&self.clock);
-        let known_models = Arc::clone(&self.known_models);
-        Box::pin(
-            async move { login_github_copilot(&client, &clock, &known_models, &interaction).await },
-        )
-    }
-
-    fn refresh(
-        &self,
-        credential: &OAuthCredential,
-        signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let client = Arc::clone(&self.client);
-        let clock = Arc::clone(&self.clock);
-        let known_models = Arc::clone(&self.known_models);
-        let refresh_token = credential.refresh.clone();
-        let enterprise_domain = copilot_enterprise_domain(credential);
-        Box::pin(async move {
-            refresh_github_copilot_token(
-                &client,
-                clock.as_ref(),
-                &known_models,
-                &refresh_token,
-                enterprise_domain.as_deref(),
-                &signal,
-            )
-            .await
-        })
-    }
-
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        ModelAuth {
-            api_key: Some(credential.access.clone()),
-            headers: None,
-            base_url: Some(get_github_copilot_base_url(
-                Some(&credential.access),
-                copilot_enterprise_domain(credential).as_deref(),
-            )),
-        }
-    }
 }

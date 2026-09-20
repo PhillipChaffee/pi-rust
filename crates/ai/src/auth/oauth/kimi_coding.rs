@@ -6,17 +6,14 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::helpers::CheckCancelled;
 use crate::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
 use crate::auth::oauth::{
-    execute, form_post_request, json_object, read_body_lossy, read_json, wire_seconds_to_i64,
-    wire_seconds_to_u64,
+    auth_error, execute, form_post_request, json_object, oauth_credentials, read_body_lossy,
+    read_json, wire_seconds_to_i64, wire_seconds_to_u64,
 };
-use crate::auth::types::AuthInteraction as _;
-use crate::auth::types::{
-    AuthError, AuthEvent, BoxAuthFuture, ModelAuth, OAuthAuth, OAuthCredential,
-    ProviderAuthInteraction,
-};
+use crate::auth::types::{AuthError, AuthEvent, OAuthCredentials};
+use crate::auth::types::ModelAuth;
+use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
 const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516c098c0a1";
@@ -97,7 +94,7 @@ async fn start_device_authorization(
     let mut response = execute(client, request).await?;
     if !(200..300).contains(&response.status) {
         let text = read_body_lossy(&mut response).await;
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "Kimi Code device authorization failed with status {}{}",
             response.status,
             if text.is_empty() {
@@ -112,7 +109,7 @@ async fn start_device_authorization(
         "Invalid Kimi Code device authorization response",
     )?;
     let missing_field = || {
-        AuthError(format!(
+        auth_error(format!(
             "Invalid Kimi Code device authorization response: {}",
             serde_json::Value::Object(json.clone())
         ))
@@ -167,7 +164,7 @@ fn parse_token_response(
         refresh.filter(|value| !value.is_empty()),
         expires_in.filter(|value| value.is_finite() && *value > 0.0),
     ) else {
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "Kimi Code token {operation} response missing fields: {}",
             serde_json::Value::Object(json.clone())
         )));
@@ -240,7 +237,7 @@ async fn poll_for_token(
                     {
                         return match parse_token_response(json, clock.as_ref(), "poll") {
                             Ok(token) => Ok(PollOutcome::Complete(token)),
-                            Err(error) => Ok(PollOutcome::Failed(error.0)),
+                            Err(error) => Ok(PollOutcome::Failed(error.to_string())),
                         };
                     }
 
@@ -298,11 +295,11 @@ async fn refresh_token(
             let backoff_ms = 1000 * u64::from(2_u32).saturating_pow(attempt - 1);
             crate::utils::sleep::sleep(backoff_ms, signal)
                 .await
-                .map_err(|_| AuthError("Kimi Code token refresh aborted".to_owned()))?;
+                .map_err(|_| auth_error("Kimi Code token refresh aborted".to_owned()))?;
         }
-        signal
-            .check_cancelled()
-            .map_err(|_| AuthError("Kimi Code token refresh aborted".to_owned()))?;
+        if signal.is_cancelled() {
+            return Err(auth_error("Kimi Code token refresh aborted"));
+        }
 
         let request = form_post_request(
             &format!("{oauth_host}/api/oauth/token"),
@@ -345,13 +342,13 @@ async fn refresh_token(
                 .and_then(|json| json.get("error_description"))
                 .and_then(serde_json::Value::as_str)
                 .map_or_else(String::new, |description| format!(": {description}"));
-            return Err(AuthError(format!(
+            return Err(auth_error(format!(
                 "Kimi Code token refresh unauthorized (status {status}){description}"
             )));
         }
 
         if is_retryable_refresh_failure(status) && attempt < REFRESH_MAX_RETRIES {
-            last_error = Some(AuthError(format!(
+            last_error = Some(auth_error(format!(
                 "Kimi Code token refresh failed with status {status}"
             )));
             continue;
@@ -365,30 +362,20 @@ async fn refresh_token(
         } else {
             format!(": {text}")
         };
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "Kimi Code token refresh failed with status {status}{text_suffix}"
         )));
     }
-    Err(last_error.unwrap_or_else(|| AuthError("Kimi Code token refresh failed".to_owned())))
+    Err(last_error.unwrap_or_else(|| auth_error("Kimi Code token refresh failed".to_owned())))
 }
 
-impl OAuthAuth for KimiCodingOAuth {
-    fn name(&self) -> &'static str {
-        "Kimi Code (subscription)"
-    }
-
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    fn login_label(&self) -> Option<&str> {
-        Some("Sign in with Kimi Code")
-    }
-
-    fn login(
+impl KimiCodingOAuth {
+    /// Run the interactive login flow: device-code authorization against the
+    /// configured host.
+    pub fn login(
         &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
         Box::pin(async move {
             let oauth_host = get_oauth_host();
@@ -396,7 +383,7 @@ impl OAuthAuth for KimiCodingOAuth {
                 Arc::new(crate::auth::clock::SystemClock);
             let device =
                 start_device_authorization(&client, &oauth_host, &interaction.signal).await?;
-            interaction.notify(AuthEvent::DeviceCode {
+            (interaction.notify)(AuthEvent::DeviceCode {
                 user_code: device.user_code.clone(),
                 verification_uri: device.verification_uri_complete.clone(),
                 interval_seconds: Some(device.interval_seconds),
@@ -404,19 +391,16 @@ impl OAuthAuth for KimiCodingOAuth {
             });
             let token =
                 poll_for_token(&client, &oauth_host, device, clock, &interaction.signal).await?;
-            Ok(OAuthCredential::new(
-                token.access,
-                token.refresh,
-                token.expires,
-            ))
+            Ok(oauth_credentials(token.access, token.refresh, token.expires))
         })
     }
 
-    fn refresh(
+    /// Exchange the refresh token for a rotated credential.
+    pub fn refresh(
         &self,
-        credential: &OAuthCredential,
+        credential: OAuthCredentials,
         signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
         let refresh_token_value = credential.refresh.clone();
         Box::pin(async move {
@@ -425,15 +409,14 @@ impl OAuthAuth for KimiCodingOAuth {
                 Arc::new(crate::auth::clock::SystemClock);
             let token =
                 refresh_token(&client, &oauth_host, &refresh_token_value, &clock, &signal).await?;
-            Ok(OAuthCredential::new(
-                token.access,
-                token.refresh,
-                token.expires,
-            ))
+            Ok(oauth_credentials(token.access, token.refresh, token.expires))
         })
     }
 
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
+    /// Derive the request auth from a valid credential: the bearer header,
+    /// no api-key slot.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
         ModelAuth {
             api_key: None,
             headers: Some({
@@ -445,6 +428,52 @@ impl OAuthAuth for KimiCodingOAuth {
                 headers
             }),
             base_url: None,
+        }
+    }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own client. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let client = Arc::clone(&self.client);
+            Arc::new(move |interaction| {
+                let flow = Self::new(Arc::clone(&client));
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn = {
+            let client = Arc::clone(&self.client);
+            Arc::new(move |credential, signal| {
+                let flow = Self::new(Arc::clone(&client));
+                flow.refresh(credential, signal)
+            })
+        };
+        let to_auth: crate::auth::types::OAuthToAuthFn = {
+            Arc::new(|credential| {
+                let auth = ModelAuth {
+                    api_key: None,
+                    headers: Some({
+                        let mut headers = crate::types::ProviderHeaders::new();
+                        headers.insert(
+                            "Authorization".to_owned(),
+                            Some(format!("Bearer {}", credential.access)),
+                        );
+                        headers
+                    }),
+                    base_url: None,
+                };
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        crate::auth::types::OAuthAuth {
+            name: "Kimi Code (subscription)".to_owned(),
+            is_subscription: Some(true),
+            login_label: Some("Sign in with Kimi Code".to_owned()),
+            login,
+            refresh,
+            to_auth,
         }
     }
 }

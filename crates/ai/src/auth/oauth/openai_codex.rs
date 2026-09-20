@@ -21,14 +21,15 @@ use crate::auth::oauth::github_copilot::status_reason;
 use crate::auth::oauth::oauth_page::{oauth_error_html, oauth_success_html};
 use crate::auth::oauth::pkce::{Pkce, decode_json_segment, generate_pkce};
 use crate::auth::oauth::{
-    execute, form_post_request, json_post_request, parse_authorization_code_state, read_body_lossy,
-    read_json,
+    auth_error, execute, form_post_request, json_post_request, oauth_credentials,
+    parse_authorization_code_state, read_body_lossy, read_json,
 };
 use crate::auth::types::{
-    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
-    BoxAuthFuture, ModelAuth, OAuthAuth, OAuthCredential, ProviderAuthInteraction,
+    AuthError, AuthEvent, AuthPrompt, AuthPromptKind, AuthPromptOption, OAuthCredentials,
 };
 use crate::http::{HttpClient, HttpResponse};
+use crate::auth::types::ModelAuth;
+use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -82,6 +83,121 @@ impl OpenAICodexOAuth {
     pub fn new(client: Arc<dyn HttpClient>, clock: Arc<dyn crate::auth::clock::AuthClock>) -> Self {
         Self { client, clock }
     }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own client and clock. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |interaction| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |credential, signal| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                flow.refresh(credential, signal)
+            })
+        };
+        let to_auth: crate::auth::types::OAuthToAuthFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |credential| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                let auth = flow.to_auth(&credential);
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        crate::auth::types::OAuthAuth {
+            name: "OpenAI (ChatGPT Plus/Pro)".to_owned(),
+            is_subscription: Some(true),
+            login_label: None,
+            login,
+            refresh,
+            to_auth,
+        }
+    }
+
+    /// Run the interactive login flow.
+    pub fn login(
+        &self,
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
+        let client = Arc::clone(&self.client);
+        let clock = Arc::clone(&self.clock);
+        Box::pin(async move {
+            let method = (interaction
+                .prompt)(AuthPrompt {
+                signal: None,
+                kind: AuthPromptKind::Select {
+                    message: "Select OpenAI Codex login method:".to_owned(),
+                    options: vec![
+                        AuthPromptOption {
+                            id: OPENAI_CODEX_BROWSER_LOGIN_METHOD.to_owned(),
+                            label: "Browser login (default)".to_owned(),
+                            description: None,
+                        },
+                        AuthPromptOption {
+                            id: OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD.to_owned(),
+                            label: "Device code login (headless)".to_owned(),
+                            description: None,
+                        },
+                    ],
+                },
+            })
+            .await
+            .map_err(AuthError::from)?;
+            if method == OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD {
+                return login_openai_codex_device_code(&client, &clock, &interaction).await;
+            }
+            if method != OPENAI_CODEX_BROWSER_LOGIN_METHOD {
+                return Err(auth_error(format!(
+                    "Unknown OpenAI Codex login method: {method}"
+                )));
+            }
+            login_openai_codex_browser(&client, &clock, &interaction).await
+        })
+    }
+
+    /// Exchange the refresh token for a rotated credential.
+    pub fn refresh(
+        &self,
+        credential: OAuthCredentials,
+        signal: CancellationToken,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
+        let client = Arc::clone(&self.client);
+        let clock = Arc::clone(&self.clock);
+        let refresh_token = credential.refresh.clone();
+        Box::pin(async move {
+            let token =
+                refresh_access_token(&client, clock.as_ref(), &refresh_token, &signal).await?;
+            credentials_from_token(token)
+        })
+    }
+
+    /// Derive the request auth from a valid credential.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
+        ModelAuth {
+            api_key: Some(credential.access.clone()),
+            ..ModelAuth::default()
+        }
+    }
 }
 
 fn callback_host() -> String {
@@ -91,7 +207,7 @@ fn callback_host() -> String {
 /// The 16-byte hex state, upstream's `createState`.
 fn create_state() -> Result<String, AuthError> {
     let mut bytes = [0_u8; 16];
-    getrandom::fill(&mut bytes).map_err(|error| AuthError(format!("getrandom failed: {error}")))?;
+    getrandom::fill(&mut bytes).map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
     let mut state = String::with_capacity(32);
     for byte in bytes {
         let _ = write!(state, "{byte:02x}");
@@ -135,7 +251,7 @@ async fn read_token_response(
         } else {
             text
         };
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "OpenAI Codex token {operation} failed ({status}): {detail}"
         )));
     }
@@ -150,7 +266,7 @@ async fn read_token_response(
         .filter(|token| !token.is_empty());
     let expires_in = json.get("expires_in").and_then(Value::as_f64);
     let (Some(access), Some(refresh), Some(expires_in)) = (access, refresh, expires_in) else {
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "OpenAI Codex token {operation} response missing fields: {json}"
         )));
     };
@@ -212,9 +328,9 @@ async fn refresh_access_token(
     let mut response = match execute(client, request).await {
         Ok(response) => response,
         Err(error) => {
-            return Err(AuthError(format!(
+            return Err(auth_error(format!(
                 "OpenAI Codex token refresh error: {}",
-                error.0
+                error
             )));
         }
     };
@@ -241,13 +357,12 @@ async fn start_openai_codex_device_auth(
     let status = response.status;
     if !(200..300).contains(&status) {
         if status == 404 {
-            return Err(AuthError(
-                "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL."
-                    .to_owned(),
+            return Err(auth_error(
+                "OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.",
             ));
         }
         let response_body = read_body_lossy(&mut response).await;
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "OpenAI Codex device code request failed with status {status}{}",
             if response_body.is_empty() {
                 String::new()
@@ -276,7 +391,7 @@ async fn start_openai_codex_device_auth(
     let (Some(device_auth_id), Some(user_code), Some(interval_seconds)) =
         (device_auth_id, user_code, interval_seconds)
     else {
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "Invalid OpenAI Codex device code response: {json}"
         )));
     };
@@ -413,14 +528,14 @@ fn get_account_id(access_token: &str) -> Option<String> {
 /// # Errors
 /// Rejects with `Failed to extract accountId from token` when the JWT claim
 /// is absent or empty.
-fn credentials_from_token(token: OAuthToken) -> Result<OAuthCredential, AuthError> {
+fn credentials_from_token(token: OAuthToken) -> Result<OAuthCredentials, AuthError> {
     let Some(account_id) = get_account_id(&token.access) else {
-        return Err(AuthError(
-            "Failed to extract accountId from token".to_owned(),
-        ));
+        return Err(auth_error("Failed to extract accountId from token"));
     };
-    let mut credential = OAuthCredential::new(token.access, token.refresh, token.expires);
-    credential.set_extra_string("accountId", account_id);
+    let mut credential = oauth_credentials(token.access, token.refresh, token.expires);
+    credential
+        .extra
+        .insert("accountId".to_owned(), Value::String(account_id));
     Ok(credential)
 }
 
@@ -433,7 +548,7 @@ async fn exchange_authorization_code_for_credentials(
     verifier: &str,
     redirect_uri: &str,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let token =
         exchange_authorization_code(client, clock.as_ref(), code, verifier, redirect_uri, signal)
             .await?;
@@ -488,23 +603,24 @@ async fn start_callback_server(
 async fn login_openai_codex_browser(
     client: &Arc<dyn HttpClient>,
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
     let pkce = generate_pkce()?;
     let state = create_state()?;
     let authorize_url = create_authorization_flow(&pkce, &state);
     let (server, wait_cell, receiver) = start_callback_server(&state).await?;
     let manual_abort = CancellationToken::new();
     let manual_prompt = AuthPrompt {
-        kind: AuthPromptKind::ManualCode,
-        message:
-            "Complete login in your browser, or paste the authorization code / redirect URL here:"
-                .to_owned(),
-        placeholder: Some(REDIRECT_URI.to_owned()),
         signal: Some(manual_abort.clone()),
+        kind: AuthPromptKind::ManualCode {
+            message:
+                "Complete login in your browser, or paste the authorization code / redirect URL here:"
+                    .to_owned(),
+            placeholder: Some(REDIRECT_URI.to_owned()),
+        },
     };
 
-    interaction.notify(AuthEvent::AuthUrl {
+    (interaction.notify)(AuthEvent::AuthUrl {
         url: authorize_url,
         instructions: Some("A browser window should open. Complete login to finish.".to_owned()),
     });
@@ -516,7 +632,7 @@ async fn login_openai_codex_browser(
         let interaction = interaction.clone();
         let wait_cell = wait_cell.clone();
         async move {
-            let result = interaction.prompt(manual_prompt).await;
+            let result = (interaction.prompt)(manual_prompt).await;
             wait_cell.settle(None).await;
             result
         }
@@ -532,12 +648,12 @@ async fn login_openai_codex_browser(
                 if parsed_state.as_ref().is_some_and(|parsed| parsed != &state) {
                     manual_abort.cancel();
                     server.close();
-                    return Err(AuthError("State mismatch".to_owned()));
+                    return Err(auth_error("State mismatch"));
                 }
                 code = parsed_code;
             }
-            Ok(Err(error)) => early_error = Some(error),
-            Err(join_error) => early_error = Some(AuthError(join_error.to_string())),
+            Ok(Err(error)) => early_error = Some(AuthError::from(error)),
+            Err(join_error) => early_error = Some(auth_error(join_error.to_string())),
         },
     }
 
@@ -556,7 +672,7 @@ async fn login_openai_codex_browser(
                 )
                 .await
             }
-            None => Err(AuthError("Missing authorization code".to_owned())),
+            None => Err(auth_error("Missing authorization code")),
         }
     };
     manual_abort.cancel();
@@ -568,10 +684,10 @@ async fn login_openai_codex_browser(
 async fn login_openai_codex_device_code(
     client: &Arc<dyn HttpClient>,
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
     let device = start_openai_codex_device_auth(client, &interaction.signal).await?;
-    interaction.notify(AuthEvent::DeviceCode {
+    (interaction.notify)(AuthEvent::DeviceCode {
         user_code: device.user_code.clone(),
         verification_uri: DEVICE_VERIFICATION_URI.to_owned(),
         interval_seconds: Some(device.interval_seconds),
@@ -595,73 +711,4 @@ struct DeviceAuthInfo {
     device_auth_id: String,
     user_code: String,
     interval_seconds: u64,
-}
-
-impl OAuthAuth for OpenAICodexOAuth {
-    #[expect(
-        clippy::unnecessary_literal_bound,
-        reason = "the trait signature ties the returned str to &self; the name is a constant"
-    )]
-    fn name(&self) -> &str {
-        "OpenAI (ChatGPT Plus/Pro)"
-    }
-
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    fn login(
-        &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let client = Arc::clone(&self.client);
-        let clock = Arc::clone(&self.clock);
-        Box::pin(async move {
-            let method = interaction
-                .prompt(AuthPrompt::new(
-                    AuthPromptKind::Select(vec![
-                        AuthSelectOption {
-                            id: OPENAI_CODEX_BROWSER_LOGIN_METHOD.to_owned(),
-                            label: "Browser login (default)".to_owned(),
-                            description: None,
-                        },
-                        AuthSelectOption {
-                            id: OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD.to_owned(),
-                            label: "Device code login (headless)".to_owned(),
-                            description: None,
-                        },
-                    ]),
-                    "Select OpenAI Codex login method:",
-                ))
-                .await?;
-            if method == OPENAI_CODEX_DEVICE_CODE_LOGIN_METHOD {
-                return login_openai_codex_device_code(&client, &clock, &interaction).await;
-            }
-            if method != OPENAI_CODEX_BROWSER_LOGIN_METHOD {
-                return Err(AuthError(format!(
-                    "Unknown OpenAI Codex login method: {method}"
-                )));
-            }
-            login_openai_codex_browser(&client, &clock, &interaction).await
-        })
-    }
-
-    fn refresh(
-        &self,
-        credential: &OAuthCredential,
-        signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let client = Arc::clone(&self.client);
-        let clock = Arc::clone(&self.clock);
-        let refresh_token = credential.refresh.clone();
-        Box::pin(async move {
-            let token =
-                refresh_access_token(&client, clock.as_ref(), &refresh_token, &signal).await?;
-            credentials_from_token(token)
-        })
-    }
-
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        ModelAuth::api_key(credential.access.clone())
-    }
 }

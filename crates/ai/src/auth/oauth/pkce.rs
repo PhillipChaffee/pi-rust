@@ -8,6 +8,7 @@
 
 use sha2::{Digest, Sha256};
 
+use super::auth_error;
 use crate::auth::types::AuthError;
 
 /// A PKCE pair: the secret verifier and its S256 challenge.
@@ -27,7 +28,7 @@ pub struct Pkce {
 pub fn generate_pkce() -> Result<Pkce, AuthError> {
     let mut verifier_bytes = [0_u8; 32];
     getrandom::fill(&mut verifier_bytes)
-        .map_err(|error| AuthError(format!("getrandom failed: {error}")))?;
+        .map_err(|error| auth_error(format!("getrandom failed: {error}")))?;
     let verifier = base64url_no_pad(&verifier_bytes);
     let challenge = base64url_no_pad(&Sha256::digest(verifier.as_bytes()));
     Ok(Pkce {
@@ -53,7 +54,7 @@ pub(crate) fn decode_base64_lenient(text: &str) -> Result<Vec<u8>, AuthError> {
     standard
         .decode(text)
         .or_else(|_| url_safe.decode(text.trim_end_matches('=')))
-        .map_err(|_| AuthError(format!("invalid base64: {text}")))
+        .map_err(|_| auth_error(format!("invalid base64: {text}")))
 }
 
 /// Decode a base64url-or-standard segment and parse it as JSON, the JWT
@@ -63,5 +64,5 @@ pub(crate) fn decode_json_segment<T: serde::de::DeserializeOwned>(
 ) -> Result<T, AuthError> {
     let bytes = decode_base64_lenient(segment)?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| AuthError(format!("invalid JSON payload: {error}")))
+        .map_err(|error| auth_error(format!("invalid JSON payload: {error}")))
 }

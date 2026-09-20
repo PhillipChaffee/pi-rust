@@ -7,7 +7,7 @@
 //! The port splits the roles: this module carries the rendering, provider
 //! lookup, credential-file io, and the stdin/stdout [`AuthInteraction`]; the
 //! `[[bin]]` entry (its ticket wires `builtinProviders` through the provider
-//! registry, each OAuth flow via [`crate::auth::oauth::load`]) builds the
+//! registry, each OAuth flow via [`crate::auth::oauth`]) builds the
 //! [`CliProvider`] list, parses the argument vector, calls [`run`], and
 //! prints the returned [`AuthError`] the way upstream's `main().catch(...)`
 //! does ("Error: {message}", exit code 1).
@@ -28,9 +28,9 @@
 //!   material stays owner-only. Nothing prints key material.
 //! - `node:readline`'s question promise becomes a blocking stdin read
 //!   inside [`tokio::task::spawn_blocking`]; stdin EOF fails the pending
-//!   prompt as "Login cancelled", the closed-terminal analogue (upstream's
-//!   readline never resolves and the process exits). [`CliInteraction`]
-//!   therefore needs a tokio runtime context to drive.
+//!   prompt as the abort rejection [`PromptFn`](crate::auth::types::PromptFn)
+//!   carries (upstream's readline never resolves and the process exits), so
+//!   driving one needs a tokio runtime context.
 //! - The per-prompt signal on [`AuthPrompt`] is accepted but not observed:
 //!   a terminal readline cannot be cancelled, and upstream passes a
 //!   never-aborted controller.
@@ -48,12 +48,8 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use tokio_util::sync::CancellationToken;
-
-use crate::auth::{
-    AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, AuthSelectOption,
-    BoxAuthFuture, Credential, OAuthAuth, ProviderAuthInteraction,
-};
+use crate::auth::oauth::auth_error;
+use crate::auth::types::{AuthError, AuthEvent, AuthInteraction, AuthPrompt, AuthPromptKind, Credential, PromptFn};
 
 /// One OAuth provider the CLI offers, upstream's filtered
 /// `builtinProviders()` entry: a provider whose `auth.oauth` is set.
@@ -68,7 +64,7 @@ pub struct CliProvider {
     /// The display name, upstream's `Provider.name`.
     pub name: String,
     /// The OAuth flow `login` drives.
-    pub oauth: Arc<dyn OAuthAuth>,
+    pub oauth: crate::auth::types::OAuthAuth,
 }
 
 /// The usage text for the help command and the no-command case, byte-for-byte
@@ -122,7 +118,10 @@ pub fn find_provider<'a>(
 /// # Errors
 /// `Invalid selection` when the line does not parse to a number inside
 /// `1..=options.len()`.
-pub fn select_choice(options: &[AuthSelectOption], raw: &str) -> Result<String, AuthError> {
+pub fn select_choice(
+    options: &[crate::auth::types::AuthPromptOption],
+    raw: &str,
+) -> Result<String, AuthError> {
     let selected = raw
         .trim()
         .parse::<usize>()
@@ -130,7 +129,7 @@ pub fn select_choice(options: &[AuthSelectOption], raw: &str) -> Result<String, 
         .and_then(|number| number.checked_sub(1))
         .and_then(|index| options.get(index));
     selected.map_or_else(
-        || Err(AuthError("Invalid selection".to_owned())),
+        || Err(auth_error("Invalid selection")),
         |option| Ok(option.id.clone()),
     )
 }
@@ -168,7 +167,7 @@ fn load_from(auth_path: &Path) -> BTreeMap<String, Credential> {
 /// An io failure on the credential file, as the [`AuthError`] the store
 /// operations report, naming the action and the path.
 fn io_error(action: &str, path: &Path, error: &std::io::Error) -> AuthError {
-    AuthError(format!("Failed to {action} {}: {error}", path.display()))
+    auth_error(format!("Failed to {action} {}: {error}", path.display()))
 }
 
 /// Merge `credential` into the store under `provider_id` and write it back
@@ -198,7 +197,7 @@ pub fn save_credentials(
             .map_err(|error| io_error("set permissions on", parent, &error))?;
     }
     let mut serialized = serde_json::to_string_pretty(&storage)
-        .map_err(|error| AuthError(format!("Failed to serialize credentials: {error}")))?;
+        .map_err(|error| auth_error(format!("Failed to serialize credentials: {error}")))?;
     serialized.push('\n');
     std::fs::write(auth_path, serialized).map_err(|error| io_error("write", auth_path, &error))?;
     std::fs::set_permissions(
@@ -216,29 +215,63 @@ pub fn save_credentials(
 /// message/placeholder question) to stdout and reads one line from stdin;
 /// `notify` prints each event per upstream's switch. Prompts read through
 /// [`tokio::task::spawn_blocking`], so driving one needs a tokio runtime;
-/// stdin EOF fails the pending prompt ("Login cancelled").
-#[derive(Debug)]
-pub struct CliInteraction;
+/// stdin EOF fails the pending prompt as the abort rejection.
+#[must_use]
+pub fn cli_interaction() -> AuthInteraction {
+    AuthInteraction {
+        signal: None,
+        prompt: prompt_fn(),
+        notify: notify_fn(),
+    }
+}
 
-impl AuthInteraction for CliInteraction {
-    fn prompt(&self, auth_prompt: AuthPrompt) -> BoxAuthFuture<Result<String, AuthError>> {
+/// The prompt half of [`cli_interaction`]: render and read one line, the
+/// `node:readline` question port.
+fn prompt_fn() -> PromptFn {
+    Arc::new(move |auth_prompt: AuthPrompt| {
         Box::pin(async move {
-            if let AuthPromptKind::Select(options) = auth_prompt.kind {
-                println!("\n{}", auth_prompt.message);
-                for (index, option) in options.iter().enumerate() {
-                    println!("  {}. {}", index + 1, option.label);
+            match auth_prompt.kind {
+                AuthPromptKind::Select { options, .. } => {
+                    println!();
+                    for (index, option) in options.iter().enumerate() {
+                        println!("  {}. {}", index + 1, option.label);
+                    }
+                    let raw = read_line(&format!("Enter number (1-{}): ", options.len())).await?;
+                    select_choice(&options, &raw).map_err(|_| crate::utils::abort::AbortError)
                 }
-                let raw = read_line(&format!("Enter number (1-{}): ", options.len())).await?;
-                select_choice(&options, &raw)
-            } else {
-                let question =
-                    prompt_line(&auth_prompt.message, auth_prompt.placeholder.as_deref());
-                read_line(&question).await
+                ref kind => {
+                    let (message, placeholder) = prompt_fields(kind);
+                    let question = prompt_line(&message, placeholder.as_deref());
+                    read_line(&question).await
+                }
             }
         })
-    }
+    })
+}
 
-    fn notify(&self, event: AuthEvent) {
+/// The message and placeholder a non-select prompt kind carries, the fields
+/// the question line renders.
+fn prompt_fields(kind: &AuthPromptKind) -> (String, Option<String>) {
+    match kind {
+        AuthPromptKind::Text {
+            message,
+            placeholder,
+        }
+        | AuthPromptKind::Secret {
+            message,
+            placeholder,
+        }
+        | AuthPromptKind::ManualCode {
+            message,
+            placeholder,
+        } => (message.clone(), placeholder.clone()),
+        AuthPromptKind::Select { .. } => unreachable!("handled by the select branch"),
+    }
+}
+
+/// The notify half of [`cli_interaction`], upstream's event switch.
+fn notify_fn() -> crate::auth::types::NotifyFn {
+    Arc::new(move |event: AuthEvent| {
         match event {
             AuthEvent::AuthUrl { url, instructions } => {
                 println!("\nOpen this URL in your browser:\n{url}");
@@ -258,7 +291,7 @@ impl AuthInteraction for CliInteraction {
                 println!("{message}");
             }
         }
-    }
+    })
 }
 
 /// The `main()` port: dispatch the argument vector against `providers` and
@@ -266,7 +299,7 @@ impl AuthInteraction for CliInteraction {
 ///
 /// No command or a help variant prints [`help_text`]; `list` prints one
 /// padded line per provider; `login` without an id picks the provider from
-/// a numbered prompt, then runs its OAuth flow over [`CliInteraction`] with
+/// a numbered prompt, then runs its OAuth flow over [`cli_interaction`] with
 /// a fresh uncancelled signal and persists the credential, printing
 /// "\nCredentials saved to {file name}".
 ///
@@ -301,11 +334,11 @@ pub async fn run(
             };
             let provider_id = selected.unwrap_or_default();
             let Some(provider) = find_provider(providers, &provider_id) else {
-                return Err(AuthError(format!("Unknown provider: {provider_id}")));
+                return Err(auth_error(format!("Unknown provider: {provider_id}")));
             };
             login_provider(provider, auth_path).await
         }
-        Some(command) => Err(AuthError(format!("Unknown command: {command}"))),
+        Some(command) => Err(auth_error(format!("Unknown command: {command}"))),
     }
 }
 
@@ -330,15 +363,16 @@ fn display_file_name(auth_path: &str) -> &str {
 /// the runtime stays responsive.
 ///
 /// # Errors
-/// Fails when the prompt cannot be flushed, when stdin ends before a line
-/// arrives or the read fails (both leave no answer to return, so the prompt
-/// fails as "Login cancelled" — upstream's closed-terminal path), or when
-/// the blocking task itself fails.
-async fn read_line(question: &str) -> Result<String, AuthError> {
+/// Fails as the abort rejection when the prompt cannot be flushed, when
+/// stdin ends before a line arrives, when the read fails, or when the
+/// blocking task itself fails — all leave no answer to return, so the prompt
+/// rejects the way a cancelled prompt does (upstream's closed-terminal path
+/// never resolves).
+async fn read_line(question: &str) -> Result<String, crate::utils::abort::AbortError> {
     print!("{question}");
     std::io::stdout()
         .flush()
-        .map_err(|error| AuthError(format!("Failed to write prompt: {error}")))?;
+        .map_err(|_| crate::utils::abort::AbortError)?;
     let line = tokio::task::spawn_blocking(|| {
         let mut line = String::new();
         match std::io::stdin().read_line(&mut line) {
@@ -351,8 +385,8 @@ async fn read_line(question: &str) -> Result<String, AuthError> {
     .await;
     match line {
         Ok(Some(line)) => Ok(line),
-        Ok(None) => Err(AuthError("Login cancelled".to_owned())),
-        Err(error) => Err(AuthError(format!("Input task failed: {error}"))),
+        // A missing answer is the abort the prompt contract carries.
+        Ok(None) | Err(_) => Err(crate::utils::abort::AbortError),
     }
 }
 
@@ -364,7 +398,9 @@ async fn select_provider(providers: &[CliProvider]) -> Result<String, AuthError>
     for (index, provider) in providers.iter().enumerate() {
         println!("  {}. {}", index + 1, provider.name);
     }
-    let raw = read_line(&format!("Enter number (1-{}): ", providers.len())).await?;
+    let raw = read_line(&format!("Enter number (1-{}): ", providers.len()))
+        .await
+        .map_err(|_| auth_error("Login cancelled"))?;
     let selected = raw
         .trim()
         .parse::<usize>()
@@ -373,11 +409,11 @@ async fn select_provider(providers: &[CliProvider]) -> Result<String, AuthError>
         .and_then(|index| providers.get(index));
     selected
         .map(|provider| provider.id.clone())
-        .ok_or_else(|| AuthError(String::new()))
+        .ok_or_else(|| auth_error(String::new()))
 }
 
 /// Run one provider's OAuth login and persist the credential, upstream's
-/// `login()`: the flow drives [`CliInteraction`] over a fresh uncancelled
+/// `login()`: the flow drives [`cli_interaction`] over a fresh uncancelled
 /// signal (upstream's `new AbortController().signal`), then the credential
 /// merges into `auth_path`'s store and the saved-to line prints the file
 /// name.
@@ -385,13 +421,12 @@ async fn select_provider(providers: &[CliProvider]) -> Result<String, AuthError>
 /// # Errors
 /// Fails when the OAuth flow fails or when persisting the credential fails.
 async fn login_provider(provider: &CliProvider, auth_path: &str) -> Result<(), AuthError> {
-    let credential = provider
-        .oauth
-        .login(ProviderAuthInteraction {
-            interaction: Arc::new(CliInteraction),
-            signal: CancellationToken::new(),
-        })
-        .await?;
+    let interaction =
+        crate::auth::types::ProviderAuthInteraction::from_interaction(
+            cli_interaction(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+    let credential = (provider.oauth.login)(interaction).await?;
     save_credentials(
         Path::new(auth_path),
         &provider.id,

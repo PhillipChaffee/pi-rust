@@ -8,13 +8,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
 use crate::auth::oauth::{
-    execute, form_post_request, read_json, required_string, wire_seconds_to_u64,
+    auth_error, execute, form_post_request, oauth_credentials, read_json, required_string,
+    wire_seconds_to_u64,
 };
-use crate::auth::types::{
-    AuthError, AuthEvent, AuthInteraction as _, BoxAuthFuture, ModelAuth, OAuthAuth,
-    OAuthCredential, ProviderAuthInteraction,
-};
+use crate::auth::types::{AuthError, AuthEvent, OAuthCredentials};
 use crate::http::HttpClient;
+use crate::auth::types::ModelAuth;
+use crate::types::BoxedFuture;
 
 const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
@@ -66,7 +66,7 @@ fn positive_number(
         Some(value) if value.is_finite() && value > 0.0 && value.fract() == 0.0 => {
             Ok(wire_seconds_to_u64(value))
         }
-        _ => Err(AuthError(format!(
+        _ => Err(auth_error(format!(
             "Invalid xAI OAuth response field: {field}"
         ))),
     }
@@ -75,9 +75,9 @@ fn positive_number(
 // The verification URI is opened in the user's browser; force it to be an
 // https URL so a malicious response cannot make `open` launch something else.
 fn validate_verification_uri(raw: &str) -> Result<String, AuthError> {
-    let url = url::Url::parse(raw).map_err(|_| AuthError(UNTRUSTED_URI.to_owned()))?;
+    let url = url::Url::parse(raw).map_err(|_| auth_error(UNTRUSTED_URI.to_owned()))?;
     if url.scheme() != "https" {
-        return Err(AuthError(UNTRUSTED_URI.to_owned()));
+        return Err(auth_error(UNTRUSTED_URI.to_owned()));
     }
     Ok(url.to_string())
 }
@@ -99,7 +99,7 @@ async fn post_form(
     );
     let mut response = execute(client, request).await.map_err(|error| {
         if signal.is_cancelled() {
-            return AuthError("Login cancelled".to_owned());
+            return auth_error("Login cancelled".to_owned());
         }
         error
     })?;
@@ -130,7 +130,7 @@ fn request_failure(
     } else {
         format!(": {detail}")
     };
-    AuthError(format!("xAI OAuth {action} failed (HTTP {status}){detail}"))
+    auth_error(format!("xAI OAuth {action} failed (HTTP {status}){detail}"))
 }
 
 fn parse_device_code(
@@ -168,7 +168,7 @@ fn required_xai_string(
 ) -> Result<String, AuthError> {
     match body.get(field) {
         Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(value.clone()),
-        _ => Err(AuthError(format!(
+        _ => Err(auth_error(format!(
             "Invalid xAI OAuth response field: {field}"
         ))),
     }
@@ -178,27 +178,27 @@ fn credentials_from_token_response(
     clock: &dyn crate::auth::clock::AuthClock,
     body: &serde_json::Map<String, serde_json::Value>,
     previous_refresh_token: Option<&str>,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let access = required_string(body, "access_token")
-        .map_err(|_| AuthError("Invalid xAI OAuth response field: access_token".to_owned()))?;
+        .map_err(|_| auth_error("Invalid xAI OAuth response field: access_token".to_owned()))?;
     // xAI may omit refresh_token on refresh when the token is not rotated.
     let refresh = if body.get("refresh_token").is_none() {
         match previous_refresh_token {
             Some(previous) => previous.to_owned(),
             None => required_string(body, "refresh_token").map_err(|_| {
-                AuthError("Invalid xAI OAuth response field: refresh_token".to_owned())
+                auth_error("Invalid xAI OAuth response field: refresh_token".to_owned())
             })?,
         }
     } else {
         required_string(body, "refresh_token")
-            .map_err(|_| AuthError("Invalid xAI OAuth response field: refresh_token".to_owned()))?
+            .map_err(|_| auth_error("Invalid xAI OAuth response field: refresh_token".to_owned()))?
     };
     let expires_in_seconds = match body.get("expires_in") {
         None | Some(serde_json::Value::Null) => DEFAULT_TOKEN_LIFETIME_SECONDS,
         Some(_) => positive_number(body, "expires_in")?,
     };
     let expires_ms = i64::try_from(expires_in_seconds.saturating_mul(1000)).unwrap_or(i64::MAX);
-    Ok(OAuthCredential::new(
+    Ok(oauth_credentials(
         access,
         refresh,
         clock.now_ms() + expires_ms - REFRESH_SKEW_MS,
@@ -231,8 +231,8 @@ async fn poll_for_tokens(
     device: XaiDeviceCode,
     clock: Arc<dyn crate::auth::clock::AuthClock>,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
-    poll_oauth_device_code_flow::<OAuthCredential>(PollOptions {
+) -> Result<OAuthCredentials, AuthError> {
+    poll_oauth_device_code_flow::<OAuthCredentials>(PollOptions {
         interval_seconds: device.interval_seconds,
         expires_in_seconds: Some(device.expires_in_seconds),
         wait_before_first_poll: true,
@@ -285,7 +285,7 @@ async fn poll_for_tokens(
                             Ok(PollOutcome::Failed("xAI device code expired".to_owned()))
                         }
                         _ => Ok(PollOutcome::Failed(
-                            request_failure("device token polling", status, &body).0,
+                            request_failure("device token polling", status, &body).to_string(),
                         )),
                     }
                 })
@@ -300,7 +300,7 @@ async fn refresh_xai_token(
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
     refresh_token: &str,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let (status, body) = post_form(
         client,
         XAI_TOKEN_URL,
@@ -318,28 +318,17 @@ async fn refresh_xai_token(
     credentials_from_token_response(clock.as_ref(), &body, Some(refresh_token))
 }
 
-impl OAuthAuth for XaiOAuth {
-    fn name(&self) -> &'static str {
-        "xAI (Grok/X subscription)"
-    }
-
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    fn login_label(&self) -> Option<&str> {
-        Some("Sign in with SuperGrok or X Premium")
-    }
-
-    fn login(
+impl XaiOAuth {
+    /// Run the interactive login flow: device-code authorization.
+    pub fn login(
         &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
         let clock = self.clock.clone();
         Box::pin(async move {
             let device = request_device_code(&client, &interaction.signal).await?;
-            interaction.notify(AuthEvent::DeviceCode {
+            (interaction.notify)(AuthEvent::DeviceCode {
                 user_code: device.user_code.clone(),
                 verification_uri: device
                     .verification_uri_complete
@@ -352,18 +341,71 @@ impl OAuthAuth for XaiOAuth {
         })
     }
 
-    fn refresh(
+    /// Exchange the refresh token for a rotated credential; an unrotated
+    /// refresh token survives an absent wire field.
+    pub fn refresh(
         &self,
-        credential: &OAuthCredential,
+        credential: OAuthCredentials,
         signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
         let client = self.client.clone();
         let clock = self.clock.clone();
         let refresh_token = credential.refresh.clone();
         Box::pin(async move { refresh_xai_token(&client, &clock, &refresh_token, &signal).await })
     }
 
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        ModelAuth::api_key(credential.access.clone())
+    /// Derive the request auth from a valid credential.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
+        ModelAuth {
+            api_key: Some(credential.access.clone()),
+            ..ModelAuth::default()
+        }
+    }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own client and clock. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |interaction| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |credential, signal| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                flow.refresh(credential, signal)
+            })
+        };
+        let to_auth: crate::auth::types::OAuthToAuthFn = {
+            Arc::new(|credential| {
+                let auth = ModelAuth {
+                    api_key: Some(credential.access.clone()),
+                    ..ModelAuth::default()
+                };
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        crate::auth::types::OAuthAuth {
+            name: "xAI (Grok/X subscription)".to_owned(),
+            is_subscription: Some(true),
+            login_label: Some("Sign in with SuperGrok or X Premium".to_owned()),
+            login,
+            refresh,
+            to_auth,
+        }
     }
 }

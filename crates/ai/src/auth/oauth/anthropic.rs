@@ -15,14 +15,13 @@ use crate::auth::oauth::callback::{
 use crate::auth::oauth::oauth_page::{oauth_error_html, oauth_success_html};
 use crate::auth::oauth::pkce::{Pkce, generate_pkce};
 use crate::auth::oauth::{
-    execute, json_post_request, parse_authorization_code_state, read_body_lossy,
-    wire_seconds_to_i64,
+    auth_error, execute, json_post_request, oauth_credentials, parse_authorization_code_state,
+    read_body_lossy, wire_seconds_to_i64,
 };
-use crate::auth::types::{
-    AuthError, AuthEvent, AuthInteraction as _, AuthPrompt, AuthPromptKind, BoxAuthFuture,
-    ModelAuth, OAuthAuth, OAuthCredential, ProviderAuthInteraction,
-};
+use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, AuthPromptKind, OAuthCredentials};
 use crate::http::HttpClient;
+use crate::auth::types::ModelAuth;
+use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;
 
 const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -56,6 +55,88 @@ impl AnthropicOAuth {
     #[must_use]
     pub fn new(client: Arc<dyn HttpClient>, clock: Arc<dyn crate::auth::clock::AuthClock>) -> Self {
         Self { client, clock }
+    }
+
+    /// The flow wired into the merged auth core's callback-based
+    /// [`OAuthAuth`](crate::auth::types::OAuthAuth): the login, refresh, and
+    /// derivation closures drive this flow's own client and clock. (#29)
+    #[must_use]
+    pub fn auth(&self) -> crate::auth::types::OAuthAuth {
+        let login: crate::auth::types::OAuthLoginFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |interaction| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                flow.login(interaction)
+            })
+        };
+        let refresh: crate::auth::types::OAuthRefreshFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |credential, signal| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                flow.refresh(credential, signal)
+            })
+        };
+        let to_auth: crate::auth::types::OAuthToAuthFn = {
+            let client = Arc::clone(&self.client);
+            let clock = Arc::clone(&self.clock);
+            Arc::new(move |credential| {
+                let flow = Self {
+                    client: Arc::clone(&client),
+                    clock: Arc::clone(&clock),
+                };
+                let auth = flow.to_auth(&credential);
+                Box::pin(async move { Ok(auth) })
+            })
+        };
+        crate::auth::types::OAuthAuth {
+            name: "Anthropic (Claude Pro/Max)".to_owned(),
+            is_subscription: Some(true),
+            login_label: None,
+            login,
+            refresh,
+            to_auth,
+        }
+    }
+
+    /// Run the interactive login flow.
+    pub fn login(
+        &self,
+        interaction: crate::auth::types::ProviderAuthInteraction,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
+        let client = self.client.clone();
+        let clock = self.clock.clone();
+        Box::pin(async move { login_anthropic(&client, &clock, &interaction).await })
+    }
+
+    /// Exchange the refresh token for a rotated credential.
+    pub fn refresh(
+        &self,
+        credential: OAuthCredentials,
+        signal: CancellationToken,
+    ) -> BoxedFuture<'static, Result<OAuthCredentials, AuthError>> {
+        let client = self.client.clone();
+        let clock = self.clock.clone();
+        let refresh_token = credential.refresh.clone();
+        Box::pin(async move {
+            refresh_anthropic_token(&client, clock.as_ref(), &refresh_token, &signal).await
+        })
+    }
+
+    /// Derive the request auth from a valid credential.
+    #[must_use]
+    pub fn to_auth(&self, credential: &OAuthCredentials) -> ModelAuth {
+        ModelAuth {
+            api_key: Some(credential.access.clone()),
+            ..ModelAuth::default()
+        }
     }
 }
 
@@ -156,7 +237,7 @@ async fn post_token_json(
     let status = response.status;
     let body_text = read_body_lossy(&mut response).await;
     if !(200..300).contains(&status) {
-        return Err(AuthError(format!(
+        return Err(auth_error(format!(
             "HTTP request failed. status={status}; url={TOKEN_URL}; body={body_text}"
         )));
     }
@@ -173,7 +254,7 @@ async fn exchange_authorization_code(
     verifier: &str,
     redirect_uri: &str,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let body = serde_json::json!({
         "grant_type": "authorization_code",
         "client_id": CLIENT_ID,
@@ -185,14 +266,14 @@ async fn exchange_authorization_code(
     let response_body = match post_token_json(client, body, signal).await {
         Ok(body) => body,
         Err(error) => {
-            return Err(AuthError(format!(
+            return Err(auth_error(format!(
                 "Token exchange request failed. url={TOKEN_URL}; redirect_uri={redirect_uri}; response_type=authorization_code; details={}",
-                error.0
+                error
             )));
         }
     };
     let map = serde_json::from_str::<serde_json::Value>(&response_body).map_err(|error| {
-        AuthError(format!(
+        auth_error(format!(
             "Token exchange returned invalid JSON. url={TOKEN_URL}; body={response_body}; details={error}"
         ))
     })?;
@@ -203,9 +284,9 @@ async fn exchange_authorization_code(
         .get("expires_in")
         .and_then(serde_json::Value::as_f64)
         .ok_or_else(|| {
-            AuthError("Token exchange returned invalid JSON: missing expires_in".to_owned())
+            auth_error("Token exchange returned invalid JSON: missing expires_in")
         })?;
-    Ok(OAuthCredential::new(
+    Ok(oauth_credentials(
         access_token,
         refresh_token,
         clock.now_ms() + wire_seconds_to_i64(expires_in).saturating_mul(1000) - EXPIRY_SKEW_MS,
@@ -218,7 +299,7 @@ async fn refresh_anthropic_token(
     clock: &dyn crate::auth::clock::AuthClock,
     refresh_token: &str,
     signal: &CancellationToken,
-) -> Result<OAuthCredential, AuthError> {
+) -> Result<OAuthCredentials, AuthError> {
     let body = serde_json::json!({
         "grant_type": "refresh_token",
         "client_id": CLIENT_ID,
@@ -227,15 +308,15 @@ async fn refresh_anthropic_token(
     let response_body = match post_token_json(client, body, signal).await {
         Ok(body) => body,
         Err(error) => {
-            return Err(AuthError(format!(
+            return Err(auth_error(format!(
                 "Anthropic token refresh request failed. url={TOKEN_URL}; details={}",
-                error.0
+                error
             )));
         }
     };
     let map = serde_json::from_str::<serde_json::Value>(&response_body)
         .map_err(|error| {
-            AuthError(format!(
+            auth_error(format!(
                 "Anthropic token refresh returned invalid JSON. url={TOKEN_URL}; body={response_body}; details={error}"
             ))
         })?;
@@ -247,11 +328,9 @@ async fn refresh_anthropic_token(
         .get("expires_in")
         .and_then(serde_json::Value::as_f64)
         .ok_or_else(|| {
-            AuthError(
-                "Anthropic token refresh returned invalid JSON: missing expires_in".to_owned(),
-            )
+            auth_error("Anthropic token refresh returned invalid JSON: missing expires_in")
         })?;
-    Ok(OAuthCredential::new(
+    Ok(oauth_credentials(
         access,
         refresh,
         clock.now_ms() + wire_seconds_to_i64(expires_in).saturating_mul(1000) - EXPIRY_SKEW_MS,
@@ -264,22 +343,23 @@ async fn refresh_anthropic_token(
 async fn login_anthropic(
     client: &Arc<dyn HttpClient>,
     clock: &Arc<dyn crate::auth::clock::AuthClock>,
-    interaction: &ProviderAuthInteraction,
-) -> Result<OAuthCredential, AuthError> {
+    interaction: &crate::auth::types::ProviderAuthInteraction,
+) -> Result<OAuthCredentials, AuthError> {
     let pkce = generate_pkce()?;
     let (server, wait_cell, receiver) = start_callback_server(&pkce.verifier).await?;
 
     let manual_abort = CancellationToken::new();
     let manual_prompt = AuthPrompt {
-        kind: AuthPromptKind::ManualCode,
-        message:
-            "Complete login in your browser, or paste the authorization code / redirect URL here:"
-                .to_owned(),
-        placeholder: Some(REDIRECT_URI.to_owned()),
         signal: Some(manual_abort.clone()),
+        kind: AuthPromptKind::ManualCode {
+            message:
+                "Complete login in your browser, or paste the authorization code / redirect URL here:"
+                    .to_owned(),
+            placeholder: Some(REDIRECT_URI.to_owned()),
+        },
     };
 
-    interaction.notify(AuthEvent::AuthUrl {
+    (interaction.notify)(AuthEvent::AuthUrl {
         url: authorize_url(&pkce),
         instructions: Some(
             "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here."
@@ -294,7 +374,7 @@ async fn login_anthropic(
         let interaction = interaction.clone();
         let wait_cell = wait_cell.clone();
         async move {
-            let result = interaction.prompt(manual_prompt).await;
+            let result = (interaction.prompt)(manual_prompt).await;
             wait_cell.settle(None).await;
             result
         }
@@ -317,23 +397,23 @@ async fn login_anthropic(
                 {
                     manual_abort.cancel();
                     server.close();
-                    return Err(AuthError("OAuth state mismatch".to_owned()));
+                    return Err(auth_error("OAuth state mismatch"));
                 }
                 code = parsed_code;
                 state = parsed_state.or_else(|| Some(pkce.verifier.clone()));
             }
-            Ok(Err(error)) => manual_error = Some(error),
-            Err(join_error) => manual_error = Some(AuthError(join_error.to_string())),
+            Ok(Err(error)) => manual_error = Some(AuthError::from(error)),
+            Err(join_error) => manual_error = Some(auth_error(join_error.to_string())),
         },
     }
 
     let credential = match (code, state) {
         (Some(code), Some(state)) => {
-            interaction.notify(AuthEvent::Progress {
+            (interaction.notify)(AuthEvent::Progress {
                 message: "Exchanging authorization code for tokens...".to_owned(),
             });
             exchange_authorization_code(
-                client,
+                &client,
                 clock.as_ref(),
                 &code,
                 &state,
@@ -344,47 +424,12 @@ async fn login_anthropic(
             .await
         }
         (None, _) => {
-            Err(manual_error.unwrap_or_else(|| AuthError("Missing authorization code".to_owned())))
+            Err(manual_error
+                .unwrap_or_else(|| auth_error("Missing authorization code")))
         }
-        (Some(_), None) => Err(AuthError("Missing OAuth state".to_owned())),
+        (Some(_), None) => Err(auth_error("Missing OAuth state")),
     };
     manual_abort.cancel();
     server.close();
     credential
-}
-
-impl OAuthAuth for AnthropicOAuth {
-    fn name(&self) -> &'static str {
-        "Anthropic (Claude Pro/Max)"
-    }
-
-    fn is_subscription(&self) -> bool {
-        true
-    }
-
-    fn login(
-        &self,
-        interaction: ProviderAuthInteraction,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let client = self.client.clone();
-        let clock = self.clock.clone();
-        Box::pin(async move { login_anthropic(&client, &clock, &interaction).await })
-    }
-
-    fn refresh(
-        &self,
-        credential: &OAuthCredential,
-        signal: CancellationToken,
-    ) -> BoxAuthFuture<Result<OAuthCredential, AuthError>> {
-        let client = self.client.clone();
-        let clock = self.clock.clone();
-        let refresh_token = credential.refresh.clone();
-        Box::pin(async move {
-            refresh_anthropic_token(&client, clock.as_ref(), &refresh_token, &signal).await
-        })
-    }
-
-    fn to_auth(&self, credential: &OAuthCredential) -> ModelAuth {
-        ModelAuth::api_key(credential.access.clone())
-    }
 }
