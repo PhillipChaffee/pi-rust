@@ -15,6 +15,11 @@
     reason = "the block helper panics on a runtime build failure by design; tests pin outcomes"
 )]
 
+pub mod auth_fixtures;
+pub mod auth_interaction;
+pub mod paused_clock;
+pub mod seam_forms;
+
 use pi_ai::types::{
     Api, AssistantBlock, AssistantMessage, Message, ProviderId, StopReason, TextContent, Usage,
     UsageCost, UserContent, UserMessage,
