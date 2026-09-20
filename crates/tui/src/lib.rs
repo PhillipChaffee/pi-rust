@@ -10,10 +10,16 @@
 //!
 //! This slice carries the ANSI-aware string-width utilities ([`utils`]), the
 //! input parsing layer ([#40](https://github.com/PhillipChaffee/pi-rust/issues/40)),
-//! and the terminal I/O layer ([#41](https://github.com/PhillipChaffee/pi-rust/issues/41));
-//! the renderers and component library land with their own port tickets.
+//! the terminal I/O layer ([#41](https://github.com/PhillipChaffee/pi-rust/issues/41)),
+//! the fuzzy matcher and the leaf components
+//! ([#42](https://github.com/PhillipChaffee/pi-rust/issues/42)), and the TUI
+//! core — the component contract, the overlay stack, the mouse routing, and
+//! the render scheduler ([#43](https://github.com/PhillipChaffee/pi-rust/issues/43)); the renderers and
+//! the layout engine land with their own port tickets.
 //!
 //! - [`utils`] — ANSI-aware width measurement and manipulation.
+//! - [`fuzzy`] — [`fuzzy::fuzzy_match`] and [`fuzzy::fuzzy_filter`], the
+//!   ordered-subsequence matcher behind the model pickers.
 //! - [`keys`] — the [`keys::Key`] identifier helper, [`keys::KeyParser`]'s
 //!   `matches_key`/`parse_key`, legacy CSI/SS3 decoding, Kitty `CSI u` events,
 //!   and printable decoding.
@@ -32,6 +38,17 @@
 //!   `drainInput`.
 //! - [`terminal_colors`] — the OSC 11 background-color response parser and
 //!   the `CSI ? 997 ; n` color-scheme report parser.
+//! - [`tui`] — the [`tui::Component`] contract and mouse event types, the
+//!   [`tui::Container`], the overlay stack and [`tui::OverlayHandle`], the
+//!   focus-restore machinery, [`tui::composite_tui_line`], the
+//!   [`tui::CURSOR_MARKER`], and the [`tui::Tui`] core with its render
+//!   scheduler; the concrete renderers land with #45 and #46.
+//! - [`terminal_image`] — the cell-dimension store and [`terminal_image::is_image_line`]
+//!   the TUI core consumes; the rest of terminal-image lands with #51.
+//! - [`components`] — the leaf components ([`components::Box`],
+//!   [`components::Text`], [`components::TruncatedText`],
+//!   [`components::Spacer`], [`components::Loader`],
+//!   [`components::CancellableLoader`]).
 //!
 //! Two upstream shapes in the input layer are restated rather than copied:
 //!
@@ -62,9 +79,15 @@
 //! modifier table entries, the write log, the UTF-8 decoder, the progress
 //! keepalive) so the 95% coverage gate binds.
 
+pub mod components;
+pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
+pub mod layout;
+pub mod layout_node;
 pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;
+pub mod terminal_image;
+pub mod tui;
 pub mod utils;

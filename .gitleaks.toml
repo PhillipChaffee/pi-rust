@@ -1,6 +1,10 @@
-# gitleaks configuration. The default ruleset runs as-is; this repository has
-# no allowlist entries. Add one only with a reason (for example, a test
-# fixture that carries a fake credential on purpose).
+# gitleaks configuration. The default ruleset runs as-is. Two allowlist
+# entries follow, each with a reason: the build-output entry covers rustdoc's
+# search index (it embeds random base64 tokens that match credential
+# detectors) and the target directory, and the catalog-hashes entry covers
+# the generated catalogs' content hashes. Add further entries only with a
+# reason (for example, a test fixture that carries a fake credential on
+# purpose).
 [extend]
 useDefault = true
 # The ported providers' generated catalog carries vendor metadata, and every

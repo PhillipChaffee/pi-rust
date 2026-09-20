@@ -1,6 +1,6 @@
 [workspace]
 # One crate per upstream TS package, per the map: crates/<pkg> mirrors packages/<pkg>.
-members = ["crates/telemetry", "crates/ai", "crates/evals", "crates/tui"]
+members = ["crates/telemetry", "crates/ai", "crates/evals", "crates/tui", "crates/chord"]
 # Edition 2024's default resolver, made explicit so the workspace table is self-describing.
 resolver = "3"
 
@@ -57,7 +57,10 @@ nursery = { level = "warn", priority = -1 }   # experimental; the pin makes its 
 cargo = { level = "warn", priority = -1 }     # lints the manifest itself (wildcard dependencies and friends); cheap group, no code noise
 
 # --- group exceptions carry reasons; start empty and add them as they fire
-# future_not_send = "allow"             # e.g. template: single-threaded UI executor
+# future_not_send fires across chord: upstream runs on one JavaScript event
+# loop, so the port keeps every future single-threaded (no crate spawns, no
+# cross-thread transport), which is the contract the tests pin. #16
+future_not_send = "allow"
 # The TLS and WebSocket stacks pin the duplicates: rustls' ring backend holds
 # getrandom 0.2 beside tokio-util's 0.4 and the uuidv7 tail's 0.3 (with their
 # r-efi and windows-sys transports), and tokio-tungstenite 0.30 pins the
