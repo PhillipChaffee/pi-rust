@@ -2431,6 +2431,20 @@ pub trait ProviderStreams: Send + Sync {
     ) -> BoxedFuture<'a, Result<(), crate::utils::provider_retry::ProviderRequestError>> {
         Box::pin(async { Err(crate::utils::provider_retry::ProviderRequestError::aborted()) })
     }
+
+    /// Whether this implementation provides `fetch_deferred`, the port of
+    /// upstream's `entry.fetchDeferred !== undefined` presence check.
+    #[must_use]
+    fn supports_fetch_deferred(&self) -> bool {
+        false
+    }
+
+    /// Whether this implementation provides `cancel_deferred`, the port of
+    /// upstream's `entry.cancelDeferred !== undefined` presence check.
+    #[must_use]
+    fn supports_cancel_deferred(&self) -> bool {
+        false
+    }
 }
 
 /// The uniform contract of an image-generation API implementation module.
