@@ -9,6 +9,10 @@ ratatui = "ratatui"
 # evn is the macro variable binding an event's name.
 evn = "evn"
 # JSON fragments the utils suites pin verbatim from the upstream tests.
+# Relace is the vendor name of the relace/relace-search model in the
+# generated OpenRouter catalog shard (models.dev/OpenRouter data).
 [default.extend-words]
 tru = "tru"
 Hel = "Hel"
+Relace = "Relace"
+relace = "relace"

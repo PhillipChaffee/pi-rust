@@ -28,6 +28,8 @@ tokio-util = { version = "0.7", default-features = false }
 url = "2.5"
 # getrandom: crypto.getRandomValues for the uuidv7 tail.
 getrandom = "0.3"
+# sha2: the model-data manifest hashes, matching node:crypto's sha256 hex.
+sha2 = "0.10"
 # rustix: the kernel release for the pi user agent, through a safe API.
 rustix = { version = "1.1", default-features = false, features = ["std", "system"] }
 # http: the HttpClient seam substrate (reqwest 0.12 + rustls per the stack
