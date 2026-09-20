@@ -7,12 +7,12 @@
 //! here each suite pins one contract directly.
 
 #![expect(
-    clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(
     clippy::panic,
     reason = "the tests pin outcomes; an unexpected shape panics by design"
+)]
+#![expect(
+    clippy::expect_used,
+    reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
 mod common;
@@ -38,6 +38,20 @@ use tokio_util::sync::CancellationToken;
 
 fn credential() -> OAuthCredentials {
     oauth_credentials("access-token", "refresh-token", 0)
+}
+
+/// The resolve input the handler closures take, over the given context and
+/// stored credential.
+fn resolve_input(
+    ctx: Arc<dyn pi_ai::auth::types::AuthContext>,
+    credential: Option<ApiKeyCredential>,
+    signal: CancellationToken,
+) -> ApiKeyAuthInput {
+    ApiKeyAuthInput {
+        ctx,
+        credential,
+        signal,
+    }
 }
 
 /// Each factory builds its surface, and the OAuth wrapper loads the real flow
@@ -185,28 +199,28 @@ async fn the_vertex_resolve_prefers_keys_then_adc_then_nothing() {
         .expect("vertex advertises a resolve");
     let signal = CancellationToken::new();
 
-    let stored = resolve(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::default()),
-        credential: Some(ApiKeyCredential {
+    let stored = resolve(resolve_input(
+        Arc::new(MapAuthContext::default()),
+        Some(ApiKeyCredential {
             key: Some("stored-key".to_owned()),
             env: None,
         }),
-        signal: signal.clone(),
-    })
+        signal.clone(),
+    ))
     .await
     .expect("the stored key resolves")
     .expect("the stored key is present");
     assert_eq!(stored.auth.api_key.as_deref(), Some("stored-key"));
     assert_eq!(stored.source.as_deref(), Some("stored credential"));
 
-    let ambient = resolve(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::new([(
+    let ambient = resolve(resolve_input(
+        Arc::new(MapAuthContext::new([(
             "GOOGLE_CLOUD_API_KEY",
             "ambient-key",
         )])),
-        credential: None,
-        signal: signal.clone(),
-    })
+        None,
+        signal.clone(),
+    ))
     .await
     .expect("the env-key resolve runs")
     .expect("the ambient key is present");
@@ -214,9 +228,9 @@ async fn the_vertex_resolve_prefers_keys_then_adc_then_nothing() {
     assert_eq!(ambient.source.as_deref(), Some("GOOGLE_CLOUD_API_KEY"));
 
     let file = sandbox_file("vertex-adc-credentials.json");
-    let adc = resolve(ApiKeyAuthInput {
-        ctx: Arc::new(DefaultAuthContext),
-        credential: Some(ApiKeyCredential {
+    let adc = resolve(resolve_input(
+        Arc::new(DefaultAuthContext),
+        Some(ApiKeyCredential {
             key: None,
             env: Some(BTreeMap::from([
                 ("GOOGLE_APPLICATION_CREDENTIALS".to_owned(), file),
@@ -224,8 +238,8 @@ async fn the_vertex_resolve_prefers_keys_then_adc_then_nothing() {
                 ("GOOGLE_CLOUD_LOCATION".to_owned(), "us-central1".to_owned()),
             ])),
         }),
-        signal: signal.clone(),
-    })
+        signal.clone(),
+    ))
     .await
     .expect("the adc resolve runs")
     .expect("the adc credentials resolve");
@@ -235,14 +249,14 @@ async fn the_vertex_resolve_prefers_keys_then_adc_then_nothing() {
     );
     assert_eq!(adc.source.as_deref(), Some("stored credential"));
 
-    let absent = resolve(ApiKeyAuthInput {
-        ctx: Arc::new(DefaultAuthContext),
-        credential: Some(ApiKeyCredential {
+    let absent = resolve(resolve_input(
+        Arc::new(DefaultAuthContext),
+        Some(ApiKeyCredential {
             key: None,
             env: None,
         }),
-        signal: signal.clone(),
-    })
+        signal.clone(),
+    ))
     .await
     .expect("the adc fallback resolve runs");
     assert!(
@@ -250,11 +264,11 @@ async fn the_vertex_resolve_prefers_keys_then_adc_then_nothing() {
         "the sandbox has no ADC file, so the resolve falls through"
     );
 
-    let none = resolve(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::default()),
-        credential: None,
-        signal: signal.clone(),
-    })
+    let none = resolve(resolve_input(
+        Arc::new(MapAuthContext::default()),
+        None,
+        signal.clone(),
+    ))
     .await
     .expect("the empty resolve runs");
     assert!(none.is_none(), "no credentials resolve to none");
@@ -274,17 +288,17 @@ async fn the_cloudflare_auth_resolves_from_the_credential_then_the_env() {
     let signal = CancellationToken::new();
     let workers = cloudflare_auth::cloudflare_workers_ai_auth();
 
-    let stored = (workers.resolve)(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::default()),
-        credential: Some(ApiKeyCredential {
+    let stored = (workers.resolve)(resolve_input(
+        Arc::new(MapAuthContext::default()),
+        Some(ApiKeyCredential {
             key: Some("cf-key".to_owned()),
             env: Some(BTreeMap::from([(
                 "CLOUDFLARE_ACCOUNT_ID".to_owned(),
                 "acc-from-credential".to_owned(),
             )])),
         }),
-        signal: signal.clone(),
-    })
+        signal.clone(),
+    ))
     .await
     .expect("the stored credential resolves")
     .expect("the credential is present");
@@ -296,41 +310,41 @@ async fn the_cloudflare_auth_resolves_from_the_credential_then_the_env() {
         Some("acc-from-credential")
     );
 
-    let ambient = (workers.resolve)(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::new([
+    let ambient = (workers.resolve)(resolve_input(
+        Arc::new(MapAuthContext::new([
             ("CLOUDFLARE_API_KEY", "env-key"),
             ("CLOUDFLARE_ACCOUNT_ID", "env-account"),
         ])),
-        credential: None,
-        signal: signal.clone(),
-    })
+        None,
+        signal.clone(),
+    ))
     .await
     .expect("the env resolution runs")
     .expect("the env values are present");
     assert_eq!(ambient.auth.api_key.as_deref(), Some("env-key"));
     assert_eq!(ambient.source.as_deref(), Some("CLOUDFLARE_API_KEY"));
 
-    let missing = (workers.resolve)(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::default()),
-        credential: None,
-        signal: signal.clone(),
-    })
+    let missing = (workers.resolve)(resolve_input(
+        Arc::new(MapAuthContext::default()),
+        None,
+        signal.clone(),
+    ))
     .await
     .expect("the empty resolution runs");
     assert!(missing.is_none(), "no values resolve to none");
 
     let gateway = cloudflare_auth::cloudflare_ai_gateway_auth();
-    let gateway_credential = (gateway.resolve)(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::default()),
-        credential: Some(ApiKeyCredential {
+    let gateway_credential = (gateway.resolve)(resolve_input(
+        Arc::new(MapAuthContext::default()),
+        Some(ApiKeyCredential {
             key: Some("gateway-key".to_owned()),
             env: Some(BTreeMap::from([
                 ("CLOUDFLARE_ACCOUNT_ID".to_owned(), "acc".to_owned()),
                 ("CLOUDFLARE_GATEWAY_ID".to_owned(), "gw".to_owned()),
             ])),
         }),
-        signal: signal.clone(),
-    })
+        signal.clone(),
+    ))
     .await
     .expect("the gateway credential resolves")
     .expect("the gateway credential is present");
@@ -355,14 +369,14 @@ async fn the_cloudflare_auth_resolves_from_the_credential_then_the_env() {
         "the standard api key header is suppressed"
     );
 
-    let gateway_missing = (gateway.resolve)(ApiKeyAuthInput {
-        ctx: Arc::new(MapAuthContext::new([
+    let gateway_missing = (gateway.resolve)(resolve_input(
+        Arc::new(MapAuthContext::new([
             ("CLOUDFLARE_API_KEY", "env-key"),
             ("CLOUDFLARE_ACCOUNT_ID", "env-account"),
         ])),
-        credential: None,
-        signal: signal.clone(),
-    })
+        None,
+        signal.clone(),
+    ))
     .await
     .expect("the gateway-less resolution runs");
     assert!(

@@ -22,10 +22,11 @@ use pi_ai::types::ProviderEnv;
 
 /// A fixture environment standing in for `process.env`.
 fn env_fixture(pairs: &[(&str, &str)]) -> ProviderEnv {
-    pairs
-        .iter()
-        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
-        .collect()
+    let mut env = ProviderEnv::new();
+    for (name, value) in pairs {
+        env.insert((*name).to_owned(), (*value).to_owned());
+    }
+    env
 }
 
 /// The discovery path over the fixture environment.
