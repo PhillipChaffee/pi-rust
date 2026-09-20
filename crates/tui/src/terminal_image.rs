@@ -230,6 +230,15 @@ pub fn crop_kitty_image_line(line: &str, hidden_rows: usize, visible_rows: usize
     )
 }
 
+/// Delete a Kitty graphics image by id, upstream `deleteKittyImage`.
+///
+/// The uppercase `d=I` frees both the placement and the uploaded image data;
+/// the main-screen renderer emits it for every id it is about to overwrite.
+#[must_use]
+pub fn delete_kitty_image(image_id: u64) -> String {
+    format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
+}
+
 /// Encode a Kitty graphics transmission, upstream `encodeKitty`: the
 /// placement command with its controls, chunked at the 4096-byte
 /// transmission boundary when the base64 payload is larger.

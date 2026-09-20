@@ -5,7 +5,7 @@
 //! trailing SGR resets.
 //!
 //! Upstream read the attribute off xterm's buffer cells; the port reads the
-//! emulator's per-cell italic through [`tui_support::TestTerminal::is_italic`].
+//! emulator's per-cell italic through [`tui_support::VirtualTerminal::is_italic`].
 
 #[path = "tui_support/mod.rs"]
 mod tui_support;
@@ -14,7 +14,7 @@ use std::rc::Rc;
 
 use pi_tui::tui::{Component, OverlayOptions, SizeValue};
 
-use tui_support::{TestTerminal, render_and_flush};
+use tui_support::{VirtualTerminal, render_and_flush};
 
 /// The suite's `StaticLines`.
 struct StaticLines {
@@ -47,7 +47,7 @@ fn does_not_leak_styles_when_a_trailing_reset_sits_beyond_the_last_visible_colum
     let width: u16 = 20;
     let base_line = format!("\x1b[3m{}\x1b[23m", "X".repeat(usize::from(width)));
 
-    let terminal = TestTerminal::new(width, 6);
+    let terminal = VirtualTerminal::new(width, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(StaticLines {
         lines: vec![base_line, "INPUT".to_string()],
@@ -63,7 +63,7 @@ fn does_not_leak_styles_when_overlay_slicing_drops_trailing_sgr_resets() {
     let width: u16 = 20;
     let base_line = format!("\x1b[3m{}\x1b[23m", "X".repeat(usize::from(width)));
 
-    let terminal = TestTerminal::new(width, 6);
+    let terminal = VirtualTerminal::new(width, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(StaticLines {
         lines: vec![base_line, "INPUT".to_string()],

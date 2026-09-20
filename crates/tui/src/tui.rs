@@ -731,8 +731,10 @@ pub trait TuiRenderer: std::fmt::Debug {
     /// Hook after the terminal starts, upstream `afterTerminalStart`.
     fn after_terminal_start(&self) {}
 
-    /// Hook before the terminal stops, upstream `beforeTerminalStop`.
-    fn before_terminal_stop(&self, _options: &TuiStopOptions) {}
+    /// Hook before the terminal stops, upstream `beforeTerminalStop`. The
+    /// base is passed so the hook can write through the terminal, upstream's
+    /// `this.terminal.write` inside the subclass body.
+    fn before_terminal_stop(&self, _tui: &Tui, _options: &TuiStopOptions) {}
 
     /// Hook after the terminal stops, upstream `afterTerminalStop`.
     fn after_terminal_stop(&self, _options: &TuiStopOptions) {}
@@ -1905,7 +1907,7 @@ impl Tui {
         if self.scheme_notifications_enabled.get() {
             self.terminal.borrow_mut().write("\x1b[?2031l");
         }
-        self.renderer.borrow().before_terminal_stop(&options);
+        self.renderer.borrow().before_terminal_stop(self, &options);
         self.terminal.borrow_mut().show_cursor();
         self.terminal.borrow_mut().stop();
         self.renderer.borrow().after_terminal_stop(&options);

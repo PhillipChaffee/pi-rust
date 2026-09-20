@@ -1,22 +1,33 @@
-//! Shared harness for the #43 TUI-core suites, restating upstream's
-//! `test/virtual-terminal.ts` until the harness ticket (#45) formalizes the
-//! port.
+//! Shared test harness for the TUI suites, the port of upstream's
+//! `test/virtual-terminal.ts` ([#45](https://github.com/PhillipChaffee/pi-rust/issues/45),
+//! upstream pin `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`).
 //!
-//! - [`TestTerminal`] — the `@xterm/headless` `VirtualTerminal` stand-in: a
-//!   `vte`-driven grid emulator with `send_input`/`resize`/`get_viewport`,
-//!   plus per-cell italic reads for the style-leak suite.
-//! - [`TestRenderer`] — the concrete `TuiBase` subclass the overlay suites
-//!   stand in for upstream's `TuiMainScreen`. It renders the mounted
-//!   children, composites overlays, extracts the cursor marker, applies the
-//!   line resets, and clears-then-rewrites the screen. The real three-
-//!   strategy differential renderer lands with #45, at which point these
-//!   suites re-point to it; the compositing contract under test lives in the
-//!   base either way.
+//! - [`VirtualTerminal`] — the `@xterm/headless` stand-in: a `vte`-driven
+//!   headless terminal emulator with upstream's `sendInput`/`resize`/
+//!   `getViewport`/`getScrollBuffer`/`waitForRender` surface, plus per-cell
+//!   italic reads for the style-leak suite and the raw write log.
+//! - [`new_test_tui`] / [`new_test_tui_with_images`] — the `Tui` construction
+//!   upstream's suites perform, with [`pi_tui::tui_main_screen::TuiMainScreen`]
+//!   as the renderer and a quiet environment lookup so the suites cannot trip
+//!   the Termux or debug-log switches.
 //!
-//! The restatements the harness carries: upstream's `waitForRender`
-//! (nextTick + 20 ms + flush) collapses into [`wait_for_render`], one pump
-//! turn — the port's event-loop turn — because writes land synchronously in
-//! the emulator instead of through xterm's async writer.
+//! The emulator's restatements, against `@xterm/headless`:
+//!
+//! - Row resize follows xterm's `Buffer.resize`: shrinking pops viewport rows
+//!   below the cursor or trims the top into scrollback, growing pulls
+//!   scrollback back into the viewport or pads blank rows, and the cursor
+//!   rides the pull. Column resize does not reflow wrapped lines — no suite
+//!   in the ported slices depends on reflow, and the harness grows that
+//!   behavior when one does.
+//! - The scrollback buffer is unbounded; xterm caps it at 1000 lines, which
+//!   no ported suite reaches.
+//! - Print past the last column drops rather than wraps; the renderer throws
+//!   on over-wide lines before they reach the terminal, so only the exact-
+//!   width full-render writes reach the emulator, and those fit.
+//! - Upstream's `waitForRender` (nextTick + 20 ms + flush) collapses into
+//!   [`wait_for_render`], two pump turns around the 20 ms sleep — the port's
+//!   event-loop turns — because writes land synchronously in the emulator
+//!   instead of through xterm's async writer.
 
 #![allow(
     unreachable_pub,
@@ -36,8 +47,8 @@ use unicode_width::UnicodeWidthChar;
 
 use pi_tui::terminal::{InputHandler, ResizeHandler, Terminal};
 use pi_tui::tui::{
-    Component, Focusable, Tui, TuiConfig, TuiMode, TuiMouseButton, TuiMouseEvent,
-    TuiMouseEventType, TuiRenderer,
+    Component, Focusable, Tui, TuiConfig, TuiMouseButton, TuiMouseEvent, TuiMouseEventType,
+    TuiRenderer,
 };
 
 /// One screen cell: the grapheme it starts, its visible width (zero for
@@ -57,9 +68,19 @@ impl ScreenCell {
     };
 }
 
-/// The visible screen upstream's xterm buffer exposed, driven by `vte`.
+/// A row of the emulated buffer.
+type ScreenRow = Vec<ScreenCell>;
+
+fn blank_row(columns: usize) -> ScreenRow {
+    vec![ScreenCell::BLANK; columns]
+}
+
+/// The visible screen upstream's xterm buffer exposed, driven by `vte`: the
+/// grid is the viewport, `scrollback` holds the lines scrolled above it, and
+/// row resizes follow xterm's pull-from-scrollback or pad-blank semantics.
 struct Screen {
-    grid: Vec<Vec<ScreenCell>>,
+    grid: Vec<ScreenRow>,
+    scrollback: Vec<ScreenRow>,
     cursor_row: usize,
     cursor_col: usize,
     italic: bool,
@@ -68,7 +89,8 @@ struct Screen {
 impl Screen {
     fn new(columns: usize, rows: usize) -> Self {
         Self {
-            grid: vec![vec![ScreenCell::BLANK; columns]; rows],
+            grid: vec![blank_row(columns); rows],
+            scrollback: Vec::new(),
             cursor_row: 0,
             cursor_col: 0,
             italic: false,
@@ -76,9 +98,37 @@ impl Screen {
     }
 
     fn resize(&mut self, columns: usize, rows: usize) {
-        self.grid.resize(rows, vec![ScreenCell::BLANK; columns]);
         for row in &mut self.grid {
             row.resize(columns, ScreenCell::BLANK);
+        }
+        let old_rows = self.grid.len();
+        if rows < old_rows {
+            // Shrink: xterm pops viewport rows below the cursor and trims the
+            // top into scrollback otherwise, so the last content stays put.
+            for _ in rows..old_rows {
+                if self.grid.len() > self.cursor_row + 1 {
+                    self.grid.pop();
+                } else {
+                    let top = self.grid.remove(0);
+                    self.scrollback.push(top);
+                }
+            }
+            self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        } else if rows > old_rows {
+            // Grow: pull scrollback back into the viewport when the buffer is
+            // too short to fill it, pad blank rows otherwise; the cursor
+            // rides the pull.
+            let mut pulled = 0;
+            for _ in old_rows..rows {
+                if !self.scrollback.is_empty() && self.grid.len() <= self.cursor_row + pulled + 1 {
+                    self.grid
+                        .insert(0, self.scrollback.pop().unwrap_or_default());
+                    pulled += 1;
+                } else {
+                    self.grid.push(blank_row(columns));
+                }
+            }
+            self.cursor_row = self.cursor_row.min(rows - 1) + pulled;
         }
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(columns.saturating_sub(1));
@@ -86,8 +136,8 @@ impl Screen {
 
     fn scroll_up(&mut self) {
         let columns = self.grid.first().map_or(1, Vec::len);
-        self.grid.remove(0);
-        self.grid.push(vec![ScreenCell::BLANK; columns]);
+        self.scrollback.push(self.grid.remove(0));
+        self.grid.push(blank_row(columns));
     }
 
     fn put(&mut self, c: char) {
@@ -125,16 +175,16 @@ impl Screen {
     /// The visible rows, trailing whitespace trimmed the way xterm's
     /// `translateToString(true)` is.
     fn viewport(&self) -> Vec<String> {
-        self.grid
+        self.grid.iter().map(|row| render_row(row)).collect()
+    }
+
+    /// Every buffer line including the scrollback, upstream
+    /// `VirtualTerminal.getScrollBuffer` over xterm's `buffer.active`.
+    fn scroll_buffer(&self) -> Vec<String> {
+        self.scrollback
             .iter()
-            .map(|row| {
-                row.iter()
-                    .filter(|cell| cell.width > 0)
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
+            .chain(self.grid.iter())
+            .map(|row| render_row(row))
             .collect()
     }
 
@@ -144,6 +194,15 @@ impl Screen {
             .and_then(|line| line.get(col))
             .is_some_and(|cell| cell.italic)
     }
+}
+
+fn render_row(row: &[ScreenCell]) -> String {
+    row.iter()
+        .filter(|cell| cell.width > 0)
+        .map(|cell| cell.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 /// The cell-size suite's SGR tracking with the extended-color groups
@@ -254,6 +313,9 @@ impl vte::Perform for Screen {
                         self.clear_row(row, 0);
                     }
                 }
+                // Clear scrollback, xterm's `eraseInDisplay` case 3: the
+                // viewport lines stay, everything above them is dropped.
+                3 => self.scrollback.clear(),
                 _ => {}
             },
             'K' => {
@@ -274,11 +336,11 @@ impl vte::Perform for Screen {
 /// that captures the TUI's writes and dispatches injected input. Tests keep
 /// a clone for the test surface; the TUI takes the terminal itself by value.
 #[derive(Clone)]
-pub struct TestTerminal {
-    shared: Rc<RefCell<TestShared>>,
+pub struct VirtualTerminal {
+    shared: Rc<RefCell<VirtualShared>>,
 }
 
-struct TestShared {
+struct VirtualShared {
     screen: Screen,
     columns: u16,
     rows: u16,
@@ -288,12 +350,12 @@ struct TestShared {
     queued_input: VecDeque<String>,
 }
 
-impl TestTerminal {
+impl VirtualTerminal {
     /// A fresh `VirtualTerminal(columns, rows)`.
     #[must_use]
     pub(crate) fn new(columns: u16, rows: u16) -> Self {
         Self {
-            shared: Rc::new(RefCell::new(TestShared {
+            shared: Rc::new(RefCell::new(VirtualShared {
                 screen: Screen::new(usize::from(columns), usize::from(rows)),
                 columns,
                 rows,
@@ -317,10 +379,16 @@ impl TestTerminal {
     }
 
     /// The raw bytes every [`Terminal::write`] delivered, for assertions the
-    /// emulator cannot make (cursor visibility, synchronized output).
+    /// emulator cannot make (cursor visibility, synchronized output, image
+    /// deletions), upstream `LoggingVirtualTerminal.getWrites`.
     #[must_use]
     pub(crate) fn write_log(&self) -> String {
         self.shared.borrow().writes.clone()
+    }
+
+    /// Drop the write log, upstream `LoggingVirtualTerminal.clearWrites`.
+    pub(crate) fn clear_writes(&self) {
+        self.shared.borrow_mut().writes.clear();
     }
 
     /// Simulate keyboard input, upstream `VirtualTerminal.sendInput`: the
@@ -357,6 +425,13 @@ impl TestTerminal {
         self.shared.borrow().screen.viewport()
     }
 
+    /// The entire scroll buffer including scrollback, upstream
+    /// `VirtualTerminal.getScrollBuffer`.
+    #[must_use]
+    pub(crate) fn get_scroll_buffer(&self) -> Vec<String> {
+        self.shared.borrow().screen.scroll_buffer()
+    }
+
     /// The italic attribute of one cell, upstream's `getCellItalic` helper.
     #[must_use]
     pub(crate) fn is_italic(&self, row: usize, col: usize) -> bool {
@@ -364,7 +439,7 @@ impl TestTerminal {
     }
 }
 
-impl Terminal for TestTerminal {
+impl Terminal for VirtualTerminal {
     fn start(&mut self, on_input: InputHandler, on_resize: ResizeHandler) {
         let mut shared = self.shared.borrow_mut();
         shared.input_handler = Some(on_input);
@@ -464,52 +539,25 @@ impl Terminal for TestTerminal {
     }
 }
 
-/// The concrete render strategy the overlay suites stand in for upstream's
-/// `TuiMainScreen` until the renderer ticket (#45) lands: renders children,
-/// composites overlays, extracts the cursor marker, applies the line resets,
-/// then clears and rewrites the screen each frame.
-#[derive(Debug)]
-pub struct TestRenderer;
-
-impl TuiRenderer for TestRenderer {
-    fn mode(&self) -> TuiMode {
-        TuiMode::Regular
-    }
-
-    fn do_render(&self, tui: &Tui) {
-        if tui.is_stopped() {
-            return;
-        }
-        let width = usize::from(tui.terminal_columns());
-        let height = usize::from(tui.terminal_rows());
-        let mut lines = tui.render_children(width);
-        if tui.has_overlay_entries() {
-            lines = tui.composite_overlays(lines, width, height);
-        }
-        let cursor = tui.extract_cursor_position(&mut lines, height);
-        let lines = tui.apply_line_resets(lines);
-        let mut out = String::from("\x1b[?2026h\x1b[2J\x1b[H");
-        for (i, line) in lines.iter().enumerate() {
-            if i > 0 {
-                out.push_str("\r\n");
-            }
-            out.push_str(line);
-        }
-        out.push_str("\x1b[?2026l");
-        tui.terminal_write(&out);
-        if cursor.is_none() {
-            tui.terminal_hide_cursor();
-        }
-    }
+/// The renderer the harness hands every TUI: [`TuiMainScreen`], upstream's
+/// `new TuiMainScreen(terminal)`. The environment lookup answers nothing, so
+/// the suites cannot trip the Termux or debug-log switches a developer's
+/// shell might export.
+#[must_use]
+pub fn test_renderer() -> Box<dyn TuiRenderer> {
+    Box::new(pi_tui::tui_main_screen::TuiMainScreen::new(
+        pi_tui::tui_main_screen::TuiMainScreenConfig {
+            env_lookup: Some(Box::new(|_| None)),
+        },
+    ))
 }
 
-/// Build the TUI the suites drive, upstream `new TuiMainScreen(terminal)`
-/// over the [`TestRenderer`] stand-in.
+/// Build the TUI the suites drive, upstream `new TuiMainScreen(terminal)`.
 #[must_use]
-pub fn new_test_tui(terminal: TestTerminal) -> Rc<Tui> {
+pub fn new_test_tui(terminal: VirtualTerminal) -> Rc<Tui> {
     Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(TestRenderer)),
+        renderer: Some(test_renderer()),
         ..TuiConfig::default()
     })
 }
@@ -517,10 +565,10 @@ pub fn new_test_tui(terminal: TestTerminal) -> Rc<Tui> {
 /// Build the TUI with the image-capable probe injected, restating the
 /// cell-size suite's `withImageTerminal` env setup.
 #[must_use]
-pub fn new_test_tui_with_images(terminal: TestTerminal) -> Rc<Tui> {
+pub fn new_test_tui_with_images(terminal: VirtualTerminal) -> Rc<Tui> {
     Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(TestRenderer)),
+        renderer: Some(test_renderer()),
         images_probe: Some(Box::new(|| true)),
         ..TuiConfig::default()
     })
@@ -534,8 +582,12 @@ pub fn render_and_flush(tui: &Tui) {
 }
 
 /// Upstream's `waitForRender`, for the suites that render through the
-/// request `start()` made: one pump turn runs the armed deadline.
+/// request `start()` made or an armed throttled deadline: the first pump
+/// turn arms the schedule, the 20 ms sleep lets the deadline pass, and the
+/// second turn is the flush.
 pub fn wait_for_render(tui: &Tui) {
+    tui.poll(Duration::ZERO);
+    std::thread::sleep(Duration::from_millis(20));
     tui.poll(Duration::ZERO);
 }
 
