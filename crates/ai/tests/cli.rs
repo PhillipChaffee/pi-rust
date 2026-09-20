@@ -99,18 +99,7 @@ fn find_provider_matches_by_id() {
 
 #[test]
 fn select_choice_returns_the_selected_option_id() {
-    let options = vec![
-        AuthPromptOption {
-            id: "browser".to_owned(),
-            label: "Browser login".to_owned(),
-            description: None,
-        },
-        AuthPromptOption {
-            id: "device_code".to_owned(),
-            label: "Device code login".to_owned(),
-            description: None,
-        },
-    ];
+    let options = login_options();
     assert_eq!(
         select_choice(&options, "1").map_err(|error| error.to_string()),
         Ok("browser".to_owned())
@@ -209,11 +198,7 @@ fn run_list_prints_the_padded_lines() {
             cli_provider("test-provider", "Test Provider"),
             cli_provider("openai-codex", "OpenAI Codex"),
         ];
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the child runtime builds")
-            .block_on(run(&[String::from("list")], &providers, "unused-auth.json"));
+        let outcome = block_run(&[String::from("list")], &providers, "unused-auth.json");
         assert!(outcome.is_ok(), "list succeeds: {outcome:?}");
         return;
     }
@@ -315,20 +300,33 @@ async fn run_login_with_an_explicit_id_persists_the_credential_without_input() {
 /// The probe mode this binary re-runs itself under, keyed per scenario.
 const INTERACTIVE_PROBE: &str = "PI_AI_CLI_INTERACTIVE_PROBE";
 
-/// Spawn this suite's own binary for `mode` with `stdin_bytes` piped in,
-/// returning the child's captured output.
+/// Spawn the interaction probe: this binary re-running its own test with
+/// `stdin_bytes` piped in, the child's captured output.
 fn run_probe(mode: &str, stdin_bytes: &[u8]) -> std::process::Output {
+    spawn_probe(
+        "the_cli_interaction_drives_piped_stdin",
+        INTERACTIVE_PROBE,
+        mode,
+        stdin_bytes,
+    )
+}
+
+/// Spawn this suite's own binary for `mode` under `probe_env` with
+/// `stdin_bytes` piped in, running the named test, and return the captured
+/// output.
+fn spawn_probe(
+    test_name: &str,
+    probe_env: &str,
+    mode: &str,
+    stdin_bytes: &[u8],
+) -> std::process::Output {
     use std::io::Write as _;
     use std::process::Stdio;
 
     let mut child =
         std::process::Command::new(std::env::current_exe().expect("the test binary path"))
-            .args([
-                "--exact",
-                "the_cli_interaction_drives_piped_stdin",
-                "--nocapture",
-            ])
-            .env(INTERACTIVE_PROBE, mode)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(probe_env, mode)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -341,6 +339,36 @@ fn run_probe(mode: &str, stdin_bytes: &[u8]) -> std::process::Output {
         .write_all(stdin_bytes)
         .expect("the stdin bytes write");
     child.wait_with_output().expect("the probe child runs")
+}
+
+/// Drive `run` on a fresh current-thread runtime, the seam the probe modes
+/// use to exercise the CLI without a multi-thread runtime.
+fn block_run(
+    args: &[String],
+    providers: &[CliProvider],
+    auth_path: &str,
+) -> Result<(), pi_ai::auth::types::AuthError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the runtime builds")
+        .block_on(run(args, providers, auth_path))
+}
+
+/// The two login-method options the select cases render.
+fn login_options() -> Vec<AuthPromptOption> {
+    vec![
+        AuthPromptOption {
+            id: "browser".to_owned(),
+            label: "Browser login".to_owned(),
+            description: None,
+        },
+        AuthPromptOption {
+            id: "device_code".to_owned(),
+            label: "Device code login".to_owned(),
+            description: None,
+        },
+    ]
 }
 
 #[test]
@@ -475,18 +503,7 @@ fn run_interaction_probe(mode: &str) {
     };
     match mode {
         "select" => {
-            let options = vec![
-                AuthPromptOption {
-                    id: "browser".to_owned(),
-                    label: "Browser login".to_owned(),
-                    description: None,
-                },
-                AuthPromptOption {
-                    id: "device_code".to_owned(),
-                    label: "Device code login".to_owned(),
-                    description: None,
-                },
-            ];
+            let options = login_options();
             let selected = prompt(AuthPrompt {
                 signal: None,
                 kind: AuthPromptKind::Select {
@@ -611,23 +628,16 @@ fn run_interaction_probe(mode: &str) {
 
 #[test]
 fn run_login_picker_serves_the_numbered_menu_and_persists_the_choice() {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
     if let Ok(mode) = std::env::var(INTERACTIVE_PROBE) {
         assert_eq!(mode, "picker-valid");
         let dir = unique_temp_dir("picker");
         let auth_path = dir.join("auth.json");
         let providers = vec![cli_provider("stub", "Stub Provider")];
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the runtime builds")
-            .block_on(run(
-                &[String::from("login")],
-                &providers,
-                auth_path.to_str().expect("utf-8 path"),
-            ));
+        let outcome = block_run(
+            &[String::from("login")],
+            &providers,
+            auth_path.to_str().expect("utf-8 path"),
+        );
         assert!(outcome.is_ok(), "the picked login succeeds: {outcome:?}");
         assert!(
             load_credentials(auth_path.to_str().expect("utf-8 path")).contains_key("stub"),
@@ -637,26 +647,12 @@ fn run_login_picker_serves_the_numbered_menu_and_persists_the_choice() {
         return;
     }
 
-    let mut child =
-        std::process::Command::new(std::env::current_exe().expect("the test binary path"))
-            .args([
-                "--exact",
-                "run_login_picker_serves_the_numbered_menu_and_persists_the_choice",
-                "--nocapture",
-            ])
-            .env(INTERACTIVE_PROBE, "picker-valid")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the probe child spawns");
-    child
-        .stdin
-        .as_mut()
-        .expect("the child stdin is piped")
-        .write_all(b"1\n")
-        .expect("the pick writes");
-    let output = child.wait_with_output().expect("the probe child runs");
+    let output = spawn_probe(
+        "run_login_picker_serves_the_numbered_menu_and_persists_the_choice",
+        INTERACTIVE_PROBE,
+        "picker-valid",
+        b"1\n",
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
@@ -675,21 +671,10 @@ fn run_login_picker_serves_the_numbered_menu_and_persists_the_choice() {
 
 #[test]
 fn run_login_picker_rejects_invalid_and_eof_input() {
-    use std::io::Write as _;
-    use std::process::Stdio;
-
     if let Ok(mode) = std::env::var(INTERACTIVE_PROBE) {
         let mode: &str = &mode;
         let providers = vec![cli_provider("stub", "Stub Provider")];
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the runtime builds");
-        let outcome = runtime.block_on(run(
-            &[String::from("login")],
-            &providers,
-            "unused-auth.json",
-        ));
+        let outcome = block_run(&[String::from("login")], &providers, "unused-auth.json");
         match mode {
             // An out-of-range number selects nothing; the picker's own
             // rejection carries the empty id upstream sends.
@@ -711,26 +696,12 @@ fn run_login_picker_rejects_invalid_and_eof_input() {
     }
 
     for (mode, stdin_bytes) in [("picker-invalid", &b"99\n"[..]), ("picker-eof", b"")] {
-        let mut child =
-            std::process::Command::new(std::env::current_exe().expect("the test binary path"))
-                .args([
-                    "--exact",
-                    "run_login_picker_rejects_invalid_and_eof_input",
-                    "--nocapture",
-                ])
-                .env(INTERACTIVE_PROBE, mode)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("the probe child spawns");
-        child
-            .stdin
-            .as_mut()
-            .expect("the child stdin is piped")
-            .write_all(stdin_bytes)
-            .expect("the stdin bytes write");
-        let output = child.wait_with_output().expect("the probe child runs");
+        let output = spawn_probe(
+            "run_login_picker_rejects_invalid_and_eof_input",
+            INTERACTIVE_PROBE,
+            mode,
+            stdin_bytes,
+        );
         assert!(
             output.status.success(),
             "the {mode:?} probe passes: {}{}",
@@ -808,15 +779,11 @@ fn run_login_surfaces_the_flow_and_persistence_failures() {
             name: "Stub Provider".to_owned(),
             oauth: StubOAuthAuth::new("Stub OAuth", Err(String::from("flow refused"))).auth(),
         }];
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the runtime builds")
-            .block_on(run(
-                &[String::from("login"), String::from("stub")],
-                &providers,
-                "unused-auth.json",
-            ));
+        let outcome = block_run(
+            &[String::from("login"), String::from("stub")],
+            &providers,
+            "unused-auth.json",
+        );
         let error = outcome.expect_err("the flow failure surfaces");
         assert_eq!(error.to_string(), "flow refused");
 
@@ -826,18 +793,14 @@ fn run_login_surfaces_the_flow_and_persistence_failures() {
         std::fs::create_dir_all(&dir).expect("the temp dir creates");
         std::fs::write(&blocker, b"x").expect("the blocker file writes");
         let providers = vec![cli_provider("stub", "Stub Provider")];
-        let outcome = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the runtime builds")
-            .block_on(run(
-                &[String::from("login"), String::from("stub")],
-                &providers,
-                blocker
-                    .join("child/auth.json")
-                    .to_str()
-                    .expect("utf-8 path"),
-            ));
+        let outcome = block_run(
+            &[String::from("login"), String::from("stub")],
+            &providers,
+            blocker
+                .join("child/auth.json")
+                .to_str()
+                .expect("utf-8 path"),
+        );
         let error = outcome.expect_err("the persistence failure surfaces");
         assert!(
             error.to_string().starts_with("Failed to create "),

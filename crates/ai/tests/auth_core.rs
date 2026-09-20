@@ -138,6 +138,134 @@ fn resolution_error(
     })
 }
 
+/// Resolve against the provider and store, unwrapping the failure to the
+/// [`ModelsError`] the assertions read.
+async fn resolve_outcome(
+    provider: &ProviderAuth,
+    store: &Arc<dyn CredentialStore>,
+    overrides: Option<&AuthResolutionOverrides>,
+) -> Result<Option<AuthResult>, ModelsError> {
+    resolution_error(resolve_provider_auth(PROVIDER, provider, store, &context(), overrides).await)
+}
+
+/// The resolution asserting: it succeeds, yielding the outcome the caller
+/// narrows.
+async fn resolved(provider: &ProviderAuth, store: &Arc<dyn CredentialStore>) -> Option<AuthResult> {
+    resolve_outcome(provider, store, None)
+        .await
+        .expect("the resolution succeeds")
+}
+
+/// The resolution asserting with overrides, the override-merge cases drive.
+async fn resolved_with(
+    provider: &ProviderAuth,
+    store: &Arc<dyn CredentialStore>,
+    overrides: &AuthResolutionOverrides,
+) -> Option<AuthResult> {
+    resolve_outcome(provider, store, Some(overrides))
+        .await
+        .expect("the resolution succeeds")
+}
+
+/// The OAuth provider over the stub with the stored credential, the
+/// resolution cases' starting shape.
+async fn stored_oauth_provider(
+    oauth: &StubOAuthAuth,
+    stored: Credential,
+) -> (ProviderAuth, Arc<dyn CredentialStore>) {
+    let provider = oauth_provider_of(|| oauth.auth());
+    let store = empty_store();
+    store_credential(store.as_ref(), PROVIDER, stored).await;
+    (provider, store)
+}
+
+/// The resolution asserting over a caller-supplied base context, the
+/// overlay-context cases drive.
+async fn resolved_over(
+    provider: &ProviderAuth,
+    store: &Arc<dyn CredentialStore>,
+    base: &Arc<dyn AuthContext>,
+    overrides: &AuthResolutionOverrides,
+) -> Option<AuthResult> {
+    resolution_error(resolve_provider_auth(PROVIDER, provider, store, base, Some(overrides)).await)
+        .expect("the resolution succeeds")
+}
+
+/// The resolution asserting: it fails with the pinned error.
+async fn resolution_fails(
+    provider: &ProviderAuth,
+    store: &Arc<dyn CredentialStore>,
+    what: &str,
+) -> ModelsError {
+    resolve_outcome(provider, store, None)
+        .await
+        .expect_err(what)
+}
+
+/// A stored api-key credential carrying `env`, the stored-branch setup the
+/// merge cases drive.
+async fn stored_env_store(env: Option<ProviderEnv>) -> Arc<dyn CredentialStore> {
+    let store = empty_store();
+    store_credential(
+        store.as_ref(),
+        PROVIDER,
+        Credential::ApiKey(ApiKeyCredential {
+            key: Some("stored-key".to_owned()),
+            env,
+        }),
+    )
+    .await;
+    store
+}
+
+/// A store and its peer gate, the deterministic serialization probe's pair.
+fn gated_store() -> (Arc<dyn CredentialStore>, Arc<ModifyGate>) {
+    (
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(ModifyGate::default()),
+    )
+}
+
+/// Spawn the modify that announces its entry, then parks on the peer gate
+/// until it is announced, before writing `credential`.
+fn spawn_gated_modify(
+    store: Arc<dyn CredentialStore>,
+    gate: Arc<ModifyGate>,
+    entered: tokio::sync::oneshot::Sender<Option<Credential>>,
+    provider_id: &str,
+    credential: Credential,
+) -> tokio::task::JoinHandle<Result<Option<Credential>, pi_ai::auth::types::AuthError>> {
+    let provider_id = provider_id.to_owned();
+    tokio::spawn(async move {
+        store
+            .modify(
+                &provider_id,
+                Box::new(move |current| {
+                    let gate = Arc::clone(&gate);
+                    let entered = entered;
+                    Box::pin(async move {
+                        let _ = entered.send(current);
+                        gate.wait_for_peer().await;
+                        Ok(Some(credential))
+                    })
+                }),
+                None,
+            )
+            .await
+    })
+}
+
+/// A modify closure that writes nothing and resolves the current entry, the
+/// read-only modify the no-write cases drive.
+fn no_write_modify() -> CredentialModifyFn {
+    Box::new(|_| {
+        Box::pin(std::future::ready(Ok::<
+            Option<Credential>,
+            pi_ai::auth::types::AuthError,
+        >(None)))
+    })
+}
+
 // ---------------------------------------------------------------------------
 // InMemoryCredentialStore
 // ---------------------------------------------------------------------------
@@ -168,16 +296,7 @@ async fn modify_returning_none_leaves_the_entry_and_returns_the_current() {
     let credential = api_key_stored("stored-key");
     store_credential(&store, PROVIDER, credential.clone()).await;
     let posted = store
-        .modify(
-            PROVIDER,
-            Box::new(|_| {
-                Box::pin(std::future::ready(Ok::<
-                    Option<Credential>,
-                    pi_ai::auth::types::AuthError,
-                >(None)))
-            }),
-            None,
-        )
+        .modify(PROVIDER, no_write_modify(), None)
         .await
         .expect("modify succeeds");
     assert_eq!(
@@ -254,37 +373,20 @@ impl ModifyGate {
 
 #[tokio::test]
 async fn concurrent_modifies_on_one_provider_serialize() {
-    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let gate = Arc::new(ModifyGate::default());
+    let (store, gate) = gated_store();
     let credential_a = api_key_stored("a");
     let credential_b = api_key_stored("b");
     let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
     // A observes the empty entry, then holds the chain lock until B has
     // queued its own modify.
-    let task_a = {
-        let store = Arc::clone(&store);
-        let gate = Arc::clone(&gate);
-        let credential = credential_a.clone();
-        tokio::spawn(async move {
-            store
-                .modify(
-                    "shared",
-                    Box::new(move |current| {
-                        let gate = Arc::clone(&gate);
-                        let credential = credential;
-                        let entered = a_entered;
-                        Box::pin(async move {
-                            let _ = entered.send(current.clone());
-                            gate.wait_for_peer().await;
-                            Ok(Some(credential))
-                        })
-                    }),
-                    None,
-                )
-                .await
-        })
-    };
+    let task_a = spawn_gated_modify(
+        Arc::clone(&store),
+        Arc::clone(&gate),
+        a_entered,
+        "shared",
+        credential_a.clone(),
+    );
     let seen_by_a = a_entered_rx.await.expect("A entered the modify");
     assert_eq!(
         seen_by_a, None,
@@ -343,33 +445,17 @@ async fn concurrent_modifies_on_one_provider_serialize() {
 
 #[tokio::test]
 async fn delete_serializes_behind_a_pending_modify() {
-    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let gate = Arc::new(ModifyGate::default());
+    let (store, gate) = gated_store();
     let credential = api_key_stored("a");
     let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
-    let task_a = {
-        let store = Arc::clone(&store);
-        let gate = Arc::clone(&gate);
-        let credential = credential.clone();
-        tokio::spawn(async move {
-            store
-                .modify(
-                    "shared",
-                    Box::new(move |current| {
-                        let entered = a_entered;
-                        let gate = Arc::clone(&gate);
-                        Box::pin(async move {
-                            let _ = entered.send(current);
-                            gate.wait_for_peer().await;
-                            Ok(Some(credential))
-                        })
-                    }),
-                    None,
-                )
-                .await
-        })
-    };
+    let task_a = spawn_gated_modify(
+        Arc::clone(&store),
+        Arc::clone(&gate),
+        a_entered,
+        "shared",
+        credential.clone(),
+    );
     let seen_by_a = a_entered_rx.await.expect("A entered the modify");
     assert_eq!(
         seen_by_a, None,
@@ -459,20 +545,12 @@ fn unknown_credential_types_reject() {
 #[tokio::test]
 async fn a_stored_oauth_credential_resolves_with_the_oauth_source() {
     let oauth = StubOAuthAuth::new("Stub OAuth", unused_login());
-    let provider = oauth_provider_of(|| oauth.auth());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        oauth_stored("stored-access", 10 * 60_000),
-    )
-    .await;
+    let (provider, store) =
+        stored_oauth_provider(&oauth, oauth_stored("stored-access", 10 * 60_000)).await;
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("a stored credential resolves");
+    let resolved = resolved(&provider, &store)
+        .await
+        .expect("a stored credential resolves");
     assert_eq!(resolved.source.as_deref(), Some("OAuth"));
     assert_eq!(resolved.auth.api_key.as_deref(), Some("stored-access"));
 }
@@ -490,10 +568,7 @@ async fn a_stored_oauth_credential_without_an_oauth_handler_resolves_none() {
     )
     .await;
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
-    )
-    .expect("the resolution succeeds");
+    let resolved = resolved(&provider, &store).await;
     assert_eq!(
         resolved, None,
         "no silent env fallback for an unmatched credential type"
@@ -504,16 +579,7 @@ async fn a_stored_oauth_credential_without_an_oauth_handler_resolves_none() {
 async fn override_env_merges_under_a_stored_api_key_credential() {
     let mut stored_env = ProviderEnv::new();
     stored_env.insert("A".to_owned(), "stored".to_owned());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        Credential::ApiKey(ApiKeyCredential {
-            key: Some("stored-key".to_owned()),
-            env: Some(stored_env),
-        }),
-    )
-    .await;
+    let store = stored_env_store(Some(stored_env.clone())).await;
 
     let mut overrides_env = ProviderEnv::new();
     overrides_env.insert("A".to_owned(), "override".to_owned());
@@ -525,11 +591,9 @@ async fn override_env_merges_under_a_stored_api_key_credential() {
     let provider =
         api_key_provider(|| env_api_key_auth("Anthropic API key", &["ANTHROPIC_API_KEY"]));
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("the stored credential resolves");
+    let resolved = resolved_with(&provider, &store, &overrides)
+        .await
+        .expect("the stored credential resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("stored-key"));
     let mut merged = ProviderEnv::new();
     merged.insert("A".to_owned(), "override".to_owned());
@@ -587,20 +651,12 @@ async fn an_expiring_oauth_credential_refreshes_under_the_lock_and_stores_the_ro
     let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
         oauth_credentials("new-access", "new-refresh", expires),
     ));
-    let provider = oauth_provider_of(|| oauth.auth());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        oauth_stored("old-access", 4 * 60_000),
-    )
-    .await;
+    let (provider, store) =
+        stored_oauth_provider(&oauth, oauth_stored("old-access", 4 * 60_000)).await;
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("the refreshed credential resolves");
+    let resolved = resolved(&provider, &store)
+        .await
+        .expect("the refreshed credential resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("new-access"));
     let read = store.read(PROVIDER, None).await.expect("read succeeds");
     assert_eq!(
@@ -621,14 +677,8 @@ async fn concurrent_resolutions_refresh_once_and_both_see_the_rotated_token() {
     let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(refresh_returning(
         oauth_credentials("new-access", "new-refresh", expires),
     ));
-    let provider = oauth_provider_of(|| oauth.auth());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        oauth_stored("old-access", 4 * 60_000),
-    )
-    .await;
+    let (provider, store) =
+        stored_oauth_provider(&oauth, oauth_stored("old-access", 4 * 60_000)).await;
 
     let task_a = {
         let provider = provider.clone();
@@ -757,14 +807,8 @@ async fn a_logout_during_refresh_resolves_none() {
 async fn a_failed_refresh_surfaces_the_oauth_models_error() {
     let oauth = StubOAuthAuth::new("Stub OAuth", unused_login())
         .with_refresh(refresh_failing("invalid_grant"));
-    let provider = oauth_provider_of(|| oauth.auth());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        oauth_stored("old-access", 4 * 60_000),
-    )
-    .await;
+    let (provider, store) =
+        stored_oauth_provider(&oauth, oauth_stored("old-access", 4 * 60_000)).await;
 
     let ModelsFailure::Models(error) =
         resolve_provider_auth(PROVIDER, &provider, &store, &context(), None)
@@ -815,14 +859,8 @@ async fn a_stuck_refresh_times_out_after_fifteen_seconds() {
     let oauth = StubOAuthAuth::new("Stub OAuth", unused_login()).with_refresh(
         refresh_after_sleeping(30_000, oauth_credentials("late-access", "r", 0)),
     );
-    let provider = oauth_provider_of(|| oauth.auth());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        oauth_stored("old-access", 4 * 60_000),
-    )
-    .await;
+    let (provider, store) =
+        stored_oauth_provider(&oauth, oauth_stored("old-access", 4 * 60_000)).await;
 
     let handle = {
         let provider = provider.clone();
@@ -1031,17 +1069,23 @@ fn struct_defaults_report_ambient_only_auth() {
 #[test]
 fn models_error_codes_display_their_wire_names() {
     let codes = [
-        (ModelsErrorCode::ModelSource, "model_source"),
-        (ModelsErrorCode::ModelValidation, "model_validation"),
-        (ModelsErrorCode::Provider, "provider"),
-        (ModelsErrorCode::Stream, "stream"),
-        (ModelsErrorCode::Auth, "auth"),
-        (ModelsErrorCode::OAuth, "oauth"),
+        ModelsErrorCode::ModelSource,
+        ModelsErrorCode::ModelValidation,
+        ModelsErrorCode::Provider,
+        ModelsErrorCode::Stream,
+        ModelsErrorCode::Auth,
+        ModelsErrorCode::OAuth,
     ];
-    for (code, name) in codes {
-        assert_eq!(code.wire(), name, "{code:?} renders {name:?}");
-        assert_eq!(code.to_string(), name);
-    }
+    let wire = [
+        "model_source",
+        "model_validation",
+        "provider",
+        "stream",
+        "auth",
+        "oauth",
+    ];
+    assert_eq!(codes.map(|code| code.wire()), wire);
+    assert_eq!(codes.map(|code| code.to_string()), wire);
 }
 
 #[test]
@@ -1596,23 +1640,12 @@ async fn an_abort_between_env_lookups_fails_the_resolution() {
 async fn stored_env_wins_when_the_override_carries_no_env() {
     let mut stored_env = ProviderEnv::new();
     stored_env.insert("A".to_owned(), "stored".to_owned());
-    let store = empty_store();
-    store_credential(
-        store.as_ref(),
-        PROVIDER,
-        Credential::ApiKey(ApiKeyCredential {
-            key: Some("stored-key".to_owned()),
-            env: Some(stored_env.clone()),
-        }),
-    )
-    .await;
+    let store = stored_env_store(Some(stored_env.clone())).await;
     let provider = api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("the stored credential resolves");
+    let resolved = resolved(&provider, &store)
+        .await
+        .expect("the stored credential resolves");
     assert_eq!(resolved.env, Some(stored_env), "the stored env survives");
 }
 
@@ -1636,11 +1669,9 @@ async fn the_override_env_applies_when_the_stored_credential_has_none() {
     };
     let provider = api_key_provider(|| env_api_key_auth("Stub key", &["ANTHROPIC_API_KEY"]));
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), Some(&overrides)).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("the stored credential resolves");
+    let resolved = resolved_with(&provider, &store, &overrides)
+        .await
+        .expect("the stored credential resolves");
     assert_eq!(resolved.auth.api_key.as_deref(), Some("stored-key"));
     assert_eq!(resolved.env, Some(override_env));
 }
@@ -1704,18 +1735,11 @@ async fn the_overlay_context_overlays_env_values_over_the_base() {
     // values: the handler resolves OVERLAY_ONLY from the overlay...
     let mut env = ProviderEnv::new();
     env.insert("OVERLAY_ONLY".to_owned(), "overlay".to_owned());
-    let overrides = AuthResolutionOverrides {
-        env: Some(env),
-        ..AuthResolutionOverrides::default()
-    };
-    let provider = api_key_provider(|| env_api_key_auth("Stub key", &["OVERLAY_ONLY"]));
-    let base: Arc<dyn AuthContext> = Arc::new(MapAuthContext::new([("BASE_ONLY", "base")]));
+    let (overrides, provider, base) = overlay_case(&["OVERLAY_ONLY"], env);
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &base, Some(&overrides)).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("the ambient resolution runs");
+    let resolved = resolved_over(&provider, &empty_store(), &base, &overrides)
+        .await
+        .expect("the ambient resolution runs");
     assert_eq!(
         resolved.auth.api_key.as_deref(),
         Some("overlay"),
@@ -1723,24 +1747,32 @@ async fn the_overlay_context_overlays_env_values_over_the_base() {
     );
 
     // ...and falls through to the base context for an overlay miss.
-    let provider = api_key_provider(|| env_api_key_auth("Stub key", &["BASE_ONLY"]));
     let mut env = ProviderEnv::new();
     env.insert("OVERLAY_ONLY".to_owned(), "overlay".to_owned());
-    let overrides = AuthResolutionOverrides {
-        env: Some(env),
-        ..AuthResolutionOverrides::default()
-    };
-    let base: Arc<dyn AuthContext> = Arc::new(MapAuthContext::new([("BASE_ONLY", "base")]));
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &empty_store(), &base, Some(&overrides)).await,
-    )
-    .expect("the resolution succeeds")
-    .expect("the ambient resolution runs");
+    let (overrides, provider, base) = overlay_case(&["BASE_ONLY"], env);
+    let resolved = resolved_over(&provider, &empty_store(), &base, &overrides)
+        .await
+        .expect("the ambient resolution runs");
     assert_eq!(
         resolved.auth.api_key.as_deref(),
         Some("base"),
         "a miss in the overlay falls through to the base context"
     );
+}
+
+/// The overlay-context case scaffold: overrides carrying `env`, a handler
+/// resolving from `keys`, and the base context holding only `BASE_ONLY`.
+fn overlay_case(
+    keys: &'static [&'static str],
+    env: ProviderEnv,
+) -> (AuthResolutionOverrides, ProviderAuth, Arc<dyn AuthContext>) {
+    let overrides = AuthResolutionOverrides {
+        env: Some(env),
+        ..AuthResolutionOverrides::default()
+    };
+    let provider = api_key_provider(|| env_api_key_auth("Stub key", keys));
+    let base: Arc<dyn AuthContext> = Arc::new(MapAuthContext::new([("BASE_ONLY", "base")]));
+    (overrides, provider, base)
 }
 
 /// A store whose modify rejects with a storage failure after the read, the
@@ -1796,10 +1828,8 @@ async fn a_failing_store_modify_surfaces_the_auth_models_error() {
     let provider = oauth_provider_of(|| oauth.auth());
     let store: Arc<dyn CredentialStore> = Arc::new(ReadOkModifyFailsStore);
 
-    let error = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
-    )
-    .expect_err("the modify failure fails the resolution");
+    let error =
+        resolution_fails(&provider, &store, "the modify failure fails the resolution").await;
     assert_eq!(error.code(), ModelsErrorCode::Auth);
     assert_eq!(
         error.to_string(),
@@ -1848,32 +1878,16 @@ async fn pre_cancelled_store_operations_reject_as_aborted() {
 
 #[tokio::test]
 async fn a_modify_cancelled_while_queued_rejects_without_touching_the_entry() {
-    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
-    let gate = Arc::new(ModifyGate::default());
+    let (store, gate) = gated_store();
     let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
-    let task_a = {
-        let store = Arc::clone(&store);
-        let gate = Arc::clone(&gate);
-        let entered = a_entered;
-        tokio::spawn(async move {
-            store
-                .modify(
-                    "queued",
-                    Box::new(move |current| {
-                        let gate = Arc::clone(&gate);
-                        let entered = entered;
-                        Box::pin(async move {
-                            let _ = entered.send(current);
-                            gate.wait_for_peer().await;
-                            Ok(Some(api_key_stored("a")))
-                        })
-                    }),
-                    None,
-                )
-                .await
-        })
-    };
+    let task_a = spawn_gated_modify(
+        Arc::clone(&store),
+        Arc::clone(&gate),
+        a_entered,
+        "queued",
+        api_key_stored("a"),
+    );
     a_entered_rx.await.expect("A entered the modify");
 
     // B queues behind A, then its signal cancels before the lock is free.
@@ -1918,33 +1932,18 @@ async fn a_modify_cancelled_while_queued_rejects_without_touching_the_entry() {
 
 #[tokio::test]
 async fn a_delete_cancelled_while_queued_rejects_as_aborted() {
-    let store = Arc::new(InMemoryCredentialStore::default());
+    let store: Arc<dyn CredentialStore> = Arc::new(InMemoryCredentialStore::default());
     store_credential(store.as_ref(), "queued", api_key_stored("k")).await;
     let gate = Arc::new(ModifyGate::default());
     let (a_entered, a_entered_rx) = tokio::sync::oneshot::channel::<Option<Credential>>();
 
-    let task_a = {
-        let store = Arc::clone(&store);
-        let gate = Arc::clone(&gate);
-        let entered = a_entered;
-        tokio::spawn(async move {
-            store
-                .modify(
-                    "queued",
-                    Box::new(move |current| {
-                        let gate = Arc::clone(&gate);
-                        let entered = entered;
-                        Box::pin(async move {
-                            let _ = entered.send(current);
-                            gate.wait_for_peer().await;
-                            Ok(Some(api_key_stored("k")))
-                        })
-                    }),
-                    None,
-                )
-                .await
-        })
-    };
+    let task_a = spawn_gated_modify(
+        Arc::clone(&store),
+        Arc::clone(&gate),
+        a_entered,
+        "queued",
+        api_key_stored("k"),
+    );
     a_entered_rx.await.expect("A entered the modify");
 
     let signal = CancellationToken::new();
@@ -2419,10 +2418,7 @@ async fn a_stored_api_key_credential_without_an_api_key_handler_resolves_none() 
     let store = empty_store();
     store_credential(store.as_ref(), PROVIDER, api_key_stored("k")).await;
 
-    let resolved = resolution_error(
-        resolve_provider_auth(PROVIDER, &provider, &store, &context(), None).await,
-    )
-    .expect("the resolution succeeds");
+    let resolved = resolved(&provider, &store).await;
     assert_eq!(
         resolved, None,
         "no silent env fallback for an unmatched credential type"

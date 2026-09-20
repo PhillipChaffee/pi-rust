@@ -70,24 +70,40 @@ fn poll_times() -> Arc<Mutex<Vec<i64>>> {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// The options a fixed-schedule case drives: the recorded poll over `clock`
+/// answering `outcomes`, the interval and lifetime the server reports.
+fn fixed_poll_options(
+    clock: &Arc<FixedClock>,
+    poll_times: &Arc<Mutex<Vec<i64>>>,
+    outcomes: &[PollOutcome<String>],
+    interval_seconds: Option<u64>,
+    expires_in_seconds: Option<u64>,
+    wait_before_first_poll: bool,
+) -> PollOptions<String> {
+    PollOptions {
+        interval_seconds,
+        expires_in_seconds,
+        wait_before_first_poll,
+        signal: CancellationToken::new(),
+        poll: recording_poll(clock, poll_times, outcomes),
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn polls_immediately_and_returns_the_completed_value() {
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = poll_times();
-    let flow = pin!(poll_oauth_device_code_flow(PollOptions {
-        interval_seconds: Some(2),
-        expires_in_seconds: Some(30),
-        wait_before_first_poll: false,
-        signal: CancellationToken::new(),
-        poll: recording_poll(
-            &clock,
-            &poll_times,
-            &[
-                PollOutcome::Pending,
-                PollOutcome::Complete("token".to_owned()),
-            ],
-        ),
-    }));
+    let flow = pin!(poll_oauth_device_code_flow(fixed_poll_options(
+        &clock,
+        &poll_times,
+        &[
+            PollOutcome::Pending,
+            PollOutcome::Complete("token".to_owned()),
+        ],
+        Some(2),
+        Some(30),
+        false,
+    )));
     let mut flow = flow;
 
     // The first poll runs immediately, upstream's advanceTimersByTimeAsync(0).
@@ -119,17 +135,14 @@ async fn polls_immediately_and_returns_the_completed_value() {
 async fn can_wait_before_the_first_poll() {
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = poll_times();
-    let flow = pin!(poll_oauth_device_code_flow(PollOptions {
-        interval_seconds: Some(2),
-        expires_in_seconds: Some(30),
-        wait_before_first_poll: true,
-        signal: CancellationToken::new(),
-        poll: recording_poll(
-            &clock,
-            &poll_times,
-            &[PollOutcome::Complete("token".to_owned())],
-        ),
-    }));
+    let flow = pin!(poll_oauth_device_code_flow(fixed_poll_options(
+        &clock,
+        &poll_times,
+        &[PollOutcome::Complete("token".to_owned())],
+        Some(2),
+        Some(30),
+        true,
+    )));
     let mut flow = flow;
 
     assert!(
@@ -159,22 +172,19 @@ async fn can_wait_before_the_first_poll() {
 async fn increases_the_interval_by_5_seconds_after_slow_down_without_a_server_interval() {
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = poll_times();
-    let flow = pin!(poll_oauth_device_code_flow(PollOptions {
-        interval_seconds: Some(2),
-        expires_in_seconds: Some(900),
-        wait_before_first_poll: false,
-        signal: CancellationToken::new(),
-        poll: recording_poll(
-            &clock,
-            &poll_times,
-            &[
-                PollOutcome::SlowDown {
-                    interval_seconds: None
-                },
-                PollOutcome::Complete("token".to_owned()),
-            ],
-        ),
-    }));
+    let flow = pin!(poll_oauth_device_code_flow(fixed_poll_options(
+        &clock,
+        &poll_times,
+        &[
+            PollOutcome::SlowDown {
+                interval_seconds: None
+            },
+            PollOutcome::Complete("token".to_owned()),
+        ],
+        Some(2),
+        Some(900),
+        false,
+    )));
     let mut flow = flow;
 
     assert!(
@@ -205,22 +215,19 @@ async fn increases_the_interval_by_5_seconds_after_slow_down_without_a_server_in
 async fn honors_a_server_provided_slow_down_interval() {
     let clock = Arc::new(FixedClock::new(START));
     let poll_times = poll_times();
-    let flow = pin!(poll_oauth_device_code_flow(PollOptions {
-        interval_seconds: Some(2),
-        expires_in_seconds: Some(900),
-        wait_before_first_poll: false,
-        signal: CancellationToken::new(),
-        poll: recording_poll(
-            &clock,
-            &poll_times,
-            &[
-                PollOutcome::SlowDown {
-                    interval_seconds: Some(30),
-                },
-                PollOutcome::Complete("token".to_owned()),
-            ],
-        ),
-    }));
+    let flow = pin!(poll_oauth_device_code_flow(fixed_poll_options(
+        &clock,
+        &poll_times,
+        &[
+            PollOutcome::SlowDown {
+                interval_seconds: Some(30),
+            },
+            PollOutcome::Complete("token".to_owned()),
+        ],
+        Some(2),
+        Some(900),
+        false,
+    )));
     let mut flow = flow;
 
     assert!(

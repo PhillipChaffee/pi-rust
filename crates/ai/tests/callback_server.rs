@@ -11,38 +11,26 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
+mod common;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+use common::oauth_fixtures::send_loopback;
 use pi_ai::auth::oauth::callback::{
     CallbackHandler, CallbackRequest, CallbackResponse, OAuthCallbackServer, WaitCell,
 };
 use pi_ai::auth::oauth::oauth_page::{oauth_error_html, oauth_success_html};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 /// The success page a callback answers with.
 const SUCCESS_PAGE: &str = "OAuth callback accepted";
 
-/// The one-request-per-connection write the browsers send.
-async fn send_request(port: u16, request: &str) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .expect("the loopback server accepts");
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .expect("the request writes");
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .expect("the response reads to EOF");
-    String::from_utf8(raw).expect("the response is utf-8")
-}
-
-#[tokio::test]
-async fn serves_one_callback_with_parsed_path_and_query() {
+/// A handler that records every request and answers the success page, the
+/// recorder the parse and route cases drive.
+fn recording_handler() -> (CallbackHandler, Arc<Mutex<Vec<CallbackRequest>>>) {
     let requests: Arc<Mutex<Vec<CallbackRequest>>> = Arc::default();
     let handler: CallbackHandler = {
         let requests = Arc::clone(&requests);
@@ -57,13 +45,38 @@ async fn serves_one_callback_with_parsed_path_and_query() {
             }))
         })
     };
+    (handler, requests)
+}
+
+/// A handler that answers every request with the success page, the stub the
+/// error-page cases ride.
+fn static_handler() -> CallbackHandler {
+    Arc::new(|_| {
+        Box::pin(std::future::ready(CallbackResponse {
+            status: 200,
+            html: SUCCESS_PAGE.to_owned(),
+        }))
+    })
+}
+
+/// Bind the callback server on an ephemeral loopback port; the case drives
+/// requests against the returned port.
+async fn bind_ephemeral(handler: CallbackHandler) -> (OAuthCallbackServer, u16) {
     let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
         .await
         .expect("the ephemeral bind succeeds");
     let port = server.local_addr().expect("the bound address").port();
+    (server, port)
+}
+
+#[tokio::test]
+async fn serves_one_callback_with_parsed_path_and_query() {
+    let (handler, requests) = recording_handler();
+    let (_server, port) = bind_ephemeral(handler).await;
     assert!(port > 0, "port 0 binds an ephemeral port");
 
-    let response = send_request(
+    let response = send_loopback(
+        "127.0.0.1",
         port,
         "GET /path?code=x&state=y HTTP/1.1\r\nHost: localhost\r\n\r\n",
     )
@@ -111,12 +124,14 @@ async fn a_wrong_path_surfaces_the_handler_status() {
         };
         Box::pin(std::future::ready(CallbackResponse { status, html }))
     });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (_server, port) = bind_ephemeral(handler).await;
 
-    let response = send_request(port, "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+    let response = send_loopback(
+        "127.0.0.1",
+        port,
+        "GET /nope HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .await;
     assert!(
         response.starts_with("HTTP/1.1 404 Not Found\r\n"),
         "the handler's 404 surfaces: {response:?}"
@@ -171,16 +186,7 @@ fn the_wait_cell_debug_names_the_cell() {
 
 #[tokio::test]
 async fn the_bound_server_debug_names_the_type_and_drop_stops_accepting() {
-    let handler: CallbackHandler = Arc::new(|_| {
-        Box::pin(std::future::ready(CallbackResponse {
-            status: 200,
-            html: SUCCESS_PAGE.to_owned(),
-        }))
-    });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (server, port) = bind_ephemeral(static_handler()).await;
     let server_debug = format!("{server:?}");
     assert!(
         server_debug.contains("OAuthCallbackServer"),
@@ -210,24 +216,8 @@ async fn the_bound_server_debug_names_the_type_and_drop_stops_accepting() {
 
 #[tokio::test]
 async fn an_immediately_closed_connection_is_ignored() {
-    let requests: Arc<Mutex<Vec<CallbackRequest>>> = Arc::default();
-    let handler: CallbackHandler = {
-        let requests = Arc::clone(&requests);
-        Arc::new(move |request| {
-            requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(request);
-            Box::pin(std::future::ready(CallbackResponse {
-                status: 200,
-                html: SUCCESS_PAGE.to_owned(),
-            }))
-        })
-    };
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (handler, requests) = recording_handler();
+    let (_server, port) = bind_ephemeral(handler).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -256,24 +246,8 @@ async fn an_immediately_closed_connection_is_ignored() {
 
 #[tokio::test]
 async fn a_partial_request_flushed_at_eof_is_still_answered() {
-    let requests: Arc<Mutex<Vec<CallbackRequest>>> = Arc::default();
-    let handler: CallbackHandler = {
-        let requests = Arc::clone(&requests);
-        Arc::new(move |request| {
-            requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(request);
-            Box::pin(std::future::ready(CallbackResponse {
-                status: 200,
-                html: SUCCESS_PAGE.to_owned(),
-            }))
-        })
-    };
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (handler, requests) = recording_handler();
+    let (_server, port) = bind_ephemeral(handler).await;
 
     // No header terminator, then EOF: the buffered request still parses,
     // the lenient-EOF read upstream's servers share.
@@ -305,23 +279,14 @@ async fn a_partial_request_flushed_at_eof_is_still_answered() {
 
 #[tokio::test]
 async fn an_oversized_request_yields_the_internal_error_page_without_a_panic() {
-    let handler: CallbackHandler = Arc::new(|_| {
-        Box::pin(std::future::ready(CallbackResponse {
-            status: 200,
-            html: SUCCESS_PAGE.to_owned(),
-        }))
-    });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (_server, port) = bind_ephemeral(static_handler()).await;
 
     // The server answers once its buffer crosses 16 KiB; a total of exactly
     // 16 KiB + 1 keeps every written byte consumed by the read that trips
     // the limit, so the close is a clean FIN and the page survives.
     let mut request = String::from("GET / HTTP/1.1\r\nHost: localhost\r\nX-Pad: ");
     request.push_str(&"x".repeat(16 * 1024 + 1 - request.len()));
-    let response = send_request(port, &request).await;
+    let response = send_loopback("127.0.0.1", port, &request).await;
     assert!(
         response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
         "the oversized request fails the parse: {response:?}"
@@ -334,16 +299,7 @@ async fn an_oversized_request_yields_the_internal_error_page_without_a_panic() {
 
 #[tokio::test]
 async fn a_non_utf8_request_yields_the_internal_error_page() {
-    let handler: CallbackHandler = Arc::new(|_| {
-        Box::pin(std::future::ready(CallbackResponse {
-            status: 200,
-            html: SUCCESS_PAGE.to_owned(),
-        }))
-    });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (_server, port) = bind_ephemeral(static_handler()).await;
 
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -366,20 +322,11 @@ async fn a_non_utf8_request_yields_the_internal_error_page() {
 
 #[tokio::test]
 async fn malformed_request_lines_yield_the_internal_error_page() {
-    let handler: CallbackHandler = Arc::new(|_| {
-        Box::pin(std::future::ready(CallbackResponse {
-            status: 200,
-            html: SUCCESS_PAGE.to_owned(),
-        }))
-    });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (_server, port) = bind_ephemeral(static_handler()).await;
 
     // No target after the method, then an unparsable target.
     for request in ["GARBAGE\r\n\r\n", "GET %zz HTTP/1.1\r\n\r\n"] {
-        let response = send_request(port, request).await;
+        let response = send_loopback("127.0.0.1", port, request).await;
         assert!(
             response.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
             "the malformed request line fails the parse: {response:?}"
@@ -402,10 +349,7 @@ async fn each_error_status_renders_its_reason_phrase() {
             html: "page".to_owned(),
         }))
     });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (_server, port) = bind_ephemeral(handler).await;
 
     for (path, status_line) in [
         ("/bad", "HTTP/1.1 400 Bad Request\r\n"),
@@ -413,7 +357,8 @@ async fn each_error_status_renders_its_reason_phrase() {
         ("/conflict", "HTTP/1.1 409 Conflict\r\n"),
         ("/gateway", "HTTP/1.1 502 Bad Gateway\r\n"),
     ] {
-        let response = send_request(port, &format!("GET {path} HTTP/1.1\r\n\r\n")).await;
+        let response =
+            send_loopback("127.0.0.1", port, &format!("GET {path} HTTP/1.1\r\n\r\n")).await;
         assert!(
             response.starts_with(status_line),
             "{path} renders {status_line:?}: {response:?}"
@@ -466,16 +411,7 @@ fn the_error_page_escapes_every_html_special_character() {
 
 #[tokio::test]
 async fn garbage_flushed_at_eof_yields_the_internal_error_page() {
-    let handler: CallbackHandler = Arc::new(|_| {
-        Box::pin(std::future::ready(CallbackResponse {
-            status: 200,
-            html: SUCCESS_PAGE.to_owned(),
-        }))
-    });
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (_server, port) = bind_ephemeral(static_handler()).await;
 
     // Unparsable bytes with no header terminator, then EOF: the buffered
     // request fails the parse, upstream's lenient-EOF read.
@@ -504,24 +440,8 @@ async fn garbage_flushed_at_eof_yields_the_internal_error_page() {
 
 #[tokio::test]
 async fn a_parked_connection_is_dropped_when_the_server_closes() {
-    let requests: Arc<Mutex<Vec<CallbackRequest>>> = Arc::default();
-    let handler: CallbackHandler = {
-        let requests = Arc::clone(&requests);
-        Arc::new(move |request| {
-            requests
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(request);
-            Box::pin(std::future::ready(CallbackResponse {
-                status: 200,
-                html: SUCCESS_PAGE.to_owned(),
-            }))
-        })
-    };
-    let server = OAuthCallbackServer::bind("127.0.0.1", 0, handler)
-        .await
-        .expect("the ephemeral bind succeeds");
-    let port = server.local_addr().expect("the bound address").port();
+    let (handler, requests) = recording_handler();
+    let (server, port) = bind_ephemeral(handler).await;
 
     // Park a connection mid-request: no terminator, no EOF, so the read
     // never completes.
