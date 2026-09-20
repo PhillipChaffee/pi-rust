@@ -812,3 +812,303 @@ async fn an_enable_that_rate_limits_exhausting_the_budget_fails_the_login() {
         "the exhausted policy batch contributes no ids"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The rate-limit retry machinery through the login path's budget
+// ---------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_429_without_a_retry_after_uses_the_default_backoff() {
+    let mock = MockHttpClient::new();
+    mount_login_route_builder(&mock, |builder| {
+        builder.respond_sequence(vec![
+            MockResponse::status(429),
+            json_response(200, &serde_json::json!({ "data": [] })),
+        ])
+    });
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+    // The wait-before-first-poll sleep, then the 500 ms default backoff.
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::advance(Duration::from_millis(500)).await;
+    tokio::task::yield_now().await;
+    let credential = handle
+        .await
+        .expect("the login task joins")
+        .expect("the backoff retried login resolves");
+    assert_eq!(
+        credential.extra.get("availableModelIds"),
+        Some(&serde_json::json!([]))
+    );
+    assert_eq!(mock.request_count(), 5, "start, poll, token, 429, retried");
+}
+
+#[tokio::test]
+async fn a_429_with_a_far_retry_after_date_exhausts_the_budget() {
+    let mock = MockHttpClient::new();
+    // The wait-before-first-poll sleep and the poll fire on the real clock:
+    // no backoff sleep runs because the dated retry is out of budget.
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(
+            200,
+            &serde_json::json!({ "access_token": "gh-token" }),
+        ));
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+    // One hour after START, in IMF-fixdate form.
+    mount_login_route_builder(&mock, |builder| {
+        builder.respond_sequence(vec![
+            MockResponse::status(429).with_header("Retry-After", "Tue, 14 Jul 2026 04:33:20 GMT"),
+            json_response(200, &serde_json::json!({ "data": [] })),
+        ])
+    });
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+    // The one-second wait-before-first-poll sleep runs on the real clock.
+    let error = handle
+        .await
+        .expect("the login task joins")
+        .expect_err("the out-of-budget dated retry fails login");
+    assert_eq!(error.to_string(), "429 Too Many Requests: ");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_device_poll_fails_without_an_error_or_access_token_field() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond(json_response(200, &serde_json::json!({})));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = handle
+        .await
+        .expect("the login task joins")
+        .expect_err("the fieldless poll fails login");
+    assert_eq!(error.to_string(), "Invalid device token response");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_device_poll_parks_on_authorization_pending_then_completes() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == DEVICE_URL)
+        .respond(json_response(200, &device_response()));
+    mock.on(|request| request.url == ACCESS_TOKEN_URL)
+        .respond_sequence(vec![
+            json_response(200, &serde_json::json!({ "error": "authorization_pending" })),
+            json_response(200, &serde_json::json!({ "access_token": "gh-token" })),
+        ]);
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+    mock.on(|request| request.url == MODELS_URL)
+        .respond(json_response(200, &serde_json::json!({ "data": [] })));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let credential = handle
+        .await
+        .expect("the login task joins")
+        .expect("login resolves");
+    assert_eq!(credential.access, COPILOT_TOKEN);
+    assert_eq!(
+        mock.request_count(),
+        5,
+        "start, pending poll, complete poll, exchange, models"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_policy_update_stops_the_batch_without_failing_the_login() {
+    // The policy POST transport-fails: the batch stops, the login still
+    // resolves with the picker's own ids.
+    let mock = MockHttpClient::new();
+    mount_login_routes(
+        &mock,
+        serde_json::json!({ "data": [
+            model_entry("claude-sonnet-4.6", false, "unconfigured"),
+        ]}),
+    );
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let credential = handle
+        .await
+        .expect("the login task joins")
+        .expect("the best-effort batch stop keeps the login");
+    assert_eq!(
+        credential.extra.get("availableModelIds"),
+        Some(&serde_json::json!([]))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_policy_status_counts_as_not_enabled() {
+    // A non-429 policy failure answers false and the batch keeps going.
+    let mock = MockHttpClient::new();
+    mount_login_routes(
+        &mock,
+        serde_json::json!({ "data": [
+            model_entry("claude-sonnet-4.6", false, "unconfigured"),
+            model_entry("gpt-5.4", false, "unconfigured"),
+        ]}),
+    );
+    mock.on(|request| request.url.ends_with("/policy"))
+        .respond(MockResponse::status(400).with_body("nope"));
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        CancellationToken::new(),
+    )));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let credential = handle
+        .await
+        .expect("the login task joins")
+        .expect("the failed policy updates are not enabled");
+    assert_eq!(
+        credential.extra.get("availableModelIds"),
+        Some(&serde_json::json!([]))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_enable_fails_the_login() {
+    // The policy responder cancels the login's own signal and aborts the
+    // request; the enable step propagates the cancellation.
+    let mock = MockHttpClient::new();
+    mount_login_routes(
+        &mock,
+        serde_json::json!({ "data": [
+            model_entry("claude-sonnet-4.6", false, "unconfigured"),
+        ]}),
+    );
+    let signal = CancellationToken::new();
+    mock.on(|request| request.url.ends_with("/policy"))
+        .respond_fn({
+            let signal = signal.clone();
+            move |_recorded| {
+                let signal = signal.clone();
+                async move {
+                    signal.cancel();
+                    Err(pi_ai::http::HttpError::Aborted)
+                }
+            }
+        });
+
+    let oauth = flow(&mock);
+    let scripted = Arc::new(ScriptedAuthInteraction::answering(""));
+    let handle = tokio::spawn(oauth.login(provider_interaction(
+        &scripted,
+        signal,
+    )));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let error = handle
+        .await
+        .expect("the login task joins")
+        .expect_err("the cancelled enable fails login");
+    assert_eq!(
+        error.to_string(),
+        "Login cancelled",
+        "the aborted exchange surfaces as the cancelled login"
+    );
+}
+
+#[tokio::test]
+async fn refresh_with_an_empty_enterprise_url_drops_the_domain() {
+    // An empty enterpriseUrl reads as "no domain", upstream's falsy-string
+    // check, so the exchange runs against github.com and the rotated
+    // credential drops the field.
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(json_response(200, &copilot_token_response()));
+    mock.on(|request| request.url == MODELS_URL)
+        .respond(json_response(200, &serde_json::json!({ "data": [] })));
+
+    let oauth = flow(&mock);
+    let mut stored = oauth_credentials("a", "r", 0);
+    stored.extra.insert(
+        "enterpriseUrl".to_owned(),
+        serde_json::Value::String(String::new()),
+    );
+    let refreshed = oauth
+        .refresh(stored, CancellationToken::new())
+        .await
+        .expect("the refresh resolves");
+    assert_eq!(
+        refreshed.extra.get("enterpriseUrl"),
+        None,
+        "the empty domain drops, upstream's falsy-string semantics"
+    );
+}
+
+#[tokio::test]
+async fn a_token_without_a_proxy_capture_falls_back_to_the_domain() {
+    // The proxy-ep capture stops at `;`; an empty capture leaves no endpoint,
+    // so the base URL falls through.
+    let mock = MockHttpClient::new();
+    let oauth = flow(&mock);
+    let auth = oauth.to_auth(&oauth_credentials("tid=1;proxy-ep=;rest", "r", 0));
+    assert_eq!(
+        auth.base_url.as_deref(),
+        Some("https://api.individual.githubcopilot.com"),
+        "an empty capture yields no endpoint"
+    );
+}
+
+#[tokio::test]
+async fn refresh_surfaces_the_exchange_status_reason() {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == COPILOT_TOKEN_URL)
+        .respond(MockResponse::status(401).with_body("revoked"));
+
+    let oauth = flow(&mock);
+    let error = oauth
+        .refresh(oauth_credentials("a", "r", 0), CancellationToken::new())
+        .await
+        .expect_err("the 401 fails refresh");
+    assert_eq!(error.to_string(), "401 Unauthorized: revoked");
+}
