@@ -92,6 +92,7 @@
 //! keepalive) so the 95% coverage gate binds.
 
 pub mod alt_screen_search;
+pub mod autocomplete;
 pub mod components;
 pub mod fuzzy;
 pub mod keybindings;

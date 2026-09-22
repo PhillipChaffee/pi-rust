@@ -51,7 +51,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 use pi_tui::components::ColorFn;
-use pi_tui::components::{EditorTheme, MarkdownTheme};
+use pi_tui::components::{Editor, EditorTheme, MarkdownTheme, SelectListTheme};
 use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
 use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
 use pi_tui::tui::{
@@ -986,12 +986,52 @@ pub fn new_editor_test_tui(columns: u16, rows: u16) -> Rc<Tui> {
 }
 
 /// The editor suites' theme, upstream test-themes.ts `defaultEditorTheme`:
-/// the border color is chalk's dim. The select-list entry of the upstream
-/// theme lands with the autocomplete child (#49).
+/// the border color is chalk's dim, and the autocomplete dropdown theme is
+/// upstream test-themes.ts `defaultSelectListTheme`.
 #[must_use]
 pub fn default_editor_theme() -> EditorTheme {
     EditorTheme {
         border_color: Rc::new(|text| format!("\x1b[2m{text}\x1b[22m")),
+        select_list: default_select_list_theme(),
+    }
+}
+
+/// Let the editor's autocomplete worker settle and apply its result,
+/// upstream `flushAutocomplete` (microtask + setImmediate): the port's
+/// request runs on a worker thread, so the flush spins until the pipeline
+/// is idle and then drains.
+///
+/// # Panics
+/// Panics if the pipeline does not settle within five seconds — a hung
+/// provider or a lost request.
+pub fn flush_autocomplete(editor: &Editor) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !editor.autocomplete_idle() {
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "autocomplete pipeline did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    editor.drain_autocomplete();
+}
+
+/// The suites' select-list theme, upstream test-themes.ts
+/// `defaultSelectListTheme` (chalk, level 3): the selected prefix blue,
+/// the selected text bold, the description, scroll info, and no-match
+/// lines dim.
+#[must_use]
+pub fn default_select_list_theme() -> SelectListTheme {
+    let chalked = |style: &'static ChalkStyle| {
+        let styled = chalk_one(style);
+        Rc::new(move |text: &str| styled(text))
+    };
+    SelectListTheme {
+        selected_prefix: chalked(&CHALK_BLUE),
+        selected_text: chalked(&CHALK_BOLD),
+        description: chalked(&CHALK_DIM),
+        scroll_info: chalked(&CHALK_DIM),
+        no_match: chalked(&CHALK_DIM),
     }
 }
 
