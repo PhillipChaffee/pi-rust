@@ -18,6 +18,7 @@ pub mod constrained_sampling;
 pub mod github_copilot_headers;
 pub mod google_generative_ai;
 pub mod google_shared;
+pub mod google_vertex;
 pub mod lazy;
 pub mod simple_options;
 pub mod transform_messages;
@@ -123,7 +124,7 @@ pub fn google_generative_ai() -> Arc<dyn ProviderStreams> {
 /// The Google Vertex AI wire API, upstream's `googleVertexApi()`.
 #[must_use]
 pub fn google_vertex() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("google-vertex")
+    Arc::new(google_vertex::GoogleVertexStreams)
 }
 
 /// The Bedrock Converse Stream wire API, upstream's

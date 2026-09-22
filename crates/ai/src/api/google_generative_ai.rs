@@ -31,27 +31,23 @@
 //!   `Usage.input` is unsigned here).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use serde_json::{Value, json};
 
 use crate::api::google_shared::{
-    convert_messages, convert_tools, is_thinking_part, map_stop_reason,
-    resolve_google_function_calling_mode, resolve_google_thinking_level, retain_thought_signature,
+    GoogleThinkingControl, api_error_message, consume_google_stream, convert_messages,
+    convert_tools, resolve_google_function_calling_mode, resolve_google_thinking_level,
     supports_google_strict_tool_sampling, ResolvedGoogleThinkingLevel,
 };
 use crate::api::simple_options::build_base_options;
 use crate::http::client::{HttpError, HttpMethod, HttpRequest, read_body_text};
 use crate::types::{
-    AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel,
-    ProviderStreams, SimpleStreamOptions, StopReason, StreamOptions, TextContent,
-    ThinkingBudgets, ThinkingContent, ToolCall,
+    AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel, ProviderStreams,
+    SimpleStreamOptions, StopReason, StreamOptions, ThinkingBudgets,
 };
-use crate::utils::error_body::safe_json_stringify;
 use crate::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
 use crate::utils::headers::{headers_to_record, provider_headers_to_record};
-use crate::utils::json_parse::parse_json_with_repair;
 use crate::utils::pi_user_agent::get_pi_user_agent;
 use crate::utils::provider_retry::{
     ProviderRequestError, ProviderRetryOptions, retry_provider_request,
@@ -60,10 +56,6 @@ use crate::utils::provider_retry::{
 /// The model id the wire names when no custom base URL is set: the SDK's
 /// default host plus its default `v1beta` version segment.
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-
-/// Counter for generating unique tool call IDs, upstream's module-level
-/// `toolCallCounter`.
-static TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The adapter-facing options, upstream's `GoogleOptions extends
 /// StreamOptions` plus the thinking control `streamSimple` resolves
@@ -111,19 +103,6 @@ pub struct GoogleStreamOptions {
     /// The thinking control, upstream's
     /// `thinking?: { enabled, budgetTokens?, level? }`.
     pub thinking: Option<GoogleThinkingControl>,
-}
-
-/// The thinking control a caller can pin for the full-fidelity `stream`
-/// entry, upstream's `GoogleOptions["thinking"]`.
-#[derive(Clone, Debug, Default)]
-pub struct GoogleThinkingControl {
-    /// Whether thinking is enabled; `false` maps a reasoning model to its
-    /// disabled-thinking config.
-    pub enabled: bool,
-    /// The thinking budget; `-1` means dynamic, `0` disables.
-    pub budget_tokens: Option<i64>,
-    /// The provider-native thinking level, upstream's `GoogleApiThinkingLevel`.
-    pub level: Option<String>,
 }
 
 impl From<StreamOptions> for GoogleStreamOptions {
@@ -593,7 +572,7 @@ fn build_params(
 /// `contents` pass through verbatim, `config` becomes `generationConfig`, and
 /// `systemInstruction`, `tools`, and `toolConfig` hoist to the body root.
 /// The body never carries a `model` key; the model names the URL path.
-fn to_wire_body(params: &Value) -> Value {
+pub(crate) fn to_wire_body(params: &Value) -> Value {
     let mut body = serde_json::Map::new();
     body.insert(
         "contents".to_owned(),
@@ -760,25 +739,6 @@ pub fn get_google_budget(
     })
 }
 
-/// The ApiError message the pinned SDK builds for a failed response: the
-/// parsed JSON body stringified, or a synthesized `{ error: { message, code,
-/// status } }` object when the body is not JSON.
-fn api_error_message(status: u16, body: &str) -> String {
-    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
-        return safe_json_stringify(&parsed);
-    }
-    if body.trim().is_empty() {
-        return safe_json_stringify(&json!({}));
-    }
-    safe_json_stringify(&json!({
-        "error": {
-            "message": body,
-            "code": status,
-            "status": "UNKNOWN",
-        }
-    }))
-}
-
 fn provider_error_from_http(error: HttpError) -> ProviderRequestError {
     match error {
         HttpError::Aborted => ProviderRequestError::aborted(),
@@ -802,304 +762,6 @@ fn setup_error_stream(model: &Model, message: &str) -> AssistantMessageEventStre
     });
     events.end(Some(&failing));
     events
-}
-
-/// Whether the open block is thinking (`Some(true)`), text (`Some(false)`),
-/// or none (`None`).
-type OpenBlock = Option<bool>;
-
-/// The per-chunk state machine, upstream's `for await` loop over the SDK's
-/// `generateContentStream` iterator.
-async fn consume_google_stream(
-    model: &Model,
-    response: crate::http::client::HttpResponse,
-    output: &mut AssistantMessage,
-    events: &AssistantMessageEventStream,
-) -> Result<(), String> {
-    let mut sse = crate::http::sse::SseStream::new(response.body);
-    let mut current_block: OpenBlock = None;
-    let mut first_event = true;
-    while let Some(sse_event) = sse.next().await.map_err(|error| match error {
-        HttpError::Aborted => "Request was aborted".to_owned(),
-        other => other.to_string(),
-    })? {
-        let value = parse_json_with_repair(&sse_event.data)
-            .map_err(|error| format!("Invalid Google streaming event: {error}"))?;
-        if first_event {
-            first_event = false;
-            // The SDK's pre-loop probe: a 200 stream whose first JSON event
-            // carries an error object with a 4xx/5xx code fails outright.
-            if let Some(code) = value
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_i64)
-                && (400..600).contains(&code)
-            {
-                return Err(format!("got status: {code}. {}", safe_json_stringify(&value)));
-            }
-        }
-
-        // `GenerateContentResponse.responseId` is an output-only field used
-        // to identify each response; keep the first non-empty one.
-        if let Some(id) = value.get("responseId").and_then(Value::as_str)
-            && !id.is_empty()
-            && output.response_id.as_ref().is_none_or(String::is_empty)
-        {
-            output.response_id = Some(id.to_owned());
-        }
-
-        let candidate = value
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|candidates| candidates.first());
-        if let Some(parts) = candidate
-            .and_then(|candidate| candidate.get("content"))
-            .and_then(|content| content.get("parts"))
-            .and_then(Value::as_array)
-        {
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    apply_text_part(
-                        text,
-                        is_thinking_part(part),
-                        part.get("thoughtSignature").and_then(Value::as_str),
-                        output,
-                        &mut current_block,
-                        events,
-                    );
-                }
-                if let Some(function_call) = part.get("functionCall") {
-                    close_current_block(&mut current_block, output, events);
-                    apply_function_call(function_call, part, output);
-                    push_tool_call_events(output, events);
-                }
-            }
-        }
-
-        if let Some(finish_reason) = candidate
-            .and_then(|candidate| candidate.get("finishReason"))
-            .and_then(Value::as_str)
-        {
-            output.raw_stop_reason = Some(finish_reason.to_owned());
-            output.stop_reason = map_stop_reason(finish_reason)?;
-            if output
-                .content
-                .iter()
-                .any(|block| matches!(block, AssistantBlock::ToolCall(_)))
-                && output.stop_reason == StopReason::Stop
-            {
-                output.stop_reason = StopReason::ToolUse;
-            }
-        }
-
-        if let Some(usage_metadata) = value.get("usageMetadata") {
-            let prompt = wire_u64(usage_metadata, "promptTokenCount");
-            let cached = wire_u64(usage_metadata, "cachedContentTokenCount");
-            let candidates = wire_u64(usage_metadata, "candidatesTokenCount");
-            let thoughts = wire_u64(usage_metadata, "thoughtsTokenCount");
-            let total = wire_u64(usage_metadata, "totalTokenCount");
-            output.usage = crate::types::Usage {
-                input: prompt.saturating_sub(cached),
-                output: candidates + thoughts,
-                cache_read: cached,
-                cache_write: 0,
-                cache_write_1h: None,
-                reasoning: Some(thoughts),
-                total_tokens: total,
-                cost: crate::types::UsageCost::default(),
-            };
-            crate::models::calculate_cost(model, &mut output.usage);
-        }
-    }
-
-    // A stream can settle without closing its last text/thinking block.
-    close_current_block(&mut current_block, output, events);
-    Ok(())
-}
-
-/// Apply one streamed text/thinking part, opening, switching, or growing the
-/// current block, upstream's text-part handling.
-fn apply_text_part(
-    text: &str,
-    is_thinking: bool,
-    thought_signature: Option<&str>,
-    output: &mut AssistantMessage,
-    current_block: &mut OpenBlock,
-    events: &AssistantMessageEventStream,
-) {
-    let block_index = output.content.len().saturating_sub(1) as u64;
-    let switch = match current_block {
-        None => true,
-        Some(open_thinking) => *open_thinking != is_thinking,
-    };
-    if switch {
-        close_current_block(current_block, output, events);
-        if is_thinking {
-            output.content.push(AssistantBlock::Thinking(ThinkingContent {
-                thinking: String::new(),
-                thinking_signature: None,
-                redacted: None,
-            }));
-            *current_block = Some(true);
-            events.push(AssistantMessageEvent::ThinkingStart {
-                content_index: output.content.len() as u64 - 1,
-                partial: output.clone(),
-            });
-        } else {
-            output.content.push(AssistantBlock::Text(TextContent {
-                text: String::new(),
-                text_signature: None,
-            }));
-            *current_block = Some(false);
-            events.push(AssistantMessageEvent::TextStart {
-                content_index: output.content.len() as u64 - 1,
-                partial: output.clone(),
-            });
-        }
-    }
-    let content_index = output.content.len() as u64 - 1;
-    let _ = block_index;
-    if is_thinking {
-        let Some(AssistantBlock::Thinking(block)) = output.content.last_mut() else {
-            return;
-        };
-        block.thinking.push_str(text);
-        block.thinking_signature = retain_thought_signature(
-            block.thinking_signature.as_deref(),
-            thought_signature,
-        );
-        events.push(AssistantMessageEvent::ThinkingDelta {
-            content_index,
-            delta: text.to_owned(),
-            partial: output.clone(),
-        });
-    } else {
-        let Some(AssistantBlock::Text(block)) = output.content.last_mut() else {
-            return;
-        };
-        block.text.push_str(text);
-        block.text_signature = retain_thought_signature(
-            block.text_signature.as_deref(),
-            thought_signature,
-        );
-        events.push(AssistantMessageEvent::TextDelta {
-            content_index,
-            delta: text.to_owned(),
-            partial: output.clone(),
-        });
-    }
-}
-
-/// Close the open text/thinking block, emitting its `*_end` event.
-fn close_current_block(
-    current_block: &mut OpenBlock,
-    output: &mut AssistantMessage,
-    events: &AssistantMessageEventStream,
-) {
-    if let Some(open_thinking) = *current_block {
-        let content_index = output.content.len() as u64 - 1;
-        if open_thinking {
-            let Some(AssistantBlock::Thinking(block)) = output.content.last() else {
-                return;
-            };
-            events.push(AssistantMessageEvent::ThinkingEnd {
-                content_index,
-                content: block.thinking.clone(),
-                partial: output.clone(),
-            });
-        } else {
-            let Some(AssistantBlock::Text(block)) = output.content.last() else {
-                return;
-            };
-            events.push(AssistantMessageEvent::TextEnd {
-                content_index,
-                content: block.text.clone(),
-                partial: output.clone(),
-            });
-        }
-        *current_block = None;
-    }
-}
-
-/// Materialize one streamed function call, upstream's function-call part
-/// handling: a synthesized id when none arrives or the id duplicates an
-/// earlier block, then the three-event start/delta/end sequence.
-fn apply_function_call(
-    function_call: &Value,
-    part: &Value,
-    output: &mut AssistantMessage,
-) {
-    let provided_id = function_call.get("id").and_then(Value::as_str);
-    let needs_new_id = provided_id.is_none_or(|id| id.is_empty())
-        || output
-            .content
-            .iter()
-            .any(|block| matches!(block, AssistantBlock::ToolCall(call) if Some(call.id.as_str()) == provided_id));
-    let tool_call_id = if needs_new_id {
-        let name = function_call
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        format!(
-            "{name}_{}_{counter}",
-            crate::auth::resolve::now_ms(),
-            counter = TOOL_CALL_COUNTER.fetch_add(1, Ordering::Relaxed) + 1,
-        )
-    } else {
-        provided_id.unwrap_or_default().to_owned()
-    };
-
-    let arguments = function_call
-        .get("args")
-        .and_then(Value::as_object)
-        .map(Clone::clone)
-        .unwrap_or_default();
-    let tool_call = ToolCall {
-        id: tool_call_id,
-        name: function_call
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        arguments,
-        thought_signature: part
-            .get("thoughtSignature")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        namespace: None,
-    };
-    output.content.push(AssistantBlock::ToolCall(tool_call));
-}
-
-/// The three-event function-call sequence, split from
-/// [`apply_function_call`] so the partial snapshot carries the pushed call.
-fn push_tool_call_events(output: &AssistantMessage, events: &AssistantMessageEventStream) {
-    let content_index = output.content.len() as u64 - 1;
-    let Some(AssistantBlock::ToolCall(tool_call)) = output.content.last() else {
-        return;
-    };
-    events.push(AssistantMessageEvent::ToolcallStart {
-        content_index,
-        partial: output.clone(),
-    });
-    events.push(AssistantMessageEvent::ToolcallDelta {
-        content_index,
-        delta: Value::Object(tool_call.arguments.clone()).to_string(),
-        partial: output.clone(),
-    });
-    events.push(AssistantMessageEvent::ToolcallEnd {
-        content_index,
-        tool_call: tool_call.clone(),
-        partial: output.clone(),
-    });
-}
-
-fn wire_u64(value: &Value, key: &str) -> u64 {
-    value
-        .get(key)
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0) as u64
 }
 
 /// The post-loop settlement, upstream's tail of the try block: the signal

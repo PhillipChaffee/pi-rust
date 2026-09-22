@@ -25,9 +25,17 @@ use crate::api::constrained_sampling::{
 };
 use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
 use crate::types::{
-    AssistantBlock, Context, ImageContent, Message, Model, ModelThinkingLevel,
-    Modality, StopReason, Tool, ToolResultBlock, ToolResultMessage,
+    AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, ImageContent, Message,
+    Model, ModelThinkingLevel, Modality, StopReason, TextContent, Tool, ToolResultBlock,
+    ToolResultMessage, ThinkingContent, ToolCall,
 };
+use crate::utils::error_body::safe_json_stringify;
+use crate::utils::event_stream::AssistantMessageEventStream;
+
+/// Counter for generating unique tool call IDs, upstream's module-level
+/// `toolCallCounter` (one per Google adapter file, shared here because the
+/// streaming loop it feeds is).
+static TOOL_CALL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The wire spelling of Google's unspecified thinking level.
 pub const GOOGLE_THINKING_LEVEL_UNSPECIFIED: &str = "THINKING_LEVEL_UNSPECIFIED";
@@ -39,6 +47,20 @@ pub const GOOGLE_THINKING_LEVEL_LOW: &str = "LOW";
 pub const GOOGLE_THINKING_LEVEL_MEDIUM: &str = "MEDIUM";
 /// The wire's `HIGH` thinking level.
 pub const GOOGLE_THINKING_LEVEL_HIGH: &str = "HIGH";
+
+/// The thinking control a caller can pin for the full-fidelity `stream`
+/// entry, upstream's `GoogleOptions["thinking"]` and
+/// `GoogleVertexOptions["thinking"]`.
+#[derive(Clone, Debug, Default)]
+pub struct GoogleThinkingControl {
+    /// Whether thinking is enabled; `false` maps a reasoning model to its
+    /// disabled-thinking config.
+    pub enabled: bool,
+    /// The thinking budget; `-1` means dynamic, `0` disables.
+    pub budget_tokens: Option<i64>,
+    /// The provider-native thinking level, upstream's `GoogleApiThinkingLevel`.
+    pub level: Option<String>,
+}
 
 /// The Google API thinking levels a model's mapping may resolve to, upstream's
 /// `ResolvedGoogleThinkingLevel = Exclude<ThinkingLevel, "xhigh" | "max">`.
@@ -269,7 +291,7 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
 /// The module's own same-model check, upstream's
 /// `msg.provider === model.provider && msg.model === model.id`; the shared
 /// [`transform_messages`] gate additionally requires the same api.
-fn same_provider_and_model(model: &Model, assistant: &crate::types::AssistantMessage) -> bool {
+fn same_provider_and_model(model: &Model, assistant: &AssistantMessage) -> bool {
     assistant.provider == model.provider && assistant.model == model.id
 }
 
@@ -607,5 +629,326 @@ pub fn map_stop_reason_string(reason: &str) -> StopReason {
         "MAX_TOKENS" => StopReason::Length,
         _ => StopReason::Error,
     }
+}
+
+/// The ApiError message the pinned `@google/genai` SDK builds for a failed
+/// response: the parsed JSON body stringified, or a synthesized
+/// `{ error: { message, code, status } }` object when the body is not JSON.
+/// Both Google adapters surface it verbatim, the `messageCarriesBody` pass
+/// through.
+#[must_use]
+pub fn api_error_message(status: u16, body: &str) -> String {
+    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        return safe_json_stringify(&parsed);
+    }
+    if body.trim().is_empty() {
+        return "{}".to_owned();
+    }
+    json!({
+        "error": {
+            "message": body,
+            "code": status,
+            "status": "UNKNOWN",
+        }
+    })
+    .to_string()
+}
+
+/// Whether the open block is thinking (`Some(true)`), text (`Some(false)`),
+/// or closed (`None`).
+type OpenBlock = Option<bool>;
+
+/// The per-chunk state machine the Google adapters share, upstream's
+/// `for await` loop over the SDK's `generateContentStream` iterator. Both
+/// upstream files carry the identical loop; the port keeps one.
+///
+/// # Errors
+/// With the adapter's error wording on aborts, parse failures, the SDK's
+/// pre-stream error probe, and unmapped finish reasons.
+pub(crate) async fn consume_google_stream(
+    model: &Model,
+    response: crate::http::client::HttpResponse,
+    output: &mut AssistantMessage,
+    events: &AssistantMessageEventStream,
+) -> Result<(), String> {
+    let mut sse = crate::http::sse::SseStream::new(response.body);
+    let mut current_block: OpenBlock = None;
+    let mut first_event = true;
+    while let Some(sse_event) = sse.next().await.map_err(|error| match error {
+        crate::http::client::HttpError::Aborted => "Request was aborted".to_owned(),
+        other => other.to_string(),
+    })? {
+        let value = crate::utils::json_parse::parse_json_with_repair(&sse_event.data)
+            .map_err(|error| format!("Invalid Google streaming event: {error}"))?;
+        if first_event {
+            first_event = false;
+            // The SDK's pre-loop probe: a 200 stream whose first JSON event
+            // carries an error object with a 4xx/5xx code fails outright.
+            if let Some(code) = value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64)
+                && (400..600).contains(&code)
+            {
+                return Err(format!(
+                    "got status: {code}. {}",
+                    safe_json_stringify(&value)
+                ));
+            }
+        }
+
+        // `GenerateContentResponse.responseId` is an output-only field used
+        // to identify each response; keep the first non-empty one.
+        if let Some(id) = value.get("responseId").and_then(Value::as_str)
+            && !id.is_empty()
+            && output
+                .response_id
+                .as_ref()
+                .is_none_or(String::is_empty)
+        {
+            output.response_id = Some(id.to_owned());
+        }
+
+        let candidate = value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first());
+        if let Some(parts) = candidate
+            .and_then(|candidate| candidate.get("content"))
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+        {
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    apply_text_part(
+                        text,
+                        is_thinking_part(part),
+                        part.get("thoughtSignature").and_then(Value::as_str),
+                        output,
+                        &mut current_block,
+                        events,
+                    );
+                }
+                if let Some(function_call) = part.get("functionCall") {
+                    close_current_block(&mut current_block, output, events);
+                    apply_function_call(function_call, part, output);
+                    push_tool_call_events(output, events);
+                }
+            }
+        }
+
+        if let Some(finish_reason) = candidate
+            .and_then(|candidate| candidate.get("finishReason"))
+            .and_then(Value::as_str)
+        {
+            output.raw_stop_reason = Some(finish_reason.to_owned());
+            output.stop_reason = map_stop_reason(finish_reason)?;
+            if output
+                .content
+                .iter()
+                .any(|block| matches!(block, AssistantBlock::ToolCall(_)))
+                && output.stop_reason == StopReason::Stop
+            {
+                output.stop_reason = StopReason::ToolUse;
+            }
+        }
+
+        if let Some(usage_metadata) = value.get("usageMetadata") {
+            let prompt = wire_u64(usage_metadata, "promptTokenCount");
+            let cached = wire_u64(usage_metadata, "cachedContentTokenCount");
+            let candidates = wire_u64(usage_metadata, "candidatesTokenCount");
+            let thoughts = wire_u64(usage_metadata, "thoughtsTokenCount");
+            let total = wire_u64(usage_metadata, "totalTokenCount");
+            output.usage = crate::types::Usage {
+                input: prompt.saturating_sub(cached),
+                output: candidates + thoughts,
+                cache_read: cached,
+                cache_write: 0,
+                cache_write_1h: None,
+                reasoning: Some(thoughts),
+                total_tokens: total,
+                cost: crate::types::UsageCost::default(),
+            };
+            crate::models::calculate_cost(model, &mut output.usage);
+        }
+    }
+
+    // A stream can settle without closing its last text/thinking block.
+    close_current_block(&mut current_block, output, events);
+    Ok(())
+}
+
+/// Apply one streamed text/thinking part, opening, switching, or growing the
+/// current block, upstream's text-part handling.
+fn apply_text_part(
+    text: &str,
+    is_thinking: bool,
+    thought_signature: Option<&str>,
+    output: &mut AssistantMessage,
+    current_block: &mut OpenBlock,
+    events: &AssistantMessageEventStream,
+) {
+    let switch = match current_block {
+        None => true,
+        Some(open_thinking) => *open_thinking != is_thinking,
+    };
+    if switch {
+        close_current_block(current_block, output, events);
+        if is_thinking {
+            output.content.push(AssistantBlock::Thinking(ThinkingContent {
+                thinking: String::new(),
+                thinking_signature: None,
+                redacted: None,
+            }));
+            *current_block = Some(true);
+            events.push(AssistantMessageEvent::ThinkingStart {
+                content_index: output.content.len() as u64 - 1,
+                partial: output.clone(),
+            });
+        } else {
+            output.content.push(AssistantBlock::Text(TextContent {
+                text: String::new(),
+                text_signature: None,
+            }));
+            *current_block = Some(false);
+            events.push(AssistantMessageEvent::TextStart {
+                content_index: output.content.len() as u64 - 1,
+                partial: output.clone(),
+            });
+        }
+    }
+    let content_index = output.content.len() as u64 - 1;
+    if is_thinking {
+        let Some(AssistantBlock::Thinking(block)) = output.content.last_mut() else {
+            return;
+        };
+        block.thinking.push_str(text);
+        block.thinking_signature =
+            retain_thought_signature(block.thinking_signature.as_deref(), thought_signature);
+        events.push(AssistantMessageEvent::ThinkingDelta {
+            content_index,
+            delta: text.to_owned(),
+            partial: output.clone(),
+        });
+    } else {
+        let Some(AssistantBlock::Text(block)) = output.content.last_mut() else {
+            return;
+        };
+        block.text.push_str(text);
+        block.text_signature =
+            retain_thought_signature(block.text_signature.as_deref(), thought_signature);
+        events.push(AssistantMessageEvent::TextDelta {
+            content_index,
+            delta: text.to_owned(),
+            partial: output.clone(),
+        });
+    }
+}
+
+/// Close the open text/thinking block, emitting its `*_end` event.
+fn close_current_block(
+    current_block: &mut OpenBlock,
+    output: &mut AssistantMessage,
+    events: &AssistantMessageEventStream,
+) {
+    if let Some(open_thinking) = *current_block {
+        let content_index = output.content.len() as u64 - 1;
+        if open_thinking {
+            let Some(AssistantBlock::Thinking(block)) = output.content.last() else {
+                return;
+            };
+            events.push(AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content: block.thinking.clone(),
+                partial: output.clone(),
+            });
+        } else {
+            let Some(AssistantBlock::Text(block)) = output.content.last() else {
+                return;
+            };
+            events.push(AssistantMessageEvent::TextEnd {
+                content_index,
+                content: block.text.clone(),
+                partial: output.clone(),
+            });
+        }
+        *current_block = None;
+    }
+}
+
+/// Materialize one streamed function call, upstream's function-call part
+/// handling: a synthesized id when none arrives or the id duplicates an
+/// earlier block, then the three-event start/delta/end sequence.
+fn apply_function_call(function_call: &Value, part: &Value, output: &mut AssistantMessage) {
+    let provided_id = function_call.get("id").and_then(Value::as_str);
+    let needs_new_id = provided_id.is_none_or(|id| id.is_empty())
+        || output
+            .content
+            .iter()
+            .any(|block| matches!(block, AssistantBlock::ToolCall(call) if Some(call.id.as_str()) == provided_id));
+    let tool_call_id = if needs_new_id {
+        let name = function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        format!(
+            "{name}_{}_{counter}",
+            crate::auth::resolve::now_ms(),
+            counter = TOOL_CALL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+        )
+    } else {
+        provided_id.unwrap_or_default().to_owned()
+    };
+
+    let arguments = function_call
+        .get("args")
+        .and_then(Value::as_object)
+        .map(Clone::clone)
+        .unwrap_or_default();
+    let tool_call = ToolCall {
+        id: tool_call_id,
+        name: function_call
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        arguments,
+        thought_signature: part
+            .get("thoughtSignature")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        namespace: None,
+    };
+    output.content.push(AssistantBlock::ToolCall(tool_call));
+}
+
+/// The three-event function-call sequence, upstream's start/delta/end push.
+fn push_tool_call_events(output: &AssistantMessage, events: &AssistantMessageEventStream) {
+    let content_index = output.content.len() as u64 - 1;
+    let Some(AssistantBlock::ToolCall(tool_call)) = output.content.last() else {
+        return;
+    };
+    events.push(AssistantMessageEvent::ToolcallStart {
+        content_index,
+        partial: output.clone(),
+    });
+    events.push(AssistantMessageEvent::ToolcallDelta {
+        content_index,
+        delta: Value::Object(tool_call.arguments.clone()).to_string(),
+        partial: output.clone(),
+    });
+    events.push(AssistantMessageEvent::ToolcallEnd {
+        content_index,
+        tool_call: tool_call.clone(),
+        partial: output.clone(),
+    });
+}
+
+fn wire_u64(value: &Value, key: &str) -> u64 {
+    value
+        .get(key)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0) as u64
 }
 

@@ -310,8 +310,6 @@ async fn the_not_ported_wire_api_stubs_report_their_notice() {
         api::openai_responses(),
         api::openai_completions(),
         api::azure_openai_responses(),
-        api::google_generative_ai(),
-        api::google_vertex(),
         api::bedrock_converse_stream(),
         api::mistral_conversations(),
         api::openai_codex_responses(),

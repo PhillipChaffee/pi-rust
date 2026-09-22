@@ -65,6 +65,10 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
   "handshake",
   "rustls-tls-webpki-roots",
 ] }
+# jsonwebtoken: the Vertex ADC service-account flow — upstream delegates
+# RS256 JWT signing and the token exchange to google-auth-library inside
+# @google/genai, and this port signs the JWT itself (#32).
+jsonwebtoken = "10"
 
 [dev-dependencies]
 # test-util: the paused clock the provider-retry tests drive, the fake-timer
