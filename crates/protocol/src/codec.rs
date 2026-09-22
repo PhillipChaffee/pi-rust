@@ -34,7 +34,9 @@ pub struct ProtocolValidationError {
 }
 
 impl ProtocolValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    /// Builds the error from its message, the constructor surface upstream
+    /// client code reaches for when it re-raises validation failures.
+    pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }

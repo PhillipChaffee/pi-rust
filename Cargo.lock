@@ -976,6 +976,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-client"
+version = "0.1.0"
+dependencies = [
+ "pi-chord",
+ "pi-protocol",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "pi-evals"
 version = "0.1.0"
 dependencies = [
