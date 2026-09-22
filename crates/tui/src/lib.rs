@@ -42,7 +42,11 @@
 //!   [`tui::Container`], the overlay stack and [`tui::OverlayHandle`], the
 //!   focus-restore machinery, [`tui::composite_tui_line`], the
 //!   [`tui::CURSOR_MARKER`], and the [`tui::Tui`] core with its render
-//!   scheduler; the concrete renderers land with #45 and #46.
+//!   scheduler.
+//! - [`tui_main_screen`] — the [`tui_main_screen::TuiMainScreen`] renderer
+//!   ([#45](https://github.com/PhillipChaffee/pi-rust/issues/45)): the
+//!   three-strategy main-screen render into scrollback with the bounded
+//!   writer; the alternate-screen renderer lands with #46.
 //! - [`terminal_image`] — the cell-dimension store and [`terminal_image::is_image_line`]
 //!   the TUI core consumes; the rest of terminal-image lands with #51.
 //! - [`components`] — the leaf components ([`components::Box`],
@@ -79,6 +83,7 @@
 //! modifier table entries, the write log, the UTF-8 decoder, the progress
 //! keepalive) so the 95% coverage gate binds.
 
+pub mod alt_screen_search;
 pub mod components;
 pub mod fuzzy;
 pub mod keybindings;
@@ -90,4 +95,6 @@ pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
 pub mod tui;
+pub mod tui_alt_screen;
+pub mod tui_main_screen;
 pub mod utils;

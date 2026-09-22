@@ -457,6 +457,34 @@ impl ScrollLayoutState for ScrollViewState {
     fn scrollbar_thumb_style(&self) -> ColorFn {
         self.thumb_style.clone()
     }
+
+    fn scroll_by(&self, lines: i64) -> i64 {
+        Self::scroll_by(self, lines)
+    }
+
+    fn scroll_to(&self, scroll_top: usize, options: ScrollViewScrollToOptions) {
+        Self::scroll_to(self, scroll_top, options);
+    }
+
+    fn scroll_to_start(&self) {
+        Self::scroll_to_start(self);
+    }
+
+    fn scroll_to_end(&self) {
+        Self::scroll_to_end(self);
+    }
+
+    fn follow_end(&self) -> bool {
+        self.follow_end
+    }
+
+    fn is_following_end(&self) -> bool {
+        self.following_end.get()
+    }
+
+    fn set_scrollbar_active(&self, active: bool) {
+        Self::set_scrollbar_active(self, active);
+    }
 }
 
 /// A single-child container that clips its content to a viewport and
@@ -476,6 +504,14 @@ impl std::fmt::Debug for ScrollView {
 }
 
 impl ScrollView {
+    /// The scroll state handle the layout engine issues, upstream's
+    /// `ScrollLayoutNode.state`: the identity the alternate-screen renderer's
+    /// selection points and scrollbar drags compare.
+    #[must_use]
+    pub fn state_handle(&self) -> crate::layout_node::ScrollStateHandle {
+        self.state.clone()
+    }
+
     /// Upstream `new ScrollView(component, options)`.
     #[must_use]
     #[expect(
@@ -576,6 +612,10 @@ impl Component for ScrollView {
         } else {
             lines.into_iter().map(|line| format!("{line} ")).collect()
         }
+    }
+
+    fn is_stock_mouse_container(&self) -> bool {
+        true
     }
 
     fn children(&self) -> Vec<Rc<dyn Component>> {

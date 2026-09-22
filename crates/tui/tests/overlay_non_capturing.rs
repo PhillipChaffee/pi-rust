@@ -3,8 +3,8 @@
 //! contract — focus management, no-op guards, focus-cycle prevention, and
 //! rendering order through the focus-order sort.
 //!
-//! The suites run against the [`tui_support::TestRenderer`] stand-in until
-//! the renderer ticket (#45) lands `TuiMainScreen`; see the support module.
+//! The suites render through [`tui_support::new_test_tui`]'s `TuiMainScreen`;
+//! see the support module.
 
 #[path = "tui_support/mod.rs"]
 mod tui_support;
@@ -14,13 +14,15 @@ use std::rc::Rc;
 
 use pi_tui::tui::{Container, OverlayOptions, OverlayUnfocusOptions, SizeValue};
 
-use tui_support::{EmptyContent, FocusableOverlay, StaticOverlay, TestTerminal, render_and_flush};
+use tui_support::{
+    EmptyContent, FocusableOverlay, StaticOverlay, VirtualTerminal, render_and_flush,
+};
 
 // === focus management ===
 
 #[test]
 fn non_capturing_overlay_preserves_focus_on_creation() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -43,7 +45,7 @@ fn non_capturing_overlay_preserves_focus_on_creation() {
 
 #[test]
 fn focus_transfers_focus_to_the_overlay() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -67,7 +69,7 @@ fn focus_transfers_focus_to_the_overlay() {
 
 #[test]
 fn unfocus_restores_previous_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -92,7 +94,7 @@ fn unfocus_restores_previous_focus() {
 
 #[test]
 fn set_hidden_false_on_non_capturing_overlay_does_not_auto_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -116,7 +118,7 @@ fn set_hidden_false_on_non_capturing_overlay_does_not_auto_focus() {
 
 #[test]
 fn hide_when_overlay_is_not_focused_does_not_change_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -138,7 +140,7 @@ fn hide_when_overlay_is_not_focused_does_not_change_focus() {
 
 #[test]
 fn hide_when_focused_restores_focus_correctly() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -162,7 +164,7 @@ fn hide_when_focused_restores_focus_correctly() {
 
 #[test]
 fn capturing_overlay_removed_with_non_capturing_below_restores_focus_to_editor() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let non_capturing = FocusableOverlay::new(&["NC"]);
@@ -188,7 +190,7 @@ fn capturing_overlay_removed_with_non_capturing_below_restores_focus_to_editor()
 
 #[test]
 fn sub_overlay_cleanup_then_hide_overlay_restores_focus_and_input_to_editor() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let timer = FocusableOverlay::new(&["TIMER"]);
@@ -222,7 +224,7 @@ fn sub_overlay_cleanup_then_hide_overlay_restores_focus_and_input_to_editor() {
 
 #[test]
 fn removed_focused_child_overlay_does_not_become_parent_overlay_fallback() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let child = FocusableOverlay::new(&["CHILD"]);
@@ -257,7 +259,7 @@ fn removed_focused_child_overlay_does_not_become_parent_overlay_fallback() {
 fn microtask_deferred_sub_overlay_pattern_restores_focus() {
     // Simulates showExtensionCustom: the timer overlay is created
     // synchronously, then the controller lands in a follow-up turn.
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let timer = FocusableOverlay::new(&["TIMER"]);
@@ -305,7 +307,7 @@ fn microtask_deferred_sub_overlay_pattern_restores_focus() {
 
 #[test]
 fn handle_input_redirection_skips_non_capturing_overlays_when_focused_overlay_becomes_invisible() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let fallback_capturing = FocusableOverlay::new(&["FALLBACK"]);
@@ -344,7 +346,7 @@ fn handle_input_redirection_skips_non_capturing_overlays_when_focused_overlay_be
 
 #[test]
 fn active_base_focus_replacement_receives_close_input_before_overlay_restore() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
@@ -390,7 +392,7 @@ fn active_base_focus_replacement_receives_close_input_before_overlay_restore() {
 
 #[test]
 fn active_replacement_still_receives_input_when_it_is_another_overlay_pre_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
@@ -445,7 +447,7 @@ fn active_replacement_still_receives_input_when_it_is_another_overlay_pre_focus(
 
 #[test]
 fn blocked_replacement_can_move_focus_internally_before_overlay_restore() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let base = Rc::new(Container::default());
     let editor = FocusableOverlay::new(&["EDITOR"]);
@@ -509,7 +511,7 @@ fn blocked_replacement_can_move_focus_internally_before_overlay_restore() {
 
 #[test]
 fn removed_replacement_restores_overlay_even_when_overlay_pre_focus_differs_from_next_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let base = Rc::new(Container::default());
     let editor = FocusableOverlay::new(&["EDITOR"]);
@@ -559,7 +561,7 @@ fn removed_replacement_restores_overlay_even_when_overlay_pre_focus_differs_from
 
 #[test]
 fn unfocus_target_releases_a_blocked_overlay_while_replacement_remains_focused() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let fallback = FocusableOverlay::new(&["FALLBACK"]);
     let target = FocusableOverlay::new(&["TARGET"]);
@@ -608,7 +610,7 @@ fn unfocus_target_releases_a_blocked_overlay_while_replacement_remains_focused()
 
 #[test]
 fn handle_input_restores_focus_to_a_visible_focused_overlay_after_base_focus_steal() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
@@ -630,7 +632,7 @@ fn handle_input_restores_focus_to_a_visible_focused_overlay_after_base_focus_ste
 
 #[test]
 fn handle_input_restores_focus_to_explicitly_focused_raw_sub_overlay_after_base_focus_steal() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let controller = FocusableOverlay::new(&["CONTROLLER"]);
@@ -658,7 +660,7 @@ fn handle_input_restores_focus_to_explicitly_focused_raw_sub_overlay_after_base_
 
 #[test]
 fn passive_non_capturing_overlay_does_not_regain_input_after_base_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let passive = FocusableOverlay::new(&["PASSIVE"]);
@@ -682,7 +684,7 @@ fn passive_non_capturing_overlay_does_not_regain_input_after_base_focus() {
 
 #[test]
 fn explicitly_focused_non_capturing_overlay_regains_input_after_base_focus_steal() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["NC"]);
@@ -707,7 +709,7 @@ fn explicitly_focused_non_capturing_overlay_regains_input_after_base_focus_steal
 
 #[test]
 fn unfocus_prevents_visible_overlay_from_regaining_input() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -726,7 +728,7 @@ fn unfocus_prevents_visible_overlay_from_regaining_input() {
 
 #[test]
 fn set_focus_null_explicitly_clears_visible_overlay_restore() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
     tui.add_child(Rc::new(EmptyContent));
@@ -742,7 +744,7 @@ fn set_focus_null_explicitly_clears_visible_overlay_restore() {
 
 #[test]
 fn blocked_replacement_set_focus_null_resumes_the_visible_overlay() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -779,7 +781,7 @@ fn blocked_replacement_set_focus_null_resumes_the_visible_overlay() {
 
 #[test]
 fn temporarily_invisible_focused_overlay_falls_back_without_losing_restore_eligibility() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -811,7 +813,7 @@ fn temporarily_invisible_focused_overlay_falls_back_without_losing_restore_eligi
 
 #[test]
 fn temporarily_invisible_focused_overlay_with_null_pre_focus_restores_when_visible_again() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
     let visible = Rc::new(Cell::new(true));
@@ -838,7 +840,7 @@ fn temporarily_invisible_focused_overlay_with_null_pre_focus_restores_when_visib
 
 #[test]
 fn cyclic_overlay_pre_focus_ancestry_does_not_hang_focus_changes() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -863,7 +865,7 @@ fn cyclic_overlay_pre_focus_ancestry_does_not_hang_focus_changes() {
 
 #[test]
 fn handle_input_restores_the_focus_order_top_overlay_after_base_focus_steal() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let lower = FocusableOverlay::new(&["LOWER"]);
@@ -885,7 +887,7 @@ fn handle_input_restores_the_focus_order_top_overlay_after_base_focus_steal() {
 
 #[test]
 fn hide_overlay_does_not_reassign_focus_when_topmost_overlay_is_non_capturing() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let capturing = FocusableOverlay::new(&["CAP"]);
@@ -910,7 +912,7 @@ fn hide_overlay_does_not_reassign_focus_when_topmost_overlay_is_non_capturing() 
 
 #[test]
 fn multiple_capturing_and_non_capturing_overlays_restore_focus_through_removals() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let c1 = FocusableOverlay::new(&["C1"]);
@@ -948,7 +950,7 @@ fn multiple_capturing_and_non_capturing_overlays_restore_focus_through_removals(
 
 #[test]
 fn capturing_overlay_unfocus_on_topmost_capturing_overlay_falls_back_to_pre_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let capturing = FocusableOverlay::new(&["CAP"]);
@@ -968,7 +970,7 @@ fn capturing_overlay_unfocus_on_topmost_capturing_overlay_falls_back_to_pre_focu
 
 #[test]
 fn focus_on_hidden_overlay_is_a_no_op() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -992,7 +994,7 @@ fn focus_on_hidden_overlay_is_a_no_op() {
 
 #[test]
 fn focus_after_hide_is_a_no_op() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -1016,7 +1018,7 @@ fn focus_after_hide_is_a_no_op() {
 
 #[test]
 fn unfocus_when_overlay_does_not_have_focus_is_a_no_op() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -1039,7 +1041,7 @@ fn unfocus_when_overlay_does_not_have_focus_is_a_no_op() {
 
 #[test]
 fn unfocus_with_null_pre_focus_clears_focus_and_does_not_route_input_back_to_overlay() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
     tui.add_child(Rc::new(EmptyContent));
@@ -1059,7 +1061,7 @@ fn unfocus_with_null_pre_focus_clears_focus_and_does_not_route_input_back_to_ove
 
 #[test]
 fn toggle_focus_between_non_capturing_overlays_then_unfocus_returns_to_editor() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let a = FocusableOverlay::new(&["A"]);
@@ -1094,7 +1096,7 @@ fn toggle_focus_between_non_capturing_overlays_then_unfocus_returns_to_editor() 
 
 #[test]
 fn explicit_unfocus_target_supports_cycling_between_three_overlays_and_editor() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let a = FocusableOverlay::new(&["A"]);
@@ -1140,7 +1142,7 @@ fn explicit_unfocus_target_supports_cycling_between_three_overlays_and_editor() 
 
 #[test]
 fn explicit_null_unfocus_target_clears_focus_without_restoring_overlays() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
     tui.add_child(Rc::new(EmptyContent));
@@ -1156,7 +1158,7 @@ fn explicit_null_unfocus_target_clears_focus_without_restoring_overlays() {
 
 #[test]
 fn hiding_focused_overlay_falls_back_to_next_visual_frontmost_overlay() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let a = FocusableOverlay::new(&["A"]);
@@ -1183,7 +1185,7 @@ fn hiding_focused_overlay_falls_back_to_next_visual_frontmost_overlay() {
 
 #[test]
 fn focus_on_already_focused_overlay_bumps_visual_order() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.add_child(Rc::new(EmptyContent));
@@ -1243,7 +1245,7 @@ fn focus_on_already_focused_overlay_bumps_visual_order() {
 
 #[test]
 fn default_rendering_order_for_overlapping_overlays_follows_creation_order() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
@@ -1280,7 +1282,7 @@ fn default_rendering_order_for_overlapping_overlays_follows_creation_order() {
 
 #[test]
 fn focus_on_lower_overlay_renders_it_on_top() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
@@ -1326,7 +1328,7 @@ fn focus_on_lower_overlay_renders_it_on_top() {
 
 #[test]
 fn focusing_middle_overlay_places_it_on_top_while_preserving_others_relative_order() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
@@ -1400,7 +1402,7 @@ fn focusing_middle_overlay_places_it_on_top_while_preserving_others_relative_ord
 
 #[test]
 fn capturing_overlay_hidden_and_shown_again_renders_on_top_after_unhide() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
@@ -1464,7 +1466,7 @@ fn capturing_overlay_hidden_and_shown_again_renders_on_top_after_unhide() {
 
 #[test]
 fn unfocus_does_not_change_visual_order_until_another_overlay_is_focused() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.add_child(Rc::new(EmptyContent));

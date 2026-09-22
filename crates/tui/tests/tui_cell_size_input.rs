@@ -17,7 +17,7 @@ use std::rc::Rc;
 use pi_tui::terminal_image::{CellDimensions, get_cell_dimensions, set_cell_dimensions};
 use pi_tui::tui::{Component, Tui};
 
-use tui_support::TestTerminal;
+use tui_support::VirtualTerminal;
 
 /// The cell-size suite's `InputRecorder`.
 struct InputRecorder {
@@ -49,7 +49,7 @@ fn with_image_terminal(setup: impl FnOnce()) {
 #[test]
 fn forwards_bare_escape_even_when_a_cell_size_query_was_sent_at_startup() {
     with_image_terminal(|| {
-        let terminal = TestTerminal::new(80, 24);
+        let terminal = VirtualTerminal::new(80, 24);
         let tui: Rc<Tui> = tui_support::new_test_tui_with_images(terminal.clone());
         let recorder = Rc::new(InputRecorder {
             inputs: RefCell::new(Vec::new()),
@@ -77,7 +77,7 @@ fn consumes_cell_size_responses_and_still_forwards_later_user_input() {
             height_px: 18,
         });
 
-        let terminal = TestTerminal::new(80, 24);
+        let terminal = VirtualTerminal::new(80, 24);
         let tui: Rc<Tui> = tui_support::new_test_tui_with_images(terminal.clone());
         let recorder = Rc::new(InputRecorder {
             inputs: RefCell::new(Vec::new()),

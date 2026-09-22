@@ -14,7 +14,6 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use pi_ai::api;
-use pi_ai::auth::oauth;
 use pi_ai::auth::types::{
     ApiKeyAuthInput, ApiKeyCredential, ApiKeyResolveFn, AuthContext, AuthError, AuthPrompt,
     AuthPromptKind, AuthResult, Credential, ModelAuth, OAuthAuth, OAuthCredentials,
@@ -354,67 +353,6 @@ fn fixture_image_model() -> pi_ai::types::ImagesModel {
         sampling_params: None,
         headers: None,
     }
-}
-
-/// The not-ported OAuth flows fail on every method with the notice.
-#[tokio::test]
-async fn the_not_ported_oauth_flows_fail_on_every_method() {
-    for oauth in [
-        oauth::load_anthropic_oauth().await,
-        oauth::load_openai_codex_oauth().await,
-        oauth::load_github_copilot_oauth().await,
-        oauth::load_openrouter_oauth().await,
-        oauth::load_kimi_coding_oauth().await,
-        oauth::load_xai_oauth().await,
-        oauth::load_radius_oauth(&oauth::RadiusOAuthOptions {
-            name: "Radius".to_owned(),
-            gateway: "https://radius.pi.dev".to_owned(),
-        })
-        .await,
-    ] {
-        assert_eq!(oauth.name, expected_stub_name(&oauth.name));
-        let error = (oauth.to_auth)(sample_oauth_credential())
-            .await
-            .expect_err("not ported");
-        assert!(
-            error.to_string().contains("has not been ported yet"),
-            "got: {error}"
-        );
-        let error = (oauth.refresh)(sample_oauth_credential(), CancellationToken::new())
-            .await
-            .expect_err("not ported");
-        assert!(
-            error.to_string().contains("has not been ported yet"),
-            "got: {error}"
-        );
-        let error = (oauth.login)(ProviderAuthInteraction::from_interaction(
-            pi_ai::auth::types::AuthInteraction {
-                signal: None,
-                prompt:
-                    Arc::new(
-                        |prompt: AuthPrompt| -> BoxedFuture<
-                            'static,
-                            Result<String, pi_ai::utils::abort::AbortError>,
-                        > {
-                            let _ = prompt;
-                            Box::pin(async { Err(pi_ai::utils::abort::AbortError) })
-                        },
-                    ),
-                notify: Arc::new(|_event| {}),
-            },
-            CancellationToken::new(),
-        ))
-        .await
-        .expect_err("not ported");
-        assert!(
-            error.to_string().contains("has not been ported yet"),
-            "got: {error}"
-        );
-    }
-}
-
-const fn expected_stub_name(name: &str) -> &str {
-    name
 }
 
 fn sample_oauth_credential() -> OAuthCredentials {

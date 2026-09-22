@@ -69,10 +69,15 @@ const DEFAULT_ROWS: u16 = 24;
 const READ_CHUNK_BYTES: usize = 4096;
 
 /// The environment lookup upstream resolved through `process.env`.
-type EnvLookup = Box<dyn Fn(&str) -> Option<String>>;
+///
+/// Shared by the terminal and the renderers: Rust cannot mutate the process
+/// environment without the `unsafe` this workspace forbids, so tests inject a
+/// map-backed lookup and sessions default to the real environment.
+pub type EnvLookup = Box<dyn Fn(&str) -> Option<String>>;
 
 /// The process environment, upstream's `process.env` default.
-fn default_env_lookup() -> EnvLookup {
+#[must_use]
+pub fn default_env_lookup() -> EnvLookup {
     Box::new(|key| std::env::var(key).ok())
 }
 
