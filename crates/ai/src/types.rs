@@ -530,6 +530,19 @@ pub enum ModelThinkingLevel {
 /// marks a level as unsupported.
 pub type ThinkingLevelMap = BTreeMap<ModelThinkingLevel, Option<String>>;
 
+impl From<ThinkingLevel> for ModelThinkingLevel {
+    fn from(level: ThinkingLevel) -> Self {
+        match level {
+            ThinkingLevel::Minimal => Self::Minimal,
+            ThinkingLevel::Low => Self::Low,
+            ThinkingLevel::Medium => Self::Medium,
+            ThinkingLevel::High => Self::High,
+            ThinkingLevel::Xhigh => Self::Xhigh,
+            ThinkingLevel::Max => Self::Max,
+        }
+    }
+}
+
 /// The thinking-control variable a chat template kwarg substitutes, upstream's
 /// `$var` discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

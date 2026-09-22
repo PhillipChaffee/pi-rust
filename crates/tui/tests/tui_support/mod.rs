@@ -1,22 +1,33 @@
-//! Shared harness for the #43 TUI-core suites, restating upstream's
-//! `test/virtual-terminal.ts` until the harness ticket (#45) formalizes the
-//! port.
+//! Shared test harness for the TUI suites, the port of upstream's
+//! `test/virtual-terminal.ts` ([#45](https://github.com/PhillipChaffee/pi-rust/issues/45),
+//! upstream pin `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`).
 //!
-//! - [`TestTerminal`] — the `@xterm/headless` `VirtualTerminal` stand-in: a
-//!   `vte`-driven grid emulator with `send_input`/`resize`/`get_viewport`,
-//!   plus per-cell italic reads for the style-leak suite.
-//! - [`TestRenderer`] — the concrete `TuiBase` subclass the overlay suites
-//!   stand in for upstream's `TuiMainScreen`. It renders the mounted
-//!   children, composites overlays, extracts the cursor marker, applies the
-//!   line resets, and clears-then-rewrites the screen. The real three-
-//!   strategy differential renderer lands with #45, at which point these
-//!   suites re-point to it; the compositing contract under test lives in the
-//!   base either way.
+//! - [`VirtualTerminal`] — the `@xterm/headless` stand-in: a `vte`-driven
+//!   headless terminal emulator with upstream's `sendInput`/`resize`/
+//!   `getViewport`/`getScrollBuffer`/`waitForRender` surface, plus per-cell
+//!   italic reads for the style-leak suite and the raw write log.
+//! - [`new_test_tui`] / [`new_test_tui_with_images`] — the `Tui` construction
+//!   upstream's suites perform, with [`pi_tui::tui_main_screen::TuiMainScreen`]
+//!   as the renderer and a quiet environment lookup so the suites cannot trip
+//!   the Termux or debug-log switches.
 //!
-//! The restatements the harness carries: upstream's `waitForRender`
-//! (nextTick + 20 ms + flush) collapses into [`wait_for_render`], one pump
-//! turn — the port's event-loop turn — because writes land synchronously in
-//! the emulator instead of through xterm's async writer.
+//! The emulator's restatements, against `@xterm/headless`:
+//!
+//! - Row resize follows xterm's `Buffer.resize`: shrinking pops viewport rows
+//!   below the cursor or trims the top into scrollback, growing pulls
+//!   scrollback back into the viewport or pads blank rows, and the cursor
+//!   rides the pull. Column resize does not reflow wrapped lines — no suite
+//!   in the ported slices depends on reflow, and the harness grows that
+//!   behavior when one does.
+//! - The scrollback buffer is unbounded; xterm caps it at 1000 lines, which
+//!   no ported suite reaches.
+//! - Print past the last column drops rather than wraps; the renderer throws
+//!   on over-wide lines before they reach the terminal, so only the exact-
+//!   width full-render writes reach the emulator, and those fit.
+//! - Upstream's `waitForRender` (nextTick + 20 ms + flush) collapses into
+//!   [`wait_for_render`], two pump turns around the 20 ms sleep — the port's
+//!   event-loop turns — because writes land synchronously in the emulator
+//!   instead of through xterm's async writer.
 
 #![allow(
     unreachable_pub,
@@ -26,27 +37,68 @@
     dead_code,
     reason = "each suite uses only the fixtures it needs; the shared module carries the rest for its siblings, and the unused set differs per binary"
 )]
+#![expect(
+    clippy::expect_used,
+    reason = "the SGR-strip regex pattern is a compile-time constant; a bad pattern is a programmer error that must surface"
+)]
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use unicode_width::UnicodeWidthChar;
 
-use pi_tui::terminal::{InputHandler, ResizeHandler, Terminal};
+use pi_tui::components::ColorFn;
+use pi_tui::components::{EditorTheme, MarkdownTheme};
+use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
+use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
 use pi_tui::tui::{
-    Component, Focusable, Tui, TuiConfig, TuiMode, TuiMouseButton, TuiMouseEvent,
-    TuiMouseEventType, TuiRenderer,
+    Component, Focusable, Tui, TuiConfig, TuiMouseButton, TuiMouseEvent, TuiMouseEventType,
+    TuiRenderer,
 };
+use pi_tui::tui_alt_screen::{TuiAltScreen, TuiAltScreenConfig};
+use pi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenConfig};
 
 /// One screen cell: the grapheme it starts, its visible width (zero for
-/// wide-char placeholders), and whether italic is active.
+/// wide-char placeholders), the SGR attributes it was printed under, and
+/// whether anything was ever written into it — upstream xterm's
+/// `translateToString(true)` trims only unwritten trailing cells, so a
+/// printed space survives.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per tracked SGR attribute (italic, bold, dim, underline) plus the written marker, mirroring xterm's cell model"
+)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ScreenCell {
     ch: char,
     width: u8,
     italic: bool,
+    bold: bool,
+    dim: bool,
+    underline: bool,
+    fg: Option<FgColor>,
+    written: bool,
+}
+
+/// A foreground color, upstream xterm's cell color model: default (no SGR
+/// 30-38 seen), an indexed 0-255 color, or a 24-bit RGB triple.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FgColor {
+    Indexed(u16),
+    Rgb(u8, u8, u8),
+}
+
+impl FgColor {
+    /// The packed number xterm's `getFgColor` reports: the index itself, or
+    /// an RGB triple packed `(r << 16) | (g << 8) | b`.
+    const fn packed(self) -> u32 {
+        match self {
+            Self::Indexed(index) => index as u32,
+            Self::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
+        }
+    }
 }
 
 impl ScreenCell {
@@ -54,31 +106,87 @@ impl ScreenCell {
         ch: ' ',
         width: 1,
         italic: false,
+        bold: false,
+        dim: false,
+        underline: false,
+        fg: None,
+        written: false,
     };
 }
 
-/// The visible screen upstream's xterm buffer exposed, driven by `vte`.
+/// A row of the emulated buffer.
+type ScreenRow = Vec<ScreenCell>;
+
+fn blank_row(columns: usize) -> ScreenRow {
+    vec![ScreenCell::BLANK; columns]
+}
+
+/// The visible screen upstream's xterm buffer exposed, driven by `vte`: the
+/// grid is the viewport, `scrollback` holds the lines scrolled above it, and
+/// row resizes follow xterm's pull-from-scrollback or pad-blank semantics.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the cursor-position SGR state is one flag per tracked attribute, exactly what xterm's buffer carries"
+)]
 struct Screen {
-    grid: Vec<Vec<ScreenCell>>,
+    grid: Vec<ScreenRow>,
+    scrollback: Vec<ScreenRow>,
     cursor_row: usize,
     cursor_col: usize,
     italic: bool,
+    bold: bool,
+    dim: bool,
+    underline: bool,
+    fg: Option<FgColor>,
 }
 
 impl Screen {
     fn new(columns: usize, rows: usize) -> Self {
         Self {
-            grid: vec![vec![ScreenCell::BLANK; columns]; rows],
+            grid: vec![blank_row(columns); rows],
+            scrollback: Vec::new(),
             cursor_row: 0,
             cursor_col: 0,
             italic: false,
+            bold: false,
+            dim: false,
+            underline: false,
+            fg: None,
         }
     }
 
     fn resize(&mut self, columns: usize, rows: usize) {
-        self.grid.resize(rows, vec![ScreenCell::BLANK; columns]);
         for row in &mut self.grid {
             row.resize(columns, ScreenCell::BLANK);
+        }
+        let old_rows = self.grid.len();
+        if rows < old_rows {
+            // Shrink: xterm pops viewport rows below the cursor and trims the
+            // top into scrollback otherwise, so the last content stays put.
+            for _ in rows..old_rows {
+                if self.grid.len() > self.cursor_row + 1 {
+                    self.grid.pop();
+                } else {
+                    let top = self.grid.remove(0);
+                    self.scrollback.push(top);
+                }
+            }
+            self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
+        } else if rows > old_rows {
+            // Grow: pull scrollback back into the viewport when the buffer is
+            // too short to fill it, pad blank rows otherwise; the cursor
+            // rides the pull.
+            let mut pulled = 0;
+            for _ in old_rows..rows {
+                if !self.scrollback.is_empty() && self.grid.len() <= self.cursor_row + pulled + 1 {
+                    self.grid
+                        .insert(0, self.scrollback.pop().unwrap_or_default());
+                    pulled += 1;
+                } else {
+                    self.grid.push(blank_row(columns));
+                }
+            }
+            self.cursor_row = self.cursor_row.min(rows - 1) + pulled;
         }
         self.cursor_row = self.cursor_row.min(rows.saturating_sub(1));
         self.cursor_col = self.cursor_col.min(columns.saturating_sub(1));
@@ -86,8 +194,8 @@ impl Screen {
 
     fn scroll_up(&mut self) {
         let columns = self.grid.first().map_or(1, Vec::len);
-        self.grid.remove(0);
-        self.grid.push(vec![ScreenCell::BLANK; columns]);
+        self.scrollback.push(self.grid.remove(0));
+        self.grid.push(blank_row(columns));
     }
 
     fn put(&mut self, c: char) {
@@ -102,6 +210,11 @@ impl Screen {
             ch: c,
             width: u8::try_from(width).unwrap_or(u8::MAX),
             italic: self.italic,
+            bold: self.bold,
+            dim: self.dim,
+            underline: self.underline,
+            fg: self.fg,
+            written: true,
         };
         let (row, col) = (self.cursor_row, self.cursor_col);
         self.grid[row][col] = cell;
@@ -110,6 +223,11 @@ impl Screen {
                 ch: '\u{0}',
                 width: 0,
                 italic: cell.italic,
+                bold: cell.bold,
+                dim: cell.dim,
+                underline: cell.underline,
+                fg: cell.fg,
+                written: true,
             };
         }
         self.cursor_col += width;
@@ -125,16 +243,16 @@ impl Screen {
     /// The visible rows, trailing whitespace trimmed the way xterm's
     /// `translateToString(true)` is.
     fn viewport(&self) -> Vec<String> {
-        self.grid
+        self.grid.iter().map(|row| render_row(row)).collect()
+    }
+
+    /// Every buffer line including the scrollback, upstream
+    /// `VirtualTerminal.getScrollBuffer` over xterm's `buffer.active`.
+    fn scroll_buffer(&self) -> Vec<String> {
+        self.scrollback
             .iter()
-            .map(|row| {
-                row.iter()
-                    .filter(|cell| cell.width > 0)
-                    .map(|cell| cell.ch)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
+            .chain(self.grid.iter())
+            .map(|row| render_row(row))
             .collect()
     }
 
@@ -144,10 +262,29 @@ impl Screen {
             .and_then(|line| line.get(col))
             .is_some_and(|cell| cell.italic)
     }
+
+    /// The cell attribute reads the style suites assert on: upstream's
+    /// `isBold`/`isDim`/`isUnderline`/`isFgDefault`/`getFgColor` per cell.
+    fn attr_at(&self, row: usize, col: usize) -> Option<ScreenCell> {
+        self.grid.get(row).and_then(|line| line.get(col)).copied()
+    }
 }
 
-/// The cell-size suite's SGR tracking with the extended-color groups
-/// skipped, so `38;2;r;g;b` never trips the italic flag.
+fn render_row(row: &[ScreenCell]) -> String {
+    let last_written = row
+        .iter()
+        .rposition(|cell| cell.written)
+        .map_or(0, |position| position + 1);
+    row[..last_written]
+        .iter()
+        .filter(|cell| cell.width > 0)
+        .map(|cell| cell.ch)
+        .collect()
+}
+
+/// The cell-style suites' SGR tracking: italic, bold, dim, underline, and
+/// the foreground color model, with the extended-color group syntax
+/// (`38;2;r;g;b`, `38;5;n`) consumed so it never trips the flags.
 fn apply_sgr(screen: &mut Screen, params: &vte::Params) {
     let groups: Vec<Vec<u16>> = params.iter().map(<[u16]>::to_vec).collect();
     let mut index = 0;
@@ -155,20 +292,70 @@ fn apply_sgr(screen: &mut Screen, params: &vte::Params) {
         let group = &groups[index];
         let param = group.first().copied().unwrap_or(0);
         match param {
-            38 | 48 | 58 | 59 => {
-                if group.len() > 1 {
-                    // Colon form: the whole spec lives in this group.
-                    index += 1;
-                } else {
-                    match groups.get(index + 1).and_then(|next| next.first()).copied() {
-                        Some(5) => index += 3,
-                        Some(2) => index += 5,
-                        _ => index += 1,
+            38 | 48 | 58 | 59 if group.len() > 1 => {
+                // Colon form: the whole spec lives in this group, and no
+                // style suite asserts on it — consume and move on.
+                index += 1;
+            }
+            38 => {
+                let spec = groups
+                    .get(index + 1)
+                    .and_then(|next| next.first())
+                    .copied()
+                    .unwrap_or(0);
+                match spec {
+                    5 => {
+                        screen.fg = groups
+                            .get(index + 2)
+                            .and_then(|g| g.first())
+                            .map(|value| FgColor::Indexed(*value));
+                        index += 3;
                     }
+                    2 => {
+                        let channel = |offset: usize| -> u8 {
+                            groups
+                                .get(index + offset)
+                                .and_then(|g| g.first())
+                                .and_then(|value| u8::try_from(*value).ok())
+                                .unwrap_or(0)
+                        };
+                        screen.fg = Some(FgColor::Rgb(channel(2), channel(3), channel(4)));
+                        index += 5;
+                    }
+                    _ => index += 1,
                 }
             }
+            48 | 58 | 59 => {
+                let spec = groups
+                    .get(index + 1)
+                    .and_then(|next| next.first())
+                    .copied()
+                    .unwrap_or(0);
+                index += match spec {
+                    5 => 3,
+                    2 => 5,
+                    _ => 1,
+                };
+            }
+            0 => {
+                screen.italic = false;
+                screen.bold = false;
+                screen.dim = false;
+                screen.underline = false;
+                screen.fg = None;
+            }
+            1 => screen.bold = true,
+            2 => screen.dim = true,
             3 => screen.italic = true,
-            23 | 0 => screen.italic = false,
+            4 => screen.underline = true,
+            22 => {
+                screen.bold = false;
+                screen.dim = false;
+            }
+            23 => screen.italic = false,
+            24 => screen.underline = false,
+            30..=37 => screen.fg = Some(FgColor::Indexed(param - 30)),
+            39 => screen.fg = None,
             _ => {}
         }
         index += 1;
@@ -254,6 +441,9 @@ impl vte::Perform for Screen {
                         self.clear_row(row, 0);
                     }
                 }
+                // Clear scrollback, xterm's `eraseInDisplay` case 3: the
+                // viewport lines stay, everything above them is dropped.
+                3 => self.scrollback.clear(),
                 _ => {}
             },
             'K' => {
@@ -274,11 +464,11 @@ impl vte::Perform for Screen {
 /// that captures the TUI's writes and dispatches injected input. Tests keep
 /// a clone for the test surface; the TUI takes the terminal itself by value.
 #[derive(Clone)]
-pub struct TestTerminal {
-    shared: Rc<RefCell<TestShared>>,
+pub struct VirtualTerminal {
+    shared: Rc<RefCell<VirtualShared>>,
 }
 
-struct TestShared {
+struct VirtualShared {
     screen: Screen,
     columns: u16,
     rows: u16,
@@ -288,12 +478,12 @@ struct TestShared {
     queued_input: VecDeque<String>,
 }
 
-impl TestTerminal {
+impl VirtualTerminal {
     /// A fresh `VirtualTerminal(columns, rows)`.
     #[must_use]
     pub(crate) fn new(columns: u16, rows: u16) -> Self {
         Self {
-            shared: Rc::new(RefCell::new(TestShared {
+            shared: Rc::new(RefCell::new(VirtualShared {
                 screen: Screen::new(usize::from(columns), usize::from(rows)),
                 columns,
                 rows,
@@ -317,10 +507,16 @@ impl TestTerminal {
     }
 
     /// The raw bytes every [`Terminal::write`] delivered, for assertions the
-    /// emulator cannot make (cursor visibility, synchronized output).
+    /// emulator cannot make (cursor visibility, synchronized output, image
+    /// deletions), upstream `LoggingVirtualTerminal.getWrites`.
     #[must_use]
     pub(crate) fn write_log(&self) -> String {
         self.shared.borrow().writes.clone()
+    }
+
+    /// Drop the write log, upstream `LoggingVirtualTerminal.clearWrites`.
+    pub(crate) fn clear_writes(&self) {
+        self.shared.borrow_mut().writes.clear();
     }
 
     /// Simulate keyboard input, upstream `VirtualTerminal.sendInput`: the
@@ -357,14 +553,76 @@ impl TestTerminal {
         self.shared.borrow().screen.viewport()
     }
 
+    /// The entire scroll buffer including scrollback, upstream
+    /// `VirtualTerminal.getScrollBuffer`.
+    #[must_use]
+    pub(crate) fn get_scroll_buffer(&self) -> Vec<String> {
+        self.shared.borrow().screen.scroll_buffer()
+    }
+
     /// The italic attribute of one cell, upstream's `getCellItalic` helper.
     #[must_use]
     pub(crate) fn is_italic(&self, row: usize, col: usize) -> bool {
         self.shared.borrow().screen.italic_at(row, col)
     }
+
+    /// The bold attribute of one cell, upstream `getCell(...).isBold()`.
+    #[must_use]
+    pub(crate) fn is_bold(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_some_and(|cell| cell.bold)
+    }
+
+    /// The dim attribute of one cell, upstream `getCell(...).isDim()`.
+    #[must_use]
+    pub(crate) fn is_dim(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_some_and(|cell| cell.dim)
+    }
+
+    /// The underline attribute of one cell, upstream `getCell(...).isUnderline()`.
+    #[must_use]
+    pub(crate) fn is_underline(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_some_and(|cell| cell.underline)
+    }
+
+    /// Whether one cell keeps the default foreground, upstream
+    /// `getCell(...).isFgDefault()`: no foreground SGR preceded the print.
+    #[must_use]
+    pub(crate) fn is_fg_default(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_none_or(|cell| cell.fg.is_none())
+    }
+
+    /// The packed foreground color of one cell, upstream
+    /// `getCell(...).getFgColor()`: `None` for the default foreground, the
+    /// palette index for indexed colors, and `(r << 16) | (g << 8) | b` for
+    /// RGB triples.
+    #[must_use]
+    pub(crate) fn fg_color(&self, row: usize, col: usize) -> Option<u32> {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .and_then(|cell| cell.fg)
+            .map(FgColor::packed)
+    }
 }
 
-impl Terminal for TestTerminal {
+impl Terminal for VirtualTerminal {
     fn start(&mut self, on_input: InputHandler, on_resize: ResizeHandler) {
         let mut shared = self.shared.borrow_mut();
         shared.input_handler = Some(on_input);
@@ -464,85 +722,34 @@ impl Terminal for TestTerminal {
     }
 }
 
-/// The concrete render strategy the overlay suites stand in for upstream's
-/// `TuiMainScreen` until the renderer ticket (#45) lands: renders children,
-/// composites overlays, extracts the cursor marker, applies the line resets,
-/// then clears and rewrites the screen each frame.
-#[derive(Debug)]
-pub struct TestRenderer;
-
-impl TuiRenderer for TestRenderer {
-    fn mode(&self) -> TuiMode {
-        TuiMode::Regular
-    }
-
-    fn do_render(&self, tui: &Tui) {
-        if tui.is_stopped() {
-            return;
-        }
-        let width = usize::from(tui.terminal_columns());
-        let height = usize::from(tui.terminal_rows());
-        let mut lines = tui.render_children(width);
-        if tui.has_overlay_entries() {
-            lines = tui.composite_overlays(lines, width, height);
-        }
-        let cursor = tui.extract_cursor_position(&mut lines, height);
-        let lines = tui.apply_line_resets(lines);
-        let mut out = String::from("\x1b[?2026h\x1b[2J\x1b[H");
-        for (i, line) in lines.iter().enumerate() {
-            if i > 0 {
-                out.push_str("\r\n");
-            }
-            out.push_str(line);
-        }
-        out.push_str("\x1b[?2026l");
-        tui.terminal_write(&out);
-        if cursor.is_none() {
-            tui.terminal_hide_cursor();
-        }
-    }
+/// The renderer the harness hands every TUI: [`TuiMainScreen`], upstream's
+/// `new TuiMainScreen(terminal)`. The environment lookup answers nothing, so
+/// the suites cannot trip the Termux or debug-log switches a developer's
+/// shell might export.
+#[must_use]
+pub fn test_renderer() -> Box<dyn TuiRenderer> {
+    Box::new(TuiMainScreen::new(TuiMainScreenConfig {
+        env_lookup: Some(Box::new(|_| None)),
+    }))
 }
 
-/// Build the TUI the suites drive, upstream `new TuiMainScreen(terminal)`
-/// over the [`TestRenderer`] stand-in.
+/// Build the TUI the suites drive, upstream `new TuiMainScreen(terminal)`.
 #[must_use]
-pub fn new_test_tui(terminal: TestTerminal) -> Rc<Tui> {
+pub fn new_test_tui(terminal: VirtualTerminal) -> Rc<Tui> {
     Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(TestRenderer)),
+        renderer: Some(test_renderer()),
         ..TuiConfig::default()
     })
-}
-
-/// The focused-editor fixture the non-capturing overlay suites drive, the
-/// setup block upstream's tests repeat: a fresh 80x24 terminal whose
-/// `EDITOR` overlay holds focus.
-#[must_use]
-pub fn focused_editor() -> (Rc<Tui>, Rc<FocusableOverlay>) {
-    let tui = new_test_tui(TestTerminal::new(80, 24));
-    let editor = FocusableOverlay::new(&["EDITOR"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    (tui, editor)
-}
-
-/// The `nonCapturing: true` overlay options the non-capturing suites show.
-#[must_use]
-pub fn non_capturing_options() -> pi_tui::tui::OverlayOptions {
-    pi_tui::tui::OverlayOptions {
-        non_capturing: true,
-        ..pi_tui::tui::OverlayOptions::default()
-    }
 }
 
 /// Build the TUI with the image-capable probe injected, restating the
 /// cell-size suite's `withImageTerminal` env setup.
 #[must_use]
-pub fn new_test_tui_with_images(terminal: TestTerminal) -> Rc<Tui> {
+pub fn new_test_tui_with_images(terminal: VirtualTerminal) -> Rc<Tui> {
     Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(TestRenderer)),
+        renderer: Some(test_renderer()),
         images_probe: Some(Box::new(|| true)),
         ..TuiConfig::default()
     })
@@ -556,8 +763,12 @@ pub fn render_and_flush(tui: &Tui) {
 }
 
 /// Upstream's `waitForRender`, for the suites that render through the
-/// request `start()` made: one pump turn runs the armed deadline.
+/// request `start()` made or an armed throttled deadline: the first pump
+/// turn arms the schedule, the 20 ms sleep lets the deadline pass, and the
+/// second turn is the flush.
 pub fn wait_for_render(tui: &Tui) {
+    tui.poll(Duration::ZERO);
+    std::thread::sleep(Duration::from_millis(20));
     tui.poll(Duration::ZERO);
 }
 
@@ -711,4 +922,309 @@ pub const fn mouse_event(
         wheel_delta: None,
         click_count: None,
     }
+}
+
+/// The suites' environment closure, `map.get(key)` closed over a clone.
+#[must_use]
+pub fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
+    let map = map.clone();
+    Box::new(move |key| map.get(key).cloned())
+}
+
+/// The render suites' TUI construction: the main-screen renderer over a
+/// quiet-map environment lookup.
+#[must_use]
+pub fn new_main_screen_tui(terminal: VirtualTerminal, env: &HashMap<String, String>) -> Rc<Tui> {
+    Tui::new(TuiConfig {
+        terminal: Some(Box::new(terminal)),
+        renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig {
+            env_lookup: Some(env_lookup(env)),
+        }))),
+        ..TuiConfig::default()
+    })
+}
+
+/// The alt-screen suites' TUI construction: the alternate-screen renderer
+/// over the given configuration, with a handle kept for the scroll and
+/// selection surfaces.
+#[must_use]
+pub fn new_alt_screen_tui(
+    terminal: VirtualTerminal,
+    config: TuiAltScreenConfig,
+) -> (Rc<Tui>, TuiAltScreen) {
+    let alt = TuiAltScreen::new(config);
+    let tui = Tui::new(TuiConfig {
+        terminal: Some(Box::new(terminal)),
+        renderer: Some(Box::new(alt.clone())),
+        ..TuiConfig::default()
+    });
+    (tui, alt)
+}
+
+/// The image suites' Kitty placement builder: `encodeKitty` with the same
+/// cell geometry the renderer reads, so the placements drive the identical
+/// branches the `Image` component would.
+#[must_use]
+pub fn kitty_image(base64: &str, columns: usize, rows: usize, image_id: u64) -> String {
+    encode_kitty(
+        base64,
+        EncodeKittyOptions {
+            columns: Some(columns),
+            rows: Some(rows),
+            image_id: Some(image_id),
+            move_cursor: Some(false),
+        },
+    )
+}
+
+/// The editor suites' TUI construction, upstream test `createTestTUI`: the
+/// main-screen renderer over a virtual terminal with default geometry,
+/// under a quiet-map environment lookup.
+#[must_use]
+pub fn new_editor_test_tui(columns: u16, rows: u16) -> Rc<Tui> {
+    new_main_screen_tui(VirtualTerminal::new(columns, rows), &HashMap::new())
+}
+
+/// The editor suites' theme, upstream test-themes.ts `defaultEditorTheme`:
+/// the border color is chalk's dim. The select-list entry of the upstream
+/// theme lands with the autocomplete child (#49).
+#[must_use]
+pub fn default_editor_theme() -> EditorTheme {
+    EditorTheme {
+        border_color: Rc::new(|text| format!("\x1b[2m{text}\x1b[22m")),
+    }
+}
+
+/// The suites' `BoundedWriteTerminal`: captures every write without
+/// emulating anything, so the chunking asserts on raw writes.
+#[derive(Clone, Default)]
+pub struct BoundedWriteTerminal {
+    writes: Rc<RefCell<Vec<String>>>,
+}
+
+impl BoundedWriteTerminal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn writes(&self) -> Vec<String> {
+        self.writes.borrow().clone()
+    }
+
+    pub fn clear_writes(&self) {
+        self.writes.borrow_mut().clear();
+    }
+}
+
+impl Terminal for BoundedWriteTerminal {
+    fn start(&mut self, _on_input: InputHandler, _on_resize: ResizeHandler) {}
+    fn stop(&mut self) {}
+    fn drain_input(&mut self, _max_ms: u64, _idle_ms: u64) {}
+    fn write(&mut self, data: &str) {
+        self.writes.borrow_mut().push(data.to_string());
+    }
+    fn columns(&self) -> u16 {
+        80
+    }
+    fn rows(&self) -> u16 {
+        24
+    }
+    fn is_kitty_protocol_active(&self) -> bool {
+        false
+    }
+    fn move_by(&mut self, _lines: i32) {}
+    fn hide_cursor(&mut self) {}
+    fn show_cursor(&mut self) {}
+    fn clear_line(&mut self) {}
+    fn clear_from_cursor(&mut self) {}
+    fn clear_screen(&mut self) {}
+    fn set_title(&mut self, _title: &str) {}
+    fn set_progress(&mut self, _active: bool) {}
+    fn poll(&mut self, _timeout: Duration) {}
+}
+
+// --- markdown suite fixtures (#48), upstream test-themes.ts -----------------
+
+/// One chalk style: the byte-exact SGR open and close pair.
+struct ChalkStyle {
+    open: &'static str,
+    close: &'static str,
+}
+
+const CHALK_BOLD: ChalkStyle = ChalkStyle {
+    open: "\x1b[1m",
+    close: "\x1b[22m",
+};
+const CHALK_DIM: ChalkStyle = ChalkStyle {
+    open: "\x1b[2m",
+    close: "\x1b[22m",
+};
+const CHALK_ITALIC: ChalkStyle = ChalkStyle {
+    open: "\x1b[3m",
+    close: "\x1b[23m",
+};
+const CHALK_UNDERLINE: ChalkStyle = ChalkStyle {
+    open: "\x1b[4m",
+    close: "\x1b[24m",
+};
+const CHALK_STRIKETHROUGH: ChalkStyle = ChalkStyle {
+    open: "\x1b[9m",
+    close: "\x1b[29m",
+};
+const CHALK_BLUE: ChalkStyle = ChalkStyle {
+    open: "\x1b[34m",
+    close: "\x1b[39m",
+};
+const CHALK_CYAN: ChalkStyle = ChalkStyle {
+    open: "\x1b[36m",
+    close: "\x1b[39m",
+};
+const CHALK_GREEN: ChalkStyle = ChalkStyle {
+    open: "\x1b[32m",
+    close: "\x1b[39m",
+};
+const CHALK_YELLOW: ChalkStyle = ChalkStyle {
+    open: "\x1b[33m",
+    close: "\x1b[39m",
+};
+const CHALK_GRAY: ChalkStyle = ChalkStyle {
+    open: "\x1b[90m",
+    close: "\x1b[39m",
+};
+const CHALK_MAGENTA: ChalkStyle = ChalkStyle {
+    open: "\x1b[35m",
+    close: "\x1b[39m",
+};
+
+/// A chalk-builder closure over one style chain, `styles` ordered innermost
+/// first: chalk's level-3 wrapping is `openAll + text + closeAll`, with each
+/// style's open code re-inserted after every occurrence of its close code
+/// when the text carries ANSI (so nested resets re-open the outer style),
+/// and each line break closed and re-opened so styles never bleed across
+/// lines (chalk#92).
+fn chalk(styles: &[ChalkStyle], text: &str) -> String {
+    let open_all: String = styles.iter().rev().map(|style| style.open).collect();
+    let close_all: String = styles.iter().map(|style| style.close).collect();
+    let mut wrapped = text.to_string();
+    if wrapped.contains('\u{1b}') {
+        for style in styles {
+            wrapped = insert_after_all(&wrapped, style.close, style.open);
+        }
+    }
+    if wrapped.contains('\n') {
+        wrapped = close_reopen_at_lfs(&wrapped, &close_all, &open_all);
+    }
+    format!("{open_all}{wrapped}{close_all}")
+}
+
+/// `stringReplaceAll(string, substring, substring + postfix)` — each match
+/// survives and the postfix lands after it.
+fn insert_after_all(text: &str, substring: &str, postfix: &str) -> String {
+    let mut result = String::new();
+    let mut cursor = 0;
+    while let Some(index) = text[cursor..].find(substring) {
+        let index = cursor + index;
+        result.push_str(&text[cursor..index + substring.len()]);
+        result.push_str(postfix);
+        cursor = index + substring.len();
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// Close the styling before every line break and reopen after it.
+fn close_reopen_at_lfs(text: &str, close_all: &str, open_all: &str) -> String {
+    let mut result = String::new();
+    let mut cursor = 0;
+    while let Some(index) = text[cursor..].find('\n') {
+        let index = cursor + index;
+        let cr = index > 0 && text.as_bytes()[index - 1] == b'\r';
+        let line_end = if cr { index - 1 } else { index };
+        result.push_str(&text[cursor..line_end]);
+        result.push_str(close_all);
+        result.push_str(if cr { "\r\n" } else { "\n" });
+        result.push_str(open_all);
+        cursor = index + 1;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// A single-style chalk closure, the fixture shape most theme entries use.
+fn chalk_one(style: &'static ChalkStyle) -> ColorFn {
+    Arc::new(move |text| chalk(std::slice::from_ref(style), text))
+}
+
+/// The markdown suites' theme, upstream test-themes.ts
+/// `defaultMarkdownTheme` (chalk, level 3): heading is bold cyan, links are
+/// blue, link URLs dim, code yellow, code blocks green, the code block
+/// border and quote border dim, quotes italic, rules dim, list bullets
+/// cyan, and the plain decorations map to chalk's own.
+#[must_use]
+pub fn default_markdown_theme() -> MarkdownTheme {
+    MarkdownTheme {
+        heading: Arc::new(|text| chalk(&[CHALK_CYAN, CHALK_BOLD], text)),
+        link: Arc::new(|text| chalk(&[CHALK_BLUE], text)),
+        link_url: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        code: Arc::new(|text| chalk(&[CHALK_YELLOW], text)),
+        code_block: Arc::new(|text| chalk(&[CHALK_GREEN], text)),
+        code_block_border: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        quote: Arc::new(|text| chalk(&[CHALK_ITALIC], text)),
+        quote_border: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        hr: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        list_bullet: Arc::new(|text| chalk(&[CHALK_CYAN], text)),
+        bold: Arc::new(|text| chalk(&[CHALK_BOLD], text)),
+        italic: Arc::new(|text| chalk(&[CHALK_ITALIC], text)),
+        strikethrough: Arc::new(|text| chalk(&[CHALK_STRIKETHROUGH], text)),
+        underline: Arc::new(|text| chalk(&[CHALK_UNDERLINE], text)),
+        highlight_code: None,
+        code_block_indent: None,
+    }
+}
+
+/// The default text styles the thinking-trace tests style with, upstream's
+/// inline `chalk.gray` / `chalk.magenta` / `chalk.cyan` / `chalk.yellow`
+/// color callbacks.
+#[must_use]
+pub fn chalk_gray() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_GRAY], text))
+}
+
+#[must_use]
+pub fn chalk_magenta() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_MAGENTA], text))
+}
+
+#[must_use]
+pub fn chalk_cyan() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_CYAN], text))
+}
+
+#[must_use]
+pub fn chalk_yellow() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_YELLOW], text))
+}
+
+/// The markdown suites' SGR-only strip, upstream `stripAnsi`: drops SGR
+/// sequences but keeps OSC 8 payloads, so hyperlink asserts see the URL.
+#[must_use]
+pub fn strip_ansi(line: &str) -> String {
+    static SGR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SGR_RE
+        .get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;]*m").expect("static pattern"))
+        .replace_all(line, "")
+        .into_owned()
+}
+
+/// Serialize the tests that override the process-wide capability cache:
+/// upstream's vitest suite runs sequentially, while cargo runs test
+/// functions on parallel threads, and the cache is module-global.
+pub fn capabilities_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

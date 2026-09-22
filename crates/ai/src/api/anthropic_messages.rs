@@ -20,14 +20,13 @@
 //!   [`crate::http::sse`] decoder; the per-API event parsing lives here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::resolve::now_ms;
-use crate::http::client::{HttpError, HttpMethod, HttpRequest, HttpResponse};
+use crate::http::client::{HttpMethod, HttpRequest, HttpResponse};
 use crate::http::sse::SseStream;
 use crate::models::calculate_cost;
 use crate::types::{
@@ -42,19 +41,18 @@ use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::pi_user_agent::get_pi_user_agent;
 use crate::utils::provider_env::get_provider_env_value;
-use crate::utils::provider_retry::{ProviderRetryOptions, retry_provider_request};
 
 use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::api::github_copilot_headers::build_copilot_dynamic_headers;
-use crate::api::request_seam::{
-    execute_checked_response, fire_response_hook, has_header, setup_error_stream, spawned_stream,
-};
 use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
 };
 use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
+use crate::api::wire_common::{
+    dispatch_with_retry, retry_options, setup_error_stream, spawn_adapter_stream, sse_error_message,
+};
 
 /// Resolve the cache retention preference, upstream's
 /// `resolveCacheRetention`: the request's value, else `PI_CACHE_RETENTION`,
@@ -352,14 +350,38 @@ pub struct AnthropicStreamOptions {
     pub tool_choice: Option<AnthropicToolChoice>,
 }
 
-crate::api::adapter_belt::impl_stream_options_from!(AnthropicStreamOptions from options {
-    thinking_enabled: None,
-    thinking_budget_tokens: None,
-    effort: None,
-    thinking_display: None,
-    interleaved_thinking: None,
-    tool_choice: None,
-});
+impl From<StreamOptions> for AnthropicStreamOptions {
+    fn from(options: StreamOptions) -> Self {
+        Self {
+            transport_options: options.transport_options,
+            api_key: options.api_key,
+            telemetry_context: options.telemetry_context,
+            env: options.env,
+            headers: options.headers,
+            timeout_ms: options.timeout_ms,
+            max_retries: options.max_retries,
+            max_retry_delay_ms: options.max_retry_delay_ms,
+            temperature: options.temperature,
+            max_tokens: options.max_tokens,
+            cache_retention: options.cache_retention,
+            session_id: options.session_id,
+            metadata: options.metadata,
+            thinking_enabled: None,
+            thinking_budget_tokens: None,
+            effort: None,
+            thinking_display: None,
+            interleaved_thinking: None,
+            tool_choice: None,
+        }
+    }
+}
+
+impl crate::api::wire_common::TransportCarrier for AnthropicStreamOptions {
+    fn transport_options(&self) -> &crate::types::TransportOptions {
+        &self.transport_options
+    }
+}
+
 /// The compat flags the adapter reads, upstream's `getAnthropicCompat`.
 /// Unset flags fall back to their defaults; OpenRouter endpoints
 /// (provider id or `openrouter.ai` base URL) detect themselves for
@@ -489,6 +511,17 @@ fn merge_header_sources(sources: Vec<BTreeMap<String, Option<String>>>) -> Vec<(
         }
     }
     merged
+}
+
+fn has_header(headers: Option<&crate::types::ProviderHeaders>, name: &str) -> bool {
+    headers.is_some_and(|headers| {
+        headers.iter().any(|(key, value)| {
+            key.eq_ignore_ascii_case(name)
+                && value
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        })
+    })
 }
 
 /// Require request auth: an API key, or a header-owned credential the
@@ -743,22 +776,13 @@ pub fn stream(
     context: &Context,
     options: Option<&AnthropicStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let options = options.cloned();
-    let signal = options.as_ref().map_or_else(
-        || crate::types::TransportOptions::default().signal(),
-        |options| options.transport_options.signal(),
-    );
-    let default_options = AnthropicStreamOptions::default();
-    spawned_stream(
+    spawn_adapter_stream(
         model,
         context,
-        signal,
-        initial_output(model, options.as_ref().unwrap_or(&default_options)),
-        move |model, context, output, forward| {
-            Box::pin(async move {
-                let options = options.unwrap_or_default();
-                run_stream(&model, &context, &options, output, &forward).await
-            })
+        options.cloned(),
+        initial_output,
+        |model, context, options, output, events| {
+            Box::pin(run_stream(model, context, options, output, events))
         },
     )
 }
@@ -775,7 +799,7 @@ fn initial_output(model: &Model, options: &AnthropicStreamOptions) -> AssistantM
                 .as_str()
                 .to_owned()
         });
-    crate::api::request_seam::initial_output(model, model.api.clone(), provider_thinking_level)
+    crate::api::wire_common::initial_output_with_thinking_level(model, provider_thinking_level)
 }
 
 async fn run_stream(
@@ -885,30 +909,16 @@ async fn dispatch_stream_request(
         timeout_ms: options.timeout_ms,
         signal: signal.clone(),
     };
-    let retry_options = ProviderRetryOptions {
-        max_retries: options.max_retries.unwrap_or(0),
-        max_retry_delay_ms: options.max_retry_delay_ms,
-        signal: Some(signal.clone()),
-        random: None,
-    };
-    let response = retry_provider_request(
-        || {
-            let client = Arc::clone(&http_client);
-            let request = request.clone();
-            async move { execute_checked_response(client, request, None).await }
-        },
-        &retry_options,
-    )
-    .await
-    .map_err(|error| error.message)?;
-
-    fire_response_hook(
+    let retry = retry_options(options.max_retries, options.max_retry_delay_ms, signal);
+    let response = dispatch_with_retry(
+        http_client,
+        request,
+        &retry,
+        sdk_error_message,
+        model,
         &options.transport_options,
-        response.status,
-        &response.headers,
-        model.clone(),
     )
-    .await;
+    .await?;
 
     Ok((response, is_oauth))
 }
@@ -923,10 +933,7 @@ async fn iterate_anthropic_events(
     events: &AssistantMessageEventStream,
 ) -> Result<(), String> {
     let mut sse = SseStream::new(response.body);
-    while let Some(sse_event) = sse.next().await.map_err(|error| match error {
-        HttpError::Aborted => "Request was aborted".to_owned(),
-        other => other.to_string(),
-    })? {
+    while let Some(sse_event) = sse.next().await.map_err(sse_error_message)? {
         if sse_event.event.as_deref() == Some("error") {
             return Err(sse_event.data);
         }
@@ -1421,6 +1428,18 @@ fn parse_error_message(
         sse_event.data,
         sse_event.raw.join("\\n")
     )
+}
+
+/// The SDK-shaped error message of a non-2xx response, upstream's
+/// `APIError.makeMessage`: `{status} {parsed body}` when the body parses,
+/// `{status} {raw body}` when it does not, `{status} status code (no body)`
+/// otherwise.
+fn sdk_error_message(status: u16, body: &str) -> String {
+    match serde_json::from_str::<Value>(body) {
+        Ok(parsed) => format!("{status} {parsed}"),
+        Err(_) if !body.is_empty() => format!("{status} {body}"),
+        Err(_) => format!("{status} status code (no body)"),
+    }
 }
 
 /// Map a pi thinking level to an Anthropic effort for adaptive thinking,
@@ -2341,4 +2360,4 @@ fn map_stop_reason(
 #[derive(Debug, Default)]
 pub struct AnthropicStreams;
 
-crate::api::adapter_belt::impl_provider_streams!(AnthropicStreams, AnthropicStreamOptions);
+crate::api::wire_common::forward_provider_streams!(AnthropicStreams, AnthropicStreamOptions);

@@ -1,48 +1,24 @@
 //! The lazy stream seam, ported from `packages/ai/src/api/lazy.ts` at commit
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 
-use crate::auth::resolve::now_ms;
-use crate::types::{
-    AssistantMessage, AssistantMessageEvent, BoxedFuture, Model, StopReason, Usage, UsageCost,
-};
+use crate::types::{AssistantMessage, AssistantMessageEvent, BoxedFuture, Model, StopReason};
 use crate::utils::event_stream::AssistantMessageEventStream;
 
 /// The failure a lazy-stream setup reports; its display text becomes the
 /// stream error's `errorMessage`.
 pub type LazyStreamError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The setup failure message, upstream's `createSetupErrorMessage`.
+/// The setup failure message, upstream's `createSetupErrorMessage`: the fresh
+/// accumulator settled as an error carrying the failure's display text.
 #[must_use]
 pub fn setup_error_message(
     model: &Model,
     error: &(dyn std::error::Error + 'static),
 ) -> AssistantMessage {
-    AssistantMessage {
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        response_model: None,
-        response_id: None,
-        provider_thinking_level: None,
-        diagnostics: None,
-        usage: Usage {
-            input: 0,
-            output: 0,
-            cache_read: 0,
-            cache_write: 0,
-            cache_write_1h: None,
-            reasoning: None,
-            total_tokens: 0,
-            cost: UsageCost::default(),
-        },
-        stop_reason: StopReason::Error,
-        deferred: None,
-        error_message: Some(error.to_string()),
-        raw_stop_reason: None,
-        end_turn: None,
-        timestamp: now_ms(),
-    }
+    let mut message = crate::api::wire_common::initial_output(model);
+    message.stop_reason = StopReason::Error;
+    message.error_message = Some(error.to_string());
+    message
 }
 
 /// Returns a stream synchronously while running async setup (auth resolution,

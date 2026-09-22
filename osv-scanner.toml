@@ -29,3 +29,58 @@ reason = "unpublished workspace crate; license declared in crates/evals/Cargo.to
 name = "pi-tui"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/tui/Cargo.toml"
+
+
+# aws-smithy-types 1.8.0 ships a license file osv-scanner cannot parse
+# (UNKNOWN); the crate is Apache-2.0 per the aws-sdk-rust repo. The override
+# comes off when the scanner learns the format or the release republishes
+# parseable metadata. See #32.
+[[PackageOverrides]]
+name = "aws-smithy-types"
+version = "1.8.0"
+license.override = ["Apache-2.0"]
+reason = "aws-smithy-types 1.8.0 ships an unparsable LICENSE file; the crate is Apache-2.0 per the aws-sdk-rust repo"
+
+# The AWS SDK's legacy hyper-0.14 connector stack (pulled by
+# aws-smithy-runtime's default connector) is the sole h2 0.3 /
+# rustls-webpki 0.101 carrier in the lockfile, and pi-ai never routes
+# traffic through it: the Bedrock client builds on aws-smithy-http-client's
+# modern rustls-ring connector. The fixes live in the h2 0.4 and
+# rustls-webpki 0.103 lines that stack cannot consume; the ignores come off
+# when the AWS SDK drops the legacy stack. Verified with
+# `cargo tree -i h2@0.3.27 --invert`. See #32.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0258"
+reason = "h2 0.3 rides only the AWS SDK's legacy hyper-0.14 connector, which the Bedrock adapter never selects; fixed only in the h2 0.4 line hyper 0.14 cannot consume"
+
+[[IgnoredVulns]]
+id = "GHSA-82j2-j2ch-gfr8"
+reason = "the h2 0.3 advisory's GitHub alias; same legacy-connector-only carrier as RUSTSEC-2026-0258"
+
+[[IgnoredVulns]]
+id = "GHSA-965h-392x-2mh5"
+reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only carrier as RUSTSEC-2026-0098"
+
+[[IgnoredVulns]]
+id = "GHSA-xgp8-3hg3-c2mh"
+reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only carrier as RUSTSEC-2026-0098"
+# RUSTSEC-2023-0071 (Marvin Attack) is a decryption side channel against RSA
+# implementations; pi-ai only signs (the RS256 service-account JWT for the
+# Vertex ADC exchange through jsonwebtoken) and never decrypts
+# attacker-controlled ciphertext, so the oracle the advisory describes does
+# not exist in this crate. No fixed rsa release exists; the ignore comes off
+# when the advisory gains one. See #32.
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa 0.9 rides jsonwebtoken's rust_crypto signing backend; pi-ai only signs JWTs and never decrypts, so the Marvin-Attack oracle the advisory describes does not exist here; no fixed release exists"
+
+[[PackageOverrides]]
+name = "pi-protocol"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/protocol/Cargo.toml"
+
+[[PackageOverrides]]
+name = "pi-client"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/client/Cargo.toml"
+

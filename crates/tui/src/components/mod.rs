@@ -3,9 +3,10 @@
 //!
 //! This directory carries the padding-and-background container, the wrapping
 //! text display, the truncated title line, the blank-line spacer, and the
-//! loader family. The stacks, scroll view, and layout engine land with the
-//! layout ticket (#44); the editor, input, and selection machinery carry
-//! their own tickets.
+//! loader family. The stacks, scroll view, and layout engine landed with
+//! #44; the editor machinery (`Editor`, `Input`) landed with #47, and the
+//! selection machinery (select list, settings list) carries its own
+//! ticket (#49).
 //!
 //! Restatements against upstream:
 //!
@@ -18,10 +19,15 @@
 //!   `tokio_util::sync::CancellationToken` per the stack decision (map
 //!   ticket "Decide the Rust stack").
 
+pub mod alt_screen_flash;
 pub mod box_component;
 pub mod cancellable_loader;
+pub mod editor;
+pub mod editor_component;
 pub mod h_stack;
+pub mod input;
 pub mod loader;
+pub mod markdown;
 pub mod mouse_region;
 pub mod scroll_view;
 pub mod spacer;
@@ -36,10 +42,17 @@ use std::sync::Arc;
 /// because the loader's animation thread invokes its color functions.
 pub type ColorFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+pub use alt_screen_flash::AltScreenFlashContainer;
 pub use box_component::Box;
 pub use cancellable_loader::CancellableLoader;
+pub use editor::{
+    CursorPosition, Editor, EditorColorFn, EditorOptions, EditorTheme, TextChunk, word_wrap_line,
+};
+pub use editor_component::EditorComponent;
 pub use h_stack::HStack;
+pub use input::{Input, InputOptions, InputStyleFn};
 pub use loader::{Loader, LoaderIndicatorOptions};
+pub use markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 pub use mouse_region::MouseRegion;
 pub use scroll_view::{
     FollowMode, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollViewScrollbar,

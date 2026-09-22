@@ -25,7 +25,7 @@ use pi_tui::tui::{
 use std::rc::Weak;
 
 use tui_support::{
-    EmptyContent, FocusableOverlay, TestTerminal, render_and_flush, wait_for_render,
+    EmptyContent, FocusableOverlay, VirtualTerminal, render_and_flush, wait_for_render,
 };
 
 // === fixtures ===
@@ -281,7 +281,7 @@ fn focusable_defaults_and_downcasting() {
 
 #[test]
 fn mode_defaults_and_counters() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal);
     assert_eq!(tui.mode(), TuiMode::Regular);
     assert!(!tui.is_viewport_tui());
@@ -306,7 +306,7 @@ fn inert_renderer_fallback_construction() {
 
 #[test]
 fn thread_render_request_flag_wakes_the_pump() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.start();
     let request = tui.render_request();
@@ -321,11 +321,11 @@ fn thread_render_request_flag_wakes_the_pump() {
 #[test]
 fn scheduler_coalesces_within_the_16_ms_interval() {
     let clock = FakeClock::new();
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let now = Rc::clone(&clock.now);
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(tui_support::TestRenderer)),
+        renderer: Some(tui_support::test_renderer()),
         clock: Some(Box::new(move || now.get())),
         ..TuiConfig::default()
     });
@@ -345,7 +345,7 @@ fn scheduler_coalesces_within_the_16_ms_interval() {
 
 #[test]
 fn stopped_sessions_skip_scheduler_and_input() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.start();
     tui.stop(pi_tui::tui::TuiStopOptions::default());
@@ -359,7 +359,7 @@ fn stopped_sessions_skip_scheduler_and_input() {
 
 #[test]
 fn queued_input_drains_after_the_terminal_poll_window() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.set_focus(Some(editor.clone()));
@@ -372,7 +372,7 @@ fn queued_input_drains_after_the_terminal_poll_window() {
 
 #[test]
 fn resize_notification_raises_render_demand() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.start();
     terminal.resize(30, 10);
@@ -384,7 +384,7 @@ fn resize_notification_raises_render_demand() {
 
 #[test]
 fn input_listeners_rewrite_consume_and_unsubscribe() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.set_focus(Some(editor.clone()));
@@ -426,7 +426,7 @@ fn input_listeners_rewrite_consume_and_unsubscribe() {
 
 #[test]
 fn debug_key_dispatches_when_installed() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.set_focus(Some(editor.clone()));
@@ -454,7 +454,7 @@ fn debug_key_dispatches_when_installed() {
 
 #[test]
 fn cell_size_consumer_drops_zero_and_huge_dimensions() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui_with_images(terminal.clone());
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.set_focus(Some(editor.clone()));
@@ -475,7 +475,7 @@ fn cell_size_consumer_drops_zero_and_huge_dimensions() {
 
 #[test]
 fn hardware_cursor_and_clear_on_shrink_toggles() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     assert!(!tui.get_show_hardware_cursor());
     assert!(!tui.get_clear_on_shrink());
@@ -492,7 +492,7 @@ fn hardware_cursor_and_clear_on_shrink_toggles() {
 
 #[test]
 fn color_scheme_notification_writes_follow_the_flag() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.set_terminal_color_scheme_notifications(true);
     assert!(terminal.write_log().contains("\x1b[?2031h"));
@@ -509,7 +509,7 @@ fn color_scheme_notification_writes_follow_the_flag() {
 
 #[test]
 fn start_emits_scheme_notifications_when_enabled_before_start() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.set_terminal_color_scheme_notifications(true);
     stop(&tui);
@@ -527,11 +527,11 @@ fn start_emits_scheme_notifications_when_enabled_before_start() {
 #[test]
 fn osc11_background_query_resolves_on_reply() {
     let clock = FakeClock::new();
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let now = Rc::clone(&clock.now);
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal.clone())),
-        renderer: Some(Box::new(tui_support::TestRenderer)),
+        renderer: Some(tui_support::test_renderer()),
         clock: Some(Box::new(move || now.get())),
         ..TuiConfig::default()
     });
@@ -558,11 +558,11 @@ fn osc11_background_query_resolves_on_reply() {
 #[test]
 fn osc11_background_query_times_out() {
     let clock = FakeClock::new();
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let now = Rc::clone(&clock.now);
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(tui_support::TestRenderer)),
+        renderer: Some(tui_support::test_renderer()),
         clock: Some(Box::new(move || now.get())),
         ..TuiConfig::default()
     });
@@ -580,11 +580,11 @@ fn osc11_background_query_times_out() {
 #[test]
 fn color_scheme_query_resolves_on_report_and_timeout_clears_the_listener() {
     let clock = FakeClock::new();
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let now = Rc::clone(&clock.now);
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal.clone())),
-        renderer: Some(Box::new(tui_support::TestRenderer)),
+        renderer: Some(tui_support::test_renderer()),
         clock: Some(Box::new(move || now.get())),
         ..TuiConfig::default()
     });
@@ -617,7 +617,7 @@ fn color_scheme_query_resolves_on_report_and_timeout_clears_the_listener() {
 
 #[test]
 fn overlay_handle_reports_bounds_and_hidden_state() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.add_child(editor);
@@ -655,7 +655,7 @@ fn overlay_handle_reports_bounds_and_hidden_state() {
 
 #[test]
 fn overlay_unfocus_with_null_target_clears_focus() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     tui.add_child(editor);
@@ -671,7 +671,7 @@ fn overlay_unfocus_with_null_target_clears_focus() {
 
 #[test]
 fn overlay_mouse_dispatch_routes_through_rendered_layouts() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal);
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
@@ -746,7 +746,7 @@ fn composite_tui_line_truncates_when_content_overflows() {
 
 #[test]
 fn extract_cursor_position_strips_the_marker_and_scans_only_the_viewport() {
-    let terminal = TestTerminal::new(20, 3);
+    let terminal = VirtualTerminal::new(20, 3);
     let tui = tui_support::new_test_tui(terminal);
     let mut lines = vec![
         format!("above{}", pi_tui::tui::CURSOR_MARKER),
@@ -767,7 +767,7 @@ fn extract_cursor_position_strips_the_marker_and_scans_only_the_viewport() {
 
 #[test]
 fn overlay_layout_clamps_negative_rows_and_margins() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(FocusableOverlay::new(&["EDITOR"]));
     let _ = tui.show_overlay(
@@ -823,7 +823,7 @@ fn default_component_contract_answers() {
 #[test]
 fn overlay_handle_on_a_dropped_tui_answers_neutrally() {
     let handle = {
-        let terminal = TestTerminal::new(20, 6);
+        let terminal = VirtualTerminal::new(20, 6);
         let tui = tui_support::new_test_tui(terminal);
         let overlay = FocusableOverlay::new(&["O"]);
         tui.show_overlay(overlay, None)
@@ -866,7 +866,7 @@ impl TuiRenderer for SelfRequestingRenderer {
 #[test]
 fn a_render_that_re_requests_rearms_the_throttle() {
     let clock = FakeClock::new();
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let renderer = Rc::new(SelfRequestingRenderer {
         self_weak: RefCell::new(Weak::new()),
         frames: Cell::new(0),
@@ -925,7 +925,7 @@ impl TuiRenderer for SelfRequestingShared {
 
 #[test]
 fn composite_without_overlays_clears_the_rendered_layouts() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal);
     let lines = vec!["a".to_string(), "b".to_string()];
     assert_eq!(tui.composite_overlays(lines.clone(), 20, 6), lines);
@@ -934,7 +934,7 @@ fn composite_without_overlays_clears_the_rendered_layouts() {
 
 #[test]
 fn child_container_helpers_reach_the_container() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal);
     let child: Rc<dyn Component> = Rc::new(EmptyContent);
     tui.add_child(child.clone());
@@ -951,7 +951,7 @@ fn child_container_helpers_reach_the_container() {
 
 #[test]
 fn free_fn_is_viewport_tui_reads_the_capability() {
-    let terminal = TestTerminal::new(20, 6);
+    let terminal = VirtualTerminal::new(20, 6);
     let tui = tui_support::new_test_tui(terminal);
     assert!(!pi_tui::tui::is_viewport_tui(&tui));
 }
@@ -968,7 +968,7 @@ fn composite_tui_line_falls_back_to_slicing_on_overflow() {
 #[test]
 fn debug_impls_cover_the_handle_and_unfocus_options() {
     let handle = {
-        let terminal = TestTerminal::new(20, 6);
+        let terminal = VirtualTerminal::new(20, 6);
         let tui = tui_support::new_test_tui(terminal);
         tui.show_overlay(FocusableOverlay::new(&["O"]), None)
     };
