@@ -80,14 +80,21 @@ fn search_input_moves_the_cursor_grapheme_wise() {
 }
 
 #[test]
-fn search_input_inserts_kitty_csi_u_printables_and_rejects_control_characters() {
+fn search_input_inserts_kitty_csi_u_printables_and_keeps_control_bytes_out_of_the_text() {
     let component = search_component();
     component.handle_input("\x1b[110u"); // Kitty printable 'n'
     let line = value_of(&component);
     assert!(line.starts_with('n'), "line: {line}");
-    component.handle_input("\x01"); // C0 control
-    component.handle_input("\x1b[200~pasted\x1b[201~"); // paste framing is not printable
-    assert!(value_of(&component).starts_with('n'));
+    // Ctrl+A (cursor to start) moves the cursor without touching the text.
+    component.handle_input("\x01");
+    component.handle_input("a");
+    let line = value_of(&component);
+    assert!(line.starts_with("an"), "line: {line}");
+    // Bracketed paste inserts its content at the cursor — the framing bytes
+    // never leak into the value.
+    component.handle_input("\x1b[200~XYZ\x1b[201~");
+    let line = value_of(&component);
+    assert!(line.starts_with("aXYZn"), "line: {line}");
 }
 
 #[test]
