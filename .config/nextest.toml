@@ -1,0 +1,11 @@
+# nextest configuration: the OAuth login tests bind well-known callback
+# ports (53692/1455/1456), so parallel processes race the listener and a
+# losing login waits forever for its authorize URL. The group pins the
+# whole binary to one process at a time; every other test keeps the
+# default concurrency.
+[profile.default.groups]
+oauth-ports = { max-concurrency = 1 }
+
+[[profile.default.overrides]]
+filter = "binary(pi-ai, oauth_flows_manual)"
+test-group = "oauth-ports"
