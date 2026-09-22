@@ -309,12 +309,7 @@ async fn the_not_ported_wire_api_stubs_report_their_notice() {
         api::openai_responses(),
         api::openai_completions(),
         api::azure_openai_responses(),
-        api::google_generative_ai(),
-        api::google_vertex(),
-        api::bedrock_converse_stream(),
-        api::mistral_conversations(),
         api::openai_codex_responses(),
-        api::pi_messages(),
     ] {
         let model = fixture_model();
         let stream = streams.stream(&model, &fake_context(), None);
@@ -1056,4 +1051,84 @@ fn the_radius_config_normalizes_urls_and_projects_models() {
         pi_ai::providers::radius_config::get_radius_models("radius", None).is_empty(),
         "no credential, no models"
     );
+}
+
+/// The prompt fixture whose Select answers with the option at the index,
+/// the walk the vertex ADC and service-account logins drive.
+fn prompt_interaction_selecting(
+    signal: CancellationToken,
+    select_index: usize,
+) -> ProviderAuthInteraction {
+    ProviderAuthInteraction {
+        signal,
+        prompt: Arc::new(move |prompt: AuthPrompt| {
+            let select_index = select_index;
+            Box::pin(async move {
+                match prompt.kind {
+                    AuthPromptKind::Select { options, .. } => Ok(options[select_index].id.clone()),
+                    AuthPromptKind::Secret { .. } => Ok("entered-secret".to_owned()),
+                    AuthPromptKind::Text { .. } => Ok("entered-text".to_owned()),
+                    AuthPromptKind::ManualCode { .. } => Ok("entered-code".to_owned()),
+                }
+            })
+        }),
+        notify: Arc::new(|_event| {}),
+    }
+}
+
+/// The vertex login's ADC path collects the project and location into the
+/// credential env, and the service-account path adds the credentials file.
+#[tokio::test]
+async fn the_vertex_login_walks_the_adc_and_service_account_paths() {
+    let vertex = pi_ai::providers::google_vertex::google_vertex_provider();
+    let auth = vertex.auth().api_key.as_ref().expect("vertex auth");
+    let login = auth.login.as_ref().expect("vertex login");
+
+    let adc = (login)(prompt_interaction_selecting(CancellationToken::new(), 1))
+        .await
+        .expect("the adc login");
+    let env = adc.env.as_ref().expect("the adc env");
+    assert!(adc.key.is_none(), "the adc login stores no key");
+    assert_eq!(
+        env_value(Some(env), "GOOGLE_CLOUD_PROJECT"),
+        Some("entered-text".to_owned())
+    );
+    assert_eq!(
+        env_value(Some(env), "GOOGLE_CLOUD_LOCATION"),
+        Some("entered-text".to_owned())
+    );
+    assert!(env_value(Some(env), "GOOGLE_APPLICATION_CREDENTIALS").is_none());
+
+    let service_account = (login)(prompt_interaction_selecting(CancellationToken::new(), 2))
+        .await
+        .expect("the service-account login");
+    let env = service_account
+        .env
+        .as_ref()
+        .expect("the service-account env");
+    assert_eq!(
+        env_value(Some(env), "GOOGLE_APPLICATION_CREDENTIALS"),
+        Some("entered-text".to_owned()),
+        "the service-account path collects the credentials file path"
+    );
+
+    // The stored ADC credential resolves through the credential env with the
+    // stored-credential source.
+    let resolve = &auth.resolve;
+    let stored_adc = ApiKeyCredential {
+        key: None,
+        env: Some(env.clone()),
+    };
+    let resolved = (resolve)(ApiKeyAuthInput {
+        ctx: Arc::new(ExistingPathContext {
+            env: env.clone(),
+            existing: "entered-text",
+        }),
+        credential: Some(stored_adc),
+        signal: CancellationToken::new(),
+    })
+    .await
+    .expect("resolve")
+    .expect("the adc credential resolves");
+    assert_eq!(resolved.source.as_deref(), Some("stored credential"));
 }

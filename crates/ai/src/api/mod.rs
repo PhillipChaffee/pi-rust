@@ -14,11 +14,20 @@ use std::sync::Arc;
 use crate::types::ProviderStreams;
 
 pub mod anthropic_messages;
+pub mod bedrock_converse_stream;
+pub mod bedrock_options;
+pub mod bedrock_sdk;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
+pub mod google_generative_ai;
+pub mod google_shared;
+pub mod google_vertex;
 pub mod lazy;
+pub mod mistral_conversations;
+pub mod pi_messages;
 pub mod simple_options;
 pub mod transform_messages;
+pub mod wire_common;
 
 /// The stub failure an unported wire-API stream reports.
 #[derive(Debug)]
@@ -115,26 +124,26 @@ pub fn openai_completions() -> Arc<dyn ProviderStreams> {
 /// The Google Generative AI wire API, upstream's `googleGenerativeAIApi()`.
 #[must_use]
 pub fn google_generative_ai() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("google-generative-ai")
+    Arc::new(google_generative_ai::GoogleStreams)
 }
 
 /// The Google Vertex AI wire API, upstream's `googleVertexApi()`.
 #[must_use]
 pub fn google_vertex() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("google-vertex")
+    Arc::new(google_vertex::GoogleVertexStreams)
 }
 
 /// The Bedrock Converse Stream wire API, upstream's
 /// `bedrockConverseStreamApi()`.
 #[must_use]
 pub fn bedrock_converse_stream() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("bedrock-converse-stream")
+    Arc::new(bedrock_converse_stream::BedrockStreams)
 }
 
 /// The Mistral Conversations wire API, upstream's `mistralConversationsApi()`.
 #[must_use]
 pub fn mistral_conversations() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("mistral-conversations")
+    Arc::new(mistral_conversations::MistralStreams)
 }
 
 /// The OpenAI Codex Responses wire API, upstream's
@@ -147,7 +156,7 @@ pub fn openai_codex_responses() -> Arc<dyn ProviderStreams> {
 /// The pi-messages wire API, upstream's `piMessagesApi()`.
 #[must_use]
 pub fn pi_messages() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("pi-messages")
+    Arc::new(pi_messages::PiMessagesStreams)
 }
 
 /// An API implementation map keyed by wire-API id, upstream's
