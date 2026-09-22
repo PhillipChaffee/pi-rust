@@ -1115,7 +1115,7 @@ fn split_into_tokens_with_ansi(text: &str) -> Vec<String> {
     tokens
 }
 
-fn is_cjk_break_segment(segment: &str) -> bool {
+pub(crate) fn is_cjk_break_segment(segment: &str) -> bool {
     CJK_BREAK_RE.is_match(segment)
 }
 
