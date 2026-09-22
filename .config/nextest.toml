@@ -7,5 +7,5 @@
 oauth-ports = { max-concurrency = 1 }
 
 [[profile.default.overrides]]
-filter = "binary(pi-ai, oauth_flows_manual)"
+filter = "binary(oauth_flows_manual)"
 test-group = "oauth-ports"
