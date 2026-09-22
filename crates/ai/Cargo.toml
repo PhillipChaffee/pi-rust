@@ -76,6 +76,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 # port per the stack decision. net + io-util: the loopback HTTP and WebSocket
 # servers the seam and transport tests run against.
 tokio = { version = "1.47", features = ["test-util", "net", "io-util"] }
+# regex: the adaptive-thinking catalog scan mirrors upstream's RegExp filter.
+regex = "1.11"
 
 [lints]
 workspace = true

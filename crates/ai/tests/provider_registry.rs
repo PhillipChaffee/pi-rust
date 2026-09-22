@@ -306,7 +306,6 @@ fn copilot_filter_models_narrows_to_the_credential_allowlist() {
 #[tokio::test]
 async fn the_not_ported_wire_api_stubs_report_their_notice() {
     for streams in [
-        api::anthropic_messages(),
         api::openai_responses(),
         api::openai_completions(),
         api::azure_openai_responses(),

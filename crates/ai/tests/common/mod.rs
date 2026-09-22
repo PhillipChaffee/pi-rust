@@ -25,8 +25,9 @@ pub mod radius_fixtures;
 pub mod seam_forms;
 
 use pi_ai::types::{
-    Api, AssistantBlock, AssistantMessage, Message, ProviderId, StopReason, TextContent, Usage,
-    UsageCost, UserContent, UserMessage,
+    Api, AssistantBlock, AssistantMessage, Message, ProviderId, StopReason, TextContent,
+    ThinkingContent, ToolResultBlock, ToolResultMessage, Usage, UsageCost, UserContent,
+    UserMessage,
 };
 
 /// A provider-shaped usage block with the given total.
@@ -382,5 +383,431 @@ pub fn images_context() -> pi_ai::types::ImagesContext {
             text: "a red circle".to_owned(),
             text_signature: None,
         })],
+    }
+}
+
+// --- The Anthropic Messages fixtures the #30 suites share ---
+
+use serde_json::json;
+
+use pi_ai::http::MockHttpClient;
+use pi_ai::types::{OnPayload, Tool, ToolCall, TransportOptions};
+
+/// The plain tool the deferred-reference suites keep immediate.
+#[must_use]
+pub fn lookup_tool() -> Tool {
+    Tool {
+        name: "lookup".to_owned(),
+        description: "Look up.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+        constrained_sampling: None,
+    }
+}
+
+/// The tool the deferred-reference suites load through the result marker.
+#[must_use]
+pub fn late_tool() -> Tool {
+    Tool {
+        name: "late_tool".to_owned(),
+        description: "Loaded late.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+        constrained_sampling: None,
+    }
+}
+
+/// The todo tool the OAuth CC-casing suites rename.
+#[must_use]
+pub fn todo_tool() -> Tool {
+    Tool {
+        name: "todowrite".to_owned(),
+        description: "Write a todo.".to_owned(),
+        parameters: json!({ "type": "object", "properties": {} }),
+        constrained_sampling: None,
+    }
+}
+
+/// The keyed stream options the mock suites send: the mock as the transport
+/// and a static test key.
+#[must_use]
+pub fn keyed_anthropic_options(
+    mock: &MockHttpClient,
+) -> pi_ai::api::anthropic_messages::AnthropicStreamOptions {
+    pi_ai::api::anthropic_messages::AnthropicStreamOptions {
+        transport_options: mock_transport(mock),
+        api_key: Some("test-key".to_owned()),
+        ..pi_ai::api::anthropic_messages::AnthropicStreamOptions::default()
+    }
+}
+
+/// The keyed simple-stream options the simple-entry mock suites send.
+#[must_use]
+pub fn keyed_simple_options(mock: &MockHttpClient) -> SimpleStreamOptions {
+    SimpleStreamOptions {
+        transport_options: mock_transport(mock),
+        api_key: Some("test-key".to_owned()),
+        ..SimpleStreamOptions::default()
+    }
+}
+
+/// A successful SSE run: the `message_start` opener, the given block events, a
+/// final stop-reason delta with the given usage, and `message_stop`.
+#[must_use]
+pub fn anthropic_done_run(
+    id: &str,
+    block_events: Vec<(&'static str, String)>,
+    stop_reason: &str,
+    usage: impl serde::Serialize,
+) -> Vec<(&'static str, String)> {
+    let mut events = vec![message_start_event(
+        id,
+        json!({ "input_tokens": 1, "output_tokens": 0 }),
+    )];
+    events.extend(block_events);
+    events.push(message_delta_event(
+        json!({ "stop_reason": stop_reason }),
+        Some(usage),
+    ));
+    events.push(message_stop_event());
+    events
+}
+
+/// A hand-built Anthropic Messages model, the shape the upstream auth-token
+/// and conformance suites construct.
+#[must_use]
+pub fn anthropic_model() -> Model {
+    Model {
+        id: "claude-test".to_owned(),
+        name: "Claude Test".to_owned(),
+        api: Api::from("anthropic-messages"),
+        provider: ProviderId::from("anthropic"),
+        base_url: "https://api.anthropic.com".to_owned(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec![pi_ai::types::Modality::Text],
+        cost: pi_ai::types::ModelCost::default(),
+        context_window: 100_000,
+        max_tokens: 4096,
+        sampling_params: None,
+        headers: None,
+        compat: None,
+    }
+}
+
+/// Resolve one generated catalog model, upstream's `getModel(provider, id)`.
+#[must_use]
+pub fn builtin_model(provider: &str, id: &str) -> Model {
+    pi_ai::providers::all::builtin_models_of(provider)
+        .into_iter()
+        .find(|model| model.id == id)
+        .expect("the catalog carries the model a suite names")
+}
+
+/// A user message with a plain-string content and a fixed timestamp.
+#[must_use]
+pub fn user_message_at(text: &str, timestamp: i64) -> Message {
+    Message::User(UserMessage {
+        content: UserContent::Text(text.to_owned()),
+        timestamp,
+    })
+}
+
+/// A user message with the current wall clock, like upstream test contexts.
+#[must_use]
+pub fn user_message_now(text: &str) -> Message {
+    user_message_at(text, pi_ai::auth::resolve::now_ms())
+}
+
+/// An assistant message with the given thinking block, the replay fixtures
+/// the signature-compat suites build.
+#[must_use]
+pub fn thinking_assistant_message(
+    api: &str,
+    provider: &str,
+    model: &str,
+    thinking: &str,
+    signature: &str,
+) -> AssistantMessage {
+    assistant_message_with_content(
+        api,
+        provider,
+        model,
+        vec![AssistantBlock::Thinking(ThinkingContent {
+            thinking: thinking.to_owned(),
+            thinking_signature: Some(signature.to_owned()),
+            redacted: None,
+        })],
+    )
+}
+
+/// An assistant message carrying one tool call, the tool-use turn the
+/// migration suites replay.
+#[must_use]
+pub fn tool_call_assistant_message(
+    api: &str,
+    provider: &str,
+    model: &str,
+    tool_call: ToolCall,
+) -> AssistantMessage {
+    assistant_message_with_content(
+        api,
+        provider,
+        model,
+        vec![AssistantBlock::ToolCall(tool_call)],
+    )
+}
+
+/// The anthropic messages context the payload-capture suites send.
+#[must_use]
+pub fn anthropic_context() -> Context {
+    Context {
+        system_prompt: Some("System prompt.".to_owned()),
+        messages: vec![user_message_now("Hello")],
+        tools: None,
+    }
+}
+
+/// An assistant message with the given content, the history-turn fixture the
+/// request-conversion suites replay.
+#[must_use]
+pub fn assistant_message_with_content(
+    api: &str,
+    provider: &str,
+    model: &str,
+    content: Vec<AssistantBlock>,
+) -> AssistantMessage {
+    AssistantMessage {
+        content,
+        api: Api::from(api),
+        provider: ProviderId::from(provider),
+        model: model.to_owned(),
+        response_model: None,
+        response_id: None,
+        provider_thinking_level: None,
+        diagnostics: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Stop,
+        deferred: None,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 1,
+    }
+}
+
+/// A tool-result message with the given content, the history-turn fixture.
+#[must_use]
+pub fn tool_result_message(
+    tool_call_id: &str,
+    content: Vec<ToolResultBlock>,
+    added_tool_names: Option<Vec<String>>,
+) -> Message {
+    Message::ToolResult(ToolResultMessage {
+        tool_call_id: tool_call_id.to_owned(),
+        tool_name: "tool".to_owned(),
+        content,
+        details: None,
+        usage: None,
+        added_tool_names,
+        is_error: false,
+        timestamp: 1,
+    })
+}
+
+/// The first recorded request's decoded JSON body, the shape the
+/// request-shape suites assert on.
+#[must_use]
+pub fn recorded_body(mock: &MockHttpClient) -> serde_json::Value {
+    serde_json::from_slice(
+        mock.recorded()[0]
+            .body
+            .as_ref()
+            .expect("the mock request carries a body"),
+    )
+    .expect("the request body is JSON")
+}
+
+/// The value of the first recorded request's named header, case-insensitive.
+#[must_use]
+pub fn recorded_header(mock: &MockHttpClient, name: &str) -> Option<String> {
+    mock.recorded()[0]
+        .headers
+        .iter()
+        .find(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+/// Mount the seam mock the stream suites inject; the route answers
+/// anthropic message requests with the given SSE body.
+#[must_use]
+pub fn anthropic_mock(events: &[(&str, String)]) -> MockHttpClient {
+    let mock = MockHttpClient::new();
+    anthropic_mock_with(&mock, events);
+    mock
+}
+
+/// The (event, data) pairs `sse_response` takes from the string-data event
+/// fixtures the anthropic suites build.
+#[must_use]
+pub fn sse_pairs<'a>(events: &'a [(&'a str, String)]) -> Vec<(&'a str, &'a str)> {
+    events
+        .iter()
+        .map(|(event, data)| (*event, data.as_str()))
+        .collect()
+}
+
+/// Mount onto an existing mock, for suites that assert the recorded request.
+pub fn anthropic_mock_with(mock: &MockHttpClient, events: &[(&str, String)]) {
+    let pairs: Vec<(&str, &str)> = events
+        .iter()
+        .map(|(event, data)| (*event, data.as_str()))
+        .collect();
+    mock.on(|request| request.url.contains("/v1/messages"))
+        .respond(pi_ai::http::sse_response(200, &pairs));
+}
+
+/// The barest successful stream, for request-shape capture suites: auth
+/// resolution threads its headers through and the stream settles.
+#[must_use]
+pub fn minimal_anthropic_done() -> Vec<(&'static str, String)> {
+    vec![
+        message_start_event("msg_test", json!({ "input_tokens": 1, "output_tokens": 0 })),
+        message_delta_event(
+            json!({ "stop_reason": "end_turn" }),
+            Some(json!({ "input_tokens": 1, "output_tokens": 1 })),
+        ),
+        message_stop_event(),
+    ]
+}
+
+/// The `message_start` frame: the stream opens with the given response id
+/// and usage block.
+#[must_use]
+pub fn message_start_event(id: &str, usage: impl serde::Serialize) -> (&'static str, String) {
+    (
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": { "id": id, "usage": usage },
+        })
+        .to_string(),
+    )
+}
+
+/// The `message_start` frame that names the serving model, the shape the
+/// fallback-repricing suites stream.
+#[must_use]
+pub fn message_start_from_serving_model(
+    serving_model: &str,
+    id: &str,
+    usage: impl serde::Serialize,
+) -> (&'static str, String) {
+    (
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": { "id": id, "model": serving_model, "usage": usage },
+        })
+        .to_string(),
+    )
+}
+
+/// The `message_delta` frame: a stop-reason delta with an optional partial
+/// usage update.
+#[must_use]
+pub fn message_delta_event(
+    delta: impl serde::Serialize,
+    usage: Option<impl serde::Serialize>,
+) -> (&'static str, String) {
+    let mut body = json!({ "type": "message_delta", "delta": delta });
+    if let Some(usage) = usage {
+        body["usage"] = json!(usage);
+    }
+    ("message_delta", body.to_string())
+}
+
+/// The `message_stop` frame.
+#[must_use]
+pub fn message_stop_event() -> (&'static str, String) {
+    (
+        "message_stop",
+        json!({ "type": "message_stop" }).to_string(),
+    )
+}
+
+/// The `content_block_start` frame: the block opens at the given wire index.
+#[must_use]
+pub fn block_start_event(
+    index: u64,
+    content_block: impl serde::Serialize,
+) -> (&'static str, String) {
+    (
+        "content_block_start",
+        json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block,
+        })
+        .to_string(),
+    )
+}
+
+/// The `content_block_delta` frame: the delta lands at the given wire index.
+#[must_use]
+pub fn block_delta_event(index: u64, delta: impl serde::Serialize) -> (&'static str, String) {
+    (
+        "content_block_delta",
+        json!({ "type": "content_block_delta", "index": index, "delta": delta }).to_string(),
+    )
+}
+
+/// The `content_block_stop` frame: the block at the given wire index closes.
+#[must_use]
+pub fn block_stop_event(index: u64) -> (&'static str, String) {
+    (
+        "content_block_stop",
+        json!({ "type": "content_block_stop", "index": index }).to_string(),
+    )
+}
+
+/// The captured on-payload hook: records the payload an adapter is about to
+/// send and keeps it unchanged, upstream's throwing `PayloadCaptured` hook
+/// minus the throw — the empty mock fails the request instead.
+#[must_use]
+pub fn payload_capture() -> (OnPayload, CapturedPayload) {
+    let captured = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&captured);
+    (
+        OnPayload::new(move |payload, _model| {
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
+            Box::pin(async { None })
+        }),
+        captured,
+    )
+}
+
+/// Wait for the captured payload, the shape upstream's capture helpers
+/// assert on.
+#[must_use]
+pub fn captured_payload(captured: &CapturedPayload) -> serde_json::Value {
+    captured
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .expect("expected payload capture before request failure")
+}
+
+/// The payload slot a capture hook fills, shared between the hook and the
+/// asserting test.
+pub type CapturedPayload = Arc<Mutex<Option<serde_json::Value>>>;
+
+/// The wire options every mock-stream test injects: the mock as the
+/// transport and no credential resolution.
+#[must_use]
+pub fn mock_transport(mock: &MockHttpClient) -> TransportOptions {
+    TransportOptions {
+        http_client: Some(Arc::new(mock.clone())),
+        ..TransportOptions::default()
     }
 }
