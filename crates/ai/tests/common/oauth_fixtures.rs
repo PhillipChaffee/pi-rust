@@ -98,9 +98,11 @@ pub fn url_query_param(url: &str, name: &str) -> Option<String> {
 /// does, and return the probed value.
 ///
 /// # Panics
-/// Panics when `what` does not hold within five seconds of wall time.
+/// Panics when `what` does not hold within a minute of wall time. The window
+/// is generous because CI runs this under the instrumented coverage build,
+/// where loopback handshakes run far behind their local wall time.
 pub async fn wait_until<T>(condition: impl Fn() -> Option<T>, what: &str) -> T {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(value) = condition() {
             return value;
@@ -109,7 +111,7 @@ pub async fn wait_until<T>(condition: impl Fn() -> Option<T>, what: &str) -> T {
             std::time::Instant::now() < deadline,
             "timed out waiting for {what}"
         );
-        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
