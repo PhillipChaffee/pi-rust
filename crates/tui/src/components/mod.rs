@@ -18,6 +18,7 @@
 //!   `tokio_util::sync::CancellationToken` per the stack decision (map
 //!   ticket "Decide the Rust stack").
 
+pub mod alt_screen_flash;
 pub mod box_component;
 pub mod cancellable_loader;
 pub mod h_stack;
@@ -36,6 +37,7 @@ use std::sync::Arc;
 /// because the loader's animation thread invokes its color functions.
 pub type ColorFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+pub use alt_screen_flash::AltScreenFlashContainer;
 pub use box_component::Box;
 pub use cancellable_loader::CancellableLoader;
 pub use h_stack::HStack;

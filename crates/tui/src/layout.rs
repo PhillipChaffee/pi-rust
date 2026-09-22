@@ -725,7 +725,7 @@ fn paint_box(box_: &LayoutBox, screen: &mut [String], total_width: usize) {
                 }
                 break;
             }
-            if image_line.is_empty() {
+            if !image_line.is_empty() {
                 break;
             }
         }

@@ -4,8 +4,8 @@
 //! percentage positioning, maxHeight, absolute positioning, and stacked
 //! overlays, all through the TUI core's compositing.
 //!
-//! The suites run against the [`tui_support::TestRenderer`] stand-in until
-//! the renderer ticket (#45) lands `TuiMainScreen`; see the support module.
+//! The suites render through [`tui_support::new_test_tui`]'s `TuiMainScreen`;
+//! see the support module.
 
 #[path = "tui_support/mod.rs"]
 mod tui_support;
@@ -14,13 +14,13 @@ use std::rc::Rc;
 
 use pi_tui::tui::{OverlayAnchor, OverlayMargin, OverlayMarginSides, OverlayOptions, SizeValue};
 
-use tui_support::{EmptyContent, StaticOverlay, TestTerminal, render_and_flush};
+use tui_support::{EmptyContent, StaticOverlay, VirtualTerminal, render_and_flush};
 
 // === width overflow protection ===
 
 #[test]
 fn truncates_overlay_lines_that_exceed_declared_width() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     // Overlay declares width 20 but renders lines much wider.
     let overlay = StaticOverlay::new(vec![&"X".repeat(100)]);
@@ -47,7 +47,7 @@ fn truncates_overlay_lines_that_exceed_declared_width() {
 
 #[test]
 fn handles_overlay_with_complex_ansi_sequences_without_crashing() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     // Simulate complex ANSI content like the crash log showed.
     let complex_line =
@@ -84,7 +84,7 @@ fn handles_overlay_composited_on_styled_base_content() {
         fn invalidate(&self) {}
     }
 
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
 
     let overlay = StaticOverlay::new(vec!["OVERLAY"]);
@@ -112,7 +112,7 @@ fn handles_overlay_composited_on_styled_base_content() {
 
 #[test]
 fn handles_wide_characters_at_overlay_boundary() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     // Wide chars (each takes 2 columns) at the edge of declared width.
     let wide_char_line = "中文日本語한글テスト漢字"; // Mix of CJK chars
@@ -137,7 +137,7 @@ fn handles_wide_characters_at_overlay_boundary() {
 
 #[test]
 fn handles_overlay_positioned_at_terminal_edge() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     // Overlay positioned at right edge with content that exceeds declared width.
     let overlay = StaticOverlay::new(vec![&"X".repeat(50)]);
@@ -176,7 +176,7 @@ fn handles_overlay_on_base_content_with_osc_sequences() {
         fn invalidate(&self) {}
     }
 
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
 
     let overlay = StaticOverlay::new(vec!["OVERLAY-TEXT"]);
@@ -203,7 +203,7 @@ fn handles_overlay_on_base_content_with_osc_sequences() {
 
 #[test]
 fn renders_overlay_at_percentage_of_terminal_width() {
-    let terminal = TestTerminal::new(100, 24);
+    let terminal = VirtualTerminal::new(100, 24);
     let tui = tui_support::new_test_tui(terminal);
     let overlay = StaticOverlay::new(vec!["test"]);
 
@@ -224,7 +224,7 @@ fn renders_overlay_at_percentage_of_terminal_width() {
 
 #[test]
 fn respects_min_width_when_width_percent_results_in_smaller_width() {
-    let terminal = TestTerminal::new(100, 24);
+    let terminal = VirtualTerminal::new(100, 24);
     let tui = tui_support::new_test_tui(terminal);
     let overlay = StaticOverlay::new(vec!["test"]);
 
@@ -248,7 +248,7 @@ fn respects_min_width_when_width_percent_results_in_smaller_width() {
 
 #[test]
 fn positions_overlay_at_top_left() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["TOP-LEFT"]);
 
@@ -277,7 +277,7 @@ fn positions_overlay_at_top_left() {
 
 #[test]
 fn positions_overlay_at_bottom_right() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["BTM-RIGHT"]);
 
@@ -309,7 +309,7 @@ fn positions_overlay_at_bottom_right() {
 
 #[test]
 fn positions_overlay_at_top_center() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["CENTERED"]);
 
@@ -347,7 +347,7 @@ fn positions_overlay_at_top_center() {
 
 #[test]
 fn clamps_negative_margins_to_zero() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["NEG-MARGIN"]);
 
@@ -384,7 +384,7 @@ fn clamps_negative_margins_to_zero() {
 
 #[test]
 fn respects_margin_as_number() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["MARGIN"]);
 
@@ -426,7 +426,7 @@ fn respects_margin_as_number() {
 
 #[test]
 fn respects_margin_object() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["MARGIN"]);
 
@@ -465,7 +465,7 @@ fn respects_margin_object() {
 
 #[test]
 fn applies_offset_x_and_offset_y_from_anchor_position() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["OFFSET"]);
 
@@ -500,7 +500,7 @@ fn applies_offset_x_and_offset_y_from_anchor_position() {
 
 #[test]
 fn positions_with_row_percent_and_col_percent() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["PCT"]);
 
@@ -534,7 +534,7 @@ fn positions_with_row_percent_and_col_percent() {
 
 #[test]
 fn row_percent_zero_positions_at_top() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["TOP"]);
 
@@ -561,7 +561,7 @@ fn row_percent_zero_positions_at_top() {
 
 #[test]
 fn row_percent_hundred_positions_at_bottom() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["BOTTOM"]);
 
@@ -590,7 +590,7 @@ fn row_percent_hundred_positions_at_bottom() {
 
 #[test]
 fn truncates_overlay_to_max_height() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["Line 1", "Line 2", "Line 3", "Line 4", "Line 5"]);
 
@@ -617,7 +617,7 @@ fn truncates_overlay_to_max_height() {
 
 #[test]
 fn truncates_overlay_to_max_height_percent() {
-    let terminal = TestTerminal::new(80, 10);
+    let terminal = VirtualTerminal::new(80, 10);
     let tui = tui_support::new_test_tui(terminal.clone());
     // 10 lines in a 10 row terminal with 50% maxHeight should show 5 lines.
     let overlay = StaticOverlay::new(vec![
@@ -647,7 +647,7 @@ fn truncates_overlay_to_max_height_percent() {
 
 #[test]
 fn row_and_col_override_anchor() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
     let overlay = StaticOverlay::new(vec!["ABSOLUTE"]);
 
@@ -685,7 +685,7 @@ fn row_and_col_override_anchor() {
 
 #[test]
 fn renders_multiple_overlays_with_later_ones_on_top() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
 
     tui.add_child(Rc::new(EmptyContent));
@@ -729,7 +729,7 @@ fn renders_multiple_overlays_with_later_ones_on_top() {
 
 #[test]
 fn handles_overlays_at_different_positions_without_interference() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
 
     tui.add_child(Rc::new(EmptyContent));
@@ -780,7 +780,7 @@ fn handles_overlays_at_different_positions_without_interference() {
 
 #[test]
 fn properly_hides_overlays_in_stack_order() {
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
 
     tui.add_child(Rc::new(EmptyContent));

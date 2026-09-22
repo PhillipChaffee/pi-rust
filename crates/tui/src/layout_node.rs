@@ -25,7 +25,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::components::ColorFn;
-use crate::components::scroll_view::ScrollViewScrollbar;
+use crate::components::scroll_view::{ScrollViewScrollToOptions, ScrollViewScrollbar};
 use crate::tui::{Component, RenderRequest};
 
 /// How a stack member participates in sizing, upstream `basis?: number |
@@ -194,6 +194,38 @@ pub trait ScrollLayoutState {
 
     /// The thumb glyph style, upstream `scrollbarThumbStyle`.
     fn scrollbar_thumb_style(&self) -> ColorFn;
+
+    // === Scroll mutations, upstream `ScrollView`'s scroll surface ===
+    //
+    // The alternate-screen renderer drives scroll views through the same
+    // `Arc` handle the engine issues (its selection points, scrollbar drags,
+    // and wheel routing carry the handle), so the scroll mutations ride the
+    // trait rather than the concrete component.
+
+    /// Scroll by lines, returning the unused delta, upstream
+    /// `ScrollView.scrollBy`.
+    fn scroll_by(&self, lines: i64) -> i64;
+
+    /// Scroll to an absolute offset, upstream `ScrollView.scrollTo`.
+    fn scroll_to(&self, scroll_top: usize, options: ScrollViewScrollToOptions);
+
+    /// Upstream `ScrollView.scrollToStart`.
+    fn scroll_to_start(&self);
+
+    /// Upstream `ScrollView.scrollToEnd`.
+    fn scroll_to_end(&self);
+
+    /// Whether the content bottom is pinned by policy, upstream
+    /// `ScrollView.followEnd`.
+    fn follow_end(&self) -> bool;
+
+    /// Whether the content bottom is currently pinned, upstream
+    /// `ScrollView.isFollowingEnd`.
+    fn is_following_end(&self) -> bool;
+
+    /// Toggle the interactive scrollbar state, upstream
+    /// `ScrollView.setScrollbarActive`.
+    fn set_scrollbar_active(&self, active: bool);
 }
 
 /// The scroll view's identity handle in a [`crate::layout::LayoutBox`].

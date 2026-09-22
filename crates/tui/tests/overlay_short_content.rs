@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use pi_tui::tui::Component;
 
-use tui_support::{TestTerminal, wait_for_render};
+use tui_support::{VirtualTerminal, wait_for_render};
 
 /// The suite's `SimpleContent`.
 struct SimpleContent {
@@ -43,7 +43,7 @@ impl Component for SimpleOverlay {
 #[test]
 fn renders_overlay_when_content_is_shorter_than_terminal_height() {
     // Terminal has 24 rows, but content only has 3 lines.
-    let terminal = TestTerminal::new(80, 24);
+    let terminal = VirtualTerminal::new(80, 24);
     let tui = tui_support::new_test_tui(terminal.clone());
 
     // Only 3 lines of content.

@@ -990,6 +990,7 @@ dependencies = [
 name = "pi-tui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "crossterm",
  "emojis",
  "libc",

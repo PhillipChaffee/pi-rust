@@ -333,6 +333,16 @@ pub trait Component: Any {
     fn layout_node(&self) -> Option<crate::layout_node::LayoutNode> {
         None
     }
+
+    /// Whether mouse dispatch through this component is the stock container
+    /// walk the layout hit path already covers — upstream compared
+    /// `handleMouse === Container.prototype.handleMouse` on layout
+    /// participants. The alternate-screen renderer skips those boxes:
+    /// dispatching through them would re-dispatch into children the boxes
+    /// already reach with different local coordinates.
+    fn is_stock_mouse_container(&self) -> bool {
+        false
+    }
 }
 
 /// Interface for components that can receive focus and display a hardware
@@ -731,8 +741,10 @@ pub trait TuiRenderer: std::fmt::Debug {
     /// Hook after the terminal starts, upstream `afterTerminalStart`.
     fn after_terminal_start(&self) {}
 
-    /// Hook before the terminal stops, upstream `beforeTerminalStop`.
-    fn before_terminal_stop(&self, _options: &TuiStopOptions) {}
+    /// Hook before the terminal stops, upstream `beforeTerminalStop`. The
+    /// base is passed so the hook can write through the terminal, upstream's
+    /// `this.terminal.write` inside the subclass body.
+    fn before_terminal_stop(&self, _tui: &Tui, _options: &TuiStopOptions) {}
 
     /// Hook after the terminal stops, upstream `afterTerminalStop`.
     fn after_terminal_stop(&self, _options: &TuiStopOptions) {}
@@ -754,6 +766,13 @@ pub trait TuiRenderer: std::fmt::Debug {
     /// `ViewportTUI.setLayoutRoot`. A no-op for renderers without the
     /// capability.
     fn set_layout_root(&self, _tui: &Tui, _component: Option<Rc<dyn Component>>) {}
+
+    /// Hand the renderer its finished base, once, after construction.
+    /// Upstream's `TuiBase` subclass constructors ran after the base
+    /// constructor and closed over `this`; [`Tui::new`] moves the renderer
+    /// in before the `Rc` exists, so it calls this after construction
+    /// instead. The default ignores it.
+    fn attach_base(&self, _tui: &Rc<Tui>) {}
 }
 
 /// Whether a TUI carries the `ViewportTUI` capability, upstream
@@ -933,6 +952,10 @@ impl Component for Container {
         lines
     }
 
+    fn is_stock_mouse_container(&self) -> bool {
+        true
+    }
+
     fn handle_mouse(&self, event: &TuiMouseEvent) -> Option<TuiMouseEventResult> {
         if event.y >= event.height {
             return None;
@@ -1102,7 +1125,7 @@ impl Tui {
         let key_parser = config
             .key_parser
             .unwrap_or_else(|| Arc::new(Mutex::new(KeyParser::new())));
-        Rc::new_cyclic(|weak| Self {
+        let tui = Rc::new_cyclic(|weak| Self {
             self_weak: weak.clone(),
             terminal: RefCell::new(terminal),
             renderer: RefCell::new(renderer),
@@ -1133,7 +1156,17 @@ impl Tui {
             images_probe: config.images_probe.unwrap_or_else(|| Box::new(|| false)),
             clock: config.clock.unwrap_or_else(|| Box::new(Instant::now)),
             pending_input: RefCell::new(VecDeque::new()),
-        })
+        });
+        tui.renderer.borrow().attach_base(&tui);
+        tui
+    }
+
+    /// The key parsing context this TUI matches keys through, upstream's
+    /// module-global parser state `matchesKey` consulted. The alternate-screen
+    /// renderer's keybinding checks share the session parser.
+    #[must_use]
+    pub fn key_parser(&self) -> Arc<Mutex<KeyParser>> {
+        Arc::clone(&self.key_parser)
     }
 
     /// Install the callback for the debug key (Shift+Ctrl+D), called before
@@ -1905,7 +1938,7 @@ impl Tui {
         if self.scheme_notifications_enabled.get() {
             self.terminal.borrow_mut().write("\x1b[?2031l");
         }
-        self.renderer.borrow().before_terminal_stop(&options);
+        self.renderer.borrow().before_terminal_stop(self, &options);
         self.terminal.borrow_mut().show_cursor();
         self.terminal.borrow_mut().stop();
         self.renderer.borrow().after_terminal_stop(&options);
