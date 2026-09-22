@@ -27,11 +27,25 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20  # bounds a hung network gate; GitHub's default is 360
+    env:
+      # sccache fronts rustc for the build-heavy steps below so repeated runs
+      # stop rebuilding the instrumented 57K-line tree from scratch. GitHub
+      # Actions is its cache backend; incremental compilation is disabled
+      # because it fights the wrapper (sccache guidance).
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
       # rustup reads rust-toolchain.toml (channel, components incl.
       # llvm-tools-preview) on the first cargo call; no toolchain step needed.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+      # The compiler cache the env vars above point at; backed by the
+      # GITHUB_ACTIONS cache service, so a warm cache rides the runner for
+      # free and only changed crates recompile.
+      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba  # v0.0.11
+        with:
+          version: "v0.18.0"
       # cargo-llvm-cov is not preinstalled on the runner and a fresh repo has
       # no rust-cache entry for it; pinned download with embedded digest, the
       # same trust-anchor model as the hygiene installs below.
@@ -42,6 +56,18 @@ jobs:
           echo "bc2122fd7bd9b6d3eb371690ed085f82e5a8bf1851f4645ef521d12ed04b2616  /tmp/llvmcov.tar.gz" | sha256sum --check --status
           mkdir /tmp/llvmcovx && tar xz -C /tmp/llvmcovx -f /tmp/llvmcov.tar.gz
           sudo mv /tmp/llvmcovx/cargo-llvm-cov /usr/local/bin/
+      # cargo-nextest drives the coverage gate's test run: nextest runs the
+      # suite as one process per test, which parallelizes across the runner
+      # far better than the stock libtest harness. Pinned download with
+      # embedded digest, the same trust-anchor model as the cargo-llvm-cov
+      # install above.
+      - name: Install pinned cargo-nextest
+        run: |
+          NEXTEST_VERSION=0.9.146
+          curl --connect-timeout 10 --max-time 300 -sSfL "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${NEXTEST_VERSION}/cargo-nextest-${NEXTEST_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o /tmp/nextest.tar.gz
+          echo "b64617e8640624e8f9ba99819e37d7971154e97836d7ae4774fed4715501a6aa  /tmp/nextest.tar.gz" | sha256sum --check --status
+          mkdir /tmp/nextestx && tar xz -C /tmp/nextestx -f /tmp/nextest.tar.gz
+          sudo mv /tmp/nextestx/cargo-nextest /usr/local/bin/
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
@@ -50,7 +76,7 @@ jobs:
       # upload below can still run on a gate failure (measured: exit 1 with
       # lcov.info on disk).
       - name: Coverage gate (lines, regions, functions — 95 each)
-        run: cargo llvm-cov --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.

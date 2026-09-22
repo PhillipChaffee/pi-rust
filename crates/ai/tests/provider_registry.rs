@@ -302,19 +302,16 @@ fn copilot_filter_models_narrows_to_the_credential_allowlist() {
     assert_eq!(narrowed[0].id, "gpt-6-astra");
 }
 
-/// The not-ported wire-API stubs settle their streams with the notice, on
-/// every wire-API seam constructor.
+/// The wire-API seam constructors: the not-ported stubs settle their streams
+/// with the notice, and the ported wire APIs fail with the real setup error
+/// (the missing key) instead.
 #[tokio::test]
 async fn the_not_ported_wire_api_stubs_report_their_notice() {
     for streams in [
-        api::openai_responses(),
-        api::openai_completions(),
-        api::azure_openai_responses(),
         api::google_generative_ai(),
         api::google_vertex(),
         api::bedrock_converse_stream(),
         api::mistral_conversations(),
-        api::openai_codex_responses(),
         api::pi_messages(),
     ] {
         let model = fixture_model();
@@ -322,6 +319,20 @@ async fn the_not_ported_wire_api_stubs_report_their_notice() {
         let message = stream.result().await;
         let text = message.error_message.unwrap_or_default();
         assert!(text.contains("has not been ported yet"), "got: {text}");
+    }
+
+    for streams in [
+        api::openai_responses(),
+        api::openai_completions(),
+        api::azure_openai_responses(),
+        api::openai_codex_responses(),
+    ] {
+        let model = fixture_model();
+        let stream = streams.stream(&model, &fake_context(), None);
+        let message = stream.result().await;
+        let text = message.error_message.unwrap_or_default();
+        assert!(text.contains("No API key for provider"), "got: {text}");
+        assert!(!text.contains("has not been ported yet"), "got: {text}");
     }
 }
 

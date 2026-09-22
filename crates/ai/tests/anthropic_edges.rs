@@ -42,6 +42,16 @@ fn keyed_options(mock: &MockHttpClient) -> AnthropicStreamOptions {
     common::keyed_anthropic_options(mock)
 }
 
+/// The keyed stream result a mock-backed case settles, the per-case setup
+/// the edges suites repeat: the catalog model against the settled context.
+async fn keyed_stream_result(mock: &MockHttpClient) -> pi_ai::types::AssistantMessage {
+    let model = common::anthropic_model();
+    let options = keyed_options(mock);
+    stream_anthropic(&model, &done_context(), Some(&options))
+        .result()
+        .await
+}
+
 /// Capture the request payload through the on-payload hook while the mock
 /// answers the request, so payload and settled message assert together.
 async fn capture_params(
@@ -208,12 +218,7 @@ async fn sdk_error_messages_cover_raw_and_missing_bodies() {
                 || MockResponse::status(status),
                 |body| MockResponse::status(status).with_body(body),
             ));
-        let model = common::anthropic_model();
-        let options = keyed_options(&mock);
-
-        let result = stream_anthropic(&model, &done_context(), Some(&options))
-            .result()
-            .await;
+        let result = keyed_stream_result(&mock).await;
 
         assert_eq!(result.stop_reason, StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some(expected));
@@ -229,12 +234,7 @@ async fn sdk_error_messages_cover_raw_and_missing_bodies() {
 #[tokio::test]
 async fn sse_error_events_fail_the_stream_with_their_data() {
     let mock = anthropic_mock(&[("error", "boom".to_owned())]);
-    let model = common::anthropic_model();
-    let options = keyed_options(&mock);
-
-    let result = stream_anthropic(&model, &done_context(), Some(&options))
-        .result()
-        .await;
+    let result = keyed_stream_result(&mock).await;
 
     assert_eq!(result.stop_reason, StopReason::Error);
     assert_eq!(result.error_message.as_deref(), Some("boom"));
@@ -275,12 +275,7 @@ async fn unnamed_sse_events_are_skipped() {
                 .with_header("content-type", "text/event-stream")
                 .with_body(body),
         );
-    let model = common::anthropic_model();
-    let options = keyed_options(&mock);
-
-    let result = stream_anthropic(&model, &done_context(), Some(&options))
-        .result()
-        .await;
+    let result = keyed_stream_result(&mock).await;
 
     assert_eq!(result.stop_reason, StopReason::Stop);
     assert_eq!(result.error_message, None);
@@ -294,12 +289,7 @@ async fn typed_deser_failures_carry_the_parse_message() {
         "content_block_start",
         json!({ "type": "content_block_start", "index": 0 }).to_string(),
     )]);
-    let model = common::anthropic_model();
-    let options = keyed_options(&mock);
-
-    let result = stream_anthropic(&model, &done_context(), Some(&options))
-        .result()
-        .await;
+    let result = keyed_stream_result(&mock).await;
 
     assert_eq!(result.stop_reason, StopReason::Error);
     let message = result.error_message.expect("the parse error");
@@ -324,12 +314,7 @@ async fn streams_ending_before_message_stop_fail() {
         })
         .to_string(),
     )]);
-    let model = common::anthropic_model();
-    let options = keyed_options(&mock);
-
-    let result = stream_anthropic(&model, &done_context(), Some(&options))
-        .result()
-        .await;
+    let result = keyed_stream_result(&mock).await;
 
     assert_eq!(result.stop_reason, StopReason::Error);
     assert_eq!(
@@ -388,12 +373,7 @@ async fn reasoning_tokens_ride_the_usage_breakdown() {
         ),
         common::message_stop_event(),
     ]);
-    let model = common::anthropic_model();
-    let options = keyed_options(&mock);
-
-    let result = stream_anthropic(&model, &done_context(), Some(&options))
-        .result()
-        .await;
+    let result = keyed_stream_result(&mock).await;
 
     assert_eq!(result.stop_reason, StopReason::Stop);
     assert_eq!(result.usage.reasoning, Some(7));

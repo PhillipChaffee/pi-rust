@@ -1919,6 +1919,14 @@ pub struct ModelCompat {
     /// `cache_control.ttl: "1h"`). Default: true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// vLLM scheduler priority sent as the top-level `priority` request field
+    /// (openai-completions), serialized as `vllmPriority`: lower values are
+    /// handled earlier; the server default is 0. Only meaningful when vLLM
+    /// runs with `--scheduling-policy priority`; useful for keeping
+    /// background/batch work from stalling interactive sessions. Off by
+    /// default; not set on the generated catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_priority: Option<serde_json::Number>,
     /// Whether the model supports message-anchored `additional_tools` input
     /// items (OpenAI Responses). Default: false.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -13,10 +13,19 @@ use std::sync::Arc;
 
 use crate::types::ProviderStreams;
 
+pub mod adapter_belt;
 pub mod anthropic_messages;
+pub mod azure_openai_responses;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
 pub mod lazy;
+pub mod openai_codex_responses;
+pub mod openai_completions;
+pub mod openai_prompt_cache;
+pub mod openai_responses;
+pub mod openai_responses_shared;
+pub mod openrouter_images;
+pub mod request_seam;
 pub mod simple_options;
 pub mod transform_messages;
 
@@ -96,20 +105,20 @@ pub fn anthropic_messages() -> Arc<dyn ProviderStreams> {
 /// The OpenAI Responses wire API, upstream's `openAIResponsesApi()`.
 #[must_use]
 pub fn openai_responses() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("openai-responses")
+    Arc::new(openai_responses::OpenAiResponsesStreams)
 }
 
 /// The Azure OpenAI Responses wire API, upstream's
 /// `azureOpenAIResponsesApi()`.
 #[must_use]
 pub fn azure_openai_responses() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("azure-openai-responses")
+    Arc::new(azure_openai_responses::AzureOpenAiResponsesStreams)
 }
 
 /// The OpenAI Completions wire API, upstream's `openAICompletionsApi()`.
 #[must_use]
 pub fn openai_completions() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("openai-completions")
+    Arc::new(openai_completions::OpenAiCompletionsStreams)
 }
 
 /// The Google Generative AI wire API, upstream's `googleGenerativeAIApi()`.
@@ -141,7 +150,7 @@ pub fn mistral_conversations() -> Arc<dyn ProviderStreams> {
 /// `openAICodexResponsesApi()`.
 #[must_use]
 pub fn openai_codex_responses() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("openai-codex-responses")
+    Arc::new(openai_codex_responses::OpenAiCodexResponsesStreams)
 }
 
 /// The pi-messages wire API, upstream's `piMessagesApi()`.
@@ -189,4 +198,11 @@ impl crate::types::ProviderImages for NotPortedImages {
             ))
         })
     }
+}
+
+/// The OpenRouter image-generation wire API, upstream's registered
+/// `openrouter-images` images provider.
+#[must_use]
+pub fn openrouter_images() -> Arc<dyn crate::types::ProviderImages> {
+    Arc::new(openrouter_images::OpenRouterImages)
 }

@@ -887,10 +887,12 @@ async fn reqwest_rejects_invalid_headers_and_methods_with_transport_errors() {
     assert!(matches!(error, HttpError::Transport(message) if message.contains("invalid method")));
 }
 
-// The stalled body cannot run under the paused clock: tokio auto-advances
-// pending timers whenever every task blocks, firing the request timeout
-// before the loopback writes its headers. Real time bounds this test at the
-// one-second timeout.
+// The stalled body cannot pause from the start: tokio auto-advances pending
+// timers whenever every task blocks, firing the request timeout before the
+// loopback writes its headers. The handshake therefore runs on the real
+// clock and the clock pauses once the body begins, so the stalled read
+// advances straight to the same one-second deadline instead of wall-clock
+// waiting for it.
 #[tokio::test]
 async fn reqwest_total_timeout_covers_a_stalled_body() {
     // Headers arrive, the body stalls: the total request timeout surfaces on
@@ -917,6 +919,7 @@ async fn reqwest_total_timeout_covers_a_stalled_body() {
     let first = body.next_chunk().await.expect("body begins");
     assert!(first.is_some());
 
+    tokio::time::pause();
     let result = body.next_chunk().await.expect_err("stalled body times out");
     assert_eq!(result, HttpError::Timeout);
 }

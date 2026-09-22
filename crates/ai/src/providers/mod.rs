@@ -19,6 +19,7 @@ pub mod cloudflare_auth;
 pub mod cloudflare_stream;
 pub mod cloudflare_workers_ai;
 pub mod deepseek;
+pub mod factory;
 pub mod fireworks;
 pub mod github_copilot;
 pub mod google;

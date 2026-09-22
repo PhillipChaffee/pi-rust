@@ -100,28 +100,37 @@ const fn source_label(has_credential: bool) -> &'static str {
     }
 }
 
+/// The api key + account id prompts both Cloudflare logins repeat, the
+/// shared prompt sequence upstream's builders inline.
+async fn prompt_key_and_account(
+    interaction: &ProviderAuthInteraction,
+) -> Result<(String, String), AuthError> {
+    let key = (interaction.prompt)(AuthPrompt {
+        signal: Some(interaction.signal.clone()),
+        kind: AuthPromptKind::Secret {
+            message: "Enter Cloudflare API key".to_owned(),
+            placeholder: None,
+        },
+    })
+    .await?;
+    let account_id = (interaction.prompt)(AuthPrompt {
+        signal: Some(interaction.signal.clone()),
+        kind: AuthPromptKind::Text {
+            message: "Enter Cloudflare account ID".to_owned(),
+            placeholder: None,
+        },
+    })
+    .await?;
+    Ok((key, account_id))
+}
+
 /// The Workers AI auth, upstream's `cloudflareWorkersAIAuth`.
 #[must_use]
 pub fn cloudflare_workers_ai_auth() -> ApiKeyAuth {
     let login: crate::auth::types::ApiKeyLoginFn = Arc::new(
         |interaction: ProviderAuthInteraction| -> BoxedFuture<'static, Result<ApiKeyCredential, AuthError>> {
             Box::pin(async move {
-                let key = (interaction.prompt)(AuthPrompt {
-                    signal: Some(interaction.signal.clone()),
-                    kind: AuthPromptKind::Secret {
-                        message: "Enter Cloudflare API key".to_owned(),
-                        placeholder: None,
-                    },
-                })
-                .await?;
-                let account_id = (interaction.prompt)(AuthPrompt {
-                    signal: Some(interaction.signal.clone()),
-                    kind: AuthPromptKind::Text {
-                        message: "Enter Cloudflare account ID".to_owned(),
-                        placeholder: None,
-                    },
-                })
-                .await?;
+                let (key, account_id) = prompt_key_and_account(&interaction).await?;
                 Ok(ApiKeyCredential {
                     key: Some(key),
                     env: Some([("CLOUDFLARE_ACCOUNT_ID".to_owned(), account_id)].into()),
@@ -171,22 +180,7 @@ pub fn cloudflare_ai_gateway_auth() -> ApiKeyAuth {
     let login: crate::auth::types::ApiKeyLoginFn = Arc::new(
         |interaction: ProviderAuthInteraction| -> BoxedFuture<'static, Result<ApiKeyCredential, AuthError>> {
             Box::pin(async move {
-                let key = (interaction.prompt)(AuthPrompt {
-                    signal: Some(interaction.signal.clone()),
-                    kind: AuthPromptKind::Secret {
-                        message: "Enter Cloudflare API key".to_owned(),
-                        placeholder: None,
-                    },
-                })
-                .await?;
-                let account_id = (interaction.prompt)(AuthPrompt {
-                    signal: Some(interaction.signal.clone()),
-                    kind: AuthPromptKind::Text {
-                        message: "Enter Cloudflare account ID".to_owned(),
-                        placeholder: None,
-                    },
-                })
-                .await?;
+                let (key, account_id) = prompt_key_and_account(&interaction).await?;
                 let gateway_id = (interaction.prompt)(AuthPrompt {
                     signal: Some(interaction.signal.clone()),
                     kind: AuthPromptKind::Text {

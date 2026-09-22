@@ -146,6 +146,68 @@ fn state_of(view: &ServiceView, member: &str) -> pi_chord::handle::StateMemberVi
     view.state(member).expect("the member is state")
 }
 
+/// Provide the revision-1 selected state for the models service, the
+/// fixture the subscription and disposal suites replay.
+fn provide_revision_one(provider: &RemoteServiceProvider, models: &Service) {
+    provider
+        .provide(
+            models,
+            implementation_with_state_and_noop_select(replicated_state(jo(vec![
+                ("selected", JsonValue::Null),
+                ("revision", number(1)),
+            ]))),
+        )
+        .unwrap_or_else(|e| panic!("provide: {e}"));
+}
+
+/// The provided-models fixture the singleton suites drive: a revision-1
+/// selected state published, bound, used, and readied, returning the live
+/// pieces the cases assert through.
+async fn provided_models_with_revision_one() -> (
+    Service,
+    RemoteServiceProvider,
+    pi_chord::consumer::RemoteServiceBinding,
+    ServiceView,
+    pi_chord::handle::StateMemberView,
+) {
+    let models = define_service("test.models").unwrap_or_else(|e| panic!("define: {e}"));
+    let provider = provider_for(&[&models]);
+    provider
+        .provide(
+            &models,
+            implementation_with_state_and_noop_select(replicated_state(jo(vec![
+                ("selected", JsonValue::Null),
+                ("revision", number(1)),
+            ]))),
+        )
+        .unwrap_or_else(|e| panic!("provide: {e}"));
+    let binding = binding_for(vec![models.clone()], &provider, None);
+    let models_view = binding
+        .use_service(&models)
+        .unwrap_or_else(|e| panic!("use: {e}"));
+    let state = state_of(&models_view, "state");
+    binding
+        .ready(background_context())
+        .await
+        .unwrap_or_else(|e| panic!("ready: {e}"));
+    (models, provider, binding, models_view, state)
+}
+
+/// Dispose the binding and its provider, the teardown the singleton suites
+/// run through the unwrap-and-panic seam.
+async fn dispose_binding_then_provider(
+    binding: &pi_chord::consumer::RemoteServiceBinding,
+    provider: &RemoteServiceProvider,
+) {
+    binding
+        .dispose(background_context())
+        .await
+        .unwrap_or_else(|e| panic!("dispose: {e}"));
+    provider
+        .dispose()
+        .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+}
+
 #[test]
 fn marks_services_remotable_by_default_and_reserves_chord_service_ids() {
     let models = define_service("test.models").unwrap_or_else(|e| panic!("define: {e}"));
@@ -356,13 +418,7 @@ fn passes_method_arguments_and_results_through_the_loopback_unchanged() {
         assert_eq!(response, Some(jo(vec![("value", js("response"))])));
         assert_eq!(*received.borrow(), Some(request));
 
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -724,13 +780,7 @@ fn publishes_compact_tracked_operations_through_the_remote_provider() {
         (raw.close)(None)
             .await
             .unwrap_or_else(|e| panic!("close: {e}"));
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -738,26 +788,8 @@ fn publishes_compact_tracked_operations_through_the_remote_provider() {
 fn keeps_singleton_facades_stable_when_their_provider_is_replaced() {
     let rt = runtime();
     rt.block_on(async {
-        let models = define_service("test.models").unwrap_or_else(|e| panic!("define: {e}"));
-        let provider = provider_for(&[&models]);
-        provider
-            .provide(
-                &models,
-                implementation_with_state_and_noop_select(replicated_state(jo(vec![
-                    ("selected", JsonValue::Null),
-                    ("revision", number(1)),
-                ]))),
-            )
-            .unwrap_or_else(|e| panic!("provide: {e}"));
-        let binding = binding_for(vec![models.clone()], &provider, None);
-        let models_view = binding
-            .use_service(&models)
-            .unwrap_or_else(|e| panic!("use: {e}"));
-        let state = state_of(&models_view, "state");
-        binding
-            .ready(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("ready: {e}"));
+        let (models, provider, binding, models_view, state) =
+            provided_models_with_revision_one().await;
         assert_eq!(
             revision_of(
                 &state
@@ -828,13 +860,7 @@ fn keeps_singleton_facades_stable_when_their_provider_is_replaced() {
             2
         );
 
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -908,15 +934,7 @@ fn delivers_active_subscriber_updates_before_reporting_listener_failures() {
     rt.block_on(async {
         let models = define_service("test.models").unwrap_or_else(|e| panic!("define: {e}"));
         let provider = provider_for(&[&models]);
-        provider
-            .provide(
-                &models,
-                implementation_with_state_and_noop_select(replicated_state(jo(vec![
-                    ("selected", JsonValue::Null),
-                    ("revision", number(1)),
-                ]))),
-            )
-            .unwrap_or_else(|e| panic!("provide: {e}"));
+        provide_revision_one(&provider, &models);
         let delivered = Rc::new(std::cell::Cell::new(0u32));
         let failing = provider
             .subscribe(
@@ -1021,26 +1039,8 @@ fn replays_every_buffered_update_before_reporting_listener_failures() {
 fn clears_retained_facades_when_providers_and_bindings_are_disposed() {
     let rt = runtime();
     rt.block_on(async {
-        let models = define_service("test.models").unwrap_or_else(|e| panic!("define: {e}"));
-        let provider = provider_for(&[&models]);
-        provider
-            .provide(
-                &models,
-                implementation_with_state_and_noop_select(replicated_state(jo(vec![
-                    ("selected", JsonValue::Null),
-                    ("revision", number(1)),
-                ]))),
-            )
-            .unwrap_or_else(|e| panic!("provide: {e}"));
-        let binding = binding_for(vec![models.clone()], &provider, None);
-        let models_view = binding
-            .use_service(&models)
-            .unwrap_or_else(|e| panic!("use: {e}"));
-        let state = state_of(&models_view, "state");
-        binding
-            .ready(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("ready: {e}"));
+        let (_models, provider, binding, models_view, state) =
+            provided_models_with_revision_one().await;
         assert_eq!(
             revision_of(
                 &state
@@ -1092,15 +1092,7 @@ fn applies_provider_disposal_buffered_while_subscriptions_are_starting() {
             },
         ])
         .unwrap_or_else(|e| panic!("provider: {e}"));
-        provider
-            .provide(
-                &models,
-                implementation_with_state_and_noop_select(replicated_state(jo(vec![
-                    ("selected", JsonValue::Null),
-                    ("revision", number(1)),
-                ]))),
-            )
-            .unwrap_or_else(|e| panic!("provide: {e}"));
+        provide_revision_one(&provider, &models);
         let spawned = provider
             .spawn(
                 &dialogs,
@@ -1242,13 +1234,7 @@ fn keeps_deferred_service_handles_inaccessible_until_host_activation() {
             0
         );
 
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -1388,13 +1374,7 @@ fn buffers_state_updates_that_race_subscription_hydration() {
             ),
             1
         );
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -1683,13 +1663,7 @@ fn hydrates_cold_replicated_state_replicas_and_replaces_them_across_rebinds() {
         );
         assert_eq!(*revisions.borrow(), vec![1, 2, 3]);
 
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -1866,13 +1840,7 @@ fn hydrates_keyed_state_before_observe_handlers_and_fences_reused_keys() {
                 .abort_signal()
                 .is_some_and(|signal| signal.aborted())
         );
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -2445,6 +2413,43 @@ fn method_member(name: &str) -> ServiceMemberSnapshot {
     }
 }
 
+/// The hooked binding whose ready handshake fails, the per-case setup the
+/// install-failure suites pin: bind, use, and take the rejection.
+async fn hooked_failed_binding(
+    services: Vec<Service>,
+    transport: Rc<dyn RemoteServiceTransport>,
+    on_error: pi_chord::handle::ErrorReporter,
+) -> (pi_chord::consumer::RemoteServiceBinding, ChordError) {
+    let binding = hook_binding(services.clone(), transport, Some(on_error));
+    let _view = binding
+        .use_service(&services[0])
+        .unwrap_or_else(|e| panic!("use: {e}"));
+    let error = binding
+        .ready(background_context())
+        .await
+        .expect_err("the ready handshake rejects");
+    (binding, error)
+}
+
+/// The hooked binding driven to readiness, the per-case setup the
+/// replacement-break suites repeat: bind the services over the hooked
+/// transport, use the first facade, and settle the ready handshake.
+async fn hooked_ready_binding(
+    services: Vec<Service>,
+    transport: Rc<dyn RemoteServiceTransport>,
+    on_error: pi_chord::handle::ErrorReporter,
+) -> pi_chord::consumer::RemoteServiceBinding {
+    let binding = hook_binding(services.clone(), transport, Some(on_error));
+    let _view = binding
+        .use_service(&services[0])
+        .unwrap_or_else(|e| panic!("use: {e}"));
+    binding
+        .ready(background_context())
+        .await
+        .unwrap_or_else(|e| panic!("ready: {e}"));
+    binding
+}
+
 fn hook_binding(
     services: Vec<Service>,
     transport: Rc<dyn RemoteServiceTransport>,
@@ -2481,14 +2486,8 @@ fn bindings_fence_singleton_snapshot_contracts_at_install() {
             on_resolve: Rc::new(RefCell::new(None)),
             delay: 0,
         });
-        let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
-        let _view = binding
-            .use_service(&models)
-            .unwrap_or_else(|e| panic!("use: {e}"));
-        let error = binding
-            .ready(background_context())
-            .await
-            .expect_err("the wrong-address snapshot rejects");
+        let (binding, error) =
+            hooked_failed_binding(vec![models.clone()], transport, on_error).await;
         assert!(error_message(&error).contains("wrong address"));
         assert!(
             errors
@@ -2519,14 +2518,8 @@ fn bindings_fence_singleton_snapshot_contracts_at_install() {
                 on_resolve: Rc::new(RefCell::new(None)),
                 delay: 0,
             });
-            let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
-            let _view = binding
-                .use_service(&models)
-                .unwrap_or_else(|e| panic!("use: {e}"));
-            let error = binding
-                .ready(background_context())
-                .await
-                .expect_err("the member-shape break rejects");
+            let (binding, error) =
+                hooked_failed_binding(vec![models.clone()], transport, on_error).await;
             assert!(error_message(&error).contains("invalid member descriptions"));
             assert_eq!(errors.borrow().len(), 1);
             binding
@@ -2567,14 +2560,7 @@ fn singleton_listeners_report_and_swallow_update_contract_breaks() {
             on_resolve: Rc::new(RefCell::new(None)),
             delay: 0,
         });
-        let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
-        let _view = binding
-            .use_service(&models)
-            .unwrap_or_else(|e| panic!("use: {e}"));
-        binding
-            .ready(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("ready: {e}"));
+        let binding = hooked_ready_binding(vec![models.clone()], transport, on_error).await;
         assert!(
             errors.borrow().iter().any(|error| error
                 .to_string()
@@ -2622,14 +2608,7 @@ fn singleton_listeners_report_and_swallow_update_contract_breaks() {
                 on_resolve: Rc::new(RefCell::new(None)),
                 delay: 0,
             });
-            let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
-            let _view = binding
-                .use_service(&models)
-                .unwrap_or_else(|e| panic!("use: {e}"));
-            binding
-                .ready(background_context())
-                .await
-                .unwrap_or_else(|e| panic!("ready: {e}"));
+            let binding = hooked_ready_binding(vec![models.clone()], transport, on_error).await;
             assert!(
                 errors
                     .borrow()
@@ -2666,14 +2645,7 @@ fn singleton_listeners_report_and_swallow_update_contract_breaks() {
                 on_resolve: Rc::new(RefCell::new(None)),
                 delay: 0,
             });
-            let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
-            let _view = binding
-                .use_service(&models)
-                .unwrap_or_else(|e| panic!("use: {e}"));
-            binding
-                .ready(background_context())
-                .await
-                .unwrap_or_else(|e| panic!("ready: {e}"));
+            let binding = hooked_ready_binding(vec![models.clone()], transport, on_error).await;
             assert!(
                 errors
                     .borrow()
@@ -2709,14 +2681,7 @@ fn singleton_listeners_report_and_swallow_update_contract_breaks() {
             on_resolve: Rc::new(RefCell::new(None)),
             delay: 0,
         });
-        let binding = hook_binding(vec![models.clone()], transport, Some(on_error));
-        let _view = binding
-            .use_service(&models)
-            .unwrap_or_else(|e| panic!("use: {e}"));
-        binding
-            .ready(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("ready: {e}"));
+        let binding = hooked_ready_binding(vec![models.clone()], transport, on_error).await;
         binding
             .rebind(false, background_context())
             .await
@@ -2896,13 +2861,7 @@ fn readiness_and_disposal_settle_through_slow_subscribe_boundaries() {
             .ready(background_context())
             .await
             .unwrap_or_else(|e| panic!("ready: {e}"));
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 
@@ -3623,13 +3582,7 @@ fn remote_views_reject_value_reads_and_delegate_through_view_targets() {
             });
         let error = error.expect_err("a remote facade member is not a value");
         assert!(error_message(&error).contains("Remote service members are not values"));
-        binding
-            .dispose(background_context())
-            .await
-            .unwrap_or_else(|e| panic!("dispose: {e}"));
-        provider
-            .dispose()
-            .unwrap_or_else(|e| panic!("provider dispose: {e}"));
+        dispose_binding_then_provider(&binding, &provider).await;
     });
 }
 

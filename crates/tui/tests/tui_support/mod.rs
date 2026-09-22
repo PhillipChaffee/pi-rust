@@ -514,6 +514,28 @@ pub fn new_test_tui(terminal: TestTerminal) -> Rc<Tui> {
     })
 }
 
+/// The focused-editor fixture the non-capturing overlay suites drive, the
+/// setup block upstream's tests repeat: a fresh 80x24 terminal whose
+/// `EDITOR` overlay holds focus.
+#[must_use]
+pub fn focused_editor() -> (Rc<Tui>, Rc<FocusableOverlay>) {
+    let tui = new_test_tui(TestTerminal::new(80, 24));
+    let editor = FocusableOverlay::new(&["EDITOR"]);
+    tui.add_child(Rc::new(EmptyContent));
+    tui.set_focus(Some(editor.clone()));
+    tui.start();
+    (tui, editor)
+}
+
+/// The `nonCapturing: true` overlay options the non-capturing suites show.
+#[must_use]
+pub fn non_capturing_options() -> pi_tui::tui::OverlayOptions {
+    pi_tui::tui::OverlayOptions {
+        non_capturing: true,
+        ..pi_tui::tui::OverlayOptions::default()
+    }
+}
+
 /// Build the TUI with the image-capable probe injected, restating the
 /// cell-size suite's `withImageTerminal` env setup.
 #[must_use]

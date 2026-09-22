@@ -9,31 +9,57 @@
 #[path = "tui_support/mod.rs"]
 mod tui_support;
 
+/// Wire `from` to focus `to` on the given keystroke, the routing the
+/// input-flow cases set up.
+fn on_input_focus_to(
+    from: &FocusableOverlay,
+    tui: &Rc<pi_tui::tui::Tui>,
+    key: &str,
+    to: Rc<FocusableOverlay>,
+) {
+    let tui_ref = Rc::clone(tui);
+    let key = key.to_owned();
+    let to: Rc<dyn pi_tui::tui::Component> = to;
+    from.set_on_input(move |data| {
+        if data == key {
+            tui_ref.set_focus(Some(Rc::clone(&to)));
+        }
+    });
+}
+
+/// The non-capturing static overlay pinned to the origin cell, the shape the
+/// focus-order cases stack, upstream's `showOverlay` corner fixture.
+fn show_corner_overlay(tui: &Rc<pi_tui::tui::Tui>, label: &str) -> OverlayHandle {
+    tui.show_overlay(
+        StaticOverlay::new(vec![label]),
+        Some(OverlayOptions {
+            row: Some(SizeValue::Cells(0)),
+            col: Some(SizeValue::Cells(0)),
+            width: Some(SizeValue::Cells(1)),
+            non_capturing: true,
+            ..OverlayOptions::default()
+        }),
+    )
+}
+
 use std::cell::Cell;
 use std::rc::Rc;
 
 use pi_tui::tui::{Container, OverlayOptions, OverlayUnfocusOptions, SizeValue};
 
-use tui_support::{EmptyContent, FocusableOverlay, StaticOverlay, TestTerminal, render_and_flush};
+use pi_tui::tui::OverlayHandle;
+use tui_support::{
+    EmptyContent, FocusableOverlay, StaticOverlay, TestTerminal, focused_editor,
+    non_capturing_options, render_and_flush,
+};
 
 // === focus management ===
 
 #[test]
 fn non_capturing_overlay_preserves_focus_on_creation() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay.clone(), Some(non_capturing_options()));
     let _ = &handle;
     render_and_flush(&tui);
     assert!(tui_support::is_focused(&editor));
@@ -43,20 +69,9 @@ fn non_capturing_overlay_preserves_focus_on_creation() {
 
 #[test]
 fn focus_transfers_focus_to_the_overlay() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay.clone(), Some(non_capturing_options()));
     handle.focus();
     render_and_flush(&tui);
     assert!(!tui_support::is_focused(&editor));
@@ -67,20 +82,9 @@ fn focus_transfers_focus_to_the_overlay() {
 
 #[test]
 fn unfocus_restores_previous_focus() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay.clone(), Some(non_capturing_options()));
     handle.focus();
     handle.unfocus(None);
     render_and_flush(&tui);
@@ -92,20 +96,9 @@ fn unfocus_restores_previous_focus() {
 
 #[test]
 fn set_hidden_false_on_non_capturing_overlay_does_not_auto_focus() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay.clone(), Some(non_capturing_options()));
     handle.set_hidden(true);
     handle.set_hidden(false);
     render_and_flush(&tui);
@@ -116,20 +109,9 @@ fn set_hidden_false_on_non_capturing_overlay_does_not_auto_focus() {
 
 #[test]
 fn hide_when_overlay_is_not_focused_does_not_change_focus() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay, Some(non_capturing_options()));
     handle.hide();
     render_and_flush(&tui);
     assert!(tui_support::is_focused(&editor));
@@ -138,20 +120,9 @@ fn hide_when_overlay_is_not_focused_does_not_change_focus() {
 
 #[test]
 fn hide_when_focused_restores_focus_correctly() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay.clone(), Some(non_capturing_options()));
     handle.focus();
     handle.hide();
     render_and_flush(&tui);
@@ -162,21 +133,10 @@ fn hide_when_focused_restores_focus_correctly() {
 
 #[test]
 fn capturing_overlay_removed_with_non_capturing_below_restores_focus_to_editor() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let non_capturing = FocusableOverlay::new(&["NC"]);
     let capturing = FocusableOverlay::new(&["CAP"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let _ = tui.show_overlay(
-        non_capturing.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(non_capturing.clone(), Some(non_capturing_options()));
     let handle = tui.show_overlay(capturing.clone(), None);
     assert!(tui_support::is_focused(&capturing));
     handle.hide();
@@ -196,13 +156,7 @@ fn sub_overlay_cleanup_then_hide_overlay_restores_focus_and_input_to_editor() {
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor.clone()));
     tui.start();
-    let timer_handle = tui.show_overlay(
-        timer.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let timer_handle = tui.show_overlay(timer.clone(), Some(non_capturing_options()));
     let _ = tui.show_overlay(controller.clone(), None);
     assert!(tui_support::is_focused(&controller));
     assert!(!tui_support::is_focused(&editor));
@@ -230,13 +184,7 @@ fn removed_focused_child_overlay_does_not_become_parent_overlay_fallback() {
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor.clone()));
     tui.start();
-    let child_handle = tui.show_overlay(
-        child.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let child_handle = tui.show_overlay(child.clone(), Some(non_capturing_options()));
     child_handle.focus();
     let parent_handle = tui.show_overlay(parent.clone(), None);
     assert!(tui_support::is_focused(&parent));
@@ -265,13 +213,7 @@ fn microtask_deferred_sub_overlay_pattern_restores_focus() {
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor.clone()));
     tui.start();
-    let timer_handle = tui.show_overlay(
-        timer.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let timer_handle = tui.show_overlay(timer.clone(), Some(non_capturing_options()));
     // `.then()` runs as a follow-up task — the port's follow-up turn is the
     // next pump.
     let _ = tui.show_overlay(controller.clone(), None);
@@ -316,13 +258,7 @@ fn handle_input_redirection_skips_non_capturing_overlays_when_focused_overlay_be
     tui.set_focus(Some(editor));
     tui.start();
     let _ = tui.show_overlay(fallback_capturing.clone(), None);
-    let _ = tui.show_overlay(
-        non_capturing.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(non_capturing.clone(), Some(non_capturing_options()));
     let visible_check = visible.clone();
     let _ = tui.show_overlay(
         primary.clone(),
@@ -349,24 +285,8 @@ fn active_base_focus_replacement_receives_close_input_before_overlay_restore() {
     let editor = FocusableOverlay::new(&["EDITOR"]);
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    {
-        let tui_ref = tui.clone();
-        let replacement_ref = replacement.clone();
-        overlay.set_on_input(move |data| {
-            if data == "b" {
-                tui_ref.set_focus(Some(replacement_ref.clone()));
-            }
-        });
-    }
-    {
-        let tui_ref = tui.clone();
-        let editor_ref = editor.clone();
-        replacement.set_on_input(move |data| {
-            if data == "\r" {
-                tui_ref.set_focus(Some(editor_ref.clone()));
-            }
-        });
-    }
+    on_input_focus_to(&overlay, &tui, "b", Rc::clone(&replacement));
+    on_input_focus_to(&replacement, &tui, "\r", Rc::clone(&editor));
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor));
     tui.start();
@@ -396,35 +316,13 @@ fn active_replacement_still_receives_input_when_it_is_another_overlay_pre_focus(
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
     let passive = FocusableOverlay::new(&["PASSIVE"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    {
-        let tui_ref = tui.clone();
-        let replacement_ref = replacement.clone();
-        overlay.set_on_input(move |data| {
-            if data == "b" {
-                tui_ref.set_focus(Some(replacement_ref.clone()));
-            }
-        });
-    }
-    {
-        let tui_ref = tui.clone();
-        let editor_ref = editor.clone();
-        replacement.set_on_input(move |data| {
-            if data == "\r" {
-                tui_ref.set_focus(Some(editor_ref.clone()));
-            }
-        });
-    }
+    on_input_focus_to(&overlay, &tui, "b", Rc::clone(&replacement));
+    on_input_focus_to(&replacement, &tui, "\r", Rc::clone(&editor));
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor.clone()));
     tui.start();
     tui.set_focus(Some(replacement.clone()));
-    let _ = tui.show_overlay(
-        passive,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(passive, Some(non_capturing_options()));
     tui.set_focus(Some(editor));
     let _ = tui.show_overlay(overlay.clone(), None);
     terminal.send_input("b");
@@ -516,15 +414,7 @@ fn removed_replacement_restores_overlay_even_when_overlay_pre_focus_differs_from
     let palette = FocusableOverlay::new(&["PALETTE"]);
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    {
-        let tui_ref = tui.clone();
-        let replacement_ref = replacement.clone();
-        overlay.set_on_input(move |data| {
-            if data == "b" {
-                tui_ref.set_focus(Some(replacement_ref.clone()));
-            }
-        });
-    }
+    on_input_focus_to(&overlay, &tui, "b", Rc::clone(&replacement));
     {
         let tui_ref = tui.clone();
         let base_ref = base.clone();
@@ -565,15 +455,7 @@ fn unfocus_target_releases_a_blocked_overlay_while_replacement_remains_focused()
     let target = FocusableOverlay::new(&["TARGET"]);
     let replacement = FocusableOverlay::new(&["REPLACEMENT"]);
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    {
-        let tui_ref = tui.clone();
-        let fallback_ref = fallback.clone();
-        replacement.set_on_input(move |data| {
-            if data == "\r" {
-                tui_ref.set_focus(Some(fallback_ref.clone()));
-            }
-        });
-    }
+    on_input_focus_to(&replacement, &tui, "\r", Rc::clone(&fallback));
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
     let overlay_handle = tui.show_overlay(overlay.clone(), None);
@@ -639,13 +521,7 @@ fn handle_input_restores_focus_to_explicitly_focused_raw_sub_overlay_after_base_
     tui.set_focus(Some(editor.clone()));
     tui.start();
     let _ = tui.show_overlay(controller.clone(), None);
-    let sub_handle = tui.show_overlay(
-        sub_overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let sub_handle = tui.show_overlay(sub_overlay.clone(), Some(non_capturing_options()));
     sub_handle.focus();
     tui.set_focus(Some(editor.clone()));
     terminal.send_input("x");
@@ -665,13 +541,7 @@ fn passive_non_capturing_overlay_does_not_regain_input_after_base_focus() {
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor.clone()));
     tui.start();
-    let _ = tui.show_overlay(
-        passive.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(passive.clone(), Some(non_capturing_options()));
     terminal.send_input("x");
     render_and_flush(&tui);
     assert_eq!(editor.inputs(), vec!["x".to_string()]);
@@ -689,13 +559,7 @@ fn explicitly_focused_non_capturing_overlay_regains_input_after_base_focus_steal
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor.clone()));
     tui.start();
-    let handle = tui.show_overlay(
-        overlay.clone(),
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay.clone(), Some(non_capturing_options()));
     handle.focus();
     tui.set_focus(Some(editor.clone()));
     terminal.send_input("x");
@@ -754,15 +618,7 @@ fn blocked_replacement_set_focus_null_resumes_the_visible_overlay() {
             }
         });
     }
-    {
-        let tui_ref = tui.clone();
-        let replacement_ref = replacement.clone();
-        overlay.set_on_input(move |data| {
-            if data == "b" {
-                tui_ref.set_focus(Some(replacement_ref.clone()));
-            }
-        });
-    }
+    on_input_focus_to(&overlay, &tui, "b", Rc::clone(&replacement));
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
     let _ = tui.show_overlay(overlay.clone(), None);
@@ -845,13 +701,7 @@ fn cyclic_overlay_pre_focus_ancestry_does_not_hang_focus_changes() {
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(overlay.clone()));
     tui.start();
-    let handle = tui.show_overlay(
-        overlay,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay, Some(non_capturing_options()));
     handle.focus();
     tui.set_focus(Some(editor.clone()));
     terminal.send_input("x");
@@ -894,13 +744,7 @@ fn hide_overlay_does_not_reassign_focus_when_topmost_overlay_is_non_capturing() 
     tui.set_focus(Some(editor));
     tui.start();
     let _ = tui.show_overlay(capturing.clone(), None);
-    let _ = tui.show_overlay(
-        non_capturing,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(non_capturing, Some(non_capturing_options()));
     assert!(tui_support::is_focused(&capturing));
     tui.hide_overlay();
     render_and_flush(&tui);
@@ -921,21 +765,9 @@ fn multiple_capturing_and_non_capturing_overlays_restore_focus_through_removals(
     tui.set_focus(Some(editor.clone()));
     tui.start();
     let c1_handle = tui.show_overlay(c1.clone(), None);
-    let _ = tui.show_overlay(
-        n1,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(n1, Some(non_capturing_options()));
     let c2_handle = tui.show_overlay(c2.clone(), None);
-    let _ = tui.show_overlay(
-        n2,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = tui.show_overlay(n2, Some(non_capturing_options()));
     assert!(tui_support::is_focused(&c2));
     c2_handle.hide();
     render_and_flush(&tui);
@@ -948,13 +780,8 @@ fn multiple_capturing_and_non_capturing_overlays_restore_focus_through_removals(
 
 #[test]
 fn capturing_overlay_unfocus_on_topmost_capturing_overlay_falls_back_to_pre_focus() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let capturing = FocusableOverlay::new(&["CAP"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
     let handle = tui.show_overlay(capturing.clone(), None);
     assert!(tui_support::is_focused(&capturing));
     handle.unfocus(None);
@@ -968,20 +795,9 @@ fn capturing_overlay_unfocus_on_topmost_capturing_overlay_falls_back_to_pre_focu
 
 #[test]
 fn focus_on_hidden_overlay_is_a_no_op() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay, Some(non_capturing_options()));
     handle.set_hidden(true);
     handle.focus();
     render_and_flush(&tui);
@@ -992,20 +808,9 @@ fn focus_on_hidden_overlay_is_a_no_op() {
 
 #[test]
 fn focus_after_hide_is_a_no_op() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay, Some(non_capturing_options()));
     handle.hide();
     handle.focus();
     render_and_flush(&tui);
@@ -1016,20 +821,9 @@ fn focus_after_hide_is_a_no_op() {
 
 #[test]
 fn unfocus_when_overlay_does_not_have_focus_is_a_no_op() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let overlay = FocusableOverlay::new(&["OVERLAY"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let handle = tui.show_overlay(
-        overlay,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let handle = tui.show_overlay(overlay, Some(non_capturing_options()));
     handle.unfocus(None);
     render_and_flush(&tui);
     assert!(tui_support::is_focused(&editor));
@@ -1059,28 +853,11 @@ fn unfocus_with_null_pre_focus_clears_focus_and_does_not_route_input_back_to_ove
 
 #[test]
 fn toggle_focus_between_non_capturing_overlays_then_unfocus_returns_to_editor() {
-    let terminal = TestTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal);
-    let editor = FocusableOverlay::new(&["EDITOR"]);
+    let (tui, editor) = focused_editor();
     let a = FocusableOverlay::new(&["A"]);
     let b = FocusableOverlay::new(&["B"]);
-    tui.add_child(Rc::new(EmptyContent));
-    tui.set_focus(Some(editor.clone()));
-    tui.start();
-    let a_handle = tui.show_overlay(
-        a,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
-    let b_handle = tui.show_overlay(
-        b,
-        Some(OverlayOptions {
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let a_handle = tui.show_overlay(a, Some(non_capturing_options()));
+    let b_handle = tui.show_overlay(b, Some(non_capturing_options()));
     a_handle.focus();
     b_handle.focus();
     a_handle.focus();
@@ -1189,37 +966,10 @@ fn focus_on_already_focused_overlay_bumps_visual_order() {
     tui.add_child(Rc::new(EmptyContent));
     tui.set_focus(Some(editor));
     tui.start();
-    let a_handle = tui.show_overlay(
-        StaticOverlay::new(vec!["A"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["B"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let a_handle = show_corner_overlay(&tui, "A");
+    let _ = show_corner_overlay(&tui, "B");
     a_handle.focus();
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["C"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = show_corner_overlay(&tui, "C");
     render_and_flush(&tui);
     assert_eq!(
         terminal
@@ -1247,26 +997,8 @@ fn default_rendering_order_for_overlapping_overlays_follows_creation_order() {
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["A"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["B"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = show_corner_overlay(&tui, "A");
+    let _ = show_corner_overlay(&tui, "B");
     render_and_flush(&tui);
     assert_eq!(
         terminal
@@ -1294,16 +1026,7 @@ fn focus_on_lower_overlay_renders_it_on_top() {
             ..OverlayOptions::default()
         }),
     );
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["B"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = show_corner_overlay(&tui, "B");
     render_and_flush(&tui);
     assert_eq!(
         terminal
@@ -1330,16 +1053,7 @@ fn focusing_middle_overlay_places_it_on_top_while_preserving_others_relative_ord
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["A"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = show_corner_overlay(&tui, "A");
     let middle = tui.show_overlay(
         StaticOverlay::new(vec!["B"]),
         Some(OverlayOptions {
@@ -1404,16 +1118,7 @@ fn capturing_overlay_hidden_and_shown_again_renders_on_top_after_unhide() {
     let tui = tui_support::new_test_tui(terminal.clone());
     tui.add_child(Rc::new(EmptyContent));
     tui.start();
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["A"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = show_corner_overlay(&tui, "A");
     let capturing = tui.show_overlay(
         StaticOverlay::new(vec!["B"]),
         Some(OverlayOptions {
@@ -1432,16 +1137,7 @@ fn capturing_overlay_hidden_and_shown_again_renders_on_top_after_unhide() {
         'B'
     );
     capturing.set_hidden(true);
-    let _ = tui.show_overlay(
-        StaticOverlay::new(vec!["C"]),
-        Some(OverlayOptions {
-            row: Some(SizeValue::Cells(0)),
-            col: Some(SizeValue::Cells(0)),
-            width: Some(SizeValue::Cells(1)),
-            non_capturing: true,
-            ..OverlayOptions::default()
-        }),
-    );
+    let _ = show_corner_overlay(&tui, "C");
     render_and_flush(&tui);
     assert_eq!(
         terminal
