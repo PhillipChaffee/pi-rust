@@ -27,6 +27,7 @@ pub mod editor_component;
 pub mod h_stack;
 pub mod input;
 pub mod loader;
+pub mod markdown;
 pub mod mouse_region;
 pub mod scroll_view;
 pub mod spacer;
@@ -51,6 +52,7 @@ pub use editor_component::EditorComponent;
 pub use h_stack::HStack;
 pub use input::{Input, InputOptions, InputStyleFn};
 pub use loader::{Loader, LoaderIndicatorOptions};
+pub use markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 pub use mouse_region::MouseRegion;
 pub use scroll_view::{
     FollowMode, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollViewScrollbar,
