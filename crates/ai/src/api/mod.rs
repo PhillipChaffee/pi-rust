@@ -21,6 +21,7 @@ pub mod google_shared;
 pub mod google_vertex;
 pub mod lazy;
 pub mod mistral_conversations;
+pub mod pi_messages;
 pub mod simple_options;
 pub mod transform_messages;
 
@@ -151,7 +152,7 @@ pub fn openai_codex_responses() -> Arc<dyn ProviderStreams> {
 /// The pi-messages wire API, upstream's `piMessagesApi()`.
 #[must_use]
 pub fn pi_messages() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("pi-messages")
+    Arc::new(pi_messages::PiMessagesStreams)
 }
 
 /// An API implementation map keyed by wire-API id, upstream's

@@ -312,7 +312,6 @@ async fn the_not_ported_wire_api_stubs_report_their_notice() {
         api::azure_openai_responses(),
         api::bedrock_converse_stream(),
         api::openai_codex_responses(),
-        api::pi_messages(),
     ] {
         let model = fixture_model();
         let stream = streams.stream(&model, &fake_context(), None);
