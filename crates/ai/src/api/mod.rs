@@ -14,6 +14,8 @@ use std::sync::Arc;
 use crate::types::ProviderStreams;
 
 pub mod anthropic_messages;
+pub mod bedrock_converse_stream;
+pub mod bedrock_options;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
 pub mod google_generative_ai;

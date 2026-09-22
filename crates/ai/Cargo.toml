@@ -69,6 +69,24 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 # RS256 JWT signing and the token exchange to google-auth-library inside
 # @google/genai, and this port signs the JWT itself (#32).
 jsonwebtoken = "10"
+# aws-sdk-bedrockruntime + aws-config + aws-smithy-http-client: the Bedrock
+# Converse Stream port rides the official Rust SDK the way upstream rides
+# @aws-sdk/client-bedrock-runtime — SigV4 signing, the eventstream framing,
+# the credential chain, and the SDK retries stay SDK-owned (#32).
+# aws-smithy-http-client carries the proxy connector the custom node HTTP
+# handler stood in for.
+aws-sdk-bedrockruntime = "1.145"
+aws-config = { version = "1.8", default-features = false, features = [
+  "behavior-version-latest",
+  "rustls",
+  "rt-tokio",
+  "sso",
+  "credentials-process",
+] }
+aws-smithy-http-client = { version = "1.4", default-features = false, features = ["rustls-ring", "test-util"] }
+# base64: the Bedrock redacted-reasoning payload round-trips through
+# thinkingSignature, upstream's bytesToBase64/base64ToBytes helpers.
+base64 = "0.22"
 
 [dev-dependencies]
 # test-util: the paused clock the provider-retry tests drive, the fake-timer
