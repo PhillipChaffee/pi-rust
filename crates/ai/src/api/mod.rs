@@ -3,18 +3,22 @@
 //!
 //! Porting restatement: upstream's per-API modules under `src/api/` export
 //! `ProviderStreams` implementations and are loaded lazily by the provider
-//! factories. The wire-API implementations land with their own tickets
-//! (Anthropic Messages, OpenAI family, Google/Mistral/Bedrock/pi-messages,
-//! images); until then each constructor returns the
-//! [`not_ported_streams`] stub whose streams fail on
-//! dispatch with the same shape upstream's missing-API dispatch produces.
+//! factories. The wire-API implementations land with their own tickets;
+//! until then each constructor returns the [`not_ported_streams`] stub whose
+//! streams fail on dispatch with the same shape upstream's missing-API
+//! dispatch produces.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::types::ProviderStreams;
 
+pub mod anthropic_messages;
+pub mod constrained_sampling;
+pub mod github_copilot_headers;
 pub mod lazy;
+pub mod simple_options;
+pub mod transform_messages;
 
 /// The stub failure an unported wire-API stream reports.
 #[derive(Debug)]
@@ -86,7 +90,7 @@ pub fn not_ported_streams(api: &str) -> Arc<dyn ProviderStreams> {
 /// The Anthropic Messages wire API, upstream's `anthropicMessagesApi()`.
 #[must_use]
 pub fn anthropic_messages() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("anthropic-messages")
+    Arc::new(anthropic_messages::AnthropicStreams)
 }
 
 /// The OpenAI Responses wire API, upstream's `openAIResponsesApi()`.

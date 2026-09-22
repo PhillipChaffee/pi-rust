@@ -1,0 +1,19 @@
+[package]
+name = "pi-protocol"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-neutral CBOR protocol for remote pi sessions: framing, codec, and envelope schemas, ported from @earendil-works/pi-protocol"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["cbor", "protocol", "rpc", "framing", "coding-agent"]
+categories = ["network-programming", "encoding"]
+
+[dependencies]
+# Upstream validates envelope payloads with chord's `isJsonValue`; the crate
+# DAG mirrors that import edge, and the opaque payload fields are owned
+# `JsonValue` trees.
+pi-chord = { path = "../chord" }
+
+[lints]
+workspace = true
