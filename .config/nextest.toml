@@ -3,8 +3,8 @@
 # losing login waits forever for its authorize URL. The group pins the
 # whole binary to one process at a time; every other test keeps the
 # default concurrency.
-[profile.default.groups]
-oauth-ports = { max-concurrency = 1 }
+[test-groups.oauth-ports]
+max-threads = 1
 
 [[profile.default.overrides]]
 filter = "binary(oauth_flows_manual)"
