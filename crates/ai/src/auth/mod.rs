@@ -5,9 +5,12 @@
 //! default environment/filesystem context), [`credential_store`] (the
 //! serialized store and its in-memory default), [`resolve`] (provider-scoped
 //! auth resolution with the double-checked OAuth refresh), [`helpers`]
-//! (shared builders), and [`oauth`] (the flow-loader seam whose flows land
-//! with the auth ticket).
+//! (shared builders), and [`oauth`] (the flow-loader seam and one flow per
+//! provider subscription login). [`clock`] is the epoch seam the flows read
+//! epoch milliseconds from — fake timers freeze upstream's `Date.now()`,
+//! and [`resolve`]'s own `now_ms()` serves the resolution path.
 
+pub mod clock;
 pub mod context;
 pub mod credential_store;
 pub mod helpers;
