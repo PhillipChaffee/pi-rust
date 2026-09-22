@@ -136,6 +136,10 @@ impl Component for HStack {
         self.core.handle_mouse(event)
     }
 
+    fn is_stock_mouse_container(&self) -> bool {
+        true
+    }
+
     fn invalidate(&self) {
         self.core.invalidate_children();
     }

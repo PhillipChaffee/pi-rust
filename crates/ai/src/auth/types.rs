@@ -84,6 +84,11 @@ pub enum Credential {
     /// A stored api key.
     ApiKey(ApiKeyCredential),
     /// A stored OAuth token set.
+    ///
+    /// The wire tag is `"oauth"` (upstream's stored `auth.json` discriminator);
+    /// serde's `snake_case` rule would spell the variant `o_auth` without the
+    /// explicit rename.
+    #[serde(rename = "oauth")]
     OAuth(OAuthCredentials),
 }
 
@@ -192,7 +197,9 @@ pub struct AuthCheck {
 pub enum AuthType {
     /// Api-key auth.
     ApiKey,
-    /// OAuth auth.
+    /// OAuth auth; the wire value is `"oauth"` (serde's `snake_case` rule
+    /// would spell the variant `o_auth` without the explicit rename).
+    #[serde(rename = "oauth")]
     OAuth,
 }
 

@@ -16,3 +16,7 @@ tru = "tru"
 Hel = "Hel"
 Relace = "Relace"
 relace = "relace"
+# Yanked kill-ring fixtures the editor and input suites pin verbatim from
+# the upstream tests (upstream's own FIRST/SECOND/SINGLE constants).
+SECON = "SECON"
+SINGL = "SINGL"

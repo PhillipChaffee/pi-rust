@@ -44,6 +44,19 @@ pub fn word_segments(text: &str) -> UWordBounds<'_> {
     text.split_word_bounds()
 }
 
+/// Whether a word-segmenter segment is word-like, upstream
+/// `Intl.Segmenter`'s `isWordLike`.
+///
+/// `unicode-segmentation` does not surface the classification per bound, so
+/// the query restates it as "contains an alphanumeric character" — letters
+/// (including CJK), digits, and marks, which is exactly the set
+/// `isWordLike` answers true for on the segments the selection and
+/// word-navigation consumers see.
+#[must_use]
+pub fn is_word_like(segment: &str) -> bool {
+    segment.chars().any(char::is_alphanumeric)
+}
+
 const WIDTH_CACHE_SIZE: usize = 512;
 
 struct WidthCache {
@@ -1102,7 +1115,7 @@ fn split_into_tokens_with_ansi(text: &str) -> Vec<String> {
     tokens
 }
 
-fn is_cjk_break_segment(segment: &str) -> bool {
+pub(crate) fn is_cjk_break_segment(segment: &str) -> bool {
     CJK_BREAK_RE.is_match(segment)
 }
 

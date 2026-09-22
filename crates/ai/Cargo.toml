@@ -21,15 +21,20 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 regex = "1.11"
 # tokio + tokio-util: the async substrate the stack decision pins —
 # cancellable sleeps, the CancellationToken port of AbortSignal, and the
-# oneshot waiters behind EventStream.
-tokio = { version = "1.47", default-features = false, features = ["sync", "time", "macros", "rt"] }
+# oneshot waiters behind EventStream. net + io-util: the OAuth callback
+# loopback servers listen on TCP and parse one request per connection.
+tokio = { version = "1.47", default-features = false, features = ["sync", "time", "macros", "rt", "net", "io-util"] }
 tokio-util = { version = "0.7", default-features = false }
 # url: WHATWG URL parsing for proxy resolution, matching node's URL.
 url = "2.5"
-# getrandom: crypto.getRandomValues for the uuidv7 tail.
+# getrandom: crypto.getRandomValues for the uuidv7 tail and the PKCE/OAuth
+# state randomness.
 getrandom = "0.3"
-# sha2: the model-data manifest hashes, matching node:crypto's sha256 hex.
+# sha2: the model-data manifest hashes (node:crypto sha256 hex) and the PKCE
+# S256 challenge over the verifier. base64: the base64url encodings the OAuth
+# flows trade (PKCE verifier/challenge, JWT payload decode).
 sha2 = "0.10"
+base64 = "0.22"
 # rustix: the kernel release for the pi user agent, through a safe API.
 rustix = { version = "1.1", default-features = false, features = ["std", "system"] }
 # http: the HttpClient seam substrate (reqwest 0.12 + rustls per the stack

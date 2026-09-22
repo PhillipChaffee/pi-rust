@@ -30,6 +30,7 @@ name = "pi-tui"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/tui/Cargo.toml"
 
+
 # aws-smithy-types 1.8.0 ships a license file osv-scanner cannot parse
 # (UNKNOWN); the crate is Apache-2.0 per the aws-sdk-rust repo. The override
 # comes off when the scanner learns the format or the release republishes
@@ -72,3 +73,14 @@ reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only ca
 [[IgnoredVulns]]
 id = "RUSTSEC-2023-0071"
 reason = "rsa 0.9 rides jsonwebtoken's rust_crypto signing backend; pi-ai only signs JWTs and never decrypts, so the Marvin-Attack oracle the advisory describes does not exist here; no fixed release exists"
+
+[[PackageOverrides]]
+name = "pi-protocol"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/protocol/Cargo.toml"
+
+[[PackageOverrides]]
+name = "pi-client"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/client/Cargo.toml"
+
