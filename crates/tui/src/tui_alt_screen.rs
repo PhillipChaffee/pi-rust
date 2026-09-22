@@ -76,10 +76,11 @@ use regex::Regex;
 
 use crate::alt_screen_search::{
     AltScreenSearchComponent, AltScreenSearchIndex, AltScreenSearchMatch, NavigationButtonStyleFn,
-    SearchStyleFn, get_alt_screen_search_match_key,
+    get_alt_screen_search_match_key,
 };
 use crate::components::{
-    AltScreenFlashContainer, FollowMode, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions,
+    AltScreenFlashContainer, FollowMode, InputStyleFn, ScrollView, ScrollViewOptions,
+    ScrollViewScrollToOptions,
 };
 use crate::keybindings::get_keybindings;
 use crate::keys::is_key_release;
@@ -348,10 +349,10 @@ pub struct TuiAltScreenConfig {
     pub mouse: Option<bool>,
     /// Style a non-current transcript search match, upstream
     /// `searchMatchStyle`.
-    pub search_match_style: Option<SearchStyleFn>,
+    pub search_match_style: Option<InputStyleFn>,
     /// Style the current transcript search match, upstream
     /// `searchCurrentMatchStyle`.
-    pub search_current_match_style: Option<SearchStyleFn>,
+    pub search_current_match_style: Option<InputStyleFn>,
     /// Style a transcript search navigation button, upstream
     /// `searchNavigationButtonStyle`.
     pub search_navigation_button_style: Option<NavigationButtonStyleFn>,
@@ -513,8 +514,8 @@ struct TuiAltScreenCore {
     last_component_click: RefCell<Option<ComponentClickTarget>>,
     wheel_scroll_lines: u32,
     mouse_enabled: bool,
-    search_match_style: SearchStyleFn,
-    search_current_match_style: SearchStyleFn,
+    search_match_style: InputStyleFn,
+    search_current_match_style: InputStyleFn,
     search_navigation_button_style: NavigationButtonStyleFn,
     scroll_to_end_indicator: Option<ScrollToEndIndicatorCallback>,
     open_url: Option<OpenUrlCallback>,

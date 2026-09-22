@@ -7,14 +7,6 @@
 //!
 //! Restatements against upstream:
 //!
-//! - Upstream `Input` (`components/input.ts`) is the editor slice's scope
-//!   ([#47](https://github.com/PhillipChaffee/pi-rust/issues/47)); the
-//!   search box consumes only the single-line editing core, so
-//!   the private `SearchInput` ports that surface — cancel/submit consume, printable
-//!   and Kitty-printable insert, backspace, grapheme-wise cursor moves, and
-//!   the full render including the horizontal-scroll window. Kill ring,
-//!   undo stack, word motions, paste buffering, and mouse placement are
-//!   #47's and stay out; #47's `Input` replaces this stand-in.
 //! - Upstream's module-global key parser behind `matchesKey` becomes a
 //!   local [`crate::keys::KeyParser`]: the input's binding checks are
 //!   stateless key-shape matches, and key releases never reach it (dispatch
@@ -27,18 +19,16 @@
 //!   crate with the `(?i)` flag; corpus offsets are byte offsets rather
 //!   than UTF-16 code units, which the span arithmetic carries end to end.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::components::input::{Input, InputOptions};
 use crate::keybindings::get_keybindings;
-use crate::keys::{KeyParser, decode_kitty_printable};
-use crate::tui::{CURSOR_MARKER, Component, Focusable};
-use crate::utils::{
-    grapheme_segments, slice_by_column, static_regex, truncate_to_width, visible_width,
-};
+use crate::tui::{Component, Focusable};
+use crate::utils::{grapheme_segments, static_regex, truncate_to_width, visible_width};
 
 static WHITESPACE_RUN: LazyLock<Regex> = LazyLock::new(|| static_regex(r"\s+"));
 static PRINTABLE_ASCII: LazyLock<Regex> = LazyLock::new(|| static_regex(r"^[\x20-\x7e]*$"));
@@ -336,248 +326,15 @@ pub fn get_alt_screen_search_match_key(match_: &AltScreenSearchMatch) -> String 
     }
 }
 
-/// The style callbacks the search overlay consumes, upstream `(text:
-/// string) => string`.
-pub type SearchStyleFn = Rc<dyn Fn(&str) -> String>;
-
 /// The navigation-button style, upstream `(text: string, hovered: boolean)
 /// => string`.
 pub type NavigationButtonStyleFn = Rc<dyn Fn(&str, bool) -> String>;
-
-/// The single-line input the search box embeds, upstream
-/// `components/input.ts`'s `Input`.
-///
-/// The full `Input` — kill ring, undo stack, word motions, paste buffering,
-/// and mouse placement — is the editor slice's scope ([#47](https://github.com/PhillipChaffee/pi-rust/issues/47));
-/// the search box consumes only the single-line editing surface, so this
-/// stand-in ports exactly that: cancel/submit consume, printable and
-/// Kitty-printable insert, backspace, grapheme-wise cursor movement, and
-/// the full render including the horizontal-scroll window. #47's `Input`
-/// replaces it.
-struct SearchInput {
-    value: RefCell<String>,
-    cursor: RefCell<usize>,
-    prompt: String,
-    placeholder: String,
-    placeholder_style: SearchStyleFn,
-    focused: Cell<bool>,
-    parser: RefCell<KeyParser>,
-}
-
-/// Construction options for [`SearchInput`], upstream `InputOptions`.
-struct SearchInputOptions {
-    prompt: Option<String>,
-    placeholder: Option<String>,
-    placeholder_style: Option<SearchStyleFn>,
-}
-
-impl SearchInput {
-    fn new(options: SearchInputOptions) -> Self {
-        Self {
-            value: RefCell::new(String::new()),
-            cursor: RefCell::new(0),
-            prompt: options.prompt.unwrap_or_else(|| "> ".to_string()),
-            placeholder: options.placeholder.unwrap_or_default(),
-            placeholder_style: options
-                .placeholder_style
-                .unwrap_or_else(|| Rc::new(ToString::to_string)),
-            focused: Cell::new(false),
-            parser: RefCell::new(KeyParser::new()),
-        }
-    }
-
-    fn get_value(&self) -> String {
-        self.value.borrow().clone()
-    }
-
-    fn handle_input(&self, data: &str) {
-        let matches = |action: &str| {
-            let parser = self.parser.borrow();
-            get_keybindings().matches(&parser, data, action)
-        };
-        if matches("tui.select.cancel") {
-            return;
-        }
-        if matches("tui.input.submit") || data == "\n" {
-            return;
-        }
-        if matches("tui.editor.deleteCharBackward") {
-            self.handle_backspace();
-            return;
-        }
-        if matches("tui.editor.cursorLeft") {
-            self.move_cursor(-1);
-            return;
-        }
-        if matches("tui.editor.cursorRight") {
-            self.move_cursor(1);
-            return;
-        }
-
-        // Kitty CSI-u printable character (e.g. \x1b[97u for 'a'): terminals
-        // with Kitty protocol flag 1 send CSI-u for all keys, including
-        // plain printable characters, and the sequences contain \x1b which
-        // the control-char check would reject.
-        if let Some(printable) = decode_kitty_printable(data) {
-            self.insert_character(&printable);
-            return;
-        }
-
-        // Regular character input — printable characters including Unicode,
-        // but reject control characters (C0: 0x00-0x1F, DEL: 0x7F,
-        // C1: 0x80-0x9F).
-        let has_control_chars = data.chars().any(|ch| {
-            let code = u32::from(ch);
-            code < 32 || code == 0x7f || (0x80..=0x9f).contains(&code)
-        });
-        if !has_control_chars {
-            self.insert_character(data);
-        }
-    }
-
-    fn insert_character(&self, text: &str) {
-        let mut value = self.value.borrow_mut();
-        let mut cursor = self.cursor.borrow_mut();
-        *cursor = (*cursor).min(value.len());
-        value.insert_str(*cursor, text);
-        *cursor += text.len();
-    }
-
-    fn handle_backspace(&self) {
-        let mut value = self.value.borrow_mut();
-        let mut cursor = self.cursor.borrow_mut();
-        if *cursor == 0 {
-            return;
-        }
-        let before_cursor = value[..*cursor].to_string();
-        let last = grapheme_segments(&before_cursor)
-            .next_back()
-            .map_or(1, str::len);
-        value.replace_range(*cursor - last..*cursor, "");
-        *cursor -= last;
-    }
-
-    fn move_cursor(&self, direction: i32) {
-        let value = self.value.borrow();
-        let mut cursor = self.cursor.borrow_mut();
-        *cursor = (*cursor).min(value.len());
-        if direction < 0 {
-            let before = &value[..*cursor];
-            let last = grapheme_segments(before).next_back().map_or(1, str::len);
-            *cursor -= last.min(*cursor);
-        } else if *cursor < value.len() {
-            let after = &value[*cursor..];
-            let first = grapheme_segments(after).next().map_or(1, str::len);
-            *cursor = (*cursor + first).min(value.len());
-        }
-    }
-
-    /// Upstream's `Input.invalidate`: a documented no-op — the input holds no
-    /// cached state to invalidate.
-    #[expect(
-        clippy::unused_self,
-        clippy::missing_const_for_fn,
-        reason = "upstream's Input.invalidate is a documented no-op; the port keeps the surface for the Component contract"
-    )]
-    fn invalidate(&self) {}
-
-    /// The prompt-and-value line, upstream `Input.render`: the inverse-video
-    /// fake cursor at the grapheme the cursor sits on, the hardware-cursor
-    /// marker ahead of it when focused, and the horizontal-scroll window
-    /// when the value overflows the available width.
-    fn render(&self, width: usize) -> Vec<String> {
-        let value = self.value.borrow().clone();
-        let cursor = (*self.cursor.borrow()).min(value.len());
-        let available_width = width.saturating_sub(visible_width(&self.prompt));
-
-        if available_width == 0 {
-            return vec![truncate_to_width(&self.prompt, width, "", false)];
-        }
-
-        if value.is_empty() && !self.placeholder.is_empty() {
-            let placeholder = truncate_to_width(&self.placeholder, available_width, "", false);
-            let at_cursor = grapheme_segments(&placeholder).next().unwrap_or(" ");
-            let after_cursor = &placeholder[at_cursor.len()..];
-            let marker = if self.focused.get() {
-                CURSOR_MARKER
-            } else {
-                ""
-            };
-            let cursor_char = format!(
-                "\x1b[7m{}{}\x1b[27m",
-                (self.placeholder_style)(at_cursor),
-                (self.placeholder_style)(after_cursor)
-            );
-            let text_with_cursor = format!("{marker}{cursor_char}");
-            let padding =
-                " ".repeat(available_width.saturating_sub(visible_width(&text_with_cursor)));
-            return vec![format!("{}{text_with_cursor}{padding}", self.prompt)];
-        }
-
-        // The horizontal-scroll window, upstream Input's over-long branch:
-        // reserve one column for the cursor when it sits at the end, then
-        // center the cursor column in the visible window.
-        let total_width = visible_width(&value);
-        let visible_text;
-        let mut cursor_display = cursor;
-        if total_width < available_width {
-            visible_text = value;
-        } else {
-            let scroll_width = if cursor == value.len() {
-                available_width - 1
-            } else {
-                available_width
-            };
-            let cursor_col = visible_width(&value[..cursor]);
-            if scroll_width > 0 {
-                let half_width = scroll_width / 2;
-                let start_col = if cursor_col < half_width {
-                    0
-                } else if cursor_col > total_width.saturating_sub(half_width) {
-                    total_width.saturating_sub(scroll_width)
-                } else {
-                    cursor_col.saturating_sub(half_width)
-                };
-                let window = slice_by_column(&value, start_col, scroll_width, true);
-                let before_cursor = slice_by_column(
-                    &value,
-                    start_col,
-                    cursor_col.saturating_sub(start_col),
-                    true,
-                );
-                cursor_display = before_cursor.len();
-                visible_text = window;
-            } else {
-                cursor_display = 0;
-                visible_text = String::new();
-            }
-        }
-
-        let after = &visible_text[cursor_display.min(visible_text.len())..];
-        let at_cursor = grapheme_segments(after).next().map_or(" ", |g| g);
-        let before_cursor = &visible_text[..cursor_display.min(visible_text.len())];
-        let after_cursor = after.get(at_cursor.len()..).unwrap_or_default();
-
-        // Hardware cursor marker (zero-width, emitted before fake cursor for
-        // IME positioning).
-        let marker = if self.focused.get() {
-            CURSOR_MARKER
-        } else {
-            ""
-        };
-        let cursor_char = format!("\x1b[7m{at_cursor}\x1b[27m");
-        let text_with_cursor = format!("{before_cursor}{marker}{cursor_char}{after_cursor}");
-        let visual_length = visible_width(&text_with_cursor);
-        let padding = " ".repeat(available_width.saturating_sub(visual_length));
-        vec![format!("{}{text_with_cursor}{padding}", self.prompt)]
-    }
-}
 
 /// The transcript search overlay, upstream `class AltScreenSearchComponent`:
 /// the input line beside the right-aligned navigation buttons, rendered as a
 /// three-line box.
 pub struct AltScreenSearchComponent {
-    input: SearchInput,
+    input: Input,
     on_query_change: Rc<dyn Fn(&str)>,
     navigation_button_style: NavigationButtonStyleFn,
     result_count: Cell<usize>,
@@ -608,7 +365,7 @@ impl AltScreenSearchComponent {
         navigation_button_style: Option<NavigationButtonStyleFn>,
     ) -> Rc<Self> {
         Rc::new(Self {
-            input: SearchInput::new(SearchInputOptions {
+            input: Input::with_options(InputOptions {
                 prompt: Some(" ".to_string()),
                 placeholder: Some("Find in transcript".to_string()),
                 placeholder_style: Some(Rc::new(|text| format!("\x1b[2m{text}\x1b[22m"))),
@@ -829,10 +586,6 @@ impl Component for AltScreenSearchComponent {
         true
     }
 
-    fn invalidate(&self) {
-        self.input.invalidate();
-    }
-
     fn as_focusable(&self) -> Option<&dyn Focusable> {
         Some(self)
     }
@@ -841,7 +594,7 @@ impl Component for AltScreenSearchComponent {
 impl Focusable for AltScreenSearchComponent {
     fn set_focused(&self, focused: bool) {
         self.focused.set(focused);
-        self.input.focused.set(focused);
+        self.input.set_focused(focused);
     }
 
     fn is_focused(&self) -> bool {

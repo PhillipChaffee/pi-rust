@@ -49,10 +49,18 @@
 //!   writer; the alternate-screen renderer lands with #46.
 //! - [`terminal_image`] — the cell-dimension store and [`terminal_image::is_image_line`]
 //!   the TUI core consumes; the rest of terminal-image lands with #51.
+//! - [`kill_ring`] — the Emacs-style kill/yank ring ([`kill_ring::KillRing`]),
+//!   and [`undo_stack`] — the snapshot stack ([`undo_stack::UndoStack`]).
+//! - [`word_navigation`] — [`word_navigation::find_word_backward`] /
+//!   [`word_navigation::find_word_forward`], the word-boundary cursor moves.
 //! - [`components`] — the leaf components ([`components::Box`],
 //!   [`components::Text`], [`components::TruncatedText`],
 //!   [`components::Spacer`], [`components::Loader`],
-//!   [`components::CancellableLoader`]).
+//!   [`components::CancellableLoader`]), the editor machinery
+//!   ([#47](https://github.com/PhillipChaffee/pi-rust/issues/47)):
+//!   [`components::Editor`], [`components::Input`], and the
+//!   [`components::EditorComponent`] extension contract, plus the stacks,
+//!   scroll view, and layout engine from #44.
 //!
 //! Two upstream shapes in the input layer are restated rather than copied:
 //!
@@ -88,6 +96,7 @@ pub mod components;
 pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
+pub mod kill_ring;
 pub mod layout;
 pub mod layout_node;
 pub mod stdin_buffer;
@@ -97,4 +106,6 @@ pub mod terminal_image;
 pub mod tui;
 pub mod tui_alt_screen;
 pub mod tui_main_screen;
+pub mod undo_stack;
 pub mod utils;
+pub mod word_navigation;
