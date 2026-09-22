@@ -154,6 +154,18 @@ fn facet(id: &str, setup: impl Fn(&mut FacetEnvironment) + 'static) -> FacetDef 
     }
 }
 
+/// The facet host over the given facets, the per-case setup the facet
+/// suites repeat: the default kernel belt with no service sources.
+async fn facet_host(facets: Vec<FacetDef>) -> pi_chord::api::FacetHost {
+    create_facet_host(FacetKernelOptions {
+        facets,
+        service_sources: Vec::new(),
+        on_error: pi_chord::handle::no_error_reporter(),
+    })
+    .await
+    .expect("the graph is valid")
+}
+
 #[test]
 fn discovers_setup_dependencies_before_connecting_stable_service_handles() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -208,13 +220,7 @@ fn discovers_setup_dependencies_before_connecting_stable_service_handles() {
             }
         });
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![projection_facet, source_facet],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![projection_facet, source_facet]).await;
 
         assert_eq!(
             *trace.borrow(),
@@ -416,13 +422,7 @@ fn owns_resources_registered_during_activation() {
                     .expect("provide lands");
             }
         });
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer, provider],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer, provider]).await;
         assert_eq!(deliveries.get(), 1);
         host.dispose()
             .await
@@ -507,16 +507,11 @@ fn routes_remotely_exposable_keyed_services_through_the_host_provider() {
             }
         });
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![
-                consumer,
-                keyed_spawner_facet("remote-keyed-provider", &keyed, "A"),
-            ],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![
+            consumer,
+            keyed_spawner_facet("remote-keyed-provider", &keyed, "A"),
+        ])
+        .await;
         // The keyed observation started inside the spawn's publication; the
         // synchronous restatement delivers it before any assertion.
         assert_eq!(observed.borrow().len(), 1);
@@ -662,17 +657,12 @@ fn scopes_singleton_service_views_to_each_facet_lifecycle() {
             }
         });
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![
-                consumer_for("A", consumer_handles.clone(), cleanup_values.clone()),
-                peer,
-                provider,
-            ],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![
+            consumer_for("A", consumer_handles.clone(), cleanup_values.clone()),
+            peer,
+            provider,
+        ])
+        .await;
         let handles: Vec<ServiceView> = consumer_handles.borrow().clone();
         let peer = peer_handle.borrow().clone().expect("peer handle");
         assert!(
@@ -935,13 +925,7 @@ fn connects_keyed_observations_only_when_the_observing_facet_activates() {
             }
         });
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![observer_facet, provider_facet],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![observer_facet, provider_facet]).await;
         // Upstream's trace pins the gate: the observation connects when the
         // observing facet activates, never at setup or at the provider's
         // spawn. The port's eager keyed start delivers inside that
@@ -997,13 +981,12 @@ fn terminates_the_host_when_keyed_replacement_publication_fails() {
     rt().block_on(async {
         let keyed = keyed_service();
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![keyed_spawner_facet("failing-keyed-provider", &keyed, "A")],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![keyed_spawner_facet(
+            "failing-keyed-provider",
+            &keyed,
+            "A",
+        )])
+        .await;
         let services = host.services().expect("assembled");
         let subscription = services
             .subscribe(
@@ -1047,17 +1030,12 @@ fn terminates_the_host_when_keyed_retirement_publication_fails() {
     rt().block_on(async {
         let keyed = keyed_service();
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![keyed_spawner_facet(
-                "failing-keyed-retirement-provider",
-                &keyed,
-                "A",
-            )],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![keyed_spawner_facet(
+            "failing-keyed-retirement-provider",
+            &keyed,
+            "A",
+        )])
+        .await;
         let services = host.services().expect("assembled");
         let subscription = services
             .subscribe(
@@ -1143,13 +1121,7 @@ fn keeps_unrestricted_local_keyed_services_process_local_across_provider_reloads
             })
         };
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer, provider_for("A")],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer, provider_for("A")]).await;
         assert_eq!(observed.borrow().len(), 1);
         let (first_view, first_context) = observed.borrow()[0].clone();
         let read = first_view
@@ -1280,13 +1252,7 @@ fn keeps_remotely_exposable_local_state_replicas_stable_across_provider_reloads(
             })
         };
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer, provider_for(1)],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer, provider_for(1)]).await;
         let retained = retained_handle
             .borrow()
             .clone()
@@ -1367,13 +1333,7 @@ fn provides_arbitrary_host_services_through_the_facet_graph() {
             }
         });
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer, provider],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer, provider]).await;
         let services = host.services().expect("assembled");
         let error = services
             .use_service(&host_values)
@@ -2069,13 +2029,7 @@ fn rejects_remote_singleton_member_shape_changes_before_reload_cutover() {
                 .expect("teardown lands");
             }
         });
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer, provider],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer, provider]).await;
 
         let replacement = facet("shape-provider", {
             let remote = remote.clone();
@@ -2132,13 +2086,7 @@ fn terminates_the_host_when_old_cleanup_fails_after_cutover() {
             })
         };
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![provider_for("A", true)],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![provider_for("A", true)]).await;
 
         let error = host
             .reload(vec![provider_for("B", false)])
@@ -2236,13 +2184,7 @@ fn cleans_failed_candidate_activation_in_reverse_dependency_order() {
             })
         };
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer_for("A", false), provider_for("A")],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer_for("A", false), provider_for("A")]).await;
         trace.borrow_mut().clear();
 
         let error = host
@@ -2280,13 +2222,7 @@ fn terminates_the_host_when_replacement_publication_fails_after_cutover() {
             })
         };
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![provider_for("A")],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![provider_for("A")]).await;
         let services = host.services().expect("assembled");
         let subscription = services
             .subscribe(
@@ -2381,13 +2317,7 @@ fn keeps_the_old_generation_active_when_replacement_activation_fails_before_cuto
             })
         };
 
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![consumer, provider_for("A", false)],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![consumer, provider_for("A", false)]).await;
         let retained = retained_handle.borrow().clone().expect("handle");
         let read = retained
             .call("read", vec![], background_context())
@@ -2677,13 +2607,7 @@ fn facets_fence_their_setup_and_spawner_lifecycles() {
                 });
             }
         });
-        let host = create_facet_host(FacetKernelOptions {
-            facets: vec![fencing],
-            service_sources: Vec::new(),
-            on_error: pi_chord::handle::no_error_reporter(),
-        })
-        .await
-        .expect("the graph is valid");
+        let host = facet_host(vec![fencing]).await;
 
         let error = setup_error
             .borrow()
