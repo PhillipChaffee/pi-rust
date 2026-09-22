@@ -2,11 +2,10 @@
 //! at commit `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759` (#42).
 //!
 //! This directory carries the padding-and-background container, the wrapping
-//! text display, the truncated title line, the blank-line spacer, and the
-//! loader family. The stacks, scroll view, and layout engine landed with
+//! text display, the truncated title line, and the blank-line spacer, and
+//! the loader family. The stacks, scroll view, and layout engine landed with
 //! #44; the editor machinery (`Editor`, `Input`) landed with #47, and the
-//! selection machinery (select list, settings list) carries its own
-//! ticket (#49).
+//! selection machinery (select list, settings list) landed with #49.
 //!
 //! Restatements against upstream:
 //!
@@ -30,6 +29,8 @@ pub mod loader;
 pub mod markdown;
 pub mod mouse_region;
 pub mod scroll_view;
+pub mod select_list;
+pub mod settings_list;
 pub mod spacer;
 pub mod stack;
 pub mod text;
@@ -56,6 +57,16 @@ pub use markdown::{DefaultTextStyle, Markdown, MarkdownOptions, MarkdownTheme};
 pub use mouse_region::MouseRegion;
 pub use scroll_view::{
     FollowMode, ScrollView, ScrollViewOptions, ScrollViewScrollToOptions, ScrollViewScrollbar,
+};
+pub use select_list::{
+    SelectItem, SelectList, SelectListCallback, SelectListCancelCallback, SelectListColorFn,
+    SelectListLayoutOptions, SelectListTheme, SelectListTruncatePrimaryContext,
+    SelectListTruncatePrimaryFn,
+};
+pub use settings_list::{
+    SettingItem, SettingsCancelCallback, SettingsChangeCallback, SettingsColorFn, SettingsList,
+    SettingsListOptions, SettingsListTheme, SettingsSelectedColorFn, SettingsSubmenuDone,
+    SettingsSubmenuDoneOptions, SettingsSubmenuFn,
 };
 pub use spacer::Spacer;
 pub use stack::{StackChild, StackEntry, StackEntryOptions, StackOptions, allocate_stack_sizes};

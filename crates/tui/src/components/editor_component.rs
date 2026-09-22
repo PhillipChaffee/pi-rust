@@ -16,10 +16,14 @@
 //!   no trait method here.
 //! - `setAutocompleteProvider` and `setAutocompleteMaxVisible` ship with
 //!   the autocomplete child
-//!   ([#49](https://github.com/PhillipChaffee/pi-rust/issues/49)).
+//!   ([#49](https://github.com/PhillipChaffee/pi-rust/issues/49)); the
+//!   port restates the optional members as defaulted methods.
 //! - `borderColor` is a consumer-assigned field on [`crate::components::Editor`],
 //!   not a trait member.
 
+use std::sync::Arc;
+
+use crate::autocomplete::AutocompleteProvider;
 use crate::tui::Component;
 
 /// The custom-editor contract, upstream `EditorComponent`.
@@ -52,5 +56,17 @@ pub trait EditorComponent: Component {
     /// Set the horizontal padding, upstream `setPaddingX`. Default: no-op.
     fn set_padding_x(&self, padding: usize) {
         let _ = padding;
+    }
+
+    /// Set the autocomplete provider, upstream `setAutocompleteProvider?`.
+    /// Default: unsupported.
+    fn set_autocomplete_provider(&self, provider: Arc<dyn AutocompleteProvider>) {
+        let _ = provider;
+    }
+
+    /// Set the autocomplete dropdown's maximum visible rows, upstream
+    /// `setAutocompleteMaxVisible?`. Default: no-op.
+    fn set_autocomplete_max_visible(&self, max_visible: usize) {
+        let _ = max_visible;
     }
 }
