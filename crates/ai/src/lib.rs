@@ -42,7 +42,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod api;
+pub mod auth;
+pub mod cli;
+pub mod env_api_keys;
 pub mod http;
+pub mod image_models;
+pub mod images_models;
+pub mod model_data;
+pub mod models;
+pub mod models_store;
+pub mod providers;
 pub mod session_resources;
 pub mod types;
 pub mod utils;
