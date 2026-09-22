@@ -12,13 +12,13 @@
 )]
 
 use pi_ai::api::google_shared::{
-    convert_messages, convert_tools, is_thinking_part, map_tool_choice, requires_tool_call_id,
+    convert_messages, convert_tools, is_thinking_part, requires_tool_call_id,
     resolve_google_function_calling_mode, retain_thought_signature, supports_google_strict_tool_sampling,
 };
 use pi_ai::types::{
     Api, AssistantBlock, AssistantMessage, ConstrainedSamplingConfig, ConstrainedSamplingSetting,
     ImageContent, Message, Modality, Model, ProviderId, Strictness, TextContent, ThinkingContent,
-    Tool, ToolCall, ToolResultBlock, ToolResultMessage, Usage, UserContent, UserMessage,
+    Tool, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use serde_json::{Value, json};
 
@@ -100,19 +100,11 @@ fn assistant_message_shape() -> AssistantMessage {
     }
 }
 
-fn signed_empty_context(
-    api: &str,
-    provider: &str,
-    model_id: &str,
-    content: Vec<AssistantBlock>,
-) -> pi_ai::types::Context {
-    replay_context(api, provider, model_id, content)
-}
 
 fn tool_call_block(id: &str, command: &str) -> AssistantBlock {
     let mut arguments = serde_json::Map::new();
     arguments.insert("command".to_owned(), json!(command));
-    AssistantBlock::ToolCall(pi_ai::types::ToolCall {
+    AssistantBlock::ToolCall(ToolCall {
         id: id.to_owned(),
         name: "bash".to_owned(),
         arguments,
@@ -368,9 +360,6 @@ fn returns_none_for_an_empty_tool_list() {
 
 const VALID_SIG: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
 
-fn signed_empty_model() -> Model {
-    google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only())
-}
 
 fn thinking_block(thinking: &str, signature: Option<&str>) -> AssistantBlock {
     AssistantBlock::Thinking(ThinkingContent {

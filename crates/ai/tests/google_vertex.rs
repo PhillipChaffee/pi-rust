@@ -25,7 +25,6 @@ use pi_ai::types::{
     Api, Context, Message, Model, ModelThinkingLevel, Modality, ProviderId, SimpleStreamOptions,
     ThinkingBudgets, ThinkingLevel, ThinkingLevelMap, UserContent, UserMessage,
 };
-use pi_ai::utils::pi_user_agent::get_pi_user_agent;
 use serde_json::json;
 
 mod common;
@@ -118,8 +117,8 @@ fn mount_metadata_server(mock: &MockHttpClient) {
 
 /// Point `GOOGLE_APPLICATION_CREDENTIALS` at a path that does not exist so
 /// the ADC chain reaches the (mocked) metadata server deterministically.
-fn env_without_credentials_file() -> std::collections::BTreeMap<String, String> {
-    std::collections::BTreeMap::from([(
+fn env_without_credentials_file() -> BTreeMap<String, String> {
+    BTreeMap::from([(
         "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
         "/nonexistent/vertex-credentials.json".to_owned(),
     )])
@@ -319,7 +318,7 @@ async fn does_not_append_api_version_when_the_base_url_includes_one() {
     mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
     let mut model = catalog_vertex();
     model.base_url = "https://proxy.example.com/v1/projects/test-project/locations/global".to_owned();
-    let mut options = build_adc(&mock);
+    let options = build_adc(&mock);
 
     let message = settle_stream(&model, &context(), &options).await;
 
