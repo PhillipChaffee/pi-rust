@@ -7,6 +7,7 @@ members = [
     "crates/evals",
     "crates/tui",
     "crates/protocol",
+    "crates/client",
 ]
 # Edition 2024's default resolver, made explicit so the workspace table is self-describing.
 resolver = "3"

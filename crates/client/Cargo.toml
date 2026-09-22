@@ -1,0 +1,45 @@
+[package]
+name = "pi-client"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-neutral client for remote pi sessions: versioned handshake, correlated requests, subscriptions, and Unix transports, ported from @earendil-works/pi-client"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["rpc", "client", "protocol", "unix-socket", "coding-agent"]
+categories = ["network-programming", "development-tools"]
+
+[dependencies]
+# Upstream opens the wire through `@earendil-works/pi-protocol` and resolves
+# service calls, subscription codecs, and the background context through
+# `@earendil-works/chord`; the crate DAG mirrors both import edges.
+pi-protocol = { path = "../protocol" }
+pi-chord = { path = "../chord" }
+# tokio: the async substrate the stack decision pins. macros: the select!
+# combinators the request racing and the discovery probes ride; sync: the
+# oneshot waiters behind the handshake and request promises, and the
+# command channel serializing Unix transport writes; net + fs + io-util:
+# the Unix-domain socket transports and discovery reads; rt: the local
+# tasks the transport I/O runs as; time: the handshake and discovery
+# timeouts.
+tokio = { version = "1.47", default-features = false, features = [
+  "rt",
+  "macros",
+  "sync",
+  "net",
+  "fs",
+  "io-util",
+  "time",
+] }
+
+[dev-dependencies]
+# macros: the test attribute macro; rt-multi-thread is not needed — the
+# client is single-threaded by construction and every test runs on the
+# current-thread runtime behind a LocalSet.
+tokio = { version = "1.47", features = ["macros"] }
+# tempdir fixtures for the real Unix-socket tests, matching upstream's
+# mkdtemp test style.
+tempfile = "3"
+
+[lints]
+workspace = true
