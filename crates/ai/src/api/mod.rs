@@ -16,6 +16,7 @@ use crate::types::ProviderStreams;
 pub mod anthropic_messages;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
+pub mod google_shared;
 pub mod lazy;
 pub mod simple_options;
 pub mod transform_messages;
