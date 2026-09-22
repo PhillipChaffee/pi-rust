@@ -1575,7 +1575,7 @@ async fn accumulates_mixed_content_reasoning_and_parallel_tool_call_deltas_indep
                             "index": 1,
                             "id": "tc_grep_initial",
                             "type": "function",
-                            "function": { "name": "grep", "arguments": "{\"pattern\":\"TODO" },
+                            "function": { "name": "grep", "arguments": "{\"pattern\":\"PATTERN" },
                         },
                         {
                             "id": "tc_list_no_index",
@@ -1803,7 +1803,7 @@ async fn accumulates_mixed_content_reasoning_and_parallel_tool_call_deltas_indep
             "tc_grep_initial",
             "grep",
             serde_json::Map::from_iter([
-                ("pattern".to_owned(), json!("TODO")),
+                ("pattern".to_owned(), json!("PATTERN")),
                 ("path".to_owned(), json!("src")),
             ]),
         ),
