@@ -20,8 +20,7 @@
 //!   a pre-pass over the source for blocks and as a scanner over text
 //!   events inline, with upstream's delimiter, rejection, and pending rules
 //!   byte-for-byte. Rendering goes through [`crate::latex::render_latex`],
-//!   the #50 seam: until that ticket lands, every expression degrades to
-//!   its raw source.
+//!   and an expression the renderer declines degrades to its raw source.
 //! - `marked`'s gfm autolinks (bare URLs and emails) are not pulldown
 //!   behavior; the port carries the same url/email scanners over text
 //!   spans, angle autolinks being core CommonMark that pulldown emits

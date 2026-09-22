@@ -535,7 +535,7 @@ fn escaped_dollar_never_becomes_latex_in_either_escape_mode() {
 }
 
 // =============================================================================
-// Inline LaTeX scanner rules (#50 seam: every expression renders raw)
+// Inline LaTeX scanner rules
 // =============================================================================
 
 #[test]
@@ -562,8 +562,10 @@ fn a_backtick_in_dollar_content_blocks_the_inline_latex_claim() {
 }
 
 #[test]
-fn inline_double_dollar_tokenizes_and_stays_raw() {
-    assert_eq!(plain(&markdown("$$x$$").render(80)), ["$$x$$"]);
+fn inline_double_dollar_tokenizes_and_renders_inline() {
+    // A single-line `$$…$$` claim rides the inline scanner's rules (#48
+    // restatement), so it renders as inline math, not a display block.
+    assert_eq!(plain(&markdown("$$x$$").render(80)), ["x"]);
 }
 
 #[test]
@@ -581,22 +583,19 @@ fn a_streamed_dollar_without_a_closer_or_math_content_stays_plain() {
 }
 
 // =============================================================================
-// Block LaTeX pre-pass (#50 seam: every expression renders raw)
+// Block LaTeX pre-pass
 // =============================================================================
 
 #[test]
 fn the_block_latex_pre_pass_cuts_a_display_block_out_of_the_document() {
-    // The cut is observable through the raw passthrough: the block's inner
-    // markdown stays raw instead of styling as a paragraph.
+    // The cut routes the block through the LaTeX renderer: the inner
+    // markdown never styles as a paragraph, and the delimiters drop.
     let markdown = markdown("text\n$$\n**st**\n$$\nmore");
     let lines = markdown.render(80);
-    assert_eq!(
-        plain(&lines),
-        ["text", "", "$$", "**st**", "$$", "", "more"]
-    );
+    assert_eq!(plain(&lines), ["text", "", "**st**", "", "more"]);
     assert!(
         !joined_output(&lines).contains("\x1b[1m"),
-        "the block content must stay raw: {lines:?}"
+        "the block content must render as math, not markdown styling: {lines:?}"
     );
 }
 

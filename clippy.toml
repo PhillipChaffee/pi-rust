@@ -13,4 +13,5 @@
 doc-valid-idents = ["AcpClient", "OpenTUI", "OpenCode", "WKWebView", "XTVersion", "WezTerm", "OpenAI", "OpenRouter",
     "MiniMax", "MiMo", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR",
     "AbortSignal", "UUIDv7", "UUIDv4", "HttpClient", "WeakMap", "serde_json",
-    "CancellableLoader", "TruncatedText", "CommonMark", ".."]
+    "CancellableLoader", "TruncatedText", "CommonMark",
+    "White_Space", ".."]     # White_Space: the latex port #50 cites the UCD property its \s regex class carries bare.

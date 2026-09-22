@@ -2,11 +2,8 @@
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`), with the upstream
 //! rendered-output goldens as the oracle.
 //!
-//! Restatements: the LaTeX-rendering goldens restate to raw passthrough
-//! until the latex ticket ([#50](https://github.com/PhillipChaffee/pi-rust/issues/50))
-//! lands the renderer — the seam answers `None`, which is markdown's
-//! documented degradation; the xterm cell-attribute reads run through the
-//! emulator's per-cell SGR tracking.
+//! Restatements: the xterm cell-attribute reads run through the emulator's
+//! per-cell SGR tracking.
 
 #![expect(
     clippy::expect_used,
@@ -851,10 +848,6 @@ fn renders_lists_and_tables_together() {
 }
 
 // --- LaTeX math -------------------------------------------------------------
-// Restated (#50): the LaTeX renderer lands with the latex ticket; until then
-// the seam answers `None` and every expression renders as its raw source —
-// markdown's documented degradation. The tokenization decisions (currency
-// suppression, pending streaming, delimiter boundaries) port 1:1.
 
 #[test]
 fn renders_inline_dollar_and_parenthesis_delimiters() {
@@ -863,10 +856,7 @@ fn renders_inline_dollar_and_parenthesis_delimiters() {
     );
     assert_eq!(
         plain_trimmed(&markdown.render(80)),
-        [
-            r"A map $\mathbb{C}^3 \to \mathbb{C}^3$, $xy$, $x-y$, $-x$, $\frac{1}{2}$, and \(s",
-            r"\to \infty\).",
-        ]
+        ["A map ℂ³ → ℂ³, xy, x-y, -x, 1/2, and s → ∞."]
     );
 }
 
@@ -881,13 +871,7 @@ after",
     );
     assert_eq!(
         plain_trimmed(&markdown.render(80)),
-        [
-            "Before",
-            "",
-            r"$$\{3x+2y,\; x \in \{0, \pm 1\}\}$$",
-            "",
-            "after"
-        ]
+        ["Before", "", "{3x+2y, x ∈ {0, ± 1}}", "", "after"]
     );
 }
 
@@ -907,9 +891,9 @@ after",
         [
             "Before",
             "",
-            r"\[",
-            r"E \approx \frac{0.1\ \text{lux}}{100\ \text{lm/W}}",
-            r"\]",
+            "    0.1 lux",
+            "E ≈ ────────",
+            "    100 lm/W",
             "",
             "after"
         ]
@@ -934,13 +918,8 @@ A=
         [
             "Consider the matrix",
             "",
-            r"\[",
-            "A=",
-            r"\begin{pmatrix}",
-            r"\pi & 0\\",
-            r"0 & \frac{1}{\pi}",
-            r"\end{pmatrix}.",
-            r"\]",
+            "A = ⎛ π │ 0   ⎞",
+            "    ⎝ 0 │ 1/π ⎠."
         ]
     );
 }
@@ -955,9 +934,9 @@ fn renders_lower_limits_beneath_display_operators() {
     assert_eq!(
         plain_trimmed(&markdown.render(80)),
         [
-            r"\[",
-            r"\lim_{x\to 0}\frac{\frac{\sin x}{x}-1}{\frac{e^x-1}{x}-1}=0",
-            r"\]"
+            "     (sin x)/x-1",
+            "lim  ─────────── = 0",
+            "x→0  (eˣ-1)/x-1"
         ]
     );
 }
@@ -974,8 +953,8 @@ fn renders_math_inside_lists_and_tables() {
     let lines = markdown.render(80);
     let plain_lines = stripped(&lines);
     let output = plain_lines.join("\n");
-    assert!(output.contains("- Formula: $F_1 = u^2$"));
-    assert!(output.contains("$\\mathbb{C}^3$"));
+    assert!(output.contains("- Formula: F₁ = u²"));
+    assert!(output.contains("│ ℂ³"));
 }
 
 #[test]
@@ -1048,9 +1027,7 @@ fn switches_from_raw_to_rendered_math_when_a_streamed_delimiter_closes() {
     assert_eq!(plain_trimmed(&markdown.render(80)), [r"Map $\mathbb{C}^3"]);
 
     markdown.set_text(r"Map $\mathbb{C}^3$");
-    // Restated (#50): with the renderer landing later, the closed delimiter
-    // still renders raw here.
-    assert_eq!(plain_trimmed(&markdown.render(80)), [r"Map $\mathbb{C}^3$"]);
+    assert_eq!(plain_trimmed(&markdown.render(80)), ["Map ℂ³"]);
 }
 
 // --- Backslash escapes ------------------------------------------------------
