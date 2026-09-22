@@ -13,4 +13,4 @@
 doc-valid-idents = ["AcpClient", "OpenTUI", "OpenCode", "WKWebView", "XTVersion", "WezTerm", "OpenAI", "OpenRouter",
     "MiniMax", "MiMo", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR",
     "AbortSignal", "UUIDv7", "UUIDv4", "HttpClient", "WeakMap", "serde_json",
-    "CancellableLoader", "TruncatedText", ".."]
+    "CancellableLoader", "TruncatedText", "CommonMark", ".."]
