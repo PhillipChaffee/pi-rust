@@ -976,6 +976,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-protocol"
+version = "0.1.0"
+dependencies = [
+ "pi-chord",
+]
+
+[[package]]
 name = "pi-rust"
 version = "0.1.0"
 
