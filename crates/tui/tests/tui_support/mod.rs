@@ -37,15 +37,21 @@
     dead_code,
     reason = "each suite uses only the fixtures it needs; the shared module carries the rest for its siblings, and the unused set differs per binary"
 )]
+#![expect(
+    clippy::expect_used,
+    reason = "the SGR-strip regex pattern is a compile-time constant; a bad pattern is a programmer error that must surface"
+)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use unicode_width::UnicodeWidthChar;
 
-use pi_tui::components::EditorTheme;
+use pi_tui::components::ColorFn;
+use pi_tui::components::{EditorTheme, MarkdownTheme};
 use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
 use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
 use pi_tui::tui::{
@@ -56,15 +62,43 @@ use pi_tui::tui_alt_screen::{TuiAltScreen, TuiAltScreenConfig};
 use pi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenConfig};
 
 /// One screen cell: the grapheme it starts, its visible width (zero for
-/// wide-char placeholders), whether italic is active, and whether anything
-/// was ever written into it — upstream xterm's `translateToString(true)`
-/// trims only unwritten trailing cells, so a printed space survives.
+/// wide-char placeholders), the SGR attributes it was printed under, and
+/// whether anything was ever written into it — upstream xterm's
+/// `translateToString(true)` trims only unwritten trailing cells, so a
+/// printed space survives.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per tracked SGR attribute (italic, bold, dim, underline) plus the written marker, mirroring xterm's cell model"
+)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ScreenCell {
     ch: char,
     width: u8,
     italic: bool,
+    bold: bool,
+    dim: bool,
+    underline: bool,
+    fg: Option<FgColor>,
     written: bool,
+}
+
+/// A foreground color, upstream xterm's cell color model: default (no SGR
+/// 30-38 seen), an indexed 0-255 color, or a 24-bit RGB triple.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FgColor {
+    Indexed(u16),
+    Rgb(u8, u8, u8),
+}
+
+impl FgColor {
+    /// The packed number xterm's `getFgColor` reports: the index itself, or
+    /// an RGB triple packed `(r << 16) | (g << 8) | b`.
+    const fn packed(self) -> u32 {
+        match self {
+            Self::Indexed(index) => index as u32,
+            Self::Rgb(r, g, b) => ((r as u32) << 16) | ((g as u32) << 8) | (b as u32),
+        }
+    }
 }
 
 impl ScreenCell {
@@ -72,6 +106,10 @@ impl ScreenCell {
         ch: ' ',
         width: 1,
         italic: false,
+        bold: false,
+        dim: false,
+        underline: false,
+        fg: None,
         written: false,
     };
 }
@@ -86,12 +124,20 @@ fn blank_row(columns: usize) -> ScreenRow {
 /// The visible screen upstream's xterm buffer exposed, driven by `vte`: the
 /// grid is the viewport, `scrollback` holds the lines scrolled above it, and
 /// row resizes follow xterm's pull-from-scrollback or pad-blank semantics.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the cursor-position SGR state is one flag per tracked attribute, exactly what xterm's buffer carries"
+)]
 struct Screen {
     grid: Vec<ScreenRow>,
     scrollback: Vec<ScreenRow>,
     cursor_row: usize,
     cursor_col: usize,
     italic: bool,
+    bold: bool,
+    dim: bool,
+    underline: bool,
+    fg: Option<FgColor>,
 }
 
 impl Screen {
@@ -102,6 +148,10 @@ impl Screen {
             cursor_row: 0,
             cursor_col: 0,
             italic: false,
+            bold: false,
+            dim: false,
+            underline: false,
+            fg: None,
         }
     }
 
@@ -160,6 +210,10 @@ impl Screen {
             ch: c,
             width: u8::try_from(width).unwrap_or(u8::MAX),
             italic: self.italic,
+            bold: self.bold,
+            dim: self.dim,
+            underline: self.underline,
+            fg: self.fg,
             written: true,
         };
         let (row, col) = (self.cursor_row, self.cursor_col);
@@ -169,6 +223,10 @@ impl Screen {
                 ch: '\u{0}',
                 width: 0,
                 italic: cell.italic,
+                bold: cell.bold,
+                dim: cell.dim,
+                underline: cell.underline,
+                fg: cell.fg,
                 written: true,
             };
         }
@@ -204,6 +262,12 @@ impl Screen {
             .and_then(|line| line.get(col))
             .is_some_and(|cell| cell.italic)
     }
+
+    /// The cell attribute reads the style suites assert on: upstream's
+    /// `isBold`/`isDim`/`isUnderline`/`isFgDefault`/`getFgColor` per cell.
+    fn attr_at(&self, row: usize, col: usize) -> Option<ScreenCell> {
+        self.grid.get(row).and_then(|line| line.get(col)).copied()
+    }
 }
 
 fn render_row(row: &[ScreenCell]) -> String {
@@ -218,8 +282,9 @@ fn render_row(row: &[ScreenCell]) -> String {
         .collect()
 }
 
-/// The cell-size suite's SGR tracking with the extended-color groups
-/// skipped, so `38;2;r;g;b` never trips the italic flag.
+/// The cell-style suites' SGR tracking: italic, bold, dim, underline, and
+/// the foreground color model, with the extended-color group syntax
+/// (`38;2;r;g;b`, `38;5;n`) consumed so it never trips the flags.
 fn apply_sgr(screen: &mut Screen, params: &vte::Params) {
     let groups: Vec<Vec<u16>> = params.iter().map(<[u16]>::to_vec).collect();
     let mut index = 0;
@@ -227,20 +292,70 @@ fn apply_sgr(screen: &mut Screen, params: &vte::Params) {
         let group = &groups[index];
         let param = group.first().copied().unwrap_or(0);
         match param {
-            38 | 48 | 58 | 59 => {
-                if group.len() > 1 {
-                    // Colon form: the whole spec lives in this group.
-                    index += 1;
-                } else {
-                    match groups.get(index + 1).and_then(|next| next.first()).copied() {
-                        Some(5) => index += 3,
-                        Some(2) => index += 5,
-                        _ => index += 1,
+            38 | 48 | 58 | 59 if group.len() > 1 => {
+                // Colon form: the whole spec lives in this group, and no
+                // style suite asserts on it — consume and move on.
+                index += 1;
+            }
+            38 => {
+                let spec = groups
+                    .get(index + 1)
+                    .and_then(|next| next.first())
+                    .copied()
+                    .unwrap_or(0);
+                match spec {
+                    5 => {
+                        screen.fg = groups
+                            .get(index + 2)
+                            .and_then(|g| g.first())
+                            .map(|value| FgColor::Indexed(*value));
+                        index += 3;
                     }
+                    2 => {
+                        let channel = |offset: usize| -> u8 {
+                            groups
+                                .get(index + offset)
+                                .and_then(|g| g.first())
+                                .and_then(|value| u8::try_from(*value).ok())
+                                .unwrap_or(0)
+                        };
+                        screen.fg = Some(FgColor::Rgb(channel(2), channel(3), channel(4)));
+                        index += 5;
+                    }
+                    _ => index += 1,
                 }
             }
+            48 | 58 | 59 => {
+                let spec = groups
+                    .get(index + 1)
+                    .and_then(|next| next.first())
+                    .copied()
+                    .unwrap_or(0);
+                index += match spec {
+                    5 => 3,
+                    2 => 5,
+                    _ => 1,
+                };
+            }
+            0 => {
+                screen.italic = false;
+                screen.bold = false;
+                screen.dim = false;
+                screen.underline = false;
+                screen.fg = None;
+            }
+            1 => screen.bold = true,
+            2 => screen.dim = true,
             3 => screen.italic = true,
-            23 | 0 => screen.italic = false,
+            4 => screen.underline = true,
+            22 => {
+                screen.bold = false;
+                screen.dim = false;
+            }
+            23 => screen.italic = false,
+            24 => screen.underline = false,
+            30..=37 => screen.fg = Some(FgColor::Indexed(param - 30)),
+            39 => screen.fg = None,
             _ => {}
         }
         index += 1;
@@ -449,6 +564,61 @@ impl VirtualTerminal {
     #[must_use]
     pub(crate) fn is_italic(&self, row: usize, col: usize) -> bool {
         self.shared.borrow().screen.italic_at(row, col)
+    }
+
+    /// The bold attribute of one cell, upstream `getCell(...).isBold()`.
+    #[must_use]
+    pub(crate) fn is_bold(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_some_and(|cell| cell.bold)
+    }
+
+    /// The dim attribute of one cell, upstream `getCell(...).isDim()`.
+    #[must_use]
+    pub(crate) fn is_dim(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_some_and(|cell| cell.dim)
+    }
+
+    /// The underline attribute of one cell, upstream `getCell(...).isUnderline()`.
+    #[must_use]
+    pub(crate) fn is_underline(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_some_and(|cell| cell.underline)
+    }
+
+    /// Whether one cell keeps the default foreground, upstream
+    /// `getCell(...).isFgDefault()`: no foreground SGR preceded the print.
+    #[must_use]
+    pub(crate) fn is_fg_default(&self, row: usize, col: usize) -> bool {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .is_none_or(|cell| cell.fg.is_none())
+    }
+
+    /// The packed foreground color of one cell, upstream
+    /// `getCell(...).getFgColor()`: `None` for the default foreground, the
+    /// palette index for indexed colors, and `(r << 16) | (g << 8) | b` for
+    /// RGB triples.
+    #[must_use]
+    pub(crate) fn fg_color(&self, row: usize, col: usize) -> Option<u32> {
+        self.shared
+            .borrow()
+            .screen
+            .attr_at(row, col)
+            .and_then(|cell| cell.fg)
+            .map(FgColor::packed)
     }
 }
 
@@ -873,4 +1043,188 @@ impl Terminal for BoundedWriteTerminal {
     fn set_title(&mut self, _title: &str) {}
     fn set_progress(&mut self, _active: bool) {}
     fn poll(&mut self, _timeout: Duration) {}
+}
+
+// --- markdown suite fixtures (#48), upstream test-themes.ts -----------------
+
+/// One chalk style: the byte-exact SGR open and close pair.
+struct ChalkStyle {
+    open: &'static str,
+    close: &'static str,
+}
+
+const CHALK_BOLD: ChalkStyle = ChalkStyle {
+    open: "\x1b[1m",
+    close: "\x1b[22m",
+};
+const CHALK_DIM: ChalkStyle = ChalkStyle {
+    open: "\x1b[2m",
+    close: "\x1b[22m",
+};
+const CHALK_ITALIC: ChalkStyle = ChalkStyle {
+    open: "\x1b[3m",
+    close: "\x1b[23m",
+};
+const CHALK_UNDERLINE: ChalkStyle = ChalkStyle {
+    open: "\x1b[4m",
+    close: "\x1b[24m",
+};
+const CHALK_STRIKETHROUGH: ChalkStyle = ChalkStyle {
+    open: "\x1b[9m",
+    close: "\x1b[29m",
+};
+const CHALK_BLUE: ChalkStyle = ChalkStyle {
+    open: "\x1b[34m",
+    close: "\x1b[39m",
+};
+const CHALK_CYAN: ChalkStyle = ChalkStyle {
+    open: "\x1b[36m",
+    close: "\x1b[39m",
+};
+const CHALK_GREEN: ChalkStyle = ChalkStyle {
+    open: "\x1b[32m",
+    close: "\x1b[39m",
+};
+const CHALK_YELLOW: ChalkStyle = ChalkStyle {
+    open: "\x1b[33m",
+    close: "\x1b[39m",
+};
+const CHALK_GRAY: ChalkStyle = ChalkStyle {
+    open: "\x1b[90m",
+    close: "\x1b[39m",
+};
+const CHALK_MAGENTA: ChalkStyle = ChalkStyle {
+    open: "\x1b[35m",
+    close: "\x1b[39m",
+};
+
+/// A chalk-builder closure over one style chain, `styles` ordered innermost
+/// first: chalk's level-3 wrapping is `openAll + text + closeAll`, with each
+/// style's open code re-inserted after every occurrence of its close code
+/// when the text carries ANSI (so nested resets re-open the outer style),
+/// and each line break closed and re-opened so styles never bleed across
+/// lines (chalk#92).
+fn chalk(styles: &[ChalkStyle], text: &str) -> String {
+    let open_all: String = styles.iter().rev().map(|style| style.open).collect();
+    let close_all: String = styles.iter().map(|style| style.close).collect();
+    let mut wrapped = text.to_string();
+    if wrapped.contains('\u{1b}') {
+        for style in styles {
+            wrapped = insert_after_all(&wrapped, style.close, style.open);
+        }
+    }
+    if wrapped.contains('\n') {
+        wrapped = close_reopen_at_lfs(&wrapped, &close_all, &open_all);
+    }
+    format!("{open_all}{wrapped}{close_all}")
+}
+
+/// `stringReplaceAll(string, substring, substring + postfix)` — each match
+/// survives and the postfix lands after it.
+fn insert_after_all(text: &str, substring: &str, postfix: &str) -> String {
+    let mut result = String::new();
+    let mut cursor = 0;
+    while let Some(index) = text[cursor..].find(substring) {
+        let index = cursor + index;
+        result.push_str(&text[cursor..index + substring.len()]);
+        result.push_str(postfix);
+        cursor = index + substring.len();
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// Close the styling before every line break and reopen after it.
+fn close_reopen_at_lfs(text: &str, close_all: &str, open_all: &str) -> String {
+    let mut result = String::new();
+    let mut cursor = 0;
+    while let Some(index) = text[cursor..].find('\n') {
+        let index = cursor + index;
+        let cr = index > 0 && text.as_bytes()[index - 1] == b'\r';
+        let line_end = if cr { index - 1 } else { index };
+        result.push_str(&text[cursor..line_end]);
+        result.push_str(close_all);
+        result.push_str(if cr { "\r\n" } else { "\n" });
+        result.push_str(open_all);
+        cursor = index + 1;
+    }
+    result.push_str(&text[cursor..]);
+    result
+}
+
+/// A single-style chalk closure, the fixture shape most theme entries use.
+fn chalk_one(style: &'static ChalkStyle) -> ColorFn {
+    Arc::new(move |text| chalk(std::slice::from_ref(style), text))
+}
+
+/// The markdown suites' theme, upstream test-themes.ts
+/// `defaultMarkdownTheme` (chalk, level 3): heading is bold cyan, links are
+/// blue, link URLs dim, code yellow, code blocks green, the code block
+/// border and quote border dim, quotes italic, rules dim, list bullets
+/// cyan, and the plain decorations map to chalk's own.
+#[must_use]
+pub fn default_markdown_theme() -> MarkdownTheme {
+    MarkdownTheme {
+        heading: Arc::new(|text| chalk(&[CHALK_CYAN, CHALK_BOLD], text)),
+        link: Arc::new(|text| chalk(&[CHALK_BLUE], text)),
+        link_url: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        code: Arc::new(|text| chalk(&[CHALK_YELLOW], text)),
+        code_block: Arc::new(|text| chalk(&[CHALK_GREEN], text)),
+        code_block_border: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        quote: Arc::new(|text| chalk(&[CHALK_ITALIC], text)),
+        quote_border: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        hr: Arc::new(|text| chalk(&[CHALK_DIM], text)),
+        list_bullet: Arc::new(|text| chalk(&[CHALK_CYAN], text)),
+        bold: Arc::new(|text| chalk(&[CHALK_BOLD], text)),
+        italic: Arc::new(|text| chalk(&[CHALK_ITALIC], text)),
+        strikethrough: Arc::new(|text| chalk(&[CHALK_STRIKETHROUGH], text)),
+        underline: Arc::new(|text| chalk(&[CHALK_UNDERLINE], text)),
+        highlight_code: None,
+        code_block_indent: None,
+    }
+}
+
+/// The default text styles the thinking-trace tests style with, upstream's
+/// inline `chalk.gray` / `chalk.magenta` / `chalk.cyan` / `chalk.yellow`
+/// color callbacks.
+#[must_use]
+pub fn chalk_gray() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_GRAY], text))
+}
+
+#[must_use]
+pub fn chalk_magenta() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_MAGENTA], text))
+}
+
+#[must_use]
+pub fn chalk_cyan() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_CYAN], text))
+}
+
+#[must_use]
+pub fn chalk_yellow() -> ColorFn {
+    Arc::new(|text| chalk(&[CHALK_YELLOW], text))
+}
+
+/// The markdown suites' SGR-only strip, upstream `stripAnsi`: drops SGR
+/// sequences but keeps OSC 8 payloads, so hyperlink asserts see the URL.
+#[must_use]
+pub fn strip_ansi(line: &str) -> String {
+    static SGR_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SGR_RE
+        .get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;]*m").expect("static pattern"))
+        .replace_all(line, "")
+        .into_owned()
+}
+
+/// Serialize the tests that override the process-wide capability cache:
+/// upstream's vitest suite runs sequentially, while cargo runs test
+/// functions on parallel threads, and the cache is module-global.
+pub fn capabilities_lock() -> std::sync::MutexGuard<'static, ()> {
+    static TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

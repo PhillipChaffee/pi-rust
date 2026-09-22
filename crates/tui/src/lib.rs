@@ -97,6 +97,7 @@ pub mod fuzzy;
 pub mod keybindings;
 pub mod keys;
 pub mod kill_ring;
+pub mod latex;
 pub mod layout;
 pub mod layout_node;
 pub mod stdin_buffer;
