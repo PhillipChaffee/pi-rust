@@ -45,6 +45,7 @@ use std::time::Duration;
 
 use unicode_width::UnicodeWidthChar;
 
+use pi_tui::components::EditorTheme;
 use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
 use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
 use pi_tui::tui::{
@@ -804,6 +805,24 @@ pub fn kitty_image(base64: &str, columns: usize, rows: usize, image_id: u64) -> 
             move_cursor: Some(false),
         },
     )
+}
+
+/// The editor suites' TUI construction, upstream test `createTestTUI`: the
+/// main-screen renderer over a virtual terminal with default geometry,
+/// under a quiet-map environment lookup.
+#[must_use]
+pub fn new_editor_test_tui(columns: u16, rows: u16) -> Rc<Tui> {
+    new_main_screen_tui(VirtualTerminal::new(columns, rows), &HashMap::new())
+}
+
+/// The editor suites' theme, upstream test-themes.ts `defaultEditorTheme`:
+/// the border color is chalk's dim. The select-list entry of the upstream
+/// theme lands with the autocomplete child (#49).
+#[must_use]
+pub fn default_editor_theme() -> EditorTheme {
+    EditorTheme {
+        border_color: Rc::new(|text| format!("\x1b[2m{text}\x1b[22m")),
+    }
 }
 
 /// The suites' `BoundedWriteTerminal`: captures every write without
