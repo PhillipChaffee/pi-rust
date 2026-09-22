@@ -1,11 +1,17 @@
 # nextest configuration: the OAuth login tests bind well-known callback
 # ports (53692/1455/1456), so parallel processes race the listener and a
-# losing login waits forever for its authorize URL. The group pins the
-# whole binary to one process at a time; every other test keeps the
-# default concurrency.
+# losing login waits forever for its authorize URL — the in-process
+# port locks the auth port added cannot see across nextest's
+# process-per-test boundaries. The group pins every OAuth-touching
+# binary to one process at a time; every other test keeps the default
+# concurrency.
 [test-groups.oauth-ports]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "binary(oauth_flows_manual)"
+filter = """
+binary(oauth_flows_manual) or binary(oauth_flows_radius) or
+binary(radius_oauth) or binary(xai_oauth) or
+binary(github_copilot_oauth) or binary(oauth_device_code) or
+binary(oauth_adapters)"""
 test-group = "oauth-ports"
