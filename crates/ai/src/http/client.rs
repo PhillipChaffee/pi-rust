@@ -201,3 +201,16 @@ pub trait HttpClient: std::fmt::Debug + Send + Sync {
     /// [`HttpError`] variants, never as `Ok` error statuses.
     fn execute(&self, request: HttpRequest) -> BoxHttpFuture<Result<HttpResponse, HttpError>>;
 }
+
+/// Read a response (or error) body to text, the helper the adapters use when
+/// an error body or a non-streaming payload must be inspected before use.
+/// The lossy UTF-8 decode mirrors the JS adapters reading `response.text()`.
+pub async fn read_body_text(
+    mut body: HttpByteStream,
+) -> Result<String, HttpError> {
+    let mut text = String::new();
+    while let Some(chunk) = body.next_chunk().await? {
+        text.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    Ok(text)
+}

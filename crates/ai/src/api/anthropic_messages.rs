@@ -27,7 +27,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::resolve::now_ms;
-use crate::http::client::{HttpByteStream, HttpError, HttpMethod, HttpRequest, HttpResponse};
+use crate::http::client::{HttpError, HttpMethod, HttpRequest, HttpResponse, read_body_text};
 use crate::http::sse::SseStream;
 use crate::models::calculate_cost;
 use crate::types::{
@@ -1523,14 +1523,6 @@ fn sdk_error_message(status: u16, body: &str) -> String {
         Err(_) if !body.is_empty() => format!("{status} {body}"),
         Err(_) => format!("{status} status code (no body)"),
     }
-}
-
-async fn read_body_text(mut body: HttpByteStream) -> Result<String, HttpError> {
-    let mut text = String::new();
-    while let Some(chunk) = body.next_chunk().await? {
-        text.push_str(&String::from_utf8_lossy(&chunk));
-    }
-    Ok(text)
 }
 
 fn provider_error_from_http(error: HttpError) -> ProviderRequestError {

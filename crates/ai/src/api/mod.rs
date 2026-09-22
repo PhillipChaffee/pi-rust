@@ -16,6 +16,7 @@ use crate::types::ProviderStreams;
 pub mod anthropic_messages;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
+pub mod google_generative_ai;
 pub mod google_shared;
 pub mod lazy;
 pub mod simple_options;
@@ -116,7 +117,7 @@ pub fn openai_completions() -> Arc<dyn ProviderStreams> {
 /// The Google Generative AI wire API, upstream's `googleGenerativeAIApi()`.
 #[must_use]
 pub fn google_generative_ai() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("google-generative-ai")
+    Arc::new(google_generative_ai::GoogleStreams)
 }
 
 /// The Google Vertex AI wire API, upstream's `googleVertexApi()`.
