@@ -19,14 +19,13 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
 
-use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
-use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
 use pi_tui::tui::{CURSOR_MARKER, Component, Tui, TuiConfig, TuiMode, TuiRenderer, TuiStopOptions};
 use pi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenConfig, TuiMainScreenRenderState};
 
-use tui_support::{VirtualTerminal, wait_for_render};
+use tui_support::{
+    BoundedWriteTerminal, VirtualTerminal, kitty_image, new_main_screen_tui, stop, wait_for_render,
+};
 
 const MAX_RENDER_WRITE_CHARS: usize = 1024 * 1024;
 
@@ -90,11 +89,6 @@ impl TuiRenderer for MainScreenHandle {
     }
 }
 
-fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
-    let map = map.clone();
-    Box::new(move |key| map.get(key).cloned())
-}
-
 /// Build the TUI and a handle on its renderer, upstream's typed
 /// `new TuiMainScreen(terminal)` the suites keep a reference to.
 fn new_tui_with_handle(
@@ -102,7 +96,7 @@ fn new_tui_with_handle(
     env: &HashMap<String, String>,
 ) -> (Rc<Tui>, Rc<TuiMainScreen>) {
     let renderer = Rc::new(TuiMainScreen::new(TuiMainScreenConfig {
-        env_lookup: Some(env_lookup(env)),
+        env_lookup: Some(tui_support::env_lookup(env)),
     }));
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
@@ -112,16 +106,6 @@ fn new_tui_with_handle(
     (tui, renderer)
 }
 
-fn new_tui(terminal: VirtualTerminal, env: &HashMap<String, String>) -> Rc<Tui> {
-    Tui::new(TuiConfig {
-        terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig {
-            env_lookup: Some(env_lookup(env)),
-        }))),
-        ..TuiConfig::default()
-    })
-}
-
 fn new_tui_showing_cursor(terminal: VirtualTerminal) -> Rc<Tui> {
     Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
@@ -129,22 +113,6 @@ fn new_tui_showing_cursor(terminal: VirtualTerminal) -> Rc<Tui> {
         show_hardware_cursor: Some(true),
         ..TuiConfig::default()
     })
-}
-
-fn kitty_image(base64: &str, columns: usize, rows: usize, image_id: u64) -> String {
-    encode_kitty(
-        base64,
-        EncodeKittyOptions {
-            columns: Some(columns),
-            rows: Some(rows),
-            image_id: Some(image_id),
-            move_cursor: Some(false),
-        },
-    )
-}
-
-fn stop(tui: &Tui) {
-    tui.stop(TuiStopOptions::default());
 }
 
 fn segment_reset() -> String {
@@ -249,62 +217,12 @@ fn bounded_writer_splits_multi_byte_lines_at_char_boundaries() {
     stop(&tui);
 }
 
-/// The ported suite's `BoundedWriteTerminal` shape, local to the boundary
-/// file's chunking test.
-#[derive(Clone)]
-struct BoundedWriteTerminal {
-    writes: Rc<RefCell<Vec<String>>>,
-}
-
-impl BoundedWriteTerminal {
-    fn new() -> Self {
-        Self {
-            writes: Rc::new(RefCell::new(Vec::new())),
-        }
-    }
-
-    fn writes(&self) -> Vec<String> {
-        self.writes.borrow().clone()
-    }
-
-    fn clear_writes(&self) {
-        self.writes.borrow_mut().clear();
-    }
-}
-
-impl Terminal for BoundedWriteTerminal {
-    fn start(&mut self, _on_input: InputHandler, _on_resize: ResizeHandler) {}
-    fn stop(&mut self) {}
-    fn drain_input(&mut self, _max_ms: u64, _idle_ms: u64) {}
-    fn write(&mut self, data: &str) {
-        self.writes.borrow_mut().push(data.to_string());
-    }
-    fn columns(&self) -> u16 {
-        80
-    }
-    fn rows(&self) -> u16 {
-        24
-    }
-    fn is_kitty_protocol_active(&self) -> bool {
-        false
-    }
-    fn move_by(&mut self, _lines: i32) {}
-    fn hide_cursor(&mut self) {}
-    fn show_cursor(&mut self) {}
-    fn clear_line(&mut self) {}
-    fn clear_from_cursor(&mut self) {}
-    fn clear_screen(&mut self) {}
-    fn set_title(&mut self, _title: &str) {}
-    fn set_progress(&mut self, _active: bool) {}
-    fn poll(&mut self, _timeout: Duration) {}
-}
-
 #[test]
 fn render_debug_dump_writes_the_frame_coordinates() {
     let mut env = HashMap::new();
     env.insert("PI_TUI_DEBUG".to_string(), "1".to_string());
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal, &env);
+    let tui = new_main_screen_tui(terminal, &env);
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
         marker_line: std::cell::Cell::new(None),
@@ -412,7 +330,7 @@ fn differential_append_scrolls_and_moves_to_the_viewport_bottom() {
 #[test]
 fn kitty_header_skips_malformed_params_and_adjacent_images_stop_reservation() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
         marker_line: std::cell::Cell::new(None),

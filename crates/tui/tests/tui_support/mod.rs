@@ -39,17 +39,20 @@
 )]
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::time::Duration;
 
 use unicode_width::UnicodeWidthChar;
 
-use pi_tui::terminal::{InputHandler, ResizeHandler, Terminal};
+use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
+use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
 use pi_tui::tui::{
     Component, Focusable, Tui, TuiConfig, TuiMouseButton, TuiMouseEvent, TuiMouseEventType,
     TuiRenderer,
 };
+use pi_tui::tui_alt_screen::{TuiAltScreen, TuiAltScreenConfig};
+use pi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenConfig};
 
 /// One screen cell: the grapheme it starts, its visible width (zero for
 /// wide-char placeholders), whether italic is active, and whether anything
@@ -554,11 +557,9 @@ impl Terminal for VirtualTerminal {
 /// shell might export.
 #[must_use]
 pub fn test_renderer() -> Box<dyn TuiRenderer> {
-    Box::new(pi_tui::tui_main_screen::TuiMainScreen::new(
-        pi_tui::tui_main_screen::TuiMainScreenConfig {
-            env_lookup: Some(Box::new(|_| None)),
-        },
-    ))
+    Box::new(TuiMainScreen::new(TuiMainScreenConfig {
+        env_lookup: Some(Box::new(|_| None)),
+    }))
 }
 
 /// Build the TUI the suites drive, upstream `new TuiMainScreen(terminal)`.
@@ -750,4 +751,107 @@ pub const fn mouse_event(
         wheel_delta: None,
         click_count: None,
     }
+}
+
+/// The suites' environment closure, `map.get(key)` closed over a clone.
+#[must_use]
+pub fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
+    let map = map.clone();
+    Box::new(move |key| map.get(key).cloned())
+}
+
+/// The render suites' TUI construction: the main-screen renderer over a
+/// quiet-map environment lookup.
+#[must_use]
+pub fn new_main_screen_tui(terminal: VirtualTerminal, env: &HashMap<String, String>) -> Rc<Tui> {
+    Tui::new(TuiConfig {
+        terminal: Some(Box::new(terminal)),
+        renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig {
+            env_lookup: Some(env_lookup(env)),
+        }))),
+        ..TuiConfig::default()
+    })
+}
+
+/// The alt-screen suites' TUI construction: the alternate-screen renderer
+/// over the given configuration, with a handle kept for the scroll and
+/// selection surfaces.
+#[must_use]
+pub fn new_alt_screen_tui(
+    terminal: VirtualTerminal,
+    config: TuiAltScreenConfig,
+) -> (Rc<Tui>, TuiAltScreen) {
+    let alt = TuiAltScreen::new(config);
+    let tui = Tui::new(TuiConfig {
+        terminal: Some(Box::new(terminal)),
+        renderer: Some(Box::new(alt.clone())),
+        ..TuiConfig::default()
+    });
+    (tui, alt)
+}
+
+/// The image suites' Kitty placement builder: `encodeKitty` with the same
+/// cell geometry the renderer reads, so the placements drive the identical
+/// branches the `Image` component would.
+#[must_use]
+pub fn kitty_image(base64: &str, columns: usize, rows: usize, image_id: u64) -> String {
+    encode_kitty(
+        base64,
+        EncodeKittyOptions {
+            columns: Some(columns),
+            rows: Some(rows),
+            image_id: Some(image_id),
+            move_cursor: Some(false),
+        },
+    )
+}
+
+/// The suites' `BoundedWriteTerminal`: captures every write without
+/// emulating anything, so the chunking asserts on raw writes.
+#[derive(Clone, Default)]
+pub struct BoundedWriteTerminal {
+    writes: Rc<RefCell<Vec<String>>>,
+}
+
+impl BoundedWriteTerminal {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn writes(&self) -> Vec<String> {
+        self.writes.borrow().clone()
+    }
+
+    pub fn clear_writes(&self) {
+        self.writes.borrow_mut().clear();
+    }
+}
+
+impl Terminal for BoundedWriteTerminal {
+    fn start(&mut self, _on_input: InputHandler, _on_resize: ResizeHandler) {}
+    fn stop(&mut self) {}
+    fn drain_input(&mut self, _max_ms: u64, _idle_ms: u64) {}
+    fn write(&mut self, data: &str) {
+        self.writes.borrow_mut().push(data.to_string());
+    }
+    fn columns(&self) -> u16 {
+        80
+    }
+    fn rows(&self) -> u16 {
+        24
+    }
+    fn is_kitty_protocol_active(&self) -> bool {
+        false
+    }
+    fn move_by(&mut self, _lines: i32) {}
+    fn hide_cursor(&mut self) {}
+    fn show_cursor(&mut self) {}
+    fn clear_line(&mut self) {}
+    fn clear_from_cursor(&mut self) {}
+    fn clear_screen(&mut self) {}
+    fn set_title(&mut self, _title: &str) {}
+    fn set_progress(&mut self, _active: bool) {}
+    fn poll(&mut self, _timeout: Duration) {}
 }

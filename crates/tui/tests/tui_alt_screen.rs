@@ -65,7 +65,9 @@ use pi_tui::tui::{
 use pi_tui::tui_alt_screen::{CopySelectionResult, TuiAltScreen, TuiAltScreenConfig};
 use pi_tui::utils::{strip_terminal_sequences, truncate_to_width};
 
-use tui_support::{VirtualTerminal, render_and_flush, wait_for_render};
+use tui_support::{
+    VirtualTerminal, new_alt_screen_tui as new_tui, render_and_flush, wait_for_render,
+};
 
 const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
 
@@ -381,16 +383,6 @@ fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
     Box::new(move |key| map.get(key).cloned())
 }
 
-fn new_tui(terminal: VirtualTerminal, config: TuiAltScreenConfig) -> (Rc<Tui>, TuiAltScreen) {
-    let alt = TuiAltScreen::new(config);
-    let tui = Tui::new(TuiConfig {
-        terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(alt.clone())),
-        ..TuiConfig::default()
-    });
-    (tui, alt)
-}
-
 fn new_recording_tui(
     terminal: RecordingTerminal,
     config: TuiAltScreenConfig,
@@ -534,19 +526,7 @@ fn shows_a_clickable_jump_to_end_indicator_on_the_transcripts_last_row_while_scr
             ..ScrollViewOptions::default()
         },
     );
-    tui.set_layout_root(Some(VStack::new(
-        vec![
-            scroll_entry(transcript.clone(), 0, 1, 1),
-            StackChild::entry(
-                text(&["editor", "footer"]),
-                StackEntryOptions {
-                    min_size: Some(1),
-                    ..StackEntryOptions::default()
-                },
-            ),
-        ],
-        StackOptions::default(),
-    )));
+    transcript_footer_layout(&tui, &transcript);
     tui.start();
     wait_for_render(&tui);
     assert!(
@@ -602,19 +582,7 @@ fn leaves_the_scrollbar_clickable_when_the_jump_to_end_indicator_spans_the_trans
             ..ScrollViewOptions::default()
         },
     );
-    tui.set_layout_root(Some(VStack::new(
-        vec![
-            scroll_entry(transcript.clone(), 0, 1, 1),
-            StackChild::entry(
-                text(&["editor", "footer"]),
-                StackEntryOptions {
-                    min_size: Some(1),
-                    ..StackEntryOptions::default()
-                },
-            ),
-        ],
-        StackOptions::default(),
-    )));
+    transcript_footer_layout(&tui, &transcript);
     tui.start();
     wait_for_render(&tui);
 
@@ -1552,27 +1520,7 @@ fn searches_the_transcript_with_ctrl_shift_f_and_restores_editor_focus_on_close(
             ..ScrollViewOptions::default()
         },
     );
-    let editor_inputs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let editor = Rc::new(RecordingComponent {
-        lines: RefCell::new(vec!["editor".to_string()]),
-        inputs: Rc::clone(&editor_inputs),
-        focused: Cell::new(false),
-    });
-    tui.set_layout_root(Some(VStack::new(
-        vec![
-            scroll_entry(transcript.clone(), 0, 1, 1),
-            StackChild::entry(
-                editor.clone(),
-                StackEntryOptions {
-                    basis: Some(Basis::Cells(1)),
-                    shrink: Some(0),
-                    ..StackEntryOptions::default()
-                },
-            ),
-        ],
-        StackOptions::default(),
-    )));
-    tui.set_focus(Some(editor));
+    let (_editor, editor_inputs) = transcript_editor_layout(&tui, &transcript);
     tui.start();
     wait_for_render(&tui);
 
@@ -1695,6 +1643,55 @@ impl Component for RecordingComponent {
     }
 }
 
+/// The search suites' layout fixture: the transcript scroll laid out as one
+/// row above a recording editor, the editor focused, with the input
+/// recorder returned so the assertions can read what the editor received.
+fn transcript_editor_layout(
+    tui: &Rc<Tui>,
+    transcript: &Rc<ScrollView>,
+) -> (Rc<RecordingComponent>, Rc<RefCell<Vec<String>>>) {
+    let editor_inputs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let editor = Rc::new(RecordingComponent {
+        lines: RefCell::new(vec!["editor".to_string()]),
+        inputs: Rc::clone(&editor_inputs),
+        focused: Cell::new(false),
+    });
+    tui.set_layout_root(Some(VStack::new(
+        vec![
+            scroll_entry(transcript.clone(), 0, 1, 1),
+            StackChild::entry(
+                editor.clone(),
+                StackEntryOptions {
+                    basis: Some(Basis::Cells(1)),
+                    shrink: Some(0),
+                    ..StackEntryOptions::default()
+                },
+            ),
+        ],
+        StackOptions::default(),
+    )));
+    tui.set_focus(Some(editor.clone()));
+    (editor, editor_inputs)
+}
+
+/// The two-row layout fixture: the transcript scroll above a two-line
+/// editor row, upstream's footer-bearing document shape.
+fn transcript_footer_layout(tui: &Rc<Tui>, transcript: &Rc<ScrollView>) {
+    tui.set_layout_root(Some(VStack::new(
+        vec![
+            scroll_entry(transcript.clone(), 0, 1, 1),
+            StackChild::entry(
+                text(&["editor", "footer"]),
+                StackEntryOptions {
+                    min_size: Some(1),
+                    ..StackEntryOptions::default()
+                },
+            ),
+        ],
+        StackOptions::default(),
+    )));
+}
+
 #[test]
 fn scrolls_the_transcript_by_half_a_page_with_custom_bindings() {
     let _guard = KEYBINDINGS_LOCK
@@ -1770,27 +1767,7 @@ fn routes_ctrl_modified_viewport_navigation_to_the_focused_component() {
             ..ScrollViewOptions::default()
         },
     );
-    let editor_inputs: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let editor = Rc::new(RecordingComponent {
-        lines: RefCell::new(vec!["editor".to_string()]),
-        inputs: Rc::clone(&editor_inputs),
-        focused: Cell::new(false),
-    });
-    tui.set_layout_root(Some(VStack::new(
-        vec![
-            scroll_entry(transcript.clone(), 0, 1, 1),
-            StackChild::entry(
-                editor.clone(),
-                StackEntryOptions {
-                    basis: Some(Basis::Cells(1)),
-                    shrink: Some(0),
-                    ..StackEntryOptions::default()
-                },
-            ),
-        ],
-        StackOptions::default(),
-    )));
-    tui.set_focus(Some(editor));
+    let (_editor, editor_inputs) = transcript_editor_layout(&tui, &transcript);
     tui.start();
     wait_for_render(&tui);
 

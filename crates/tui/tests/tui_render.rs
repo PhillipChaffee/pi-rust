@@ -25,12 +25,14 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
-use pi_tui::terminal_image::{EncodeKittyOptions, delete_kitty_image, encode_kitty};
-use pi_tui::tui::{Component, Tui, TuiConfig, TuiStopOptions};
+use pi_tui::terminal::Terminal;
+use pi_tui::terminal_image::delete_kitty_image;
+use pi_tui::tui::{Component, Tui, TuiConfig};
 use pi_tui::tui_main_screen::{TuiMainScreen, TuiMainScreenConfig};
 
-use tui_support::{VirtualTerminal, wait_for_render};
+use tui_support::{
+    BoundedWriteTerminal, VirtualTerminal, kitty_image, new_main_screen_tui, stop, wait_for_render,
+};
 
 const MAX_RENDER_WRITE_CHARS: usize = 1024 * 1024;
 
@@ -83,65 +85,6 @@ impl Component for InputComponent {
     fn invalidate(&self) {}
 }
 
-/// The suite's `BoundedWriteTerminal`: captures every write without
-/// emulating anything, so the chunking asserts on raw writes.
-#[derive(Clone)]
-struct BoundedWriteTerminal {
-    writes: Rc<RefCell<Vec<String>>>,
-}
-
-impl BoundedWriteTerminal {
-    fn writes(&self) -> Vec<String> {
-        self.writes.borrow().clone()
-    }
-
-    fn clear_writes(&self) {
-        self.writes.borrow_mut().clear();
-    }
-}
-
-impl Terminal for BoundedWriteTerminal {
-    fn start(&mut self, _on_input: InputHandler, _on_resize: ResizeHandler) {}
-    fn stop(&mut self) {}
-    fn drain_input(&mut self, _max_ms: u64, _idle_ms: u64) {}
-    fn write(&mut self, data: &str) {
-        self.writes.borrow_mut().push(data.to_string());
-    }
-    fn columns(&self) -> u16 {
-        80
-    }
-    fn rows(&self) -> u16 {
-        24
-    }
-    fn is_kitty_protocol_active(&self) -> bool {
-        false
-    }
-    fn move_by(&mut self, _lines: i32) {}
-    fn hide_cursor(&mut self) {}
-    fn show_cursor(&mut self) {}
-    fn clear_line(&mut self) {}
-    fn clear_from_cursor(&mut self) {}
-    fn clear_screen(&mut self) {}
-    fn set_title(&mut self, _title: &str) {}
-    fn set_progress(&mut self, _active: bool) {}
-    fn poll(&mut self, _timeout: Duration) {}
-}
-
-fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
-    let map = map.clone();
-    Box::new(move |key| map.get(key).cloned())
-}
-
-fn new_tui(terminal: VirtualTerminal, env: &HashMap<String, String>) -> Rc<Tui> {
-    Tui::new(TuiConfig {
-        terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig {
-            env_lookup: Some(env_lookup(env)),
-        }))),
-        ..TuiConfig::default()
-    })
-}
-
 fn new_tui_with_log_dir(
     terminal: VirtualTerminal,
     env: &HashMap<String, String>,
@@ -150,27 +93,11 @@ fn new_tui_with_log_dir(
     Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal)),
         renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig {
-            env_lookup: Some(env_lookup(env)),
+            env_lookup: Some(tui_support::env_lookup(env)),
         }))),
         log_directory: Some(log_dir),
         ..TuiConfig::default()
     })
-}
-
-fn kitty_image(base64: &str, columns: usize, rows: usize, image_id: u64) -> String {
-    encode_kitty(
-        base64,
-        EncodeKittyOptions {
-            columns: Some(columns),
-            rows: Some(rows),
-            image_id: Some(image_id),
-            move_cursor: Some(false),
-        },
-    )
-}
-
-fn stop(tui: &Tui) {
-    tui.stop(TuiStopOptions::default());
 }
 
 fn temp_dir(prefix: &str) -> PathBuf {
@@ -183,12 +110,24 @@ fn temp_dir(prefix: &str) -> PathBuf {
     ))
 }
 
+/// The suites' most common fixture: a started TUI carrying one fresh
+/// [`TestComponent`], with handles on the terminal and the component.
+fn started_component(width: u16, height: u16) -> (Rc<Tui>, VirtualTerminal, Rc<TestComponent>) {
+    let terminal = VirtualTerminal::new(width, height);
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
+    let component = Rc::new(TestComponent {
+        lines: RefCell::new(Vec::new()),
+    });
+    tui.add_child(component.clone());
+    (tui, terminal, component)
+}
+
 // === TUI render scheduling ===
 
 #[test]
 fn renders_keyboard_input_without_waiting_for_a_throttled_frame() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
     let component = Rc::new(InputComponent {
         lines: RefCell::new(vec!["initial".to_string()]),
         render_count: Cell::new(0),
@@ -250,9 +189,7 @@ fn writes_redraw_logs_to_the_provided_directory() {
 
 #[test]
 fn splits_a_large_full_render_without_changing_its_output() {
-    let terminal = BoundedWriteTerminal {
-        writes: Rc::new(RefCell::new(Vec::new())),
-    };
+    let terminal = BoundedWriteTerminal::new();
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal.clone())),
         renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig::default()))),
@@ -287,9 +224,7 @@ fn splits_a_large_full_render_without_changing_its_output() {
 
 #[test]
 fn splits_large_differential_updates_without_a_full_redraw() {
-    let terminal = BoundedWriteTerminal {
-        writes: Rc::new(RefCell::new(Vec::new())),
-    };
+    let terminal = BoundedWriteTerminal::new();
     let tui = Tui::new(TuiConfig {
         terminal: Some(Box::new(terminal.clone())),
         renderer: Some(Box::new(TuiMainScreen::new(TuiMainScreenConfig::default()))),
@@ -333,7 +268,7 @@ fn splits_large_differential_updates_without_a_full_redraw() {
 #[test]
 fn writes_the_crash_dump_to_the_os_temp_directory_instead_of_a_home_directory_default() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal, &HashMap::new());
+    let tui = new_main_screen_tui(terminal, &HashMap::new());
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
     });
@@ -367,12 +302,7 @@ fn writes_the_crash_dump_to_the_os_temp_directory_instead_of_a_home_directory_de
 
 #[test]
 fn clears_reserved_kitty_image_rows_before_drawing_appended_image_placements() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     component.set_lines(vec!["before"]);
     tui.start();
@@ -405,12 +335,7 @@ fn clears_reserved_kitty_image_rows_before_drawing_appended_image_placements() {
 
 #[test]
 fn falls_back_to_full_redraw_when_kitty_image_pre_clear_would_scroll() {
-    let terminal = VirtualTerminal::new(40, 2);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 2);
 
     component.set_lines(vec!["before"]);
     tui.start();
@@ -441,12 +366,7 @@ fn falls_back_to_full_redraw_when_kitty_image_pre_clear_would_scroll() {
 
 #[test]
 fn reserves_kitty_image_rows_before_drawing_during_full_redraw_fallbacks() {
-    let terminal = VirtualTerminal::new(40, 5);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 5);
 
     component.set_lines(vec!["l0", "l1", "l2", "l3", "l4"]);
     tui.start();
@@ -482,12 +402,7 @@ fn reserves_kitty_image_rows_before_drawing_during_full_redraw_fallbacks() {
 
 #[test]
 fn does_not_use_cursor_up_placement_for_kitty_images_taller_than_the_viewport() {
-    let terminal = VirtualTerminal::new(40, 5);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 5);
 
     component.set_lines(vec!["before"]);
     tui.start();
@@ -531,12 +446,7 @@ fn does_not_use_cursor_up_placement_for_kitty_images_taller_than_the_viewport() 
 
 #[test]
 fn deletes_changed_image_ids_before_drawing_moved_placements() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     let old_image = kitty_image("AAAA", 2, 2, 42);
     component.set_lines(vec!["top", &old_image]);
@@ -568,12 +478,7 @@ fn deletes_changed_image_ids_before_drawing_moved_placements() {
 
 #[test]
 fn redraws_image_lines_when_an_earlier_reserved_image_row_changes() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     let image = kitty_image("AAAA", 2, 2, 88);
     component.set_lines(vec!["", &image]);
@@ -611,12 +516,7 @@ fn redraws_image_lines_when_an_earlier_reserved_image_row_changes() {
 
 #[test]
 fn deletes_previously_rendered_image_ids_during_full_redraws() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     let image = kitty_image("AAAA", 2, 2, 77);
     component.set_lines(vec![&image]);
@@ -651,12 +551,7 @@ fn deletes_previously_rendered_image_ids_during_full_redraws() {
 fn triggers_full_re_render_when_terminal_height_changes() {
     // The injected environment lookup answers nothing, so the session is not
     // a Termux session, upstream's `withEnv({ TERMUX_VERSION: undefined })`.
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     component.set_lines(vec!["Line 0", "Line 1", "Line 2"]);
     tui.start();
@@ -688,7 +583,7 @@ fn skips_full_re_render_on_height_changes_in_termux() {
     let mut env = HashMap::new();
     env.insert("TERMUX_VERSION".to_string(), "1".to_string());
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &env);
+    let tui = new_main_screen_tui(terminal.clone(), &env);
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
     });
@@ -732,12 +627,7 @@ fn skips_full_re_render_on_height_changes_in_termux() {
 
 #[test]
 fn triggers_full_re_render_when_terminal_width_changes() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     component.set_lines(vec!["Line 0", "Line 1", "Line 2"]);
     tui.start();
@@ -763,7 +653,7 @@ fn triggers_full_re_render_when_terminal_width_changes() {
 #[test]
 fn clears_empty_rows_when_content_shrinks_significantly() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
     tui.set_clear_on_shrink(true); // Explicitly enable (may be disabled via env var)
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
@@ -815,7 +705,7 @@ fn clears_empty_rows_when_content_shrinks_significantly() {
 #[test]
 fn handles_shrink_to_single_line() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
     tui.set_clear_on_shrink(true);
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
@@ -849,7 +739,7 @@ fn handles_shrink_to_single_line() {
 #[test]
 fn handles_shrink_to_empty() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
     tui.set_clear_on_shrink(true);
     let component = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
@@ -883,12 +773,7 @@ fn handles_shrink_to_empty() {
 
 #[test]
 fn tracks_cursor_correctly_when_content_shrinks_with_unchanged_remaining_lines() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     // Initial render: 5 identical lines
     component.set_lines(vec!["Line 0", "Line 1", "Line 2", "Line 3", "Line 4"]);
@@ -917,12 +802,7 @@ fn tracks_cursor_correctly_when_content_shrinks_with_unchanged_remaining_lines()
 
 #[test]
 fn renders_correctly_when_only_a_middle_line_changes_spinner_case() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     // Initial render
     component.set_lines(vec!["Header", "Working...", "Footer"]);
@@ -957,12 +837,7 @@ fn renders_correctly_when_only_a_middle_line_changes_spinner_case() {
 
 #[test]
 fn resets_styles_after_each_rendered_line() {
-    let terminal = VirtualTerminal::new(20, 6);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(20, 6);
 
     component.set_lines(vec!["\x1b[3mItalic", "Plain"]);
     tui.start();
@@ -977,12 +852,7 @@ fn resets_styles_after_each_rendered_line() {
 
 #[test]
 fn renders_correctly_when_first_line_changes_but_rest_stays_same() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     component.set_lines(vec!["Line 0", "Line 1", "Line 2", "Line 3"]);
     tui.start();
@@ -1018,12 +888,7 @@ fn renders_correctly_when_first_line_changes_but_rest_stays_same() {
 
 #[test]
 fn renders_correctly_when_last_line_changes_but_rest_stays_same() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     component.set_lines(vec!["Line 0", "Line 1", "Line 2", "Line 3"]);
     tui.start();
@@ -1057,12 +922,7 @@ fn renders_correctly_when_last_line_changes_but_rest_stays_same() {
 
 #[test]
 fn renders_correctly_when_multiple_non_adjacent_lines_change() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     component.set_lines(vec!["Line 0", "Line 1", "Line 2", "Line 3", "Line 4"]);
     tui.start();
@@ -1104,12 +964,7 @@ fn renders_correctly_when_multiple_non_adjacent_lines_change() {
 
 #[test]
 fn handles_transition_from_content_to_empty_and_back_to_content() {
-    let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(40, 10);
 
     // Start with content
     component.set_lines(vec!["Line 0", "Line 1", "Line 2"]);
@@ -1151,12 +1006,7 @@ fn handles_transition_from_content_to_empty_and_back_to_content() {
 
 #[test]
 fn full_re_renders_when_deleted_lines_move_the_viewport_upward() {
-    let terminal = VirtualTerminal::new(20, 5);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(20, 5);
 
     let lines: Vec<String> = (0..12).map(|i| format!("Line {i}")).collect();
     let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -1186,12 +1036,7 @@ fn full_re_renders_when_deleted_lines_move_the_viewport_upward() {
 
 #[test]
 fn appends_after_a_shrink_without_another_full_redraw_once_the_viewport_is_reset() {
-    let terminal = VirtualTerminal::new(20, 5);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
-    let component = Rc::new(TestComponent {
-        lines: RefCell::new(Vec::new()),
-    });
-    tui.add_child(component.clone());
+    let (tui, terminal, component) = started_component(20, 5);
 
     let lines: Vec<String> = (0..8).map(|i| format!("Line {i}")).collect();
     let line_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
@@ -1231,7 +1076,7 @@ fn appends_after_a_shrink_without_another_full_redraw_once_the_viewport_is_reset
 #[test]
 fn clears_stale_content_when_max_lines_rendered_was_inflated_by_a_transient_component() {
     let terminal = VirtualTerminal::new(40, 10);
-    let tui = new_tui(terminal.clone(), &HashMap::new());
+    let tui = new_main_screen_tui(terminal.clone(), &HashMap::new());
     let chat = Rc::new(TestComponent {
         lines: RefCell::new(Vec::new()),
     });

@@ -15,9 +15,9 @@ use pi_tui::alt_screen_search::{
     get_alt_screen_search_match_key,
 };
 use pi_tui::components::AltScreenFlashContainer;
-use pi_tui::tui::{Component, Tui, TuiConfig, TuiStopOptions};
+use pi_tui::tui::{Component, TuiStopOptions};
 use pi_tui::tui_alt_screen::{CopySelectionResult, TuiAltScreen, TuiAltScreenConfig};
-use tui_support::{VirtualTerminal, wait_for_render};
+use tui_support::{VirtualTerminal, new_alt_screen_tui as new_tui, wait_for_render};
 
 fn search_component() -> Rc<AltScreenSearchComponent> {
     AltScreenSearchComponent::new(Rc::new(|_query: &str| {}), None)
@@ -220,16 +220,6 @@ fn alt_screen_mouse_wheel_clamps_oversized_coordinates() {
     assert!(alt.viewport_top() <= 6);
     let _ = top;
     tui.stop(TuiStopOptions::default());
-}
-
-fn new_tui(terminal: VirtualTerminal, config: TuiAltScreenConfig) -> (Rc<Tui>, TuiAltScreen) {
-    let alt = TuiAltScreen::new(config);
-    let tui = Tui::new(TuiConfig {
-        terminal: Some(Box::new(terminal)),
-        renderer: Some(Box::new(alt.clone())),
-        ..TuiConfig::default()
-    });
-    (tui, alt)
 }
 
 #[test]
