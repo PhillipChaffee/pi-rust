@@ -20,6 +20,7 @@ pub mod google_generative_ai;
 pub mod google_shared;
 pub mod google_vertex;
 pub mod lazy;
+pub mod mistral_conversations;
 pub mod simple_options;
 pub mod transform_messages;
 
@@ -137,7 +138,7 @@ pub fn bedrock_converse_stream() -> Arc<dyn ProviderStreams> {
 /// The Mistral Conversations wire API, upstream's `mistralConversationsApi()`.
 #[must_use]
 pub fn mistral_conversations() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("mistral-conversations")
+    Arc::new(mistral_conversations::MistralStreams)
 }
 
 /// The OpenAI Codex Responses wire API, upstream's
