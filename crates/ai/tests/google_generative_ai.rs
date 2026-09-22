@@ -25,7 +25,7 @@ use pi_ai::api::google_generative_ai::{
 use pi_ai::api::google_shared::{ResolvedGoogleThinkingLevel, resolve_google_thinking_level};
 use pi_ai::http::mock::MockResponse;
 use pi_ai::types::{
-    Api, Context, Message, Model, ModelThinkingLevel, Modality, ProviderId, SimpleStreamOptions,
+    Api, Context, Message, Modality, Model, ModelThinkingLevel, ProviderId, SimpleStreamOptions,
     ThinkingBudgets, ThinkingLevel, ThinkingLevelMap, ToolCall, UserContent, UserMessage,
 };
 use pi_ai::utils::pi_user_agent::get_pi_user_agent;
@@ -137,7 +137,10 @@ async fn preserves_raw_gemini_finish_reasons_for_errors() {
         .await;
 
     assert_eq!(message.stop_reason, pi_ai::types::StopReason::Error);
-    assert_eq!(message.raw_stop_reason.as_deref(), Some("MALFORMED_FUNCTION_CALL"));
+    assert_eq!(
+        message.raw_stop_reason.as_deref(),
+        Some("MALFORMED_FUNCTION_CALL")
+    );
     assert_eq!(
         message.error_message.as_deref(),
         Some("Provider stopped with: MALFORMED_FUNCTION_CALL")
@@ -159,10 +162,12 @@ async fn preserves_max_tokens_with_a_tool_call_as_length() {
 
     assert_eq!(message.stop_reason, pi_ai::types::StopReason::Length);
     assert_eq!(message.raw_stop_reason.as_deref(), Some("MAX_TOKENS"));
-    assert!(message
-        .content
-        .iter()
-        .any(|block| matches!(block, pi_ai::types::AssistantBlock::ToolCall(_))));
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, pi_ai::types::AssistantBlock::ToolCall(_)))
+    );
 }
 
 /// `STOP` with a tool call upgrades to `toolUse`.
@@ -179,10 +184,12 @@ async fn maps_stop_with_a_tool_call_to_tool_use() {
 
     assert_eq!(message.stop_reason, pi_ai::types::StopReason::ToolUse);
     assert_eq!(message.raw_stop_reason.as_deref(), Some("STOP"));
-    let Some(pi_ai::types::AssistantBlock::ToolCall(ToolCall { id, .. })) =
-        message.content.iter().find(|block| matches!(block, pi_ai::types::AssistantBlock::ToolCall(_)))
+    let Some(pi_ai::types::AssistantBlock::ToolCall(ToolCall { id, .. })) = message
+        .content
+        .iter()
+        .find(|block| matches!(block, pi_ai::types::AssistantBlock::ToolCall(_)))
     else {
-        panic!("expected a tool call block");
+        unreachable!("expected a tool call block");
     };
     assert_eq!(id, "call-1");
 }
@@ -195,7 +202,9 @@ async fn uses_pi_user_agent_by_default() {
     let model = catalog_gemini();
     let options = gemini_options(&mock);
 
-    let _ = stream_google(&model, &context(), Some(&options)).result().await;
+    let _ = stream_google(&model, &context(), Some(&options))
+        .result()
+        .await;
 
     assert_eq!(
         common::recorded_header(&mock, "User-Agent").as_deref(),
@@ -215,7 +224,9 @@ async fn lets_explicit_headers_override_the_default_user_agent() {
         Some("custom-agent".to_owned()),
     )]));
 
-    let _ = stream_google(&model, &context(), Some(&options)).result().await;
+    let _ = stream_google(&model, &context(), Some(&options))
+        .result()
+        .await;
 
     assert_eq!(
         common::recorded_header(&mock, "User-Agent").as_deref(),
@@ -231,13 +242,11 @@ async fn lets_explicit_headers_override_the_default_user_agent() {
 fn exhaustively_resolves_supported_logical_levels_and_mapping_values() {
     let model = google_model("gemini-3.7-flash", ThinkingLevelMap::new());
     assert_eq!(
-        resolve_google_thinking_level(&model, ModelThinkingLevel::Off)
-            .expect("off"),
+        resolve_google_thinking_level(&model, ModelThinkingLevel::Off).expect("off"),
         ResolvedGoogleThinkingLevel::High
     );
     assert_eq!(
-        resolve_google_thinking_level(&model, ModelThinkingLevel::Minimal)
-            .expect("minimal"),
+        resolve_google_thinking_level(&model, ModelThinkingLevel::Minimal).expect("minimal"),
         ResolvedGoogleThinkingLevel::Minimal
     );
     assert_eq!(
@@ -245,8 +254,7 @@ fn exhaustively_resolves_supported_logical_levels_and_mapping_values() {
         ResolvedGoogleThinkingLevel::Low
     );
     assert_eq!(
-        resolve_google_thinking_level(&model, ModelThinkingLevel::Medium)
-            .expect("medium"),
+        resolve_google_thinking_level(&model, ModelThinkingLevel::Medium).expect("medium"),
         ResolvedGoogleThinkingLevel::Medium
     );
     assert_eq!(
@@ -254,19 +262,28 @@ fn exhaustively_resolves_supported_logical_levels_and_mapping_values() {
         ResolvedGoogleThinkingLevel::High
     );
 
-    for mapped in ["minimal", "low", "medium", "high", "MINIMAL", "LOW", "MEDIUM", "HIGH"] {
-        let model = model_with_map("gemini-3.7-flash", &[
-            (ModelThinkingLevel::High, mapped),
-            (ModelThinkingLevel::Xhigh, mapped),
-            (ModelThinkingLevel::Max, mapped),
-        ]);
+    for mapped in [
+        "minimal", "low", "medium", "high", "MINIMAL", "LOW", "MEDIUM", "HIGH",
+    ] {
+        let model = model_with_map(
+            "gemini-3.7-flash",
+            &[
+                (ModelThinkingLevel::High, mapped),
+                (ModelThinkingLevel::Xhigh, mapped),
+                (ModelThinkingLevel::Max, mapped),
+            ],
+        );
         let expected = match mapped.to_lowercase().as_str() {
             "minimal" => ResolvedGoogleThinkingLevel::Minimal,
             "low" => ResolvedGoogleThinkingLevel::Low,
             "medium" => ResolvedGoogleThinkingLevel::Medium,
             _ => ResolvedGoogleThinkingLevel::High,
         };
-        for level in [ModelThinkingLevel::High, ModelThinkingLevel::Xhigh, ModelThinkingLevel::Max] {
+        for level in [
+            ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
+            ModelThinkingLevel::Max,
+        ] {
             assert_eq!(
                 resolve_google_thinking_level(&model, level).expect("resolved"),
                 expected,
@@ -275,7 +292,10 @@ fn exhaustively_resolves_supported_logical_levels_and_mapping_values() {
         }
     }
 
-    let invalid = model_with_map("gemini-3.7-flash", &[(ModelThinkingLevel::Xhigh, "extreme")]);
+    let invalid = model_with_map(
+        "gemini-3.7-flash",
+        &[(ModelThinkingLevel::Xhigh, "extreme")],
+    );
     assert_eq!(
         resolve_google_thinking_level(&invalid, ModelThinkingLevel::Xhigh),
         Err("Unsupported Google thinking level mapping for test-google/gemini-3.7-flash: xhigh -> extreme"
@@ -336,7 +356,7 @@ async fn capture_payload(
         ..SimpleStreamOptions::default()
     };
 
-    let stream = stream_simple(&model, &context(), Some(&options));
+    let stream = stream_simple(model, &context(), Some(&options));
     let message = stream.result().await;
     (common::captured_payload(&captured), message)
 }

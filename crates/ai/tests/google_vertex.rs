@@ -19,10 +19,12 @@
 use std::collections::BTreeMap;
 
 use pi_ai::api::google_shared::{ResolvedGoogleThinkingLevel, resolve_google_thinking_level};
-use pi_ai::api::google_vertex::{GoogleVertexStreamOptions, stream as stream_vertex, stream_simple};
+use pi_ai::api::google_vertex::{
+    GoogleVertexStreamOptions, stream as stream_vertex, stream_simple,
+};
 use pi_ai::http::mock::{MockHttpClient, MockResponse};
 use pi_ai::types::{
-    Api, Context, Message, Model, ModelThinkingLevel, Modality, ProviderId, SimpleStreamOptions,
+    Api, Context, Message, Modality, Model, ModelThinkingLevel, ProviderId, SimpleStreamOptions,
     ThinkingBudgets, ThinkingLevel, ThinkingLevelMap, UserContent, UserMessage,
 };
 use serde_json::json;
@@ -110,9 +112,10 @@ fn mount_vertex_stream(mock: &MockHttpClient, chunk: &str) {
 /// resolves hermetically even on machines with real gcloud credentials.
 fn mount_metadata_server(mock: &MockHttpClient) {
     mock.on(|request| request.url.contains("169.254.169.254"))
-        .respond(MockResponse::status(200).with_body(
-            r#"{"access_token": "metadata-token", "expires_in": 3600}"#,
-        ));
+        .respond(
+            MockResponse::status(200)
+                .with_body(r#"{"access_token": "metadata-token", "expires_in": 3600}"#),
+        );
 }
 
 /// Point `GOOGLE_APPLICATION_CREDENTIALS` at a path that does not exist so
@@ -317,7 +320,8 @@ async fn does_not_append_api_version_when_the_base_url_includes_one() {
     mount_metadata_server(&mock);
     mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
     let mut model = catalog_vertex();
-    model.base_url = "https://proxy.example.com/v1/projects/test-project/locations/global".to_owned();
+    model.base_url =
+        "https://proxy.example.com/v1/projects/test-project/locations/global".to_owned();
     let options = build_adc(&mock);
 
     let message = settle_stream(&model, &context(), &options).await;
@@ -398,10 +402,12 @@ async fn preserves_max_tokens_with_a_tool_call_as_length_on_vertex() {
 
     assert_eq!(message.stop_reason, pi_ai::types::StopReason::Length);
     assert_eq!(message.raw_stop_reason.as_deref(), Some("MAX_TOKENS"));
-    assert!(message
-        .content
-        .iter()
-        .any(|block| matches!(block, pi_ai::types::AssistantBlock::ToolCall(_))));
+    assert!(
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, pi_ai::types::AssistantBlock::ToolCall(_)))
+    );
 }
 
 /// `STOP` with a tool call upgrades to `toolUse` on Vertex too.
@@ -486,8 +492,536 @@ fn resolves_vertex_thinking_levels() {
     let map = ThinkingLevelMap::from([(ModelThinkingLevel::Xhigh, Some("high".to_owned()))]);
     let model = vertex_model("gemini-3.7-flash", map);
     assert_eq!(
-        resolve_google_thinking_level(&model, ModelThinkingLevel::Xhigh)
-            .expect("resolved"),
+        resolve_google_thinking_level(&model, ModelThinkingLevel::Xhigh).expect("resolved"),
         ResolvedGoogleThinkingLevel::High
+    );
+}
+
+// --- the ADC credential-file flows ---
+
+/// One os-randomness-backed RNG, the generator the service-account fixture
+/// signs with so no key material rides the repository.
+struct TestRng;
+
+impl rsa::rand_core::RngCore for TestRng {
+    fn next_u32(&mut self) -> u32 {
+        let mut bytes = [0u8; 4];
+        self.fill_bytes(&mut bytes);
+        u32::from_le_bytes(bytes)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut bytes = [0u8; 8];
+        self.fill_bytes(&mut bytes);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        getrandom::fill(dest).expect("os randomness");
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rsa::rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rsa::rand_core::CryptoRng for TestRng {}
+
+/// A throwaway RSA key pair as the PEM the service-account fixture carries.
+fn generated_rsa_pem() -> String {
+    use rsa::pkcs8::EncodePrivateKey;
+
+    let mut rng = TestRng;
+    let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("the test key pair generates");
+    key.to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .expect("the key serializes")
+        .to_string()
+}
+
+/// The path of the ADC credentials file fixture, the temp-dir spelling the
+/// other suites use, cleaned up when the test drops the guard.
+fn credentials_file(name: &str, contents: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("pi-vertex-adc-{name}.json"));
+    std::fs::write(&path, contents).expect("the fixture writes");
+    path
+}
+
+fn env_with_credentials_file(path: &std::path::Path) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+        path.to_string_lossy().into_owned(),
+    )])
+}
+
+/// The full service-account JWT exchange: the credentials file signs a
+/// scoped RS256 JWT and exchanges it for the bearer token the stream
+/// carries, with the quota project riding the `x-goog-user-project` header.
+#[tokio::test]
+async fn exchanges_a_service_account_jwt_for_a_bearer_token() {
+    let mock = MockHttpClient::new();
+    let pem = generated_rsa_pem();
+    let fixture = credentials_file(
+        "service-account",
+        &json!({
+            "type": "service_account",
+            "client_email": "sa@test-project.iam.gserviceaccount.com",
+            "private_key": pem,
+            "quota_project_id": "billing-project",
+        })
+        .to_string(),
+    );
+    mock.on(|request| request.url.contains("oauth2.googleapis.com/token"))
+        .respond(MockResponse::status(200).with_body(r#"{"access_token": "sa-token"}"#));
+    mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
+    let mut options = adc_options(&mock);
+    options.env = Some(env_with_credentials_file(&fixture));
+
+    let message = settle_stream(&catalog_vertex(), &context(), &options).await;
+
+    assert_eq!(message.stop_reason, pi_ai::types::StopReason::Stop);
+    let token_request = &mock.recorded()[0];
+    assert_eq!(token_request.url, "https://oauth2.googleapis.com/token");
+    assert_eq!(
+        recorded_header_at(&mock, 0, "content-type").as_deref(),
+        Some("application/x-www-form-urlencoded")
+    );
+    let body = String::from_utf8(
+        token_request
+            .body
+            .as_ref()
+            .expect("the token body")
+            .to_vec(),
+    )
+    .expect("the token body");
+    let (grant, assertion) = body
+        .split_once("&assertion=")
+        .expect("the jwt-bearer grant body");
+    assert_eq!(
+        grant,
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer"
+    );
+    let claims: Vec<&str> = assertion.split('.').collect();
+    assert_eq!(claims.len(), 3, "the RS256 JWT carries three segments");
+    let (header, payload) = (claims[0], claims[1]);
+    let decode = |segment: &str| -> String {
+        use base64::Engine;
+        String::from_utf8(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(segment)
+                .expect("the JWT segment decodes"),
+        )
+        .expect("the JWT segment is text")
+    };
+    assert!(
+        decode(header).contains("RS256"),
+        "the header names the RS256 algorithm: {}",
+        decode(header)
+    );
+    assert!(
+        decode(payload).contains("https://www.googleapis.com/auth/cloud-platform"),
+        "the claims carry the cloud-platform scope: {}",
+        decode(payload)
+    );
+
+    assert_eq!(
+        recorded_header_at(&mock, 1, "authorization").as_deref(),
+        Some("Bearer sa-token")
+    );
+    assert_eq!(
+        recorded_header_at(&mock, 1, "x-goog-user-project").as_deref(),
+        Some("billing-project"),
+        "the quota project rides the stream request"
+    );
+    let _ = std::fs::remove_file(&fixture);
+}
+
+/// The authorized-user refresh grant: the form-encoded refresh body carries
+/// the `%`-encoded fields and the access token rides the stream request.
+#[tokio::test]
+async fn exchanges_the_authorized_user_refresh_grant_for_a_bearer_token() {
+    let mock = MockHttpClient::new();
+    let fixture = credentials_file(
+        "authorized-user",
+        &json!({
+            "type": "authorized_user",
+            "client_id": "apps.googleusercontent.com",
+            "client_secret": "secret&x=1",
+            "refresh_token": "refresh+token",
+        })
+        .to_string(),
+    );
+    mock.on(|request| request.url.contains("oauth2.googleapis.com/token"))
+        .respond(
+            MockResponse::status(200)
+                .with_body(r#"{"access_token": "refreshed-token", "expires_in": 3600}"#),
+        );
+    mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
+    let mut options = adc_options(&mock);
+    options.env = Some(env_with_credentials_file(&fixture));
+
+    let message = settle_stream(&catalog_vertex(), &context(), &options).await;
+
+    assert_eq!(message.stop_reason, pi_ai::types::StopReason::Stop);
+    let body = String::from_utf8(
+        mock.recorded()[0]
+            .body
+            .as_ref()
+            .expect("the token body")
+            .to_vec(),
+    )
+    .expect("the token body is text");
+    assert_eq!(
+        body,
+        "grant_type=refresh_token&refresh_token=refresh%2Btoken&client_id=apps.googleusercontent.com&client_secret=secret%26x%3D1"
+    );
+    assert_eq!(
+        recorded_header_at(&mock, 1, "authorization").as_deref(),
+        Some("Bearer refreshed-token")
+    );
+    let _ = std::fs::remove_file(&fixture);
+}
+
+/// The token-exchange failures surface with the upstream wording: non-2xx
+/// with the body, non-JSON bodies, and credential-shape gates.
+#[tokio::test]
+async fn reports_the_token_exchange_failures() {
+    let pem = generated_rsa_pem();
+
+    for (name, contents, expected) in [
+        (
+            "unsupported-type",
+            json!({ "type": "external_account" }).to_string(),
+            "Unsupported Google credentials type: external_account",
+        ),
+        (
+            "missing-email",
+            json!({ "type": "service_account", "private_key": &pem }).to_string(),
+            "Google service-account credentials are missing client_email",
+        ),
+        (
+            "missing-key",
+            json!({
+                "type": "service_account",
+                "client_email": "sa@test.iam.gserviceaccount.com",
+            })
+            .to_string(),
+            "Google service-account credentials are missing private_key",
+        ),
+        (
+            "bad-key",
+            json!({
+                "type": "service_account",
+                "client_email": "sa@test.iam.gserviceaccount.com",
+                "private_key": "not a pem",
+            })
+            .to_string(),
+            "Google service-account private key is not usable",
+        ),
+        (
+            "missing-client-id",
+            json!({ "type": "authorized_user", "client_secret": "s", "refresh_token": "r" })
+                .to_string(),
+            "Google authorized-user credentials are missing client_id",
+        ),
+        (
+            "missing-client-secret",
+            json!({ "type": "authorized_user", "client_id": "i", "refresh_token": "r" })
+                .to_string(),
+            "Google authorized-user credentials are missing client_secret",
+        ),
+        (
+            "missing-refresh-token",
+            json!({ "type": "authorized_user", "client_id": "i", "client_secret": "s" })
+                .to_string(),
+            "Google authorized-user credentials are missing refresh_token",
+        ),
+    ] {
+        let mock = MockHttpClient::new();
+        let fixture = credentials_file(name, &contents);
+        let mut options = adc_options(&mock);
+        options.env = Some(env_with_credentials_file(&fixture));
+
+        let message = settle_stream(&catalog_vertex(), &context(), &options).await;
+
+        assert_eq!(message.stop_reason, pi_ai::types::StopReason::Error);
+        assert!(
+            message
+                .error_message
+                .as_deref()
+                .is_some_and(|text| text.contains(expected)),
+            "{name}: {:?}",
+            message.error_message
+        );
+        let _ = std::fs::remove_file(&fixture);
+    }
+}
+
+/// The gcloud well-known path expands `~` onto the home directory before
+/// the file read, upstream's ADC default.
+#[tokio::test]
+async fn expands_the_tilde_in_the_credentials_path() {
+    let mock = MockHttpClient::new();
+    let fixture = credentials_file(
+        "tilde",
+        &json!({
+            "type": "authorized_user",
+            "client_id": "i",
+            "client_secret": "s",
+            "refresh_token": "r",
+        })
+        .to_string(),
+    );
+    let home = std::env::home_dir().expect("the home directory");
+    let home_copy = fixture
+        .file_name()
+        .map(|name| home.join(name))
+        .expect("the fixture has a name");
+    std::fs::copy(&fixture, &home_copy).expect("the home copy writes");
+    mock.on(|request| request.url.contains("oauth2.googleapis.com/token"))
+        .respond(MockResponse::status(200).with_body(r#"{"access_token": "home-token"}"#));
+    mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
+    let mut options = adc_options(&mock);
+    let tilde_path = format!(
+        "~/{}",
+        home_copy
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the name")
+    );
+    options.env = Some(BTreeMap::from([(
+        "GOOGLE_APPLICATION_CREDENTIALS".to_owned(),
+        tilde_path,
+    )]));
+
+    let message = settle_stream(&catalog_vertex(), &context(), &options).await;
+
+    assert_eq!(message.stop_reason, pi_ai::types::StopReason::Stop);
+    assert_eq!(
+        recorded_header_at(&mock, 1, "authorization").as_deref(),
+        Some("Bearer home-token")
+    );
+    let _ = std::fs::remove_file(&fixture);
+    let _ = std::fs::remove_file(&home_copy);
+}
+
+/// The metadata-server fallback failures surface with the phase wording.
+#[tokio::test]
+async fn reports_the_metadata_server_failures() {
+    let model = catalog_vertex();
+
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url.contains("169.254.169.254"))
+        .respond(MockResponse::status(403));
+    let message = settle_stream(&model, &context(), &adc_options(&mock)).await;
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("Google metadata server returned status 403")),
+        "{:?}",
+        message.error_message
+    );
+
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url.contains("169.254.169.254"))
+        .respond(MockResponse::status(200).with_body("not json"));
+    let message = settle_stream(&model, &context(), &adc_options(&mock)).await;
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("Google metadata server token is not JSON")),
+        "{:?}",
+        message.error_message
+    );
+
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url.contains("169.254.169.254"))
+        .respond(MockResponse::status(200).with_body(r#"{"expires_in": 3600}"#));
+    let message = settle_stream(&model, &context(), &adc_options(&mock)).await;
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("carries no access_token")),
+        "{:?}",
+        message.error_message
+    );
+}
+
+/// The token exchange's non-2xx and non-JSON bodies surface with the phase
+/// wording, the authorized-user fixture driving the request.
+#[tokio::test]
+async fn reports_the_token_endpoint_failures() {
+    let model = catalog_vertex();
+    let fixture = credentials_file(
+        "failing-user",
+        &json!({
+            "type": "authorized_user",
+            "client_id": "i",
+            "client_secret": "s",
+            "refresh_token": "r",
+        })
+        .to_string(),
+    );
+
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url.contains("oauth2.googleapis.com/token"))
+        .respond(MockResponse::status(400).with_body("bad grant"));
+    let mut options = adc_options(&mock);
+    options.env = Some(env_with_credentials_file(&fixture));
+    let message = settle_stream(&model, &context(), &options).await;
+    assert!(
+        message.error_message.as_deref().is_some_and(
+            |text| text.contains("Google token exchange returned status 400: bad grant")
+        ),
+        "{:?}",
+        message.error_message
+    );
+
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url.contains("oauth2.googleapis.com/token"))
+        .respond(MockResponse::status(200).with_body("not json"));
+    let mut options = adc_options(&mock);
+    options.env = Some(env_with_credentials_file(&fixture));
+    let message = settle_stream(&model, &context(), &options).await;
+    assert!(
+        message
+            .error_message
+            .as_deref()
+            .is_some_and(|text| text.contains("Google token exchange response is not JSON")),
+        "{:?}",
+        message.error_message
+    );
+
+    let _ = std::fs::remove_file(&fixture);
+}
+
+// --- the disabled-thinking configs and the Gemini 3 simple stream ---
+
+/// The config payload a `streamSimple` capture sees, the thinking-shape
+/// helper the level-mapping suites share.
+async fn capture_simple_thinking_config(
+    model: &Model,
+    reasoning: Option<ThinkingLevel>,
+) -> serde_json::Value {
+    let mock = MockHttpClient::new();
+    let (on_payload, captured) = common::payload_capture();
+    let mut transport = common::mock_transport(&mock);
+    transport.on_payload = Some(on_payload);
+    let options = SimpleStreamOptions {
+        transport_options: transport,
+        api_key: Some("test".to_owned()),
+        reasoning,
+        ..SimpleStreamOptions::default()
+    };
+
+    let stream = stream_simple(model, &context(), Some(&options));
+    let _message = stream.result().await;
+    common::captured_payload(&captured)["config"]["thinkingConfig"].clone()
+}
+
+/// `streamSimple` without reasoning disables thinking with the model-native
+/// shape: the Gemini 3 levels, the budget zero elsewhere.
+#[tokio::test]
+async fn disables_thinking_with_the_model_native_shape_without_reasoning() {
+    let pro = common::builtin_model("google-vertex", "gemini-3.1-pro-preview");
+    assert_eq!(
+        capture_simple_thinking_config(&pro, None).await,
+        json!({ "thinkingLevel": "LOW" })
+    );
+
+    let flash = common::builtin_model("google-vertex", "gemini-3-flash-preview");
+    assert_eq!(
+        capture_simple_thinking_config(&flash, None).await,
+        json!({ "thinkingLevel": "MINIMAL" })
+    );
+
+    let other = vertex_model("gemini-2.5-flash", ThinkingLevelMap::default());
+    assert_eq!(
+        capture_simple_thinking_config(&other, None).await,
+        json!({ "thinkingBudget": 0 })
+    );
+
+    // A level that resolves keeps the enabled-thinking shape.
+    assert_eq!(
+        capture_simple_thinking_config(&flash, Some(ThinkingLevel::High)).await,
+        json!({ "thinkingLevel": "HIGH", "includeThoughts": true })
+    );
+}
+
+/// The Gemini 3 simple stream maps the pi level onto the provider-native
+/// level for the flash and pro families.
+#[tokio::test]
+async fn maps_gemini3_reasoning_levels_on_the_simple_stream() {
+    let flash = common::builtin_model("google-vertex", "gemini-3-flash-preview");
+    assert_eq!(
+        capture_simple_thinking_config(&flash, Some(ThinkingLevel::Medium)).await["thinkingLevel"],
+        json!("MEDIUM")
+    );
+    assert_eq!(
+        capture_simple_thinking_config(&flash, Some(ThinkingLevel::Minimal)).await["thinkingLevel"],
+        json!("MINIMAL")
+    );
+
+    let pro = common::builtin_model("google-vertex", "gemini-3.1-pro-preview");
+    assert_eq!(
+        capture_simple_thinking_config(&pro, Some(ThinkingLevel::Low)).await["thinkingLevel"],
+        json!("LOW")
+    );
+    assert_eq!(
+        capture_simple_thinking_config(&pro, Some(ThinkingLevel::High)).await["thinkingLevel"],
+        json!("HIGH")
+    );
+}
+
+/// The multi-region and global locations ride the SDK's host selection: the
+/// `us`/`eu` rep hosts, the plain host for `global`, and the embedded host
+/// for everything else.
+#[tokio::test]
+async fn selects_the_default_hosts_per_location() {
+    for (location, expected_prefix) in [
+        ("us", "https://aiplatform.us.rep.googleapis.com"),
+        ("eu", "https://aiplatform.eu.rep.googleapis.com"),
+        ("global", "https://aiplatform.googleapis.com"),
+        (
+            "asia-northeast1",
+            "https://asia-northeast1-aiplatform.googleapis.com",
+        ),
+    ] {
+        let mock = MockHttpClient::new();
+        mount_metadata_server(&mock);
+        mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
+        let mut options = adc_options(&mock);
+        options.location = Some(location.to_owned());
+
+        let message = settle_stream(&catalog_vertex(), &context(), &options).await;
+
+        assert_eq!(message.stop_reason, pi_ai::types::StopReason::Stop);
+        let url = &mock.recorded()[1].url;
+        assert!(
+            url.starts_with(&format!("{expected_prefix}/v1/projects/")),
+            "{location}: {url}"
+        );
+    }
+}
+
+/// A custom base URL carrying a `v1beta2` version segment suppresses the
+/// version insertion too, upstream's `baseUrlIncludesApiVersion`.
+#[tokio::test]
+async fn does_not_append_the_version_when_the_custom_base_carries_beta() {
+    let mock = MockHttpClient::new();
+    mount_vertex_stream(&mock, &raw_stop_chunk("STOP", false));
+    let mut model = catalog_vertex();
+    model.base_url = "https://proxy.example.com/v1beta2".to_owned();
+    let options = express_options(&mock);
+
+    let message = settle_stream(&model, &context(), &options).await;
+
+    assert_eq!(message.stop_reason, pi_ai::types::StopReason::Stop);
+    assert_eq!(
+        mock.recorded()[0].url,
+        "https://proxy.example.com/v1beta2/publishers/google/models/gemini-3-flash-preview:streamGenerateContent?alt=sse"
     );
 }

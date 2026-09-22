@@ -13,7 +13,8 @@
 
 use pi_ai::api::google_shared::{
     convert_messages, convert_tools, is_thinking_part, requires_tool_call_id,
-    resolve_google_function_calling_mode, retain_thought_signature, supports_google_strict_tool_sampling,
+    resolve_google_function_calling_mode, retain_thought_signature,
+    supports_google_strict_tool_sampling,
 };
 use pi_ai::types::{
     Api, AssistantBlock, AssistantMessage, ConstrainedSamplingConfig, ConstrainedSamplingSetting,
@@ -57,7 +58,12 @@ fn text_and_image() -> Vec<Modality> {
 
 /// The replay turn the conversion suites build: an assistant message plus
 /// matching tool results, upstream's `makeContext`.
-fn replay_context(api: &str, provider: &str, model_id: &str, content: Vec<AssistantBlock>) -> pi_ai::types::Context {
+fn replay_context(
+    api: &str,
+    provider: &str,
+    model_id: &str,
+    content: Vec<AssistantBlock>,
+) -> pi_ai::types::Context {
     pi_ai::types::Context {
         system_prompt: None,
         messages: vec![
@@ -99,7 +105,6 @@ fn assistant_message_shape() -> AssistantMessage {
         timestamp: 1,
     }
 }
-
 
 fn tool_call_block(id: &str, command: &str) -> AssistantBlock {
     let mut arguments = serde_json::Map::new();
@@ -330,16 +335,17 @@ fn uses_validated_function_calling_for_strict_tools_on_gemini_3() {
         },
     ));
 
-    assert!(supports_google_strict_tool_sampling("gemini-3.1-pro-preview"));
+    assert!(supports_google_strict_tool_sampling(
+        "gemini-3.1-pro-preview"
+    ));
     assert!(!supports_google_strict_tool_sampling("gemini-2.5-pro"));
     assert_eq!(
         resolve_google_function_calling_mode(std::slice::from_ref(&tool), None, true)
             .expect("mode"),
         Some("VALIDATED")
     );
-    let error =
-        resolve_google_function_calling_mode(std::slice::from_ref(&tool), None, false)
-            .expect_err("strict requirement without support");
+    let error = resolve_google_function_calling_mode(std::slice::from_ref(&tool), None, false)
+        .expect_err("strict requirement without support");
     assert!(
         error.contains("Tool \"test_tool\" requires JSON-schema constrained sampling"),
         "{error}"
@@ -348,7 +354,10 @@ fn uses_validated_function_calling_for_strict_tools_on_gemini_3() {
 
 #[test]
 fn returns_none_for_an_empty_tool_list() {
-    assert_eq!(convert_tools(&[], false, true).expect("convert_tools"), None);
+    assert_eq!(
+        convert_tools(&[], false, true).expect("convert_tools"),
+        None
+    );
     assert_eq!(convert_tools(&[], true, true).expect("convert_tools"), None);
 }
 
@@ -359,7 +368,6 @@ fn returns_none_for_an_empty_tool_list() {
 // empty text/thinking block is skipped only when it is UNSIGNED.
 
 const VALID_SIG: &str = "AAAAAAAAAAAAAAAAAAAAAA==";
-
 
 fn thinking_block(thinking: &str, signature: Option<&str>) -> AssistantBlock {
     AssistantBlock::Thinking(ThinkingContent {
@@ -384,7 +392,12 @@ fn model_turn(contents: &[Value]) -> Option<&Value> {
 
 #[test]
 fn keeps_a_signed_empty_thinking_block_so_its_signature_is_echoed_back() {
-    let model = google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
         &replay_context(
@@ -397,8 +410,7 @@ fn keeps_a_signed_empty_thinking_block_so_its_signature_is_echoed_back() {
             ],
         ),
     );
-    let signed = model_turn(&contents)
-        .expect("model turn")["parts"]
+    let signed = model_turn(&contents).expect("model turn")["parts"]
         .as_array()
         .expect("parts")
         .iter()
@@ -410,7 +422,12 @@ fn keeps_a_signed_empty_thinking_block_so_its_signature_is_echoed_back() {
 
 #[test]
 fn keeps_a_signed_empty_text_block_the_same_way() {
-    let model = google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
         &replay_context(
@@ -423,8 +440,7 @@ fn keeps_a_signed_empty_text_block_the_same_way() {
             ],
         ),
     );
-    let signed = model_turn(&contents)
-        .expect("model turn")["parts"]
+    let signed = model_turn(&contents).expect("model turn")["parts"]
         .as_array()
         .expect("parts")
         .iter()
@@ -435,7 +451,12 @@ fn keeps_a_signed_empty_text_block_the_same_way() {
 
 #[test]
 fn still_drops_unsigned_empty_blocks() {
-    let model = google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
         &replay_context(
@@ -458,7 +479,12 @@ fn still_drops_unsigned_empty_blocks() {
 
 #[test]
 fn still_drops_signed_empty_blocks_from_a_different_provider_model() {
-    let model = google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
         &replay_context(
@@ -477,7 +503,12 @@ fn still_drops_signed_empty_blocks_from_a_different_provider_model() {
         .expect("parts");
     assert_eq!(parts.len(), 1);
     assert!(parts[0].get("functionCall").is_some());
-    assert!(!model_turn(&contents).expect("model turn").to_string().contains(VALID_SIG));
+    assert!(
+        !model_turn(&contents)
+            .expect("model turn")
+            .to_string()
+            .contains(VALID_SIG)
+    );
 }
 
 // --- upstream google-shared-image-tool-result-routing.test.ts ---
@@ -493,61 +524,77 @@ fn image_routing_context(api: &str, provider: &str, model_id: &str) -> pi_ai::ty
             tool_call_block("call_b", "ls"),
         ],
     );
-    context.messages.push(Message::ToolResult(ToolResultMessage {
-        tool_call_id: "call_a".to_owned(),
-        tool_name: "read".to_owned(),
-        content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
-            text: "alpha text".to_owned(),
-            text_signature: None,
-        })],
-        details: None,
-        usage: None,
-        added_tool_names: None,
-        is_error: false,
-        timestamp: 1,
-    }));
-    context.messages.push(Message::ToolResult(ToolResultMessage {
-        tool_call_id: "call_img".to_owned(),
-        tool_name: "read".to_owned(),
-        content: vec![pi_ai::types::ToolResultBlock::Image(ImageContent {
-            data: "abc".to_owned(),
-            mime_type: "image/png".to_owned(),
-        })],
-        details: None,
-        usage: None,
-        added_tool_names: None,
-        is_error: false,
-        timestamp: 1,
-    }));
-    context.messages.push(Message::ToolResult(ToolResultMessage {
-        tool_call_id: "call_b".to_owned(),
-        tool_name: "read".to_owned(),
-        content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
-            text: "beta text".to_owned(),
-            text_signature: None,
-        })],
-        details: None,
-        usage: None,
-        added_tool_names: None,
-        is_error: false,
-        timestamp: 1,
-    }));
+    context
+        .messages
+        .push(Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_a".to_owned(),
+            tool_name: "read".to_owned(),
+            content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
+                text: "alpha text".to_owned(),
+                text_signature: None,
+            })],
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            is_error: false,
+            timestamp: 1,
+        }));
+    context
+        .messages
+        .push(Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_img".to_owned(),
+            tool_name: "read".to_owned(),
+            content: vec![pi_ai::types::ToolResultBlock::Image(ImageContent {
+                data: "abc".to_owned(),
+                mime_type: "image/png".to_owned(),
+            })],
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            is_error: false,
+            timestamp: 1,
+        }));
+    context
+        .messages
+        .push(Message::ToolResult(ToolResultMessage {
+            tool_call_id: "call_b".to_owned(),
+            tool_name: "read".to_owned(),
+            content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
+                text: "beta text".to_owned(),
+                text_signature: None,
+            })],
+            details: None,
+            usage: None,
+            added_tool_names: None,
+            is_error: false,
+            timestamp: 1,
+        }));
     context
 }
 
 /// Gemini 2.x gets the synthetic "Tool result image:" user turn.
 #[test]
 fn keeps_a_separate_synthetic_image_turn_for_gemini_2_models() {
-    let model = google_model("google-generative-ai", "google", "gemini-2.5-flash", text_and_image());
-    let contents = convert_messages(&model, &image_routing_context("google-generative-ai", "google", "gemini-2.5-flash"));
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-2.5-flash",
+        text_and_image(),
+    );
+    let contents = convert_messages(
+        &model,
+        &image_routing_context("google-generative-ai", "google", "gemini-2.5-flash"),
+    );
 
     assert_eq!(contents.len(), 5);
     let turn = &contents[2];
-    assert!(turn["parts"]
-        .as_array()
-        .expect("parts")
-        .iter()
-        .all(|part| part.get("functionResponse").is_some()));
+    assert!(
+        turn["parts"]
+            .as_array()
+            .expect("parts")
+            .iter()
+            .all(|part| part.get("functionResponse").is_some())
+    );
     assert_eq!(contents[3]["parts"][0]["text"], json!("Tool result image:"));
     assert!(contents[3]["parts"][1].get("inlineData").is_some());
     assert!(contents[4]["parts"][0].get("functionResponse").is_some());
@@ -614,21 +661,28 @@ fn unsigned_tool_call_context(
     model_id: &str,
     thought_signature: Option<&str>,
 ) -> pi_ai::types::Context {
-    let mut context = replay_context(api, provider, model_id, unsigned_tool_call_content(thought_signature));
+    let mut context = replay_context(
+        api,
+        provider,
+        model_id,
+        unsigned_tool_call_content(thought_signature),
+    );
     for (id, text) in [("call_1", "hi"), ("call_2", "files")] {
-        context.messages.push(Message::ToolResult(ToolResultMessage {
-            tool_call_id: id.to_owned(),
-            tool_name: "bash".to_owned(),
-            content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
-                text: text.to_owned(),
-                text_signature: None,
-            })],
-            details: None,
-            usage: None,
-            added_tool_names: None,
-            is_error: false,
-            timestamp: 1,
-        }));
+        context
+            .messages
+            .push(Message::ToolResult(ToolResultMessage {
+                tool_call_id: id.to_owned(),
+                tool_name: "bash".to_owned(),
+                content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
+                    text: text.to_owned(),
+                    text_signature: None,
+                })],
+                details: None,
+                usage: None,
+                added_tool_names: None,
+                is_error: false,
+                timestamp: 1,
+            }));
     }
     context
 }
@@ -657,9 +711,18 @@ fn preserves_tool_call_ids_for_gemini_3_history() {
         ("google-vertex", "google-vertex", "gemini-3-pro-preview"),
     ] {
         let model = google_model(api, provider, id, text_only());
-        let contents = convert_messages(&model, &unsigned_tool_call_context(api, provider, id, None));
-        assert_eq!(function_call_ids(&contents), vec!["call_1", "call_2"], "{id}");
-        assert_eq!(function_response_ids(&contents), vec!["call_1", "call_2"], "{id}");
+        let contents =
+            convert_messages(&model, &unsigned_tool_call_context(api, provider, id, None));
+        assert_eq!(
+            function_call_ids(&contents),
+            vec!["call_1", "call_2"],
+            "{id}"
+        );
+        assert_eq!(
+            function_response_ids(&contents),
+            vec!["call_1", "call_2"],
+            "{id}"
+        );
     }
 }
 
@@ -667,7 +730,12 @@ fn preserves_tool_call_ids_for_gemini_3_history() {
 /// reappear, and cross-model history carries no historical-context text.
 #[test]
 fn does_not_add_skip_thought_signature_validator_for_unsigned_google_tool_calls() {
-    let model = google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
         &unsigned_tool_call_context("google-generative-ai", "google", "other-model", None),
@@ -684,7 +752,11 @@ fn does_not_add_skip_thought_signature_validator_for_unsigned_google_tool_calls(
     for part in &function_call_parts {
         assert!(part.get("thoughtSignature").is_none());
     }
-    assert!(!model_turn.to_string().contains("skip_thought_signature_validator"));
+    assert!(
+        !model_turn
+            .to_string()
+            .contains("skip_thought_signature_validator")
+    );
     let historical = model_turn["parts"]
         .as_array()
         .expect("parts")
@@ -700,8 +772,21 @@ fn does_not_add_skip_thought_signature_validator_for_unsigned_google_tool_calls(
 
 #[test]
 fn does_not_add_skip_thought_signature_validator_for_unsigned_vertex_tool_calls() {
-    let model = google_model("google-vertex", "google-vertex", "gemini-3-pro-preview", text_only());
-    let contents = convert_messages(&model, &unsigned_tool_call_context("google-vertex", "google-vertex", "gemini-3-pro-preview", None));
+    let model = google_model(
+        "google-vertex",
+        "google-vertex",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
+    let contents = convert_messages(
+        &model,
+        &unsigned_tool_call_context(
+            "google-vertex",
+            "google-vertex",
+            "gemini-3-pro-preview",
+            None,
+        ),
+    );
     let model_turn = model_turn(&contents).expect("model turn");
     let function_call_parts: Vec<&Value> = model_turn["parts"]
         .as_array()
@@ -714,15 +799,29 @@ fn does_not_add_skip_thought_signature_validator_for_unsigned_vertex_tool_calls(
     for part in &function_call_parts {
         assert!(part.get("thoughtSignature").is_none());
     }
-    assert!(!model_turn.to_string().contains("skip_thought_signature_validator"));
+    assert!(
+        !model_turn
+            .to_string()
+            .contains("skip_thought_signature_validator")
+    );
 }
 
 #[test]
 fn preserves_a_valid_thought_signature_for_the_same_provider_and_model() {
-    let model = google_model("google-generative-ai", "google", "gemini-3-pro-preview", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-3-pro-preview",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
-        &unsigned_tool_call_context("google-generative-ai", "google", "gemini-3-pro-preview", Some(VALID_SIG)),
+        &unsigned_tool_call_context(
+            "google-generative-ai",
+            "google",
+            "gemini-3-pro-preview",
+            Some(VALID_SIG),
+        ),
     );
     let model_turn = model_turn(&contents).expect("model turn");
     let function_call_parts: Vec<&Value> = model_turn["parts"]
@@ -739,7 +838,12 @@ fn preserves_a_valid_thought_signature_for_the_same_provider_and_model() {
 
 #[test]
 fn does_not_add_a_thought_signature_or_ids_for_non_gemini_3_models() {
-    let model = google_model("google-generative-ai", "google", "gemini-2.5-flash", text_only());
+    let model = google_model(
+        "google-generative-ai",
+        "google",
+        "gemini-2.5-flash",
+        text_only(),
+    );
     let contents = convert_messages(
         &model,
         &unsigned_tool_call_context("google-generative-ai", "google", "other-model", None),
@@ -764,16 +868,22 @@ fn does_not_add_a_thought_signature_or_ids_for_non_gemini_3_models() {
         .collect();
 
     assert_eq!(function_call_parts.len(), 2);
-    assert!(function_call_parts
-        .iter()
-        .all(|part| part["functionCall"].get("id").is_none()));
-    assert!(function_call_parts
-        .iter()
-        .all(|part| part.get("thoughtSignature").is_none()));
+    assert!(
+        function_call_parts
+            .iter()
+            .all(|part| part["functionCall"].get("id").is_none())
+    );
+    assert!(
+        function_call_parts
+            .iter()
+            .all(|part| part.get("thoughtSignature").is_none())
+    );
     assert_eq!(function_response_parts.len(), 2);
-    assert!(function_response_parts
-        .iter()
-        .all(|part| part["functionResponse"].get("id").is_none()));
+    assert!(
+        function_response_parts
+            .iter()
+            .all(|part| part["functionResponse"].get("id").is_none())
+    );
 }
 
 /// The id-requiring rule: Gemini 3+, Claude models behind Google APIs, and

@@ -7,10 +7,10 @@
 //!   `POST {baseUrl}/v1/chat/completions` over SSE — one request, no retry;
 //!   upstream accepts `maxRetries` in its options type and never wires it.
 //! - The camelCase "SDK-style" payload `onPayload` sees converts to the
-//!   snake_case wire body afterwards, upstream's `toMistralWirePayload`; a
+//!   `snake_case` wire body afterwards, upstream's `toMistralWirePayload`; a
 //!   hook replacement rides through the same conversion.
 //! - `stripSymbolKeys` vanishes: serde JSON values carry no symbol-keyed
-//!   decorations, the TypeBox artifacts upstream deletes before send.
+//!   decorations, the `TypeBox` artifacts upstream deletes before send.
 //! - `sanitizeSurrogates` is statically upheld: Rust strings are valid
 //!   UTF-8.
 //! - Upstream's `AbortSignal.timeout`/`AbortSignal.any` collapse into the
@@ -35,16 +35,18 @@ use crate::api::constrained_sampling::{
 };
 use crate::api::simple_options::build_base_options;
 use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
+use crate::api::wire_common::{
+    call_response_hook, close_current_block, initial_output, missing_api_key_message,
+    setup_error_stream, spawn_adapter_stream, upsert_header,
+};
 use crate::http::client::{HttpError, HttpMethod, HttpRequest, read_body_text};
 use crate::types::{
-    AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Message, Model,
-    ModelThinkingLevel, Modality, ProviderStreams, SimpleStreamOptions, StopReason, StreamOptions,
-    TextContent, ThinkingContent, Tool, ToolCall, ToolResultBlock,
-    UserBlock, UserContent,
+    AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Message, Modality, Model,
+    ModelThinkingLevel, SimpleStreamOptions, StopReason, StreamOptions, Tool, ToolCall,
+    ToolResultBlock, UserBlock, UserContent,
 };
-use crate::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
+use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
-use crate::utils::headers::headers_to_record;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::pi_user_agent::get_pi_user_agent;
 
@@ -58,7 +60,7 @@ const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 /// The tool choice Mistral accepts, upstream's
 /// `MistralOptions["toolChoice"]`: the shared choices plus `any`,
 /// `required`, and the OpenAI-style forced function.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MistralToolChoice {
     /// Let the provider decide.
     Auto,
@@ -78,7 +80,7 @@ pub enum MistralToolChoice {
 
 impl MistralToolChoice {
     /// The wire shape, upstream's `mapToolChoice` passthrough value.
-    fn to_wire(self) -> Value {
+    fn to_wire(&self) -> Value {
         match self {
             Self::Auto => json!("auto"),
             Self::None => json!("none"),
@@ -104,7 +106,7 @@ pub enum MistralReasoningEffort {
 
 impl MistralReasoningEffort {
     /// The wire spelling.
-    fn as_wire(self) -> &'static str {
+    const fn as_wire(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::High => "high",
@@ -122,7 +124,7 @@ pub enum MistralPromptMode {
 
 impl MistralPromptMode {
     /// The wire spelling.
-    fn as_wire(self) -> &'static str {
+    const fn as_wire(self) -> &'static str {
         match self {
             Self::Reasoning => "reasoning",
         }
@@ -226,26 +228,13 @@ impl From<StreamOptions> for MistralStreamOptions {
 #[derive(Debug, Default)]
 pub struct MistralStreams;
 
-impl ProviderStreams for MistralStreams {
-    fn stream(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&StreamOptions>,
-    ) -> AssistantMessageEventStream {
-        let options = options.cloned().map(MistralStreamOptions::from);
-        stream(model, context, options.as_ref())
-    }
-
-    fn stream_simple(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        stream_simple(model, context, options)
+impl crate::api::wire_common::TransportCarrier for MistralStreamOptions {
+    fn transport_options(&self) -> &crate::types::TransportOptions {
+        &self.transport_options
     }
 }
+
+crate::api::wire_common::forward_provider_streams!(MistralStreams, MistralStreamOptions);
 
 /// Stream an assistant response, upstream's `stream` export.
 #[must_use]
@@ -254,35 +243,15 @@ pub fn stream(
     context: &Context,
     options: Option<&MistralStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let events = assistant_message_event_stream();
-    let forward = events.clone();
-    let model = model.clone();
-    let context = context.clone();
-    let options = options.cloned();
-    tokio::spawn(async move {
-        let options = options.unwrap_or_default();
-        let mut output = initial_output(&model);
-        match run_stream(&model, &context, &options, &mut output, &forward).await {
-            Ok(()) => {
-                // The done event already settled the final result.
-                forward.end(None);
-            }
-            Err(message) => {
-                output.stop_reason = if options.transport_options.signal().is_cancelled() {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
-                forward.push(AssistantMessageEvent::Error {
-                    reason: output.stop_reason,
-                    error: output.clone(),
-                });
-                forward.end(None);
-            }
-        }
-    });
-    events
+    spawn_adapter_stream(
+        model,
+        context,
+        options.cloned(),
+        |model, _| initial_output(model),
+        |model, context, options, output, events| {
+            Box::pin(run_stream(model, context, options, output, events))
+        },
+    )
 }
 
 /// Stream a simple assistant response, upstream's `streamSimple` export:
@@ -296,11 +265,15 @@ pub fn stream_simple(
     context: &Context,
     options: Option<&SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let Some(api_key) = options.as_ref().and_then(|options| options.api_key.as_deref()) else {
-        return setup_error_stream(model, &format!("No API key for provider: {}", model.provider.0));
+    let Some(api_key) = options
+        .as_ref()
+        .and_then(|options| options.api_key.as_deref())
+    else {
+        return setup_error_stream(model, &missing_api_key_message(&model.provider));
     };
 
-    let mut base = MistralStreamOptions::from(build_base_options(model, context, options, Some(api_key)));
+    let mut base =
+        MistralStreamOptions::from(build_base_options(model, context, options, Some(api_key)));
     base.tool_choice = options
         .and_then(|options| options.tool_choice)
         .map(|choice| match choice {
@@ -310,7 +283,9 @@ pub fn stream_simple(
 
     let clamped = options
         .and_then(|options| options.reasoning)
-        .map(|reasoning| crate::models::clamp_thinking_level(model, ModelThinkingLevel::from(reasoning)));
+        .map(|reasoning| {
+            crate::models::clamp_thinking_level(model, ModelThinkingLevel::from(reasoning))
+        });
     let reasoning = match clamped {
         Some(ModelThinkingLevel::Off) | None => None,
         Some(level) => Some(level),
@@ -326,27 +301,6 @@ pub fn stream_simple(
     stream(model, context, Some(&base))
 }
 
-/// The fresh accumulator a stream starts from, upstream's `createOutput`.
-fn initial_output(model: &Model) -> AssistantMessage {
-    AssistantMessage {
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        response_model: None,
-        response_id: None,
-        provider_thinking_level: None,
-        diagnostics: None,
-        usage: crate::types::Usage::default(),
-        stop_reason: StopReason::Pending,
-        deferred: None,
-        error_message: None,
-        raw_stop_reason: None,
-        end_turn: None,
-        timestamp: crate::auth::resolve::now_ms(),
-    }
-}
-
 async fn run_stream(
     model: &Model,
     context: &Context,
@@ -355,7 +309,7 @@ async fn run_stream(
     events: &AssistantMessageEventStream,
 ) -> Result<(), String> {
     let Some(api_key) = options.api_key.clone().filter(|key| !key.is_empty()) else {
-        return Err(format!("No API key for provider: {}", model.provider.0));
+        return Err(missing_api_key_message(&model.provider));
     };
 
     // The normalizer state is synchronous scratch; the scoped block drops it
@@ -410,7 +364,7 @@ enum ToolBlockKey {
 }
 
 /// Build the camelCase chat payload, upstream's `buildChatPayload`; the
-/// snake_case wire conversion happens in [`to_wire_payload`].
+/// `snake_case` wire conversion happens in [`to_wire_payload`].
 ///
 /// # Errors
 /// When a tool requires strict sampling that cannot be resolved, or when the
@@ -432,6 +386,10 @@ fn build_chat_payload(
         "stream": true,
         "messages": messages,
     });
+    #[expect(
+        clippy::expect_used,
+        reason = "the json! literal above is an object by construction"
+    )]
     let object = payload.as_object_mut().expect("payload object");
 
     let tools = context.tools.as_deref().unwrap_or_default();
@@ -451,7 +409,10 @@ fn build_chat_payload(
         object.insert("promptMode".to_owned(), json!(prompt_mode.as_wire()));
     }
     if let Some(reasoning_effort) = &options.reasoning_effort {
-        object.insert("reasoningEffort".to_owned(), json!(reasoning_effort.as_wire()));
+        object.insert(
+            "reasoningEffort".to_owned(),
+            json!(reasoning_effort.as_wire()),
+        );
     }
     if let Some(session_id) = should_use_prompt_caching(options) {
         object.insert("promptCacheKey".to_owned(), json!(session_id));
@@ -472,7 +433,7 @@ fn should_use_prompt_caching(options: &MistralStreamOptions) -> Option<&str> {
     options.session_id.as_deref()
 }
 
-/// Convert the camelCase payload to the snake_case wire body, upstream's
+/// Convert the camelCase payload to the `snake_case` wire body, upstream's
 /// `toMistralWirePayload`.
 fn to_wire_payload(payload: &Value) -> Value {
     let Some(object) = payload.as_object() else {
@@ -501,19 +462,19 @@ fn to_wire_payload(payload: &Value) -> Value {
         }
     }
     if let Some(response_format) = wire.get_mut("response_format")
-        && response_format.is_object()
+        && let Some(response_format) = response_format.as_object_mut()
     {
-        remap_property(response_format.as_object_mut().expect("object"), "jsonSchema", "json_schema");
+        remap_property(response_format, "jsonSchema", "json_schema");
         if let Some(json_schema) = response_format.get_mut("json_schema")
-            && json_schema.is_object()
+            && let Some(json_schema) = json_schema.as_object_mut()
         {
-            remap_property(json_schema.as_object_mut().expect("object"), "schemaDefinition", "schema");
+            remap_property(json_schema, "schemaDefinition", "schema");
         }
     }
     Value::Object(wire)
 }
 
-fn to_wire_message(message: &mut Value) -> Value {
+fn to_wire_message(message: &Value) -> Value {
     let mut wire = message.as_object().cloned().unwrap_or_default();
     remap_property(&mut wire, "toolCalls", "tool_calls");
     remap_property(&mut wire, "toolCallId", "tool_call_id");
@@ -544,6 +505,10 @@ fn remap_property(record: &mut serde_json::Map<String, Value>, source: &str, tar
 }
 
 /// The chat messages in Mistral's wire shape, upstream's `toChatMessages`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the per-role conversion mirrors upstream's toChatMessages arm for arm"
+)]
 fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
 
@@ -594,7 +559,9 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
                                 content_parts.push(json!({ "type": "text", "text": text.text }));
                             }
                         }
-                        AssistantBlock::Thinking(thinking) if !thinking.thinking.trim().is_empty() => {
+                        AssistantBlock::Thinking(thinking)
+                            if !thinking.thinking.trim().is_empty() =>
+                        {
                             content_parts.push(json!({
                                 "type": "thinking",
                                 "thinking": [{ "type": "text", "text": thinking.thinking }],
@@ -675,7 +642,12 @@ fn to_chat_messages(messages: &[Message], supports_images: bool) -> Vec<Value> {
 
 /// The tool-result text with the error/omitted-image wording, upstream's
 /// `buildToolResultText`.
-fn build_tool_result_text(text: &str, has_images: bool, supports_images: bool, is_error: bool) -> String {
+fn build_tool_result_text(
+    text: &str,
+    has_images: bool,
+    supports_images: bool,
+    is_error: bool,
+) -> String {
     let trimmed = text.trim();
     let error_prefix = if is_error { "[tool error] " } else { "" };
 
@@ -766,19 +738,23 @@ fn create_tool_call_id_normalizer() -> impl FnMut(&str) -> String {
 
 /// The 9-character id derivation, upstream's `deriveMistralToolCallId`.
 fn derive_tool_call_id(id: &str, attempt: u32) -> String {
-    let normalized: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let normalized: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
     if attempt == 0 && normalized.chars().count() == MISTRAL_TOOL_CALL_ID_LENGTH {
         return normalized;
     }
-    let seed_base = if normalized.is_empty() { id.to_owned() } else { normalized };
+    let seed_base = if normalized.is_empty() {
+        id.to_owned()
+    } else {
+        normalized
+    };
     let seed = if attempt == 0 {
         seed_base
     } else {
-        format!("{seedBase}:{attempt}", seedBase = seed_base)
+        format!("{seed_base}:{attempt}")
     };
     short_hash(&seed)
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .take(MISTRAL_TOOL_CALL_ID_LENGTH)
         .collect()
 }
@@ -859,7 +835,7 @@ async fn consume_chat_stream(
         if let Some(content) = delta.and_then(|delta| delta.get("content"))
             && !content.is_null()
         {
-            apply_content_delta(content, output, &mut current_block, events)?;
+            apply_content_delta(content, output, &mut current_block, events);
         }
 
         let tool_calls = delta
@@ -868,7 +844,7 @@ async fn consume_chat_stream(
             .cloned()
             .unwrap_or_default();
         for tool_call in &tool_calls {
-            apply_tool_call_delta(tool_call, output, &mut current_block, scratch, events)?;
+            apply_tool_call_delta(tool_call, output, &mut current_block, scratch, events);
         }
     }
 
@@ -930,11 +906,10 @@ fn apply_content_delta(
     output: &mut AssistantMessage,
     current_block: &mut Option<bool>,
     events: &AssistantMessageEventStream,
-) -> Result<(), String> {
+) {
     match content {
         Value::String(text) => {
             apply_text_delta(text, output, current_block, events);
-            Ok(())
         }
         Value::Array(items) => {
             for item in items {
@@ -967,9 +942,8 @@ fn apply_content_delta(
                     _ => {}
                 }
             }
-            Ok(())
         }
-        _ => Ok(()),
+        _ => {}
     }
 }
 
@@ -979,18 +953,7 @@ fn apply_text_delta(
     current_block: &mut Option<bool>,
     events: &AssistantMessageEventStream,
 ) {
-    if *current_block != Some(false) {
-        close_current_block(current_block, output, events);
-        output.content.push(AssistantBlock::Text(TextContent {
-            text: String::new(),
-            text_signature: None,
-        }));
-        *current_block = Some(false);
-        events.push(AssistantMessageEvent::TextStart {
-            content_index: output.content.len() as u64 - 1,
-            partial: output.clone(),
-        });
-    }
+    crate::api::wire_common::open_stream_block(current_block, output, events, false);
     let content_index = output.content.len() as u64 - 1;
     if let Some(AssistantBlock::Text(block)) = output.content.last_mut() {
         block.text.push_str(text);
@@ -1008,19 +971,7 @@ fn apply_thinking_delta(
     current_block: &mut Option<bool>,
     events: &AssistantMessageEventStream,
 ) {
-    if *current_block != Some(true) {
-        close_current_block(current_block, output, events);
-        output.content.push(AssistantBlock::Thinking(ThinkingContent {
-            thinking: String::new(),
-            thinking_signature: None,
-            redacted: None,
-        }));
-        *current_block = Some(true);
-        events.push(AssistantMessageEvent::ThinkingStart {
-            content_index: output.content.len() as u64 - 1,
-            partial: output.clone(),
-        });
-    }
+    crate::api::wire_common::open_stream_block(current_block, output, events, true);
     let content_index = output.content.len() as u64 - 1;
     if let Some(AssistantBlock::Thinking(block)) = output.content.last_mut() {
         block.thinking.push_str(thinking);
@@ -1040,7 +991,7 @@ fn apply_tool_call_delta(
     current_block: &mut Option<bool>,
     scratch: &mut ToolCallScratch,
     events: &AssistantMessageEventStream,
-) -> Result<(), String> {
+) {
     if current_block.is_some() {
         close_current_block(current_block, output, events);
     }
@@ -1058,39 +1009,35 @@ fn apply_tool_call_delta(
     let key = tool_call
         .get("index")
         .and_then(Value::as_u64)
-        .map_or_else(
-            || ToolBlockKey::Id(call_id.clone()),
-            ToolBlockKey::Index,
-        );
+        .map_or_else(|| ToolBlockKey::Id(call_id.clone()), ToolBlockKey::Index);
 
     let existing_index = scratch
         .blocks
         .iter()
         .find(|(key_entry, _)| *key_entry == key)
         .map(|(_, index)| *index);
-    let content_index = match existing_index {
-        Some(index) => index,
-        None => {
-            let name = tool_call
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            output.content.push(AssistantBlock::ToolCall(ToolCall {
-                id: call_id,
-                name: name.to_owned(),
-                arguments: serde_json::Map::new(),
-                thought_signature: None,
-                namespace: None,
-            }));
-            let index = output.content.len() - 1;
-            scratch.blocks.push((key, index));
-            events.push(AssistantMessageEvent::ToolcallStart {
-                content_index: index as u64,
-                partial: output.clone(),
-            });
-            index
-        }
+    let content_index = if let Some(index) = existing_index {
+        index
+    } else {
+        let name = tool_call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        output.content.push(AssistantBlock::ToolCall(ToolCall {
+            id: call_id,
+            name: name.to_owned(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+            namespace: None,
+        }));
+        let index = output.content.len() - 1;
+        scratch.blocks.push((key, index));
+        events.push(AssistantMessageEvent::ToolcallStart {
+            content_index: index as u64,
+            partial: output.clone(),
+        });
+        index
     };
 
     let arguments = tool_call
@@ -1099,13 +1046,9 @@ fn apply_tool_call_delta(
     let args_delta = match arguments {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Object(object)) => Value::Object(object.clone()).to_string(),
-        Some(_) => String::new(),
-        None => String::new(),
+        Some(_) | None => String::new(),
     };
-    let entry = scratch
-        .partial_args
-        .entry(content_index)
-        .or_default();
+    let entry = scratch.partial_args.entry(content_index).or_default();
     entry.push_str(&args_delta);
     let parsed = parse_streaming_json(Some(entry.as_str()))
         .as_object()
@@ -1119,39 +1062,8 @@ fn apply_tool_call_delta(
         delta: args_delta,
         partial: output.clone(),
     });
-    Ok(())
 }
 
-/// Close the open text/thinking block, emitting its `*_end` event.
-fn close_current_block(
-    current_block: &mut Option<bool>,
-    output: &mut AssistantMessage,
-    events: &AssistantMessageEventStream,
-) {
-    if let Some(open_thinking) = *current_block {
-        let content_index = output.content.len() as u64 - 1;
-        if open_thinking {
-            let Some(AssistantBlock::Thinking(block)) = output.content.last() else {
-                return;
-            };
-            events.push(AssistantMessageEvent::ThinkingEnd {
-                content_index,
-                content: block.thinking.clone(),
-                partial: output.clone(),
-            });
-        } else {
-            let Some(AssistantBlock::Text(block)) = output.content.last() else {
-                return;
-            };
-            events.push(AssistantMessageEvent::TextEnd {
-                content_index,
-                content: block.text.clone(),
-                partial: output.clone(),
-            });
-        }
-        *current_block = None;
-    }
-}
 /// The reasoning-effort model families, upstream's `usesReasoningEffort`.
 fn uses_reasoning_effort(model: &Model) -> bool {
     model.id == "mistral-small-2603"
@@ -1169,7 +1081,10 @@ fn uses_prompt_mode_reasoning(model: &Model) -> bool {
 /// The reasoning effort for the clamped level, upstream's
 /// `mapReasoningEffort`: the model's mapped value when it names an effort,
 /// `high` otherwise.
-fn map_reasoning_effort(model: &Model, level: Option<ModelThinkingLevel>) -> MistralReasoningEffort {
+fn map_reasoning_effort(
+    model: &Model,
+    level: Option<ModelThinkingLevel>,
+) -> MistralReasoningEffort {
     let mapped = level
         .and_then(|level| {
             model
@@ -1186,6 +1101,11 @@ fn map_reasoning_effort(model: &Model, level: Option<ModelThinkingLevel>) -> Mis
 /// The cached-token probe across the four spellings plus the two flat
 /// keys, clamped to `[0, promptTokens]`, upstream's
 /// `getMistralCachedPromptTokens`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the token count clamps to non-negative and truncates like upstream's Number coercion"
+)]
 fn cached_prompt_tokens(usage: &Value, prompt_tokens: u64) -> u64 {
     let raw = usage
         .get("promptTokensDetails")
@@ -1230,9 +1150,8 @@ fn parse_effort(value: &str) -> Option<MistralReasoningEffort> {
 /// The finish-reason mapping, upstream's `mapChatStopReason`.
 fn map_chat_stop_reason(reason: Option<&str>) -> (StopReason, Option<String>) {
     match reason {
-        None => (StopReason::Stop, None),
-        Some("stop") => (StopReason::Stop, None),
-        Some("length") | Some("model_length") => (StopReason::Length, None),
+        None | Some("stop") => (StopReason::Stop, None),
+        Some("length" | "model_length") => (StopReason::Length, None),
         Some("tool_calls") => (StopReason::ToolUse, None),
         Some("error") => (
             StopReason::Error,
@@ -1250,14 +1169,14 @@ fn wire_u64(value: &Value, key: &str) -> u64 {
         .get(key)
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        .max(0) as u64
+        .max(0)
+        .cast_unsigned()
 }
 
 /// The chat-completions URL, upstream's URL join: the base path keeps its
 /// trailing slash and `v1/chat/completions` rides after it.
 fn chat_completions_url(model: &Model) -> Result<String, String> {
-    let base = url::Url::parse(&model.base_url)
-        .map_err(|error| format!("invalid URL: {error}"))?;
+    let base = url::Url::parse(&model.base_url).map_err(|error| format!("invalid URL: {error}"))?;
     let path = format!(
         "{trimmed}/v1/chat/completions",
         trimmed = base.path().trim_end_matches('/')
@@ -1299,10 +1218,11 @@ fn build_request_headers(
     }
     if should_use_prompt_caching(options).is_some()
         && !has_header_override(model.headers.as_ref(), "x-affinity")
-        && !options
-            .headers
-            .as_ref()
-            .is_some_and(|headers| headers.keys().any(|name| name.eq_ignore_ascii_case("x-affinity")))
+        && !options.headers.as_ref().is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("x-affinity"))
+        })
     {
         let session_id = options.session_id.clone().unwrap_or_default();
         upsert_header(&mut headers, "x-affinity", &session_id);
@@ -1310,23 +1230,11 @@ fn build_request_headers(
     headers
 }
 
-fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some(entry) = headers
-        .iter_mut()
-        .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
-    {
-        entry.1 = value.to_owned();
-    } else {
-        headers.push((name.to_owned(), value.to_owned()));
-    }
-}
-
-fn has_header_override(headers: Option<&std::collections::BTreeMap<String, String>>, target: &str) -> bool {
-    headers.is_some_and(|headers| {
-        headers
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case(target))
-    })
+fn has_header_override(
+    headers: Option<&std::collections::BTreeMap<String, String>>,
+    target: &str,
+) -> bool {
+    headers.is_some_and(|headers| headers.keys().any(|name| name.eq_ignore_ascii_case(target)))
 }
 
 /// Dispatch the stream request, upstream's `requestMistralStream`: one
@@ -1352,21 +1260,13 @@ async fn dispatch_stream_request(
         .await
         .map_err(mistral_error_from_http)?;
 
-    if let Some(hook) = &options.transport_options.on_response {
-        hook.call(
-            crate::types::ProviderResponse {
-                status: response.status,
-                headers: headers_to_record(
-                    response
-                        .headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                ),
-            },
-            model.clone(),
-        )
-        .await;
-    }
+    call_response_hook(
+        &options.transport_options,
+        model,
+        response.status,
+        &response.headers,
+    )
+    .await;
 
     if !(200..300).contains(&response.status) {
         let body_text = read_body_text(response.body).await.unwrap_or_default();
@@ -1399,24 +1299,10 @@ fn mistral_error_from_http(error: HttpError) -> String {
     }
 }
 
-/// The stream-setup failure as a settled error stream, upstream's
-/// synchronous `streamSimple` throw encoded per the stream contract.
-fn setup_error_stream(model: &Model, message: &str) -> AssistantMessageEventStream {
-    let events = assistant_message_event_stream();
-    let failure = std::io::Error::other(message.to_owned());
-    let failing = crate::api::lazy::setup_error_message(model, &failure);
-    events.push(AssistantMessageEvent::Error {
-        reason: StopReason::Error,
-        error: failing.clone(),
-    });
-    events.end(Some(&failing));
-    events
-}
-
 /// The post-loop settlement, upstream's tail of the try block.
 fn finish_stream(
     options: &MistralStreamOptions,
-    output: &mut AssistantMessage,
+    output: &AssistantMessage,
     events: &AssistantMessageEventStream,
 ) -> Result<(), String> {
     if options.transport_options.signal().is_cancelled() {

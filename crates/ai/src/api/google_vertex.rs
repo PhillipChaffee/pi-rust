@@ -30,30 +30,27 @@
 //! - Surrogate sanitization is statically upheld: Rust strings are valid
 //!   UTF-8, so `sanitizeSurrogates` has no work.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
-use crate::api::google_generative_ai::to_wire_body;
 use crate::api::google_shared::{
-    GoogleThinkingControl, ResolvedGoogleThinkingLevel, api_error_message, convert_messages,
-    convert_tools, resolve_google_function_calling_mode, resolve_google_thinking_level,
-    supports_google_strict_tool_sampling,
+    GoogleThinkingControl, ResolvedGoogleThinkingLevel, base_google_request_headers,
+    build_google_params, consume_google_stream, dispatch_google_stream, finish_google_stream,
+    is_gemini3_flash_model, is_gemini3_pro_model, resolve_google_thinking_level,
 };
 use crate::api::simple_options::build_base_options;
+use crate::api::wire_common::{
+    initial_output, push_header_if_absent, setup_error_stream, spawn_adapter_stream,
+};
 use crate::http::client::{HttpMethod, HttpRequest, read_body_text};
 use crate::types::{
-    AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel, ProviderStreams,
-    SimpleStreamOptions, StopReason, StreamOptions, ThinkingBudgets,
+    AssistantMessage, AssistantMessageEvent, Context, Model, ModelThinkingLevel,
+    SimpleStreamOptions, ThinkingBudgets,
 };
-use crate::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
-use crate::utils::headers::{headers_to_record, provider_headers_to_record};
+use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::pi_user_agent::get_pi_user_agent;
 use crate::utils::provider_env::get_provider_env_value;
-use crate::utils::provider_retry::{
-    ProviderRequestError, ProviderRetryOptions, retry_provider_request,
-};
 
 /// The Vertex REST version the SDK client pins.
 const API_VERSION: &str = "v1";
@@ -64,125 +61,15 @@ const VERTEX_ADC_PATH: &str = "~/.config/gcloud/application_default_credentials.
 /// The cloud-platform scope the SDK pins for Vertex.
 const VERTEX_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
-/// The adapter-facing options, upstream's `GoogleVertexOptions`.
-#[derive(Clone, Debug, Default)]
-pub struct GoogleVertexStreamOptions {
-    /// The transport seam: the request's HTTP client, cancellation token,
-    /// and lifecycle callbacks.
-    pub transport_options: crate::types::TransportOptions,
-    /// The API key, overriding credential resolution.
-    pub api_key: Option<String>,
-    /// Explicit parent context for telemetry produced by this logical request.
-    pub telemetry_context: Option<pi_telemetry::TelemetryHandle>,
-    /// Provider-scoped environment values; these take precedence over the
-    /// process environment.
-    pub env: Option<crate::types::ProviderEnv>,
-    /// Custom HTTP headers merged with provider defaults.
-    pub headers: Option<crate::types::ProviderHeaders>,
-    /// HTTP request timeout in milliseconds.
-    pub timeout_ms: Option<u64>,
-    /// Maximum retry attempts for client-side retries.
-    pub max_retries: Option<u32>,
-    /// Maximum delay in milliseconds to wait for a retry when the server
-    /// requests a long wait.
-    pub max_retry_delay_ms: Option<u64>,
-    /// Sampling temperature.
-    pub temperature: Option<f64>,
-    /// Arbitrary sampling parameters merged into the request body as-is.
-    pub sampling_params: Option<std::collections::BTreeMap<String, Value>>,
-    /// Maximum output tokens.
-    pub max_tokens: Option<u64>,
-    /// Preferred transport; SSE is the only transport this adapter speaks.
-    pub transport: Option<crate::types::Transport>,
-    /// Prompt cache retention preference. Default: `"short"`.
-    pub cache_retention: Option<crate::types::CacheRetention>,
-    /// Optional session identifier for providers that support session-based
-    /// caching.
-    pub session_id: Option<String>,
-    /// WebSocket connect timeout in milliseconds.
-    pub websocket_connect_timeout_ms: Option<u64>,
-    /// Optional metadata to include in API requests.
-    pub metadata: Option<std::collections::BTreeMap<String, Value>>,
-    /// The tool choice, upstream's `"auto" | "none" | "any"`.
-    pub tool_choice: Option<String>,
-    /// The thinking control, upstream's
-    /// `thinking?: { enabled, budgetTokens?, level? }`.
-    pub thinking: Option<GoogleThinkingControl>,
-    /// The GCP project id.
-    pub project: Option<String>,
-    /// The GCP region, e.g. `us-central1`.
-    pub location: Option<String>,
-}
-
-impl From<StreamOptions> for GoogleVertexStreamOptions {
-    fn from(options: StreamOptions) -> Self {
-        let StreamOptions {
-            transport_options,
-            api_key,
-            telemetry_context,
-            env,
-            headers,
-            timeout_ms,
-            max_retries,
-            max_retry_delay_ms,
-            temperature,
-            sampling_params,
-            max_tokens,
-            transport,
-            cache_retention,
-            session_id,
-            websocket_connect_timeout_ms,
-            metadata,
-        } = options;
-        Self {
-            transport_options,
-            api_key,
-            telemetry_context,
-            env,
-            headers,
-            timeout_ms,
-            max_retries,
-            max_retry_delay_ms,
-            temperature,
-            sampling_params,
-            max_tokens,
-            transport,
-            cache_retention,
-            session_id,
-            websocket_connect_timeout_ms,
-            metadata,
-            tool_choice: None,
-            thinking: None,
-            project: None,
-            location: None,
-        }
-    }
-}
+/// The adapter-facing options, upstream's `GoogleVertexOptions`: the shared
+/// Google options shape under the adapter's historical name.
+pub use crate::api::google_shared::GoogleOptions as GoogleVertexStreamOptions;
 
 /// The Google Vertex streams, upstream's `googleVertexApi()`.
 #[derive(Debug, Default)]
 pub struct GoogleVertexStreams;
 
-impl ProviderStreams for GoogleVertexStreams {
-    fn stream(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&StreamOptions>,
-    ) -> AssistantMessageEventStream {
-        let options = options.cloned().map(GoogleVertexStreamOptions::from);
-        stream(model, context, options.as_ref())
-    }
-
-    fn stream_simple(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        stream_simple(model, context, options)
-    }
-}
+crate::api::wire_common::forward_provider_streams!(GoogleVertexStreams, GoogleVertexStreamOptions);
 
 /// Stream an assistant response, upstream's `stream` export.
 #[must_use]
@@ -191,53 +78,37 @@ pub fn stream(
     context: &Context,
     options: Option<&GoogleVertexStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let events = assistant_message_event_stream();
-    let forward = events.clone();
-    let model = model.clone();
-    let context = context.clone();
-    let options = options.cloned();
-    tokio::spawn(async move {
-        let options = options.unwrap_or_default();
-        let mut output = initial_output(&model);
-        match run_stream(&model, &context, &options, &mut output, &forward).await {
-            Ok(()) => {
-                // The done event already settled the final result.
-                forward.end(None);
-            }
-            Err(message) => {
-                let signal = options.transport_options.signal();
-                output.stop_reason = if signal.is_cancelled() {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
-                forward.push(AssistantMessageEvent::Error {
-                    reason: output.stop_reason,
-                    error: output.clone(),
-                });
-                forward.end(None);
-            }
-        }
-    });
-    events
+    spawn_adapter_stream(
+        model,
+        context,
+        options.cloned(),
+        |model, _| initial_output(model),
+        |model, context, options, output, events| {
+            Box::pin(run_stream(model, context, options, output, events))
+        },
+    )
 }
 
-/// Stream a simple assistant response, upstream's `streamSimple` export:
-/// resolves the pi reasoning level to either a provider-native level
-/// (Gemini 3) or a token budget, and disables thinking outright when no
-/// level is requested. Auth resolves inside the stream, upstream-side too.
+/// Stream a simple assistant response, upstream's `streamSimple` export.
+///
+/// The pi reasoning level resolves to a provider-native level (Gemini 3) or
+/// a token budget; no level disables thinking outright.
+///
+/// Auth resolves inside the stream, upstream-side too.
 #[must_use]
 pub fn stream_simple(
     model: &Model,
     context: &Context,
     options: Option<&SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let mut base = GoogleVertexStreamOptions::from(build_base_options(model, context, options, None));
-    base.tool_choice = options.and_then(|options| options.tool_choice).map(|choice| match choice {
-        crate::types::ToolChoice::Auto => "auto".to_owned(),
-        crate::types::ToolChoice::None => "none".to_owned(),
-    });
+    let mut base =
+        GoogleVertexStreamOptions::from(build_base_options(model, context, options, None));
+    base.tool_choice = options
+        .and_then(|options| options.tool_choice)
+        .map(|choice| match choice {
+            crate::types::ToolChoice::Auto => "auto".to_owned(),
+            crate::types::ToolChoice::None => "none".to_owned(),
+        });
 
     let Some(reasoning) = options.and_then(|options| options.reasoning) else {
         return stream(
@@ -292,27 +163,6 @@ pub fn stream_simple(
     )
 }
 
-/// The fresh accumulator a stream starts from, upstream's `output`.
-fn initial_output(model: &Model) -> AssistantMessage {
-    AssistantMessage {
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        response_model: None,
-        response_id: None,
-        provider_thinking_level: None,
-        diagnostics: None,
-        usage: crate::types::Usage::default(),
-        stop_reason: StopReason::Pending,
-        deferred: None,
-        error_message: None,
-        raw_stop_reason: None,
-        end_turn: None,
-        timestamp: crate::auth::resolve::now_ms(),
-    }
-}
-
 /// The resolved request identity: an express API key, or an ADC credential
 /// resolved to a bearer token, carrying the project/location the URL needs.
 enum VertexAuth {
@@ -329,7 +179,10 @@ enum VertexAuth {
 /// Resolve the request identity, upstream's `resolveApiKey` + client
 /// selection. The ADC token acquisition runs here too; upstream it happens
 /// lazily inside the SDK's send.
-async fn resolve_auth(_model: &Model, options: &GoogleVertexStreamOptions) -> Result<VertexAuth, String> {
+async fn resolve_auth(
+    _model: &Model,
+    options: &GoogleVertexStreamOptions,
+) -> Result<VertexAuth, String> {
     if let Some(api_key) = resolve_api_key(options) {
         return Ok(VertexAuth::ApiKey(api_key));
     }
@@ -405,7 +258,9 @@ async fn resolve_adc_token(
     {
         return acquire_file_credentials(options, &credentials).await;
     }
-    acquire_metadata_server_token(options).await.map(|token| (token, None))
+    acquire_metadata_server_token(options)
+        .await
+        .map(|token| (token, None))
 }
 
 fn expand_home(path: &str) -> Option<std::path::PathBuf> {
@@ -452,8 +307,8 @@ async fn acquire_file_credentials(
                 .get("refresh_token")
                 .and_then(Value::as_str)
                 .ok_or("Google authorized-user credentials are missing refresh_token")?;
-            let token = exchange_refresh_token(options, client_id, client_secret, refresh_token)
-                .await?;
+            let token =
+                exchange_refresh_token(options, client_id, client_secret, refresh_token).await?;
             Ok((token, None))
         }
         other => Err(format!(
@@ -484,9 +339,8 @@ async fn exchange_service_account_jwt(
         .map_err(|error| format!("Google service-account private key is not usable: {error}"))?;
     let jwt = encode(&Header::new(Algorithm::RS256), &claims, &key)
         .map_err(|error| format!("Google service-account JWT signing failed: {error}"))?;
-    let body = format!(
-        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}"
-    );
+    let body =
+        format!("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={jwt}");
     token_request(options, &body)
         .await
         .map(|response| response.access_token)
@@ -510,8 +364,10 @@ async fn exchange_refresh_token(
         .map(|response| response.access_token)
 }
 
-/// The GCE metadata-server token endpoint, upstream's ComputeClient path.
-async fn acquire_metadata_server_token(options: &GoogleVertexStreamOptions) -> Result<String, String> {
+/// The GCE metadata-server token endpoint, upstream's `ComputeClient` path.
+async fn acquire_metadata_server_token(
+    options: &GoogleVertexStreamOptions,
+) -> Result<String, String> {
     let url = "http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token?scopes=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcloud-platform";
     let http_client = options.transport_options.client();
     let request = HttpRequest {
@@ -589,15 +445,17 @@ async fn token_request(
 }
 
 /// `%`-encode the characters a token-endpoint form body must not carry raw;
-/// the form encoding upstream delegates to URLSearchParams.
+/// the form encoding upstream delegates to `URLSearchParams`.
 fn urlencode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
+                encoded.push(byte as char);
             }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = write!(encoded, "%{byte:02X}");
+            }
         }
     }
     encoded
@@ -618,94 +476,32 @@ async fn run_stream(
             .await
             .unwrap_or(params);
     }
-    let response = dispatch_stream_request(model, &params, options, &auth).await?;
-    events.push(AssistantMessageEvent::Start {
-        partial: output.clone(),
-    });
-    crate::api::google_shared::consume_google_stream(model, response, output, events).await?;
-    finish_stream(options, output, events)
-}
-
-/// Build and dispatch the stream request with the shared provider retry
-/// policy, the seam-side port of upstream's `createClient` (express or ADC) +
-/// `retryGoogleRequest(() => client.models.generateContentStream(params))`.
-async fn dispatch_stream_request(
-    model: &Model,
-    params: &Value,
-    options: &GoogleVertexStreamOptions,
-    auth: &VertexAuth,
-) -> Result<crate::http::client::HttpResponse, String> {
-    let http_client = options.transport_options.client();
-    let signal = options.transport_options.signal();
-    let mut headers = build_request_headers(model, options, auth);
+    let mut headers = build_request_headers(model, options, &auth);
     if let VertexAuth::Adc {
         quota_project: Some(project),
         ..
-    } = auth
+    } = &auth
     {
         headers.push(("x-goog-user-project".to_owned(), project.clone()));
     }
-    let request = HttpRequest {
-        method: HttpMethod::Post,
-        url: stream_generate_url(model, auth),
+    let response = dispatch_google_stream(
+        model,
+        options,
+        stream_generate_url(model, &auth),
         headers,
-        body: Some(Bytes::from(to_wire_body(params).to_string())),
-        timeout_ms: options.timeout_ms,
-        signal: signal.clone(),
-    };
-    let retry_options = ProviderRetryOptions {
-        max_retries: options.max_retries.unwrap_or(0),
-        max_retry_delay_ms: options.max_retry_delay_ms,
-        signal: Some(signal.clone()),
-        random: None,
-    };
-    let response = retry_provider_request(
-        || {
-            let client = Arc::clone(&http_client);
-            let request = request.clone();
-            async move {
-                let response = client
-                    .execute(request)
-                    .await
-                    .map_err(provider_error_from_http)?;
-                if !(200..300).contains(&response.status) {
-                    let body_text = read_body_text(response.body).await.unwrap_or_default();
-                    return Err(ProviderRequestError::new(
-                        Some(response.status),
-                        Some(headers_to_record(
-                            response
-                                .headers
-                                .iter()
-                                .map(|(name, value)| (name.as_str(), value.as_str())),
-                        )),
-                        api_error_message(response.status, &body_text),
-                    ));
-                }
-                Ok(response)
-            }
-        },
-        &retry_options,
+        &params,
     )
-    .await
-    .map_err(|error| error.message)?;
-
-    if let Some(hook) = &options.transport_options.on_response {
-        hook.call(
-            crate::types::ProviderResponse {
-                status: response.status,
-                headers: headers_to_record(
-                    response
-                        .headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                ),
-            },
-            model.clone(),
-        )
-        .await;
-    }
-
-    Ok(response)
+    .await?;
+    events.push(AssistantMessageEvent::Start {
+        partial: output.clone(),
+    });
+    consume_google_stream(model, response, output, events).await?;
+    finish_google_stream(
+        &options.transport_options,
+        output,
+        events,
+        "Google Vertex stream ended without a finish reason",
+    )
 }
 
 /// Assemble the request headers, upstream's `buildHttpOptions` header merge
@@ -716,50 +512,16 @@ fn build_request_headers(
     options: &GoogleVertexStreamOptions,
     auth: &VertexAuth,
 ) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = vec![
-        ("User-Agent".to_owned(), get_pi_user_agent()),
-        ("content-type".to_owned(), "application/json".to_owned()),
-    ];
-    if let Some(model_headers) = &model.headers {
-        for (name, value) in model_headers {
-            upsert_header(&mut headers, name, value);
-        }
-    }
-    if let Some(record) = provider_headers_to_record(options.headers.as_ref()) {
-        for (name, value) in record {
-            upsert_header(&mut headers, &name, &value);
-        }
-    }
+    let mut headers = base_google_request_headers(model, options.headers.as_ref());
     match auth {
         VertexAuth::ApiKey(api_key) => {
-            if !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("x-goog-api-key"))
-            {
-                headers.push(("x-goog-api-key".to_owned(), api_key.clone()));
-            }
+            push_header_if_absent(&mut headers, "x-goog-api-key", api_key.clone());
         }
         VertexAuth::Adc { token, .. } => {
-            if !headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            {
-                headers.push(("authorization".to_owned(), format!("Bearer {token}")));
-            }
+            push_header_if_absent(&mut headers, "authorization", format!("Bearer {token}"));
         }
     }
     headers
-}
-
-fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
-    if let Some(entry) = headers
-        .iter_mut()
-        .find(|(existing, _)| existing.eq_ignore_ascii_case(name))
-    {
-        entry.1 = value.to_owned();
-    } else {
-        headers.push((name.to_owned(), value.to_owned()));
-    }
 }
 
 /// The request URL, the SDK's URL construction for the Vertex backend: a
@@ -769,10 +531,9 @@ fn upsert_header(headers: &mut Vec<(String, String)>, name: &str, value: &str) {
 /// rides for ADC and the plain host for API keys.
 fn stream_generate_url(model: &Model, auth: &VertexAuth) -> String {
     let custom_base = resolve_custom_base_url(&model.base_url);
-    let include_version = match &custom_base {
-        Some(base) => !base_url_includes_api_version(base),
-        None => true,
-    };
+    let include_version = custom_base
+        .as_ref()
+        .is_none_or(|base| !base_url_includes_api_version(base));
     let has_custom_base = custom_base.is_some();
     let base = custom_base.unwrap_or_else(|| default_vertex_host(auth));
     let mut url = base;
@@ -783,17 +544,19 @@ fn stream_generate_url(model: &Model, auth: &VertexAuth) -> String {
     url.push('/');
     // The COLLECTION resource scope suppresses the project/location prefix
     // whenever a custom base URL rides; only generated-URL requests carry it.
-    if let VertexAuth::Adc { project, location, .. } = auth
+    if let VertexAuth::Adc {
+        project, location, ..
+    } = auth
         && !has_custom_base
     {
-        url.push_str(&format!("projects/{project}/locations/{location}/"));
+        let _ = write!(url, "projects/{project}/locations/{location}/");
     }
     url.push_str(&t_model_vertex(&model.id));
     url.push_str(":streamGenerateContent?alt=sse");
     url
 }
 
-/// The default host for a generated-URL request, upstream's ApiClient
+/// The default host for a generated-URL request, upstream's `ApiClient`
 /// baseUrl selection: `us`/`eu` multi-regions use the `rep` host, `global`
 /// and express keys use the plain host, everything else embeds the location.
 fn default_vertex_host(auth: &VertexAuth) -> String {
@@ -811,10 +574,7 @@ fn default_vertex_host(auth: &VertexAuth) -> String {
 /// `publisher/model` ids under their publisher, already-prefixed ids pass
 /// through.
 fn t_model_vertex(id: &str) -> String {
-    if id.starts_with("publishers/")
-        || id.starts_with("projects/")
-        || id.starts_with("models/")
-    {
+    if id.starts_with("publishers/") || id.starts_with("projects/") || id.starts_with("models/") {
         return id.to_owned();
     }
     match id.split_once('/') {
@@ -842,7 +602,7 @@ fn base_url_includes_api_version(base_url: &str) -> bool {
             let Some(rest) = part.strip_prefix('v') else {
                 return false;
             };
-            let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
             if digits == 0 {
                 return false;
             }
@@ -851,17 +611,18 @@ fn base_url_includes_api_version(base_url: &str) -> bool {
                 .is_none_or(|tail| tail.chars().all(|c| c.is_ascii_digit()))
         });
     }
-    base_url.split(|c: char| c == '/' || c == '?' || c == '#').any(|part| {
+    base_url.split(['/', '?', '#']).any(|part| {
         let Some(rest) = part.strip_prefix('v') else {
             return false;
         };
-        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
         digits > 0 && (rest.len() == digits + 1 || rest[digits..].starts_with("beta"))
     })
 }
 
-/// Build the SDK-style params, upstream's `buildParams`; identical to the
-/// Gemini builder with the Vertex thinking-level vocabulary.
+/// Build the SDK-style params, upstream's `buildParams`: `{ model, contents,
+/// config }` with the camelCase config fields. The wire flattening happens in
+/// `to_wire_body`; `onPayload` sees this shape.
 ///
 /// # Errors
 /// When a tool requires strict sampling that cannot be resolved, or when the
@@ -871,85 +632,7 @@ fn build_params(
     context: &Context,
     options: &GoogleVertexStreamOptions,
 ) -> Result<Value, String> {
-    let contents = convert_messages(model, context);
-
-    let mut generation_config = serde_json::Map::new();
-    if let Some(temperature) = options.temperature {
-        generation_config.insert("temperature".to_owned(), json!(temperature));
-    }
-    if let Some(max_tokens) = options.max_tokens {
-        generation_config.insert("maxOutputTokens".to_owned(), json!(max_tokens));
-    }
-
-    let supports_strict_mode = supports_google_strict_tool_sampling(&model.id);
-    let tools = context.tools.as_deref().unwrap_or_default();
-    let function_calling_mode = if !tools.is_empty() {
-        Some(resolve_google_function_calling_mode(
-            tools,
-            options.tool_choice.as_deref(),
-            supports_strict_mode,
-        )?)
-    } else {
-        None
-    };
-
-    let mut config = serde_json::Map::new();
-    for (key, value) in generation_config {
-        config.insert(key, value);
-    }
-    if let Some(system_prompt) = &context.system_prompt {
-        config.insert("systemInstruction".to_owned(), json!(system_prompt));
-    }
-    if let Some(tools) = &context.tools {
-        if !tools.is_empty()
-            && let Some(declarations) = convert_tools(tools, false, supports_strict_mode)?
-        {
-            config.insert("tools".to_owned(), declarations);
-        }
-    }
-    if let Some(Some(mode)) = function_calling_mode {
-        config.insert(
-            "toolConfig".to_owned(),
-            json!({ "functionCallingConfig": { "mode": mode } }),
-        );
-    }
-
-    if options.thinking.as_ref().is_some_and(|thinking| thinking.enabled) && model.reasoning {
-        let mut thinking_config = serde_json::Map::new();
-        thinking_config.insert("includeThoughts".to_owned(), json!(true));
-        if let Some(level) = options
-            .thinking
-            .as_ref()
-            .and_then(|thinking| thinking.level.as_deref())
-        {
-            thinking_config.insert("thinkingLevel".to_owned(), json!(level));
-        } else if let Some(budget) = options
-            .thinking
-            .as_ref()
-            .and_then(|thinking| thinking.budget_tokens)
-        {
-            thinking_config.insert("thinkingBudget".to_owned(), json!(budget));
-        }
-        config.insert("thinkingConfig".to_owned(), Value::Object(thinking_config));
-    } else if model.reasoning
-        && let Some(thinking) = &options.thinking
-        && !thinking.enabled
-    {
-        config.insert(
-            "thinkingConfig".to_owned(),
-            get_disabled_thinking_config(model),
-        );
-    }
-
-    if options.transport_options.signal().is_cancelled() {
-        return Err("Request aborted".to_owned());
-    }
-
-    Ok(json!({
-        "model": model.id,
-        "contents": contents,
-        "config": Value::Object(config),
-    }))
+    build_google_params(model, context, options, get_disabled_thinking_config)
 }
 
 /// The disabled-thinking config, upstream's Vertex `getDisabledThinkingConfig`
@@ -962,40 +645,6 @@ fn get_disabled_thinking_config(model: &Model) -> Value {
     } else {
         json!({ "thinkingBudget": 0 })
     }
-}
-
-/// `/gemini-3(?:\.\d+)?-pro/` over the lowercased id.
-fn is_gemini3_pro_model(model: &Model) -> bool {
-    let id = model.id.to_lowercase();
-    id.split("gemini-3").skip(1).any(|rest| {
-        let rest = rest.strip_prefix('.').map_or(rest, |after_dot| {
-            let digits = after_dot.chars().take_while(|c| c.is_ascii_digit()).count();
-            if digits == 0 {
-                rest
-            } else {
-                &after_dot[digits..]
-            }
-        });
-        rest.starts_with("-pro")
-    })
-}
-
-/// `/gemini-3(?:\.\d+)?-flash/` over the lowercased id, plus the two
-/// rolling-latest aliases.
-fn is_gemini3_flash_model(model: &Model) -> bool {
-    let id = model.id.to_lowercase();
-    id.split("gemini-3").skip(1).any(|rest| {
-        let rest = rest.strip_prefix('.').map_or(rest, |after_dot| {
-            let digits = after_dot.chars().take_while(|c| c.is_ascii_digit()).count();
-            if digits == 0 {
-                rest
-            } else {
-                &after_dot[digits..]
-            }
-        });
-        rest.starts_with("-flash")
-    }) || id == "gemini-flash-latest"
-        || id == "gemini-flash-lite-latest"
 }
 
 /// Map a resolved pi level to the provider-native thinking level, upstream's
@@ -1052,61 +701,4 @@ pub fn get_google_budget(
         ResolvedGoogleThinkingLevel::Medium => medium,
         ResolvedGoogleThinkingLevel::High => high,
     })
-}
-
-fn provider_error_from_http(error: crate::http::client::HttpError) -> ProviderRequestError {
-    match error {
-        crate::http::client::HttpError::Aborted => ProviderRequestError::aborted(),
-        crate::http::client::HttpError::Timeout => {
-            ProviderRequestError::new(None, None, "request timed out")
-        }
-        crate::http::client::HttpError::Transport(message) => {
-            ProviderRequestError::new(None, None, message)
-        }
-        crate::http::client::HttpError::InvalidUrl(url) => {
-            ProviderRequestError::new(None, None, format!("invalid URL: {url}"))
-        }
-    }
-}
-
-/// The stream-setup failure as a settled error stream, upstream's
-/// synchronous throw encoded per the stream contract.
-fn setup_error_stream(model: &Model, message: &str) -> AssistantMessageEventStream {
-    let events = assistant_message_event_stream();
-    let failure = std::io::Error::other(message.to_owned());
-    let failing = crate::api::lazy::setup_error_message(model, &failure);
-    events.push(AssistantMessageEvent::Error {
-        reason: StopReason::Error,
-        error: failing.clone(),
-    });
-    events.end(Some(&failing));
-    events
-}
-
-/// The post-loop settlement, upstream's tail of the try block: the signal
-/// check, the pending and provider-stopped rejections, then the done event.
-fn finish_stream(
-    options: &GoogleVertexStreamOptions,
-    output: &mut AssistantMessage,
-    events: &AssistantMessageEventStream,
-) -> Result<(), String> {
-    if options.transport_options.signal().is_cancelled() {
-        return Err("Request was aborted".to_owned());
-    }
-    if output.stop_reason == StopReason::Pending {
-        return Err("Google Vertex stream ended without a finish reason".to_owned());
-    }
-    if matches!(output.stop_reason, StopReason::Aborted | StopReason::Error) {
-        return Err(output
-            .raw_stop_reason
-            .as_ref()
-            .map(|reason| format!("Provider stopped with: {reason}"))
-            .unwrap_or_else(|| "An unknown error occurred".to_owned()));
-    }
-
-    events.push(AssistantMessageEvent::Done {
-        reason: output.stop_reason,
-        message: output.clone(),
-    });
-    Ok(())
 }

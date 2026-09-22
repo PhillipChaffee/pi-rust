@@ -16,6 +16,7 @@ use crate::types::ProviderStreams;
 pub mod anthropic_messages;
 pub mod bedrock_converse_stream;
 pub mod bedrock_options;
+pub mod bedrock_sdk;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
 pub mod google_generative_ai;
@@ -26,6 +27,7 @@ pub mod mistral_conversations;
 pub mod pi_messages;
 pub mod simple_options;
 pub mod transform_messages;
+pub mod wire_common;
 
 /// The stub failure an unported wire-API stream reports.
 #[derive(Debug)]
@@ -135,7 +137,7 @@ pub fn google_vertex() -> Arc<dyn ProviderStreams> {
 /// `bedrockConverseStreamApi()`.
 #[must_use]
 pub fn bedrock_converse_stream() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("bedrock-converse-stream")
+    Arc::new(bedrock_converse_stream::BedrockStreams)
 }
 
 /// The Mistral Conversations wire API, upstream's `mistralConversationsApi()`.

@@ -1,9 +1,9 @@
-//! The Bedrock adapter options, client-config resolution, and the
-//! Converse Stream command-input builder, ported from
-//! `packages/ai/src/api/bedrock-converse-stream.ts` at commit
-//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`. The config fields mirror the
-//! SDK client construction upstream's tests capture from the mocked
-//! constructor.
+//! The Bedrock adapter options, client-config resolution, and the Converse
+//! Stream command-input builder, ported from `packages/ai/src/api/`.
+//!
+//! Upstream commit: `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`. The config
+//! fields mirror the SDK client construction upstream's tests capture from
+//! the mocked constructor.
 
 use serde_json::{Value, json};
 
@@ -73,6 +73,9 @@ pub struct BedrockStreamOptions {
     pub request_metadata: Option<std::collections::BTreeMap<String, Value>>,
     /// The Bedrock API key, bypassing SigV4, upstream's `bearerToken`.
     pub bearer_token: Option<String>,
+    /// The Converse Stream runtime seam, upstream's `BedrockRuntimeClient`;
+    /// `None` uses the official SDK adapter.
+    pub runtime: Option<std::sync::Arc<dyn crate::api::bedrock_converse_stream::BedrockRuntime>>,
 }
 
 impl From<crate::types::StreamOptions> for BedrockStreamOptions {
@@ -120,13 +123,14 @@ impl From<crate::types::StreamOptions> for BedrockStreamOptions {
             thinking_display: None,
             request_metadata: None,
             bearer_token: None,
+            runtime: None,
         }
     }
 }
 
 /// The AWS credentials the config resolution applies, upstream's
 /// `getConfiguredBedrockCredentials`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BedrockCredentials {
     /// The access key id.
     pub access_key_id: String,
@@ -138,7 +142,7 @@ pub struct BedrockCredentials {
 
 /// The resolved client configuration the seam sends with, the shape the
 /// upstream tests capture from the mocked client constructor.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BedrockClientConfig {
     /// The resolved region.
     pub region: Option<String>,
@@ -179,7 +183,7 @@ fn standard_endpoint_region(base_url: &str) -> Option<String> {
         && region
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
-        .then(|| region.to_owned())
+    .then(|| region.to_owned())
 }
 
 /// Whether the endpoint is pinned to the SDK, upstream's
@@ -191,14 +195,40 @@ fn should_use_explicit_bedrock_endpoint(
     configured_region: Option<&str>,
     ambient_profile: bool,
 ) -> bool {
-    standard_endpoint_region(&model.base_url)
-        .is_none()
+    standard_endpoint_region(&model.base_url).is_none()
         || (configured_region.is_none() && !ambient_profile)
 }
 
-/// The ambient-profile flag, upstream's `hasAmbientConfiguredProfile`.
-fn has_ambient_configured_profile(options: &BedrockStreamOptions) -> bool {
-    crate::utils::provider_env::get_provider_env_value("AWS_PROFILE", options.env.as_ref()).is_some()
+/// The ambient-profile flag, upstream's `hasAmbientConfiguredProfile`:
+/// `getProviderEnvValue("AWS_PROFILE")` with no env argument — the process
+/// environment only, so a provider-scoped `AWS_PROFILE` overlay never counts.
+fn has_ambient_configured_profile(process_env: &impl Fn(&str) -> Option<String>) -> bool {
+    process_env("AWS_PROFILE").is_some_and(|value| !value.is_empty())
+}
+
+/// The process-environment lookup, the hermetic seam's default leg.
+fn std_process_env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// The profile the stored credential or explicit option scoped, upstream's
+/// `optionsProfile` (`options.profile || options.env?.AWS_PROFILE`): the
+/// overlay map only, never the process environment. This is the credential
+/// rule's trigger — an ambient profile leaves env access keys in place, so
+/// the SDK chain can weigh them together.
+fn scoped_profile(options: &BedrockStreamOptions) -> Option<String> {
+    options
+        .profile
+        .clone()
+        .filter(|profile| !profile.is_empty())
+        .or_else(|| {
+            options
+                .env
+                .as_ref()?
+                .get("AWS_PROFILE")
+                .filter(|value| !value.is_empty())
+                .cloned()
+        })
 }
 
 /// The configured region from the options or the environment, upstream's
@@ -207,24 +237,42 @@ fn configured_region(options: &BedrockStreamOptions) -> Option<String> {
     options
         .region
         .clone()
-        .or_else(|| crate::utils::provider_env::get_provider_env_value("AWS_REGION", options.env.as_ref()))
         .or_else(|| {
-            crate::utils::provider_env::get_provider_env_value("AWS_DEFAULT_REGION", options.env.as_ref())
+            crate::utils::provider_env::get_provider_env_value("AWS_REGION", options.env.as_ref())
+        })
+        .or_else(|| {
+            crate::utils::provider_env::get_provider_env_value(
+                "AWS_DEFAULT_REGION",
+                options.env.as_ref(),
+            )
         })
 }
 
-/// The region resolution, upstream's precedence table: the ARN-embedded
-/// region, then the configured region, then the endpoint's region when the
-/// endpoint is pinned, then `us-east-1` only when no ambient profile rides.
+/// The region resolution, upstream's precedence table.
+///
+/// The ARN-embedded region wins, then the configured region, then the
+/// endpoint's region when the endpoint is pinned, then `us-east-1` only when
+/// no ambient profile rides.
 #[must_use]
 pub fn resolve_region(model: &Model, options: &BedrockStreamOptions) -> String {
+    resolve_region_with_process_env(model, options, &std_process_env)
+}
+
+/// The region resolution with the process environment injectable, the
+/// hermetic seam the ambient-profile tests drive.
+#[must_use]
+pub fn resolve_region_with_process_env(
+    model: &Model,
+    options: &BedrockStreamOptions,
+    process_env: &impl Fn(&str) -> Option<String>,
+) -> String {
     if let Some(arn_region) = arn_region(&model.id) {
         return arn_region;
     }
     if let Some(region) = configured_region(options) {
         return region;
     }
-    let ambient_profile = has_ambient_configured_profile(options);
+    let ambient_profile = has_ambient_configured_profile(process_env);
     if should_use_explicit_bedrock_endpoint(model, None, ambient_profile)
         && let Some(region) = standard_endpoint_region(&model.base_url)
     {
@@ -240,7 +288,7 @@ pub fn resolve_region(model: &Model, options: &BedrockStreamOptions) -> String {
 
 /// The region embedded in an inference-profile ARN, upstream's regex
 /// `arn:aws(?:-[a-z0-9-]+)?:bedrock:([a-z0-9-]+):`, which covers the
-/// GovCloud partition spellings too.
+/// `GovCloud` partition spellings too.
 fn arn_region(model_id: &str) -> Option<String> {
     let rest = model_id
         .strip_prefix("arn:aws-us-gov:bedrock:")
@@ -256,41 +304,72 @@ fn arn_region(model_id: &str) -> Option<String> {
 /// upstream's endpoint pinning decision.
 #[must_use]
 pub fn resolve_endpoint(model: &Model, options: &BedrockStreamOptions) -> Option<String> {
-    let ambient_profile = has_ambient_configured_profile(options);
-    if should_use_explicit_bedrock_endpoint(model, configured_region(options).as_deref(), ambient_profile)
-    {
+    resolve_endpoint_with_process_env(model, options, &std_process_env)
+}
+
+/// The endpoint pinning with the process environment injectable.
+#[must_use]
+pub fn resolve_endpoint_with_process_env(
+    model: &Model,
+    options: &BedrockStreamOptions,
+    process_env: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let ambient_profile = has_ambient_configured_profile(process_env);
+    if should_use_explicit_bedrock_endpoint(
+        model,
+        configured_region(options).as_deref(),
+        ambient_profile,
+    ) {
         Some(model.base_url.clone())
     } else {
         None
     }
 }
 
-/// The profile the client configures, upstream's `config.profile`.
+/// The profile the client configures, upstream's `config.profile`: the
+/// scoped profile first, then the full `AWS_PROFILE` chain.
 #[must_use]
 pub fn resolve_profile(options: &BedrockStreamOptions) -> Option<String> {
-    options
-        .profile
-        .clone()
-        .or_else(|| crate::utils::provider_env::get_provider_env_value("AWS_PROFILE", options.env.as_ref()))
+    resolve_profile_with_process_env(options, &std_process_env)
+}
+
+/// The profile resolution with the process environment injectable.
+fn resolve_profile_with_process_env(
+    options: &BedrockStreamOptions,
+    process_env: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    scoped_profile(options).or_else(|| {
+        crate::utils::provider_env::get_provider_env_value_with_process_env(
+            "AWS_PROFILE",
+            options.env.as_ref(),
+            process_env,
+        )
+    })
 }
 
 /// The env access keys, upstream's `getConfiguredBedrockCredentials`: both
 /// required, the session token optional.
-fn env_credentials(options: &BedrockStreamOptions) -> Option<BedrockCredentials> {
-    let access_key_id = crate::utils::provider_env::get_provider_env_value(
+fn env_credentials(
+    options: &BedrockStreamOptions,
+    process_env: &impl Fn(&str) -> Option<String>,
+) -> Option<BedrockCredentials> {
+    let access_key_id = crate::utils::provider_env::get_provider_env_value_with_process_env(
         "AWS_ACCESS_KEY_ID",
         options.env.as_ref(),
+        process_env,
     )?;
-    let secret_access_key = crate::utils::provider_env::get_provider_env_value(
+    let secret_access_key = crate::utils::provider_env::get_provider_env_value_with_process_env(
         "AWS_SECRET_ACCESS_KEY",
         options.env.as_ref(),
+        process_env,
     )?;
     Some(BedrockCredentials {
         access_key_id,
         secret_access_key,
-        session_token: crate::utils::provider_env::get_provider_env_value(
+        session_token: crate::utils::provider_env::get_provider_env_value_with_process_env(
             "AWS_SESSION_TOKEN",
             options.env.as_ref(),
+            process_env,
         ),
     })
 }
@@ -303,29 +382,48 @@ fn resolve_bearer_token(options: &BedrockStreamOptions) -> Option<String> {
         .clone()
         .or_else(|| options.api_key.clone())
         .or_else(|| {
-            crate::utils::provider_env::get_provider_env_value("AWS_BEARER_TOKEN_BEDROCK", options.env.as_ref())
+            crate::utils::provider_env::get_provider_env_value(
+                "AWS_BEARER_TOKEN_BEDROCK",
+                options.env.as_ref(),
+            )
         })
 }
 
-/// Resolve the client configuration, upstream's client-config construction:
-/// profile precedence over ambient keys, env credentials only without a
-/// profile, the skip-auth dummy pair, the bearer-token path, and the proxy.
+/// Resolve the client configuration, upstream's client-config construction.
+///
+/// Profile precedence over ambient keys, env credentials only without a
+/// scoped profile, the skip-auth dummy pair, the bearer-token path, and the
+/// proxy.
 #[must_use]
 pub fn resolve_client_config(model: &Model, options: &BedrockStreamOptions) -> BedrockClientConfig {
-    let skip_auth = crate::utils::provider_env::get_provider_env_value(
+    resolve_client_config_with_process_env(model, options, &std_process_env)
+}
+
+/// The client-config resolution with the process environment injectable, the
+/// hermetic seam the ambient-credential tests drive.
+#[must_use]
+pub fn resolve_client_config_with_process_env(
+    model: &Model,
+    options: &BedrockStreamOptions,
+    process_env: &impl Fn(&str) -> Option<String>,
+) -> BedrockClientConfig {
+    let skip_auth = crate::utils::provider_env::get_provider_env_value_with_process_env(
         "AWS_BEDROCK_SKIP_AUTH",
         options.env.as_ref(),
+        process_env,
     )
     .as_deref()
         == Some("1");
-    let profile = resolve_profile(options);
+    let profile = resolve_profile_with_process_env(options, process_env);
 
-    let credentials = if skip_auth || profile.is_some() {
-        // A configured profile must beat ambient access keys: the SDK default
-        // chain would ignore profiles once credentials ride the config.
+    // A configured profile must beat ambient access keys: the SDK default
+    // chain would ignore profiles once credentials ride the config. Only a
+    // SCOPED profile suppresses them — an ambient one leaves the keys in
+    // place, upstream's `!optionsProfile` rule. See #6957.
+    let credentials = if skip_auth || scoped_profile(options).is_some() {
         None
     } else {
-        env_credentials(options)
+        env_credentials(options, process_env)
     };
 
     let token = if skip_auth {
@@ -342,16 +440,18 @@ pub fn resolve_client_config(model: &Model, options: &BedrockStreamOptions) -> B
     .ok()
     .flatten()
     .map(|url| url.to_string());
-    let force_http1 = crate::utils::provider_env::get_provider_env_value(
+    let force_http1 = crate::utils::provider_env::get_provider_env_value_with_process_env(
         "AWS_BEDROCK_FORCE_HTTP1",
         options.env.as_ref(),
+        process_env,
     )
     .as_deref()
         == Some("1");
 
     BedrockClientConfig {
-        region: Some(resolve_region(model, options)).filter(|region| !region.is_empty()),
-        endpoint: resolve_endpoint(model, options),
+        region: Some(resolve_region_with_process_env(model, options, process_env))
+            .filter(|region| !region.is_empty()),
+        endpoint: resolve_endpoint_with_process_env(model, options, process_env),
         profile,
         credentials,
         skip_auth,
@@ -368,12 +468,13 @@ pub fn resolve_client_config(model: &Model, options: &BedrockStreamOptions) -> B
 /// upstream's custom-headers middleware rule.
 #[must_use]
 pub fn custom_headers(options: &BedrockStreamOptions) -> Vec<(String, String)> {
-    let Some(record) = crate::utils::headers::provider_headers_to_record(options.headers.as_ref()) else {
+    let Some(record) = crate::utils::headers::provider_headers_to_record(options.headers.as_ref())
+    else {
         return Vec::new();
     };
     record
         .into_iter()
-        .filter(|(name, _)| !is_reserved_header(&name))
+        .filter(|(name, _)| !is_reserved_header(name))
         .collect()
 }
 
@@ -384,10 +485,11 @@ pub fn is_reserved_header(name: &str) -> bool {
     lowered.starts_with("x-amz-") || lowered == "authorization" || lowered == "host"
 }
 
-/// The command input the SDK adapter sends, upstream's `commandInput`:
-/// `modelId`, the converted messages and system, the inference config, the
-/// tool config, the additional model request fields, and the cost-allocation
-/// metadata.
+/// The command input the SDK adapter sends, upstream's `commandInput`.
+///
+/// The fields: `modelId`, the converted messages and system, the inference
+/// config, the tool config, the additional model request fields, and the
+/// cost-allocation metadata.
 ///
 /// # Errors
 /// When the message or tool conversions fail (image types, strict sampling).
@@ -407,7 +509,12 @@ pub fn build_command_input(
         "messages".to_owned(),
         json!(convert_messages(context, model, cache_retention, env)?),
     );
-    if let Some(system) = build_system_prompt(context.system_prompt.as_deref(), model, cache_retention, env) {
+    if let Some(system) = build_system_prompt(
+        context.system_prompt.as_deref(),
+        model,
+        cache_retention,
+        env,
+    ) {
         input.insert("system".to_owned(), json!(system));
     }
     let mut inference_config = serde_json::Map::new();
@@ -421,9 +528,16 @@ pub fn build_command_input(
         inference_config.insert("temperature".to_owned(), json!(temperature));
     }
     if !inference_config.is_empty() {
-        input.insert("inferenceConfig".to_owned(), Value::Object(inference_config));
+        input.insert(
+            "inferenceConfig".to_owned(),
+            Value::Object(inference_config),
+        );
     }
-    if let Some(tool_config) = convert_tool_config(context.tools.as_deref().unwrap_or_default(), tool_choice, supports_strict)? {
+    if let Some(tool_config) = convert_tool_config(
+        context.tools.as_deref().unwrap_or_default(),
+        tool_choice,
+        supports_strict,
+    )? {
         input.insert("toolConfig".to_owned(), tool_config);
     }
     if let Some(additional) = build_additional_model_request_fields(
@@ -450,14 +564,15 @@ pub fn build_command_input(
 /// the explicit option wins, then the `PI_CACHE_RETENTION` env opt-in, then
 /// the short default.
 #[must_use]
-pub fn resolve_cache_retention(
-    options: &BedrockStreamOptions,
-) -> crate::types::CacheRetention {
+pub fn resolve_cache_retention(options: &BedrockStreamOptions) -> crate::types::CacheRetention {
     if let Some(cache_retention) = options.cache_retention {
         return cache_retention;
     }
-    if crate::utils::provider_env::get_provider_env_value("PI_CACHE_RETENTION", options.env.as_ref())
-        .as_deref()
+    if crate::utils::provider_env::get_provider_env_value(
+        "PI_CACHE_RETENTION",
+        options.env.as_ref(),
+    )
+    .as_deref()
         == Some("long")
     {
         return crate::types::CacheRetention::Long;

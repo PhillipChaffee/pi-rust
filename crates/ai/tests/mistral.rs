@@ -17,18 +17,19 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use pi_ai::api::mistral_conversations::{
     MistralPromptMode, MistralReasoningEffort, MistralStreamOptions, MistralToolChoice,
     stream as stream_mistral, stream_simple,
 };
 use pi_ai::http::mock::{MockHttpClient, MockResponse};
 use pi_ai::types::{
-    Api, AssistantBlock, ConstrainedSamplingConfig, Context, Message, Model, Modality, OnPayload,
+    Api, AssistantBlock, ConstrainedSamplingConfig, Context, Message, Modality, Model, OnPayload,
     ProviderId, SimpleStreamOptions, StopReason, Strictness, TextContent, ThinkingContent,
     ThinkingLevel, Tool, ToolCall, UserBlock, UserContent, UserMessage,
 };
-use bytes::Bytes;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 
 mod common;
 
@@ -69,10 +70,10 @@ fn terminal_chunk(finish_reason: &str) -> String {
 /// Mount the SSE frames plus the `[DONE]` terminator, upstream's
 /// `createSseResponse`.
 fn mount_mistral_stream(mock: &MockHttpClient, events: &[String]) {
-    let mut body = events
-        .iter()
-        .map(|event| format!("data: {event}\n\n"))
-        .collect::<String>();
+    let mut body = String::new();
+    for event in events {
+        let _ = write!(body, "data: {event}\n\n");
+    }
     body.push_str("data: [DONE]\n\n");
     mock.on(|request| request.url.contains("/v1/chat/completions"))
         .respond(
@@ -100,8 +101,12 @@ fn forced_lookup() -> MistralToolChoice {
 
 // --- upstream mistral-http-transport.test.ts ---
 
-/// The SDK-style payload serializes to Mistral's snake_case wire format with
+/// The SDK-style payload serializes to Mistral's `snake_case` wire format with
 /// the affinity and override headers, upstream's first transport test.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the transport assertion walks every remapped field in one stream"
+)]
 #[tokio::test(start_paused = true)]
 async fn serializes_sdk_style_payloads_to_the_mistral_wire_format() {
     let mock = MockHttpClient::new();
@@ -124,12 +129,13 @@ async fn serializes_sdk_style_payloads_to_the_mistral_wire_format() {
     let responses: Arc<std::sync::Mutex<Vec<pi_ai::types::ProviderResponse>>> =
         Arc::new(std::sync::Mutex::new(Vec::new()));
     let slot = Arc::clone(&responses);
-    options.transport_options.on_response = Some(pi_ai::types::OnResponse::new(move |response, _model| {
-        slot.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(response);
-        Box::pin(async {})
-    }));
+    options.transport_options.on_response =
+        Some(pi_ai::types::OnResponse::new(move |response, _model| {
+            slot.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(response);
+            Box::pin(async {})
+        }));
 
     let message = stream_mistral(&model, &transport_context(), Some(&options))
         .result()
@@ -259,7 +265,9 @@ fn capture_and_extend() -> (OnPayload, common::CapturedPayload) {
             object.insert("parallelToolCalls".to_owned(), json!(true));
             object.insert("safePrompt".to_owned(), json!(true));
         }
-        *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
+        *slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload.clone());
         Box::pin(async move { Some(payload) })
     });
     (hook, captured)
@@ -477,7 +485,7 @@ async fn parses_sse_and_utf8_sequences_split_across_transport_chunks() {
         .await;
 
     let Some(AssistantBlock::Text(block)) = message.content.first() else {
-        panic!("expected a text block");
+        unreachable!("expected a text block");
     };
     assert_eq!(block.text, "héllo 🌍");
 }
@@ -570,10 +578,7 @@ async fn applies_the_request_timeout_while_waiting_for_a_chunk() {
 async fn preserves_http_status_and_response_bodies_in_errors() {
     let mock = MockHttpClient::new();
     mock.on(|request| request.url.contains("/v1/chat/completions"))
-        .respond(
-            MockResponse::status(403)
-                .with_body(r#"{"message":"blocked by gateway"}"#),
-        );
+        .respond(MockResponse::status(403).with_body(r#"{"message":"blocked by gateway"}"#));
     let model = common::builtin_model("mistral", "mistral-large-latest");
     let options = transport_options(&mock);
 
@@ -668,7 +673,7 @@ async fn uses_prompt_mode_for_magistral_reasoning_models() {
 }
 
 /// The GLM-5.2 regression: Mistral-hosted GLM ignores `prompt_mode`, so it
-/// rides the reasoning_effort control.
+/// rides the `reasoning_effort` control.
 #[tokio::test]
 async fn uses_reasoning_effort_for_zai_glm() {
     let model = reasoning_model("zai-glm-5-2", true);

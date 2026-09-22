@@ -20,17 +20,25 @@
 
 use serde_json::{Value, json};
 
+use bytes::Bytes;
+
 use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
+use crate::api::wire_common::{
+    close_current_block, dispatch_with_retry, retry_options, upsert_header,
+};
+use crate::http::client::{HttpMethod, HttpRequest};
 use crate::types::{
     AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, ImageContent, Message,
-    Model, ModelThinkingLevel, Modality, StopReason, TextContent, Tool, ToolResultBlock,
-    ToolResultMessage, ThinkingContent, ToolCall,
+    Modality, Model, ModelThinkingLevel, StopReason, StreamOptions, Tool, ToolCall,
+    ToolResultBlock, ToolResultMessage,
 };
 use crate::utils::error_body::safe_json_stringify;
 use crate::utils::event_stream::AssistantMessageEventStream;
+use crate::utils::headers::provider_headers_to_record;
+use crate::utils::pi_user_agent::get_pi_user_agent;
 
 /// Counter for generating unique tool call IDs, upstream's module-level
 /// `toolCallCounter` (one per Google adapter file, shared here because the
@@ -60,6 +68,112 @@ pub struct GoogleThinkingControl {
     pub budget_tokens: Option<i64>,
     /// The provider-native thinking level, upstream's `GoogleApiThinkingLevel`.
     pub level: Option<String>,
+}
+
+/// The adapter-facing options both Google wire adapters share, upstream's
+/// `GoogleOptions`/`GoogleVertexOptions extends StreamOptions` plus the
+/// thinking control `streamSimple` resolves upstream-side.
+///
+/// The Gemini backend ignores `project` and `location`, which only the
+/// Vertex backend reads.
+#[derive(Clone, Debug, Default)]
+pub struct GoogleOptions {
+    /// The transport seam: the request's HTTP client, cancellation token,
+    /// and lifecycle callbacks.
+    pub transport_options: crate::types::TransportOptions,
+    /// The API key, overriding credential resolution.
+    pub api_key: Option<String>,
+    /// Explicit parent context for telemetry produced by this logical request.
+    pub telemetry_context: Option<pi_telemetry::TelemetryHandle>,
+    /// Provider-scoped environment values; these take precedence over the
+    /// process environment.
+    pub env: Option<crate::types::ProviderEnv>,
+    /// Custom HTTP headers merged with provider defaults.
+    pub headers: Option<crate::types::ProviderHeaders>,
+    /// HTTP request timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Maximum retry attempts for client-side retries.
+    pub max_retries: Option<u32>,
+    /// Maximum delay in milliseconds to wait for a retry when the server
+    /// requests a long wait.
+    pub max_retry_delay_ms: Option<u64>,
+    /// Sampling temperature.
+    pub temperature: Option<f64>,
+    /// Arbitrary sampling parameters merged into the request body as-is.
+    pub sampling_params: Option<std::collections::BTreeMap<String, Value>>,
+    /// Maximum output tokens.
+    pub max_tokens: Option<u64>,
+    /// Preferred transport; SSE is the only transport this adapter speaks.
+    pub transport: Option<crate::types::Transport>,
+    /// Prompt cache retention preference. Default: `"short"`.
+    pub cache_retention: Option<crate::types::CacheRetention>,
+    /// Optional session identifier for providers that support session-based
+    /// caching.
+    pub session_id: Option<String>,
+    /// WebSocket connect timeout in milliseconds.
+    pub websocket_connect_timeout_ms: Option<u64>,
+    /// Optional metadata to include in API requests.
+    pub metadata: Option<std::collections::BTreeMap<String, Value>>,
+    /// The GCP project id; Vertex-only.
+    pub project: Option<String>,
+    /// The GCP region, e.g. `us-central1`; Vertex-only.
+    pub location: Option<String>,
+    /// The tool choice, upstream's `"auto" | "none" | "any"`.
+    pub tool_choice: Option<String>,
+    /// The thinking control, upstream's
+    /// `thinking?: { enabled, budgetTokens?, level? }`.
+    pub thinking: Option<GoogleThinkingControl>,
+}
+
+impl crate::api::wire_common::TransportCarrier for GoogleOptions {
+    fn transport_options(&self) -> &crate::types::TransportOptions {
+        &self.transport_options
+    }
+}
+
+impl From<StreamOptions> for GoogleOptions {
+    fn from(options: StreamOptions) -> Self {
+        let StreamOptions {
+            transport_options,
+            api_key,
+            telemetry_context,
+            env,
+            headers,
+            timeout_ms,
+            max_retries,
+            max_retry_delay_ms,
+            temperature,
+            sampling_params,
+            max_tokens,
+            transport,
+            cache_retention,
+            session_id,
+            websocket_connect_timeout_ms,
+            metadata,
+        } = options;
+        Self {
+            transport_options,
+            api_key,
+            telemetry_context,
+            env,
+            headers,
+            timeout_ms,
+            max_retries,
+            max_retry_delay_ms,
+            temperature,
+            sampling_params,
+            max_tokens,
+            transport,
+            cache_retention,
+            session_id,
+            websocket_connect_timeout_ms,
+            metadata,
+            project: None,
+            location: None,
+            tool_choice: None,
+            thinking: None,
+        }
+    }
 }
 
 /// The Google API thinking levels a model's mapping may resolve to, upstream's
@@ -136,7 +250,7 @@ pub fn resolve_google_thinking_level(
 }
 
 /// The upstream spelling of a [`ModelThinkingLevel`] in error messages.
-fn level_wire_name(level: ModelThinkingLevel) -> &'static str {
+const fn level_wire_name(level: ModelThinkingLevel) -> &'static str {
     match level {
         ModelThinkingLevel::Off => "off",
         ModelThinkingLevel::Minimal => "minimal",
@@ -171,9 +285,11 @@ pub fn is_thinking_part(part: &Value) -> bool {
 }
 
 /// Retain thought signatures during streaming, upstream's
-/// `retainThoughtSignature`: some backends only send the signature on the
-/// first delta of a block, so the last non-empty signature wins. This never
-/// merges or moves signatures across distinct parts.
+/// `retainThoughtSignature`.
+///
+/// Some backends only send the signature on the first delta of a block, so
+/// the last non-empty signature wins. This never merges or moves signatures
+/// across distinct parts.
 #[must_use]
 pub fn retain_thought_signature(existing: Option<&str>, incoming: Option<&str>) -> Option<String> {
     match incoming {
@@ -190,9 +306,9 @@ fn is_valid_thought_signature(signature: Option<&str>) -> bool {
     if signature.is_empty() || signature.len() % 4 != 0 {
         return false;
     }
-    signature.bytes().all(|byte| {
-        byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/' || byte == b'='
-    })
+    signature
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/' || byte == b'=')
 }
 
 /// Only keep signatures from the same provider/model and with valid base64.
@@ -222,7 +338,7 @@ fn gemini_major_version(model_id: &str) -> Option<u32> {
     let rest = lowered
         .strip_prefix("gemini-live-")
         .or_else(|| lowered.strip_prefix("gemini-"))?;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() {
         return None;
     }
@@ -230,10 +346,7 @@ fn gemini_major_version(model_id: &str) -> Option<u32> {
 }
 
 fn supports_multimodal_function_response(model_id: &str) -> bool {
-    match gemini_major_version(model_id) {
-        Some(version) => version >= 3,
-        None => true,
-    }
+    gemini_major_version(model_id).is_none_or(|version| version >= 3)
 }
 
 /// Convert internal messages to Gemini `Content[]` format, upstream's
@@ -244,7 +357,11 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
     let normalize_tool_call_id: &ToolCallIdNormalizer<'_> =
         &|id, _model, _source| normalize_google_tool_call_id(id, &model.id);
 
-    let transformed = transform_messages(context.messages.clone(), model, Some(normalize_tool_call_id));
+    let transformed = transform_messages(
+        context.messages.clone(),
+        model,
+        Some(normalize_tool_call_id),
+    );
 
     for msg in transformed {
         match msg {
@@ -273,7 +390,8 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
             },
             Message::Assistant(assistant) => {
                 let is_same_provider_and_model = same_provider_and_model(model, &assistant);
-                let parts = convert_assistant_parts(model, &assistant.content, is_same_provider_and_model);
+                let parts =
+                    convert_assistant_parts(model, &assistant.content, is_same_provider_and_model);
                 if parts.is_empty() {
                     continue;
                 }
@@ -292,7 +410,9 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
 /// `msg.provider === model.provider && msg.model === model.id`; the shared
 /// [`transform_messages`] gate additionally requires the same api.
 fn same_provider_and_model(model: &Model, assistant: &AssistantMessage) -> bool {
-    assistant.provider == model.provider && assistant.model == model.id
+    let same_provider = assistant.provider == model.provider;
+    let same_model = assistant.model == model.id;
+    same_provider && same_model
 }
 
 fn convert_assistant_parts(
@@ -304,8 +424,10 @@ fn convert_assistant_parts(
     for block in content {
         match block {
             AssistantBlock::Text(text) => {
-                let thought_signature =
-                    resolve_thought_signature(is_same_provider_and_model, text.text_signature.as_deref());
+                let thought_signature = resolve_thought_signature(
+                    is_same_provider_and_model,
+                    text.text_signature.as_deref(),
+                );
                 // An empty text block is skipped unless it carries a thought
                 // signature: Gemini can attach the signature to a part whose
                 // visible text is empty and requires it echoed back; dropping
@@ -346,8 +468,10 @@ fn convert_assistant_parts(
                 }
             }
             AssistantBlock::ToolCall(call) => {
-                let thought_signature =
-                    resolve_thought_signature(is_same_provider_and_model, call.thought_signature.as_deref());
+                let thought_signature = resolve_thought_signature(
+                    is_same_provider_and_model,
+                    call.thought_signature.as_deref(),
+                );
                 let mut function_call = json!({
                     "name": call.name,
                     "args": Value::Object(call.arguments.clone()),
@@ -367,15 +491,28 @@ fn convert_assistant_parts(
 }
 
 /// The Google tool-call id rule, upstream's inline `normalizeToolCallId`.
+/// The tool-call id sanitation both stream loops share, upstream's
+/// `normalizeToolCallId` core: characters outside `[A-Za-z0-9_-]` fold to
+/// `_`, and the id truncates to 64 characters.
+pub(crate) fn sanitize_tool_call_id(id: &str) -> String {
+    let replaced: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    replaced.chars().take(64).collect()
+}
+
 fn normalize_google_tool_call_id(id: &str, model_id: &str) -> String {
     if !requires_tool_call_id(model_id) {
         return id.to_owned();
     }
-    let replaced: String = id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
-    replaced.chars().take(64).collect()
+    sanitize_tool_call_id(id)
 }
 
 fn append_tool_result_contents(
@@ -461,7 +598,9 @@ fn append_tool_result_contents(
                 .get("parts")
                 .and_then(Value::as_array)
                 .is_some_and(|parts| {
-                    parts.iter().any(|part| part.get("functionResponse").is_some())
+                    parts
+                        .iter()
+                        .any(|part| part.get("functionResponse").is_some())
                 })
     });
     if is_function_response_turn {
@@ -470,7 +609,7 @@ fn append_tool_result_contents(
             .and_then(|last| last.get_mut("parts"))
             .and_then(Value::as_array_mut)
         {
-            parts.push(function_response_part.clone());
+            parts.push(function_response_part);
         }
     } else {
         contents.push(json!({ "role": "user", "parts": [function_response_part] }));
@@ -518,7 +657,7 @@ pub fn sanitize_for_open_api(schema: &Value) -> Value {
 /// `convertTools`.
 ///
 /// `parametersJsonSchema` supports full JSON Schema (anyOf, oneOf, const, ...).
-/// `use_parameters` selects the legacy `parameters` field instead (OpenAPI 3.03
+/// `use_parameters` selects the legacy `parameters` field instead (`OpenAPI` 3.03
 /// schema), which Cloud Code Assist translates into Anthropic's `input_schema`
 /// for Claude models behind Google APIs.
 ///
@@ -565,6 +704,10 @@ pub fn supports_google_strict_tool_sampling(model_id: &str) -> bool {
 /// Map a tool choice to the Gemini `FunctionCallingConfigMode` wire string,
 /// upstream's `mapToolChoice`.
 #[must_use]
+#[expect(
+    clippy::match_same_arms,
+    reason = "the arm-per-choice table mirrors upstream's switch, wildcard included"
+)]
 pub fn map_tool_choice(choice: &str) -> &'static str {
     match choice {
         "auto" => "AUTO",
@@ -593,13 +736,47 @@ pub fn resolve_google_function_calling_mode(
         .collect::<Result<Vec<Option<bool>>, String>>()?
         .into_iter()
         .any(|strict| strict == Some(true));
-    if matches!(tool_choice, Some("none") | Some("any")) {
+    if matches!(tool_choice, Some("none" | "any")) {
         return Ok(Some(map_tool_choice(tool_choice.unwrap_or_default())));
     }
     if use_strict_mode {
         return Ok(Some("VALIDATED"));
     }
     Ok(tool_choice.map(map_tool_choice))
+}
+
+/// `/gemini-3(?:\.\d+)?-pro/` over the lowercased id.
+pub(crate) fn is_gemini3_pro_model(model: &Model) -> bool {
+    let id = model.id.to_lowercase();
+    id.split("gemini-3").skip(1).any(|rest| {
+        let rest = rest.strip_prefix('.').map_or(rest, |after_dot| {
+            let digits = after_dot.chars().take_while(char::is_ascii_digit).count();
+            if digits == 0 {
+                rest
+            } else {
+                &after_dot[digits..]
+            }
+        });
+        rest.starts_with("-pro")
+    })
+}
+
+/// `/gemini-3(?:\.\d+)?-flash/` over the lowercased id, plus the two
+/// rolling-latest aliases.
+pub(crate) fn is_gemini3_flash_model(model: &Model) -> bool {
+    let id = model.id.to_lowercase();
+    id.split("gemini-3").skip(1).any(|rest| {
+        let rest = rest.strip_prefix('.').map_or(rest, |after_dot| {
+            let digits = after_dot.chars().take_while(char::is_ascii_digit).count();
+            if digits == 0 {
+                rest
+            } else {
+                &after_dot[digits..]
+            }
+        });
+        rest.starts_with("-flash")
+    }) || id == "gemini-flash-latest"
+        || id == "gemini-flash-lite-latest"
 }
 
 /// Map a Gemini `FinishReason` wire string to the pi stop reason, upstream's
@@ -612,10 +789,22 @@ pub fn map_stop_reason(reason: &str) -> Result<StopReason, String> {
     match reason {
         "STOP" => Ok(StopReason::Stop),
         "MAX_TOKENS" => Ok(StopReason::Length),
-        "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "SAFETY" | "IMAGE_SAFETY"
-        | "IMAGE_PROHIBITED_CONTENT" | "IMAGE_RECITATION" | "IMAGE_OTHER" | "RECITATION"
-        | "FINISH_REASON_UNSPECIFIED" | "OTHER" | "LANGUAGE" | "MALFORMED_FUNCTION_CALL"
-        | "UNEXPECTED_TOOL_CALL" | "TOO_MANY_TOOL_CALLS" | "NO_IMAGE" => Ok(StopReason::Error),
+        "BLOCKLIST"
+        | "PROHIBITED_CONTENT"
+        | "SPII"
+        | "SAFETY"
+        | "IMAGE_SAFETY"
+        | "IMAGE_PROHIBITED_CONTENT"
+        | "IMAGE_RECITATION"
+        | "IMAGE_OTHER"
+        | "RECITATION"
+        | "FINISH_REASON_UNSPECIFIED"
+        | "OTHER"
+        | "LANGUAGE"
+        | "MALFORMED_FUNCTION_CALL"
+        | "UNEXPECTED_TOOL_CALL"
+        | "TOO_MANY_TOOL_CALLS"
+        | "NO_IMAGE" => Ok(StopReason::Error),
         _ => Err(format!("Unhandled stop reason: {reason}")),
     }
 }
@@ -631,8 +820,10 @@ pub fn map_stop_reason_string(reason: &str) -> StopReason {
     }
 }
 
-/// The ApiError message the pinned `@google/genai` SDK builds for a failed
-/// response: the parsed JSON body stringified, or a synthesized
+/// The `ApiError` message the pinned `@google/genai` SDK builds for a
+/// failed response.
+///
+/// The parsed JSON body stringified, or a synthesized
 /// `{ error: { message, code, status } }` object when the body is not JSON.
 /// Both Google adapters surface it verbatim, the `messageCarriesBody` pass
 /// through.
@@ -652,6 +843,246 @@ pub fn api_error_message(status: u16, body: &str) -> String {
         }
     })
     .to_string()
+}
+
+/// Build the SDK-style params both Google wire adapters send, upstream's
+/// `buildParams`: `{ model, contents, config }` with the camelCase config
+/// fields.
+///
+/// The disabled-thinking config differs per backend — Vertex has no Gemma-4
+/// catalog entries — so the caller supplies its own mapping.
+///
+/// # Errors
+/// When a tool requires strict sampling that cannot be resolved, or when the
+/// request is already aborted.
+pub fn build_google_params(
+    model: &Model,
+    context: &Context,
+    options: &GoogleOptions,
+    disabled_thinking_config: fn(&Model) -> Value,
+) -> Result<Value, String> {
+    let contents = convert_messages(model, context);
+
+    let mut generation_config = serde_json::Map::new();
+    if let Some(temperature) = options.temperature {
+        generation_config.insert("temperature".to_owned(), json!(temperature));
+    }
+    if let Some(max_tokens) = options.max_tokens {
+        generation_config.insert("maxOutputTokens".to_owned(), json!(max_tokens));
+    }
+
+    let supports_strict_mode = supports_google_strict_tool_sampling(&model.id);
+    let tools = context.tools.as_deref().unwrap_or_default();
+    let function_calling_mode = if tools.is_empty() {
+        None
+    } else {
+        Some(resolve_google_function_calling_mode(
+            tools,
+            options.tool_choice.as_deref(),
+            supports_strict_mode,
+        )?)
+    };
+
+    let mut config = serde_json::Map::new();
+    for (key, value) in generation_config {
+        config.insert(key, value);
+    }
+    if let Some(system_prompt) = &context.system_prompt {
+        config.insert("systemInstruction".to_owned(), json!(system_prompt));
+    }
+    if let Some(tools) = &context.tools
+        && !tools.is_empty()
+        && let Some(declarations) = convert_tools(tools, false, supports_strict_mode)?
+    {
+        config.insert("tools".to_owned(), declarations);
+    }
+    if let Some(Some(mode)) = function_calling_mode {
+        config.insert(
+            "toolConfig".to_owned(),
+            json!({ "functionCallingConfig": { "mode": mode } }),
+        );
+    }
+
+    if options
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.enabled)
+        && model.reasoning
+    {
+        let mut thinking_config = serde_json::Map::new();
+        thinking_config.insert("includeThoughts".to_owned(), json!(true));
+        if let Some(level) = options
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.level.as_deref())
+        {
+            thinking_config.insert("thinkingLevel".to_owned(), json!(level));
+        } else if let Some(budget) = options
+            .thinking
+            .as_ref()
+            .and_then(|thinking| thinking.budget_tokens)
+        {
+            thinking_config.insert("thinkingBudget".to_owned(), json!(budget));
+        }
+        config.insert("thinkingConfig".to_owned(), Value::Object(thinking_config));
+    } else if model.reasoning
+        && let Some(thinking) = &options.thinking
+        && !thinking.enabled
+    {
+        config.insert("thinkingConfig".to_owned(), disabled_thinking_config(model));
+    }
+
+    if options.transport_options.signal().is_cancelled() {
+        return Err("Request aborted".to_owned());
+    }
+
+    Ok(json!({
+        "model": model.id,
+        "contents": contents,
+        "config": Value::Object(config),
+    }))
+}
+
+/// The request headers both Google wire adapters start from, upstream's
+/// `createClient`/`buildHttpOptions` default merge: pi's user agent, JSON
+/// content type, then the model headers and the caller headers merged by
+/// case-insensitive name.
+pub(crate) fn base_google_request_headers(
+    model: &Model,
+    options_headers: Option<&crate::types::ProviderHeaders>,
+) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = vec![
+        ("User-Agent".to_owned(), get_pi_user_agent()),
+        ("content-type".to_owned(), "application/json".to_owned()),
+    ];
+    if let Some(model_headers) = &model.headers {
+        for (name, value) in model_headers {
+            upsert_header(&mut headers, name, value);
+        }
+    }
+    if let Some(record) = provider_headers_to_record(options_headers) {
+        for (name, value) in record {
+            upsert_header(&mut headers, &name, &value);
+        }
+    }
+    headers
+}
+
+/// Flatten the SDK-style params into the request body the API expects, the
+/// port of upstream's `generateContentParametersToMldev` serializer:
+/// `contents` pass through verbatim, `config` becomes `generationConfig`, and
+/// `systemInstruction`, `tools`, and `toolConfig` hoist to the body root.
+/// The body never carries a `model` key; the model names the URL path.
+pub(crate) fn to_wire_body(params: &Value) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "contents".to_owned(),
+        params.get("contents").cloned().unwrap_or_else(|| json!([])),
+    );
+
+    if let Some(config) = params.get("config").and_then(Value::as_object) {
+        let mut generation_config = serde_json::Map::new();
+        for (key, value) in config {
+            match key.as_str() {
+                "systemInstruction" => {
+                    body.insert("systemInstruction".to_owned(), content_from_text(value));
+                }
+                "tools" => {
+                    body.insert("tools".to_owned(), value.clone());
+                }
+                "toolConfig" => {
+                    body.insert("toolConfig".to_owned(), value.clone());
+                }
+                _ => {
+                    generation_config.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        if !generation_config.is_empty() {
+            body.insert(
+                "generationConfig".to_owned(),
+                Value::Object(generation_config),
+            );
+        }
+    }
+
+    Value::Object(body)
+}
+
+/// The SDK's `tContent`: a string system instruction rides as a Content
+/// object with role `user`; an already-shaped object passes through.
+fn content_from_text(value: &Value) -> Value {
+    value.as_str().map_or_else(
+        || value.clone(),
+        |text| json!({ "role": "user", "parts": [{ "text": text }] }),
+    )
+}
+
+/// Dispatch the stream request both Google wire adapters send: one POST of
+/// the flattened wire body through the shared provider retry policy and the
+/// Google error fold.
+pub(crate) async fn dispatch_google_stream(
+    model: &Model,
+    options: &GoogleOptions,
+    url: String,
+    headers: Vec<(String, String)>,
+    params: &Value,
+) -> Result<crate::http::client::HttpResponse, String> {
+    let signal = options.transport_options.signal();
+    let request = HttpRequest {
+        method: HttpMethod::Post,
+        url,
+        headers,
+        body: Some(Bytes::from(to_wire_body(params).to_string())),
+        timeout_ms: options.timeout_ms,
+        signal: signal.clone(),
+    };
+    let retry = retry_options(options.max_retries, options.max_retry_delay_ms, signal);
+    dispatch_with_retry(
+        options.transport_options.client(),
+        request,
+        &retry,
+        api_error_message,
+        model,
+        &options.transport_options,
+    )
+    .await
+}
+
+/// The post-loop settlement both Google adapters share, upstream's tail of
+/// the try block: the signal check, the pending and provider-stopped
+/// rejections, then the done event.
+///
+/// `no_finish_reason` is the adapter's wording for a stream that stopped
+/// without a finish reason.
+///
+/// # Errors
+/// When the request was aborted, the stream stopped without a finish reason,
+/// or the provider stopped with an error: the matching wording.
+pub fn finish_google_stream(
+    transport_options: &crate::types::TransportOptions,
+    output: &AssistantMessage,
+    events: &AssistantMessageEventStream,
+    no_finish_reason: &str,
+) -> Result<(), String> {
+    if transport_options.signal().is_cancelled() {
+        return Err("Request was aborted".to_owned());
+    }
+    if output.stop_reason == StopReason::Pending {
+        return Err(no_finish_reason.to_owned());
+    }
+    if matches!(output.stop_reason, StopReason::Aborted | StopReason::Error) {
+        return Err(output.raw_stop_reason.as_ref().map_or_else(
+            || "An unknown error occurred".to_owned(),
+            |reason| format!("Provider stopped with: {reason}"),
+        ));
+    }
+
+    events.push(AssistantMessageEvent::Done {
+        reason: output.stop_reason,
+        message: output.clone(),
+    });
+    Ok(())
 }
 
 /// Whether the open block is thinking (`Some(true)`), text (`Some(false)`),
@@ -674,10 +1105,11 @@ pub(crate) async fn consume_google_stream(
     let mut sse = crate::http::sse::SseStream::new(response.body);
     let mut current_block: OpenBlock = None;
     let mut first_event = true;
-    while let Some(sse_event) = sse.next().await.map_err(|error| match error {
-        crate::http::client::HttpError::Aborted => "Request was aborted".to_owned(),
-        other => other.to_string(),
-    })? {
+    while let Some(sse_event) = sse
+        .next()
+        .await
+        .map_err(crate::api::wire_common::sse_error_message)?
+    {
         let value = crate::utils::json_parse::parse_json_with_repair(&sse_event.data)
             .map_err(|error| format!("Invalid Google streaming event: {error}"))?;
         if first_event {
@@ -701,10 +1133,7 @@ pub(crate) async fn consume_google_stream(
         // to identify each response; keep the first non-empty one.
         if let Some(id) = value.get("responseId").and_then(Value::as_str)
             && !id.is_empty()
-            && output
-                .response_id
-                .as_ref()
-                .is_none_or(String::is_empty)
+            && output.response_id.as_ref().is_none_or(String::is_empty)
         {
             output.response_id = Some(id.to_owned());
         }
@@ -788,35 +1217,7 @@ fn apply_text_part(
     current_block: &mut OpenBlock,
     events: &AssistantMessageEventStream,
 ) {
-    let switch = match current_block {
-        None => true,
-        Some(open_thinking) => *open_thinking != is_thinking,
-    };
-    if switch {
-        close_current_block(current_block, output, events);
-        if is_thinking {
-            output.content.push(AssistantBlock::Thinking(ThinkingContent {
-                thinking: String::new(),
-                thinking_signature: None,
-                redacted: None,
-            }));
-            *current_block = Some(true);
-            events.push(AssistantMessageEvent::ThinkingStart {
-                content_index: output.content.len() as u64 - 1,
-                partial: output.clone(),
-            });
-        } else {
-            output.content.push(AssistantBlock::Text(TextContent {
-                text: String::new(),
-                text_signature: None,
-            }));
-            *current_block = Some(false);
-            events.push(AssistantMessageEvent::TextStart {
-                content_index: output.content.len() as u64 - 1,
-                partial: output.clone(),
-            });
-        }
-    }
+    crate::api::wire_common::open_stream_block(current_block, output, events, is_thinking);
     let content_index = output.content.len() as u64 - 1;
     if is_thinking {
         let Some(AssistantBlock::Thinking(block)) = output.content.last_mut() else {
@@ -845,43 +1246,12 @@ fn apply_text_part(
     }
 }
 
-/// Close the open text/thinking block, emitting its `*_end` event.
-fn close_current_block(
-    current_block: &mut OpenBlock,
-    output: &mut AssistantMessage,
-    events: &AssistantMessageEventStream,
-) {
-    if let Some(open_thinking) = *current_block {
-        let content_index = output.content.len() as u64 - 1;
-        if open_thinking {
-            let Some(AssistantBlock::Thinking(block)) = output.content.last() else {
-                return;
-            };
-            events.push(AssistantMessageEvent::ThinkingEnd {
-                content_index,
-                content: block.thinking.clone(),
-                partial: output.clone(),
-            });
-        } else {
-            let Some(AssistantBlock::Text(block)) = output.content.last() else {
-                return;
-            };
-            events.push(AssistantMessageEvent::TextEnd {
-                content_index,
-                content: block.text.clone(),
-                partial: output.clone(),
-            });
-        }
-        *current_block = None;
-    }
-}
-
 /// Materialize one streamed function call, upstream's function-call part
 /// handling: a synthesized id when none arrives or the id duplicates an
 /// earlier block, then the three-event start/delta/end sequence.
 fn apply_function_call(function_call: &Value, part: &Value, output: &mut AssistantMessage) {
     let provided_id = function_call.get("id").and_then(Value::as_str);
-    let needs_new_id = provided_id.is_none_or(|id| id.is_empty())
+    let needs_new_id = provided_id.is_none_or(str::is_empty)
         || output
             .content
             .iter()
@@ -903,7 +1273,7 @@ fn apply_function_call(function_call: &Value, part: &Value, output: &mut Assista
     let arguments = function_call
         .get("args")
         .and_then(Value::as_object)
-        .map(Clone::clone)
+        .cloned()
         .unwrap_or_default();
     let tool_call = ToolCall {
         id: tool_call_id,
@@ -949,6 +1319,6 @@ fn wire_u64(value: &Value, key: &str) -> u64 {
         .get(key)
         .and_then(Value::as_i64)
         .unwrap_or(0)
-        .max(0) as u64
+        .max(0)
+        .cast_unsigned()
 }
-

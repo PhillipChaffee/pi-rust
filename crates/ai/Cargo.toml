@@ -67,14 +67,17 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 ] }
 # jsonwebtoken: the Vertex ADC service-account flow — upstream delegates
 # RS256 JWT signing and the token exchange to google-auth-library inside
-# @google/genai, and this port signs the JWT itself (#32).
-jsonwebtoken = "10"
+# @google/genai, and this port signs the JWT itself (#32). rust_crypto pins
+# the signing backend; without one the RS256 signer panics at runtime.
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 # aws-sdk-bedrockruntime + aws-config + aws-smithy-http-client: the Bedrock
 # Converse Stream port rides the official Rust SDK the way upstream rides
 # @aws-sdk/client-bedrock-runtime — SigV4 signing, the eventstream framing,
 # the credential chain, and the SDK retries stay SDK-owned (#32).
 # aws-smithy-http-client carries the proxy connector the custom node HTTP
-# handler stood in for.
+# handler stood in for; aws-smithy-runtime-api carries the pre-signing and
+# response-capture interceptors the Smithy middlewares stood in for;
+# aws-credential-types carries the explicit and skip-auth credential pairs.
 aws-sdk-bedrockruntime = "1.145"
 aws-config = { version = "1.8", default-features = false, features = [
   "behavior-version-latest",
@@ -84,6 +87,11 @@ aws-config = { version = "1.8", default-features = false, features = [
   "credentials-process",
 ] }
 aws-smithy-http-client = { version = "1.4", default-features = false, features = ["rustls-ring", "test-util"] }
+# test-util: the fake runtime components the interceptor unit tests drive,
+# the same for_tests seam the SDK's own interceptor tests use.
+aws-smithy-runtime-api = { version = "1.17", features = ["test-util"] }
+aws-smithy-types = "1.8"
+aws-credential-types = "1.3"
 # base64: the Bedrock redacted-reasoning payload round-trips through
 # thinkingSignature, upstream's bytesToBase64/base64ToBytes helpers.
 base64 = "0.22"
@@ -95,6 +103,12 @@ base64 = "0.22"
 tokio = { version = "1.47", features = ["test-util", "net", "io-util"] }
 # regex: the adaptive-thinking catalog scan mirrors upstream's RegExp filter.
 regex = "1.11"
+# crc32fast: the loopback event-stream server's frame checksums, the crate the
+# smithy eventstream decoder itself verifies against.
+crc32fast = "1.5"
+# rsa: the Vertex ADC service-account fixture signs its JWT with a key pair
+# generated in-test, so no fixture key material rides the repository.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem"] }
 
 [lints]
 workspace = true

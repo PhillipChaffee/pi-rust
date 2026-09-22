@@ -21,17 +21,43 @@
 //!   middleware becomes the SDK adapter's response hook.
 //! - The `Uint8Array` redacted-reasoning chunks carry over as base64 in
 //!   `thinkingSignature`, upstream's `bytesToBase64` flush.
+//! - The failure diagnostic reads a typed [`BedrockStreamFailure`] instead
+//!   of duck-typed SDK error objects; the `instanceof
+//!   BedrockRuntimeServiceException` prefix gate becomes a name lookup, which
+//!   also keeps the SDK's `Unknown` placeholder from branding a gateway
+//!   failure.
+//! - The wire events the seam yields are JSON values in the Converse Stream
+//!   frame shapes; the SDK adapter's `redactedContent` blobs ride as base64
+//!   strings, and the replay path carries them as byte arrays the way the
+//!   JSON command input does.
 
-use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
 
+use futures_util::StreamExt;
+use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::api::bedrock_options::{self, BedrockClientConfig};
 use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
-use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
-use crate::types::{
-    AssistantBlock, Context, ImageContent, Message, Model, ModelThinkingLevel, StopReason, Tool,
-    ToolResultBlock, ToolResultMessage,
+use crate::api::simple_options::{
+    MIN_ANSWER_TOKENS, adjust_max_tokens_for_thinking, build_base_options,
+    clamp_max_tokens_to_context, clamp_reasoning,
 };
+use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
+use crate::api::wire_common::initial_output;
+use crate::types::{
+    AssistantBlock, AssistantMessage, AssistantMessageDiagnostic, AssistantMessageEvent,
+    BoxedFuture, Context, ImageContent, Message, Model, ModelThinkingLevel, SimpleStreamOptions,
+    StopReason, TextContent, ThinkingContent, ThinkingLevel, Tool, ToolCall, ToolResultBlock,
+    ToolResultMessage,
+};
+use crate::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
+use crate::utils::json_parse::parse_streaming_json;
 
 /// Replaces blank/empty text in user messages and tool results: Bedrock
 /// rejects empty content blocks, upstream's `EMPTY_TEXT_PLACEHOLDER`.
@@ -68,9 +94,7 @@ pub fn bedrock_error_prefix(name: &str) -> Option<&'static str> {
 pub fn is_anthropic_claude_model(model: &Model) -> bool {
     let id = model.id.to_lowercase();
     let name = model.name.to_lowercase();
-    id.contains("anthropic.claude")
-        || id.contains("anthropic/claude")
-        || name.contains("claude")
+    id.contains("anthropic.claude") || id.contains("anthropic/claude") || name.contains("claude")
 }
 
 /// The model-candidate keys the catalog scans run over: id plus name, each
@@ -94,15 +118,19 @@ pub fn model_match_candidates(model: &Model) -> Vec<String> {
 }
 
 /// Whether the model's prompt caching rides on explicit cache points,
-/// upstream's `supportsPromptCaching`: Nova has automatic caching (only
-/// `AWS_BEDROCK_FORCE_CACHE=1` turns cache points on), and the Claude
-/// 3.5 Haiku / 3.7 Sonnet / 4.x / 5.x name families cache. Application
-/// inference profiles join the scan through `model.name` when the ARN lacks
-/// the model name.
+/// upstream's `supportsPromptCaching`.
+///
+/// Nova has automatic caching (only `AWS_BEDROCK_FORCE_CACHE=1` turns cache
+/// points on), and the Claude 3.5 Haiku / 3.7 Sonnet / 4.x / 5.x name
+/// families cache. Application inference profiles join the scan through
+/// `model.name` when the ARN lacks the model name.
 #[must_use]
 pub fn supports_prompt_caching(model: &Model, env: Option<&crate::types::ProviderEnv>) -> bool {
     let candidates = model_match_candidates(model);
-    if !candidates.iter().any(|candidate| candidate.contains("claude")) {
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.contains("claude"))
+    {
         return crate::utils::provider_env::get_provider_env_value("AWS_BEDROCK_FORCE_CACHE", env)
             .as_deref()
             == Some("1");
@@ -134,8 +162,8 @@ pub fn supports_strict_mode(model: &Model) -> bool {
 #[must_use]
 pub fn map_stop_reason(reason: Option<&str>) -> (StopReason, Option<String>) {
     match reason {
-        Some("end_turn") | Some("stop_sequence") => (StopReason::Stop, None),
-        Some("max_tokens") | Some("model_context_window_exceeded") => (StopReason::Length, None),
+        Some("end_turn" | "stop_sequence") => (StopReason::Stop, None),
+        Some("max_tokens" | "model_context_window_exceeded") => (StopReason::Length, None),
         Some("tool_use") => (StopReason::ToolUse, None),
         Some(reason) => (
             StopReason::Error,
@@ -207,9 +235,10 @@ fn create_required_text_block(text: &str) -> Value {
 }
 
 /// Recursively drop empty-string object keys from replayed tool input,
-/// upstream's `sanitizeBedrockDocument` — the streaming parser can emit `""`
-/// keys Bedrock rejects. Arrays and nested objects recurse; primitives pass
-/// through.
+/// upstream's `sanitizeBedrockDocument`.
+///
+/// The streaming parser can emit `""` keys Bedrock rejects. Arrays and
+/// nested objects recurse; primitives pass through.
 #[must_use]
 pub fn sanitize_bedrock_document(value: &Value) -> Value {
     match value {
@@ -227,11 +256,7 @@ pub fn sanitize_bedrock_document(value: &Value) -> Value {
 
 /// The tool-call id rule, upstream's `normalizeToolCallId`.
 fn normalize_bedrock_tool_call_id(id: &str) -> String {
-    let replaced: String = id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
-    replaced.chars().take(64).collect()
+    crate::api::google_shared::sanitize_tool_call_id(id)
 }
 
 /// The decoded redacted-thinking payload, upstream's `decodeRedactedContent`;
@@ -257,7 +282,7 @@ fn cache_point_block(long: bool) -> Value {
 }
 
 /// The Bedrock tool choice, upstream's `BedrockOptions["toolChoice"]`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BedrockToolChoice {
     /// Let the provider decide.
     Auto,
@@ -306,10 +331,10 @@ fn supports_native_xhigh_effort(model: &Model) -> bool {
 /// one, else the minimal/low pair collapsing to `low`.
 fn map_thinking_level_to_effort(
     model: &Model,
-    level: crate::types::ThinkingLevel,
+    level: ThinkingLevel,
     thinking_level_map: Option<&crate::types::ThinkingLevelMap>,
 ) -> String {
-    if level == crate::types::ThinkingLevel::Xhigh && supports_native_xhigh_effort(model) {
+    if level == ThinkingLevel::Xhigh && supports_native_xhigh_effort(model) {
         return "xhigh".to_owned();
     }
     let key = ModelThinkingLevel::from(level);
@@ -319,14 +344,13 @@ fn map_thinking_level_to_effort(
         return mapped.clone();
     }
     match level {
-        crate::types::ThinkingLevel::Minimal | crate::types::ThinkingLevel::Low => "low".to_owned(),
-        crate::types::ThinkingLevel::Medium => "medium".to_owned(),
-        crate::types::ThinkingLevel::High | crate::types::ThinkingLevel::Xhigh
-        | crate::types::ThinkingLevel::Max => "high".to_owned(),
+        ThinkingLevel::Minimal | ThinkingLevel::Low => "low".to_owned(),
+        ThinkingLevel::Medium => "medium".to_owned(),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high".to_owned(),
     }
 }
 
-/// Whether the target is GovCloud, upstream's `isGovCloudBedrockTarget`: the
+/// Whether the target is `GovCloud`, upstream's `isGovCloudBedrockTarget`: the
 /// region starts `us-gov-`, or the model id names a `us-gov.` or
 /// `arn:aws-us-gov:` profile.
 fn is_govcloud_bedrock_target(model: &Model, region: Option<&str>) -> bool {
@@ -336,17 +360,19 @@ fn is_govcloud_bedrock_target(model: &Model, region: Option<&str>) -> bool {
 }
 
 /// The additional-model-request-fields document for thinking, upstream's
-/// `buildAdditionalModelRequestFields`: absent without a reasoning request or
-/// a non-Claude model, adaptive for the 4.6+/5.x families, fixed-budget
-/// otherwise, with the interleaved-thinking beta on non-adaptive Claude and
-/// the `display` field dropped for GovCloud targets.
+/// `buildAdditionalModelRequestFields`.
+///
+/// Absent without a reasoning request or a non-Claude model; adaptive for
+/// the 4.6+/5.x families, fixed-budget otherwise, with the
+/// interleaved-thinking beta on non-adaptive Claude and the `display` field
+/// dropped for `GovCloud` targets.
 ///
 /// `level` is the clamped pi reasoning level; `display` carries the thinking
 /// display option (default `summarized`).
 #[must_use]
 pub fn build_additional_model_request_fields(
     model: &Model,
-    reasoning: Option<crate::types::ThinkingLevel>,
+    reasoning: Option<ThinkingLevel>,
     thinking_budgets: Option<&crate::types::ThinkingBudgets>,
     interleaved_thinking: Option<bool>,
     thinking_display: Option<&str>,
@@ -356,15 +382,19 @@ pub fn build_additional_model_request_fields(
     if !model.reasoning || !is_anthropic_claude_model(model) {
         return None;
     }
+    // GovCloud Bedrock currently rejects the Claude thinking.display field;
+    // omit it there until the GovCloud Converse schema catches up. Elsewhere
+    // the pi default keeps the older-Claude behavior, upstream's
+    // `thinkingDisplay ?? "summarized"`.
     let display = if is_govcloud_bedrock_target(model, region) {
         None
     } else {
-        thinking_display
+        Some(thinking_display.unwrap_or("summarized"))
     };
 
-    let mut additional = serde_json::Map::new();
+    let mut additional = Map::new();
     if supports_adaptive_thinking(model) {
-        let mut thinking = serde_json::Map::new();
+        let mut thinking = Map::new();
         thinking.insert("type".to_owned(), json!("adaptive"));
         if let Some(display) = display {
             thinking.insert("display".to_owned(), json!(display));
@@ -384,13 +414,11 @@ pub fn build_additional_model_request_fields(
     }
 
     let level = match reasoning {
-        crate::types::ThinkingLevel::Xhigh | crate::types::ThinkingLevel::Max => {
-            crate::types::ThinkingLevel::High
-        }
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => ThinkingLevel::High,
         other => other,
     };
     let budget = thinking_budget_for_level(level, thinking_budgets, reasoning);
-    let mut thinking = serde_json::Map::new();
+    let mut thinking = Map::new();
     thinking.insert("type".to_owned(), json!("enabled"));
     thinking.insert("budget_tokens".to_owned(), json!(budget));
     if let Some(display) = display {
@@ -409,37 +437,38 @@ pub fn build_additional_model_request_fields(
 /// The fixed thinking budget for the clamped level, upstream's default
 /// budget table plus the caller's `thinkingBudgets` override.
 fn thinking_budget_for_level(
-    level: crate::types::ThinkingLevel,
+    level: ThinkingLevel,
     thinking_budgets: Option<&crate::types::ThinkingBudgets>,
-    requested: crate::types::ThinkingLevel,
+    requested: ThinkingLevel,
 ) -> u64 {
     let custom = thinking_budgets.and_then(|budgets| match level {
-        crate::types::ThinkingLevel::Minimal => budgets.minimal,
-        crate::types::ThinkingLevel::Low => budgets.low,
-        crate::types::ThinkingLevel::Medium => budgets.medium,
-        crate::types::ThinkingLevel::High => budgets.high,
-        crate::types::ThinkingLevel::Xhigh | crate::types::ThinkingLevel::Max => None,
+        ThinkingLevel::Minimal => budgets.minimal,
+        ThinkingLevel::Low => budgets.low,
+        ThinkingLevel::Medium => budgets.medium,
+        ThinkingLevel::High => budgets.high,
+        ThinkingLevel::Xhigh | ThinkingLevel::Max => None,
     });
     if let Some(budget) = custom {
         return budget;
     }
     // The extended levels clamp to the high budget, upstream's default table.
     match requested {
-        crate::types::ThinkingLevel::Minimal => 1024,
+        ThinkingLevel::Minimal => 1024,
         _ => match level {
-            crate::types::ThinkingLevel::Minimal => 1024,
-            crate::types::ThinkingLevel::Low => 2048,
-            crate::types::ThinkingLevel::Medium => 8192,
-            crate::types::ThinkingLevel::High | crate::types::ThinkingLevel::Xhigh
-            | crate::types::ThinkingLevel::Max => 16384,
+            ThinkingLevel::Minimal => 1024,
+            ThinkingLevel::Low => 2048,
+            ThinkingLevel::Medium => 8192,
+            ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => 16384,
         },
     }
 }
 
 /// Convert internal messages to Bedrock's Message shape, upstream's
-/// `convertMessages`: consecutive tool results merge into one user message,
-/// assistant blocks degrade per the signature rules, and empty content drops
-/// with the `<empty>` placeholder where Bedrock requires content.
+/// `convertMessages`.
+///
+/// Consecutive tool results merge into one user message, assistant blocks
+/// degrade per the signature rules, and empty content drops with the
+/// `<empty>` placeholder where Bedrock requires content.
 ///
 /// # Errors
 /// When an image MIME type is unknown or its data is not base64.
@@ -466,8 +495,8 @@ fn convert_transformed_messages(
     cache_retention: crate::types::CacheRetention,
     env: Option<&crate::types::ProviderEnv>,
 ) -> Result<Vec<Value>, String> {
-    let caching =
-        cache_retention != crate::types::CacheRetention::None && supports_prompt_caching(model, env);
+    let caching = cache_retention != crate::types::CacheRetention::None
+        && supports_prompt_caching(model, env);
     let long = cache_retention == crate::types::CacheRetention::Long;
 
     let mut wire_messages: Vec<Value> = Vec::new();
@@ -505,7 +534,7 @@ fn convert_transformed_messages(
             }
             Message::Assistant(assistant) => {
                 flush_tool_results(&mut wire_messages, &mut pending_tool_results, caching, long);
-                let content = convert_assistant_content(assistant, model)?;
+                let content = convert_assistant_content(assistant, model);
                 if content.is_empty() {
                     // Aborted requests carry no content and skip entirely.
                     continue;
@@ -527,7 +556,9 @@ fn convert_transformed_messages(
         && let Some(last) = wire_messages.last_mut()
         && last.get("role").and_then(Value::as_str) == Some("user")
         && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
-        && !content.iter().any(|block| block.get("cachePoint").is_some())
+        && !content
+            .iter()
+            .any(|block| block.get("cachePoint").is_some())
     {
         content.push(cache_point_block(long));
     }
@@ -557,10 +588,7 @@ fn flush_tool_results(
 /// The assistant message's Bedrock content blocks, upstream's inline
 /// assistant conversion: empty blocks skip, tool use sanitizes its input,
 /// and thinking degrades per the signature rules.
-fn convert_assistant_content(
-    assistant: &crate::types::AssistantMessage,
-    model: &Model,
-) -> Result<Vec<Value>, String> {
+fn convert_assistant_content(assistant: &AssistantMessage, model: &Model) -> Vec<Value> {
     let mut content: Vec<Value> = Vec::new();
     for block in &assistant.content {
         match block {
@@ -619,7 +647,7 @@ fn convert_assistant_content(
             }
         }
     }
-    Ok(content)
+    content
 }
 
 /// One tool result as a Bedrock user-content block, the per-message
@@ -660,8 +688,8 @@ pub fn build_system_prompt(
     env: Option<&crate::types::ProviderEnv>,
 ) -> Option<Vec<Value>> {
     let system_prompt = system_prompt?;
-    let caching =
-        cache_retention != crate::types::CacheRetention::None && supports_prompt_caching(model, env);
+    let caching = cache_retention != crate::types::CacheRetention::None
+        && supports_prompt_caching(model, env);
     let long = cache_retention == crate::types::CacheRetention::Long;
     let mut blocks = vec![json!({ "text": system_prompt })];
     if caching {
@@ -716,4 +744,857 @@ pub fn convert_tool_config(
         }
     }
     Ok(Some(config))
+}
+
+/// Format a Bedrock failure with a human-readable prefix, upstream's
+/// `formatBedrockError`.
+///
+/// The raw HTTP body (with status) surfaces when the message does not
+/// already carry it — what stops a gateway 403 from collapsing to
+/// `Unknown: UnknownError` — a data-retention-mode failure points at the AWS
+/// docs, and a recognized exception name rides as the stable prefix the
+/// retry and overflow classifiers match on.
+#[must_use]
+pub fn format_bedrock_error(
+    error_name: Option<&str>,
+    message: &str,
+    status: Option<u16>,
+    body: Option<&str>,
+) -> String {
+    let carries_body = body.is_none_or(|body| message.contains(body));
+    let core = match (status, body) {
+        (Some(status), Some(body)) if !carries_body => format!("{status}: {body}"),
+        _ => message.to_owned(),
+    };
+    let data_retention_hint = if core.to_lowercase().contains("data retention mode") {
+        format!(" See {BEDROCK_DATA_RETENTION_DOCS_URL} for supported data retention modes.")
+    } else {
+        String::new()
+    };
+    error_name.and_then(bedrock_error_prefix).map_or_else(
+        || format!("{core}{data_retention_hint}"),
+        |prefix| format!("{prefix}: {core}{data_retention_hint}"),
+    )
+}
+
+/// The trimmed header-derived diagnostic value within the length bound,
+/// upstream's `normalizeDiagnosticValue`; over-long values drop rather than
+/// truncate, because a truncated request id is not a request id.
+fn normalize_diagnostic_value(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+/// Structured metadata alongside `errorMessage`, upstream's
+/// `appendBedrockFailureDiagnostic`: `errorMessage` stays byte-identical
+/// because the retry classifier matches against it, so the status, the
+/// modeled error code, and the request id ride the diagnostic details.
+/// Unknown fields are omitted, never guessed.
+fn append_bedrock_failure_diagnostic(
+    output: &mut AssistantMessage,
+    error_name: Option<&str>,
+    status: Option<u16>,
+    request_id: Option<&str>,
+    fallback_request_id: Option<&str>,
+) {
+    let mut details: BTreeMap<String, Value> = BTreeMap::new();
+
+    if let Some(status) = status {
+        details.insert("status".to_owned(), json!(status));
+    }
+
+    // Modeled Bedrock errors all end in `Exception`, unlike transport names
+    // such as `TimeoutError` and the SDK's `Unknown` placeholder.
+    if let Some(error_code) = error_name
+        .filter(|name| name.ends_with("Exception"))
+        .and_then(|name| normalize_diagnostic_value(Some(name)))
+    {
+        details.insert("errorCode".to_owned(), json!(error_code));
+    }
+
+    if let Some(request_id) = normalize_diagnostic_value(request_id)
+        .or_else(|| normalize_diagnostic_value(fallback_request_id))
+    {
+        details.insert("requestId".to_owned(), json!(request_id));
+    }
+
+    if details.is_empty() {
+        return;
+    }
+
+    crate::utils::diagnostics::append_assistant_message_diagnostic(
+        output,
+        AssistantMessageDiagnostic {
+            kind: "bedrock_response_failure".to_owned(),
+            timestamp: crate::auth::resolve::now_ms(),
+            error: None,
+            details: Some(details),
+        },
+    );
+}
+
+/// The boxed stream of wire events the runtime seam opens, upstream's
+/// `response.stream`: one JSON value per Converse Stream frame, or a
+/// mid-stream failure.
+pub type BedrockEventStream =
+    Pin<Box<dyn futures_core::Stream<Item = Result<Value, BedrockStreamFailure>> + Send>>;
+
+/// The send-time response the runtime seam opens, upstream's
+/// `client.send()` result reduced to the metadata fields the adapter reads.
+pub struct BedrockStreamReply {
+    /// The response's request id, upstream's `$metadata.requestId`.
+    pub request_id: Option<String>,
+    /// The HTTP status of the initial response, upstream's
+    /// `$metadata.httpStatusCode`.
+    pub status: Option<u16>,
+    /// The event stream to consume.
+    pub events: BedrockEventStream,
+}
+
+impl std::fmt::Debug for BedrockStreamReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BedrockStreamReply")
+            .field("request_id", &self.request_id)
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The failure a Converse Stream send or frame reports, upstream's SDK, upstream's SDK
+/// exception reduced to the fields `formatBedrockError` and the failure
+/// diagnostic read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BedrockStreamFailure {
+    /// The exception name, upstream's `error.name`: modeled Bedrock errors
+    /// end in `Exception`, transport names such as `TimeoutError` do not.
+    pub name: Option<String>,
+    /// The failure message, upstream's `error.message`.
+    pub message: String,
+    /// The HTTP status, upstream's `$metadata.httpStatusCode`.
+    pub status: Option<u16>,
+    /// The raw HTTP body, upstream's `$response.body`.
+    pub body: Option<String>,
+    /// The request id, upstream's `$metadata.requestId`.
+    pub request_id: Option<String>,
+}
+
+impl BedrockStreamFailure {
+    /// A failure carrying only its message, upstream's plain `Error` throws
+    /// and the bare exception literals the unmarshaller can produce.
+    #[must_use]
+    pub const fn plain(message: String) -> Self {
+        Self {
+            name: None,
+            message,
+            status: None,
+            body: None,
+            request_id: None,
+        }
+    }
+}
+
+/// The runtime seam: one Converse Stream send, upstream's
+/// `BedrockRuntimeClient.send(ConverseStreamCommand)` plus the event stream
+/// it opens. The SDK adapter implements it; the tests mock it.
+pub trait BedrockRuntime: std::fmt::Debug + Send + Sync {
+    /// Send the command input and open the wire event stream.
+    ///
+    /// # Errors
+    /// When the send fails before the event stream opens (credentials,
+    /// endpoint, model rejection): the returned failure carries the HTTP
+    /// status, body, and request id the response had. Mid-stream failures
+    /// ride the returned event stream as `Err` items instead.
+    fn converse_stream(
+        &self,
+        input: Value,
+        config: BedrockClientConfig,
+        signal: CancellationToken,
+    ) -> BoxedFuture<'static, Result<BedrockStreamReply, BedrockStreamFailure>>;
+}
+
+/// The Bedrock Converse Stream streams, upstream's `bedrockConverseStreamApi()`.
+#[derive(Debug, Default)]
+pub struct BedrockStreams;
+
+crate::api::wire_common::forward_provider_streams!(
+    BedrockStreams,
+    bedrock_options::BedrockStreamOptions
+);
+
+/// Stream an assistant response, upstream's `stream` export: the config
+/// resolution, the command input, and the event adaptation run inside the
+/// spawned task.
+///
+/// Every failure settles as a terminal error event, upstream's catch path.
+#[must_use]
+pub fn stream(
+    model: &Model,
+    context: &Context,
+    options: Option<&bedrock_options::BedrockStreamOptions>,
+) -> AssistantMessageEventStream {
+    let events = assistant_message_event_stream();
+    let forward = events.clone();
+    let model = model.clone();
+    let context = context.clone();
+    let options = options.cloned();
+    tokio::spawn(async move {
+        let options = options.unwrap_or_default();
+        let runtime: Arc<dyn BedrockRuntime> = options
+            .runtime
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::api::bedrock_sdk::SdkBedrockRuntime::new()));
+        let mut output = initial_output(&model);
+        let mut scratch = StreamScratch::default();
+        match run_stream(
+            &model,
+            &context,
+            &options,
+            runtime.as_ref(),
+            &mut output,
+            &mut scratch,
+            &forward,
+        )
+        .await
+        {
+            Ok(()) => {
+                // The done event already settled the final result.
+                forward.end(None);
+            }
+            Err(failure) => {
+                // A stream can settle without stopping every block, so the
+                // error path finalizes too, upstream's catch head.
+                finalize_blocks(&mut output, &mut scratch.blocks);
+                let aborted = options.transport_options.signal().is_cancelled();
+                output.stop_reason = if aborted {
+                    StopReason::Aborted
+                } else {
+                    StopReason::Error
+                };
+                output.error_message = Some(format_bedrock_error(
+                    failure.name.as_deref(),
+                    &failure.message,
+                    failure.status,
+                    failure.body.as_deref(),
+                ));
+                if output.stop_reason == StopReason::Error {
+                    append_bedrock_failure_diagnostic(
+                        &mut output,
+                        failure.name.as_deref(),
+                        failure.status,
+                        failure.request_id.as_deref(),
+                        scratch.response_request_id.as_deref(),
+                    );
+                }
+                forward.push(AssistantMessageEvent::Error {
+                    reason: output.stop_reason,
+                    error: output.clone(),
+                });
+                forward.end(Some(&output));
+            }
+        }
+    });
+    events
+}
+
+/// Stream a simple assistant response, upstream's `streamSimple` export:
+/// base options from the shared shaping, then the thinking level mapping.
+///
+/// The shared tool choice narrows to the two Bedrock choices, and the
+/// thinking level maps per model family. Credential sources are ambient, so
+/// no key is asserted here.
+#[must_use]
+pub fn stream_simple(
+    model: &Model,
+    context: &Context,
+    options: Option<&SimpleStreamOptions>,
+) -> AssistantMessageEventStream {
+    let mut base = bedrock_options::BedrockStreamOptions::from(build_base_options(
+        model, context, options, None,
+    ));
+    base.tool_choice = options
+        .and_then(|options| options.tool_choice)
+        .map(|choice| match choice {
+            crate::types::ToolChoice::Auto => BedrockToolChoice::Auto,
+            crate::types::ToolChoice::None => BedrockToolChoice::None,
+        });
+    let Some(reasoning) = options.and_then(|options| options.reasoning) else {
+        return stream(model, context, Some(&base));
+    };
+
+    if is_anthropic_claude_model(model) {
+        if supports_adaptive_thinking(model) {
+            base.reasoning = Some(reasoning);
+            base.thinking_budgets = options.and_then(|options| options.thinking_budgets);
+            return stream(model, context, Some(&base));
+        }
+
+        // `None` means the caller did not request an output cap; the helper
+        // then uses the model cap. Do not coerce to 0 here, or the thinking
+        // budget would become the entire maxTokens value.
+        let (max_tokens, thinking_budget) = adjust_max_tokens_for_thinking(
+            base.max_tokens,
+            model.max_tokens,
+            reasoning,
+            options.and_then(|options| options.thinking_budgets.as_ref()),
+        );
+        let max_tokens = clamp_max_tokens_to_context(model, context, max_tokens);
+        base.max_tokens = Some(max_tokens);
+        base.reasoning = Some(reasoning);
+        let mut budgets = options
+            .and_then(|options| options.thinking_budgets)
+            .unwrap_or_default();
+        let budget = thinking_budget.min(max_tokens.saturating_sub(MIN_ANSWER_TOKENS));
+        match clamp_reasoning(Some(reasoning)).unwrap_or(ThinkingLevel::High) {
+            ThinkingLevel::Minimal => budgets.minimal = Some(budget),
+            ThinkingLevel::Low => budgets.low = Some(budget),
+            ThinkingLevel::Medium => budgets.medium = Some(budget),
+            ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => {
+                budgets.high = Some(budget);
+            }
+        }
+        base.thinking_budgets = Some(budgets);
+        return stream(model, context, Some(&base));
+    }
+
+    base.reasoning = Some(reasoning);
+    base.thinking_budgets = options.and_then(|options| options.thinking_budgets);
+    stream(model, context, Some(&base))
+}
+
+/// Streaming scratch keyed by the wire's `contentBlockIndex`; the blocks on
+/// the accumulator never carry it, upstream's `Block` index/partialJson/
+/// redactedChunks fields.
+#[derive(Default)]
+struct BlockScratch {
+    /// The live wire index -> accumulator position; the matching stop removes
+    /// it, upstream's `block.index` delete.
+    live: HashMap<u64, usize>,
+    /// The accumulated raw tool-argument JSON per wire index, upstream's
+    /// `block.partialJson`.
+    partial_json: HashMap<u64, String>,
+    /// The buffered redacted-reasoning bytes per wire index, upstream's
+    /// `block.redactedChunks`.
+    redacted_chunks: HashMap<u64, Vec<u8>>,
+}
+
+/// The cross-phase stream scratch: the block buffers plus the send-time
+/// response request id, kept so the failure path can correlate a mid-stream
+/// exception, upstream's `responseRequestId`.
+#[derive(Default)]
+struct StreamScratch {
+    blocks: BlockScratch,
+    response_request_id: Option<String>,
+}
+
+async fn run_stream(
+    model: &Model,
+    context: &Context,
+    options: &bedrock_options::BedrockStreamOptions,
+    runtime: &dyn BedrockRuntime,
+    output: &mut AssistantMessage,
+    scratch: &mut StreamScratch,
+    events: &AssistantMessageEventStream,
+) -> Result<(), BedrockStreamFailure> {
+    let config = bedrock_options::resolve_client_config(model, options);
+    let mut input = bedrock_options::build_command_input(
+        model,
+        context,
+        options,
+        bedrock_options::resolve_cache_retention(options),
+    )
+    .map_err(BedrockStreamFailure::plain)?;
+    if let Some(hook) = &options.transport_options.on_payload {
+        input = hook
+            .call(input.clone(), model.clone())
+            .await
+            .unwrap_or(input);
+    }
+
+    let reply = runtime
+        .converse_stream(input, config, options.transport_options.signal())
+        .await;
+    // Kept outside the error path so the catch can still correlate a
+    // mid-stream failure: exceptions delivered as stream events carry no
+    // HTTP metadata of their own.
+    scratch.response_request_id = reply
+        .as_ref()
+        .ok()
+        .and_then(|reply| normalize_diagnostic_value(reply.request_id.as_deref()));
+    let reply = reply?;
+
+    // The `$metadata` fallback for the response hook, upstream's
+    // deserialize-step middleware collapsing into one fire after send.
+    if let (Some(status), Some(hook)) =
+        (reply.status, options.transport_options.on_response.as_ref())
+    {
+        let mut headers = BTreeMap::new();
+        if let Some(request_id) = reply.request_id.clone() {
+            headers.insert("x-amzn-requestid".to_owned(), request_id);
+        }
+        hook.call(
+            crate::types::ProviderResponse { status, headers },
+            model.clone(),
+        )
+        .await;
+    }
+
+    consume_chat_stream(model, reply, output, scratch, events).await?;
+    finish_stream(options, output, scratch, events)?;
+    Ok(())
+}
+
+/// The post-loop settlement, upstream's try-block tail: the aborted check
+/// runs first, then the missing-stop and stop-reason failures, then every
+/// block finalizes and the done event settles the stream.
+fn finish_stream(
+    options: &bedrock_options::BedrockStreamOptions,
+    output: &mut AssistantMessage,
+    scratch: &mut StreamScratch,
+    events: &AssistantMessageEventStream,
+) -> Result<(), BedrockStreamFailure> {
+    if options.transport_options.signal().is_cancelled() {
+        return Err(BedrockStreamFailure::plain(
+            "Request was aborted".to_owned(),
+        ));
+    }
+    if output.stop_reason == StopReason::Pending {
+        return Err(BedrockStreamFailure::plain(
+            "Bedrock stream ended without a stop reason".to_owned(),
+        ));
+    }
+    if matches!(output.stop_reason, StopReason::Error | StopReason::Aborted) {
+        return Err(BedrockStreamFailure::plain(
+            output
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "An unknown error occurred".to_owned()),
+        ));
+    }
+    finalize_blocks(output, &mut scratch.blocks);
+    events.push(AssistantMessageEvent::Done {
+        reason: output.stop_reason,
+        message: output.clone(),
+    });
+    Ok(())
+}
+
+/// The event adaptation over the Converse Stream frames, upstream's
+/// `for await (const item of response.stream)` loop: the message/block
+/// handlers below, the raw stop reason on `messageStop`, the usage pricing
+/// on `metadata`, and the five modeled exceptions thrown into the catch path.
+async fn consume_chat_stream(
+    model: &Model,
+    reply: BedrockStreamReply,
+    output: &mut AssistantMessage,
+    scratch: &mut StreamScratch,
+    events: &AssistantMessageEventStream,
+) -> Result<(), BedrockStreamFailure> {
+    let mut wire_events = reply.events;
+    while let Some(item) = wire_events.next().await {
+        let item = match item {
+            Ok(item) => item,
+            Err(failure) => return Err(failure),
+        };
+        if let Some(start) = item.get("messageStart") {
+            if start.get("role").and_then(Value::as_str) != Some("assistant") {
+                return Err(BedrockStreamFailure::plain(
+                    "Unexpected assistant message start but got user message start instead"
+                        .to_owned(),
+                ));
+            }
+            events.push(AssistantMessageEvent::Start {
+                partial: output.clone(),
+            });
+        } else if let Some(event) = item.get("contentBlockStart") {
+            handle_content_block_start(event, output, &mut scratch.blocks, events);
+        } else if let Some(event) = item.get("contentBlockDelta") {
+            handle_content_block_delta(event, output, &mut scratch.blocks, events);
+        } else if let Some(event) = item.get("contentBlockStop") {
+            handle_content_block_stop(event, output, &mut scratch.blocks, events);
+        } else if let Some(stop) = item.get("messageStop") {
+            output.raw_stop_reason = stop
+                .get("stopReason")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let (stop_reason, error_message) = map_stop_reason(output.raw_stop_reason.as_deref());
+            output.stop_reason = stop_reason;
+            if let Some(error_message) = error_message {
+                output.error_message = Some(error_message);
+            }
+        } else if let Some(metadata) = item.get("metadata") {
+            handle_metadata(metadata, model, output);
+        } else if let Some(exception) = modeled_stream_exception(&item) {
+            return Err(failure_from_exception(&exception));
+        }
+    }
+    Ok(())
+}
+
+/// The wire's content-block index a frame addresses, upstream's
+/// `contentBlockIndex!` non-null assertion with a zero fallback.
+fn wire_index(event: &Value) -> u64 {
+    event
+        .get("contentBlockIndex")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// The wire's optional string field, upstream's `|| ""` defaulting.
+fn string_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The token count the wire reports, upstream's `|| 0` defaulting.
+fn wire_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Handle `contentBlockStart`: only a `toolUse` start opens a block, upstream's
+/// `handleContentBlockStart` — text and reasoning blocks open on their first
+/// delta instead.
+fn handle_content_block_start(
+    event: &Value,
+    output: &mut AssistantMessage,
+    scratch: &mut BlockScratch,
+    events: &AssistantMessageEventStream,
+) {
+    let index = wire_index(event);
+    let Some(tool_use) = event.get("start").and_then(|start| start.get("toolUse")) else {
+        return;
+    };
+    output.content.push(AssistantBlock::ToolCall(ToolCall {
+        id: string_field(tool_use, "toolUseId"),
+        name: string_field(tool_use, "name"),
+        arguments: Map::new(),
+        thought_signature: None,
+        namespace: None,
+    }));
+    let content_index = output.content.len() - 1;
+    scratch.live.insert(index, content_index);
+    scratch.partial_json.insert(index, String::new());
+    events.push(AssistantMessageEvent::ToolcallStart {
+        content_index: content_index as u64,
+        partial: output.clone(),
+    });
+}
+
+/// Handle `contentBlockDelta` for text, tool-use, and reasoning deltas,
+/// upstream's `handleContentBlockDelta`.
+fn handle_content_block_delta(
+    event: &Value,
+    output: &mut AssistantMessage,
+    scratch: &mut BlockScratch,
+    events: &AssistantMessageEventStream,
+) {
+    let index = wire_index(event);
+    let delta = event.get("delta");
+    let live = scratch.live.get(&index).copied();
+
+    // If no text block exists yet, create one: `contentBlockStart` is not
+    // sent for text blocks.
+    if let Some(text) = delta
+        .and_then(|delta| delta.get("text"))
+        .and_then(Value::as_str)
+    {
+        let content_index = if let Some(position) = live {
+            position
+        } else {
+            output.content.push(AssistantBlock::Text(TextContent {
+                text: String::new(),
+                text_signature: None,
+            }));
+            let position = output.content.len() - 1;
+            scratch.live.insert(index, position);
+            events.push(AssistantMessageEvent::TextStart {
+                content_index: position as u64,
+                partial: output.clone(),
+            });
+            position
+        };
+        // A live non-text block at the wire index swallows the delta,
+        // upstream's `block.type === "text"` guard.
+        if let Some(AssistantBlock::Text(block)) = output.content.get_mut(content_index) {
+            block.text.push_str(text);
+            events.push(AssistantMessageEvent::TextDelta {
+                content_index: content_index as u64,
+                delta: text.to_owned(),
+                partial: output.clone(),
+            });
+        }
+    } else if let Some(tool_use) = delta.and_then(|delta| delta.get("toolUse")) {
+        // A tool-use delta only applies to a live tool block, upstream's
+        // `block?.type === "toolCall"` guard.
+        if let Some(position) = live
+            && let Some(AssistantBlock::ToolCall(block)) = output.content.get_mut(position)
+        {
+            let chunk = tool_use
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let partial = scratch.partial_json.entry(index).or_default();
+            partial.push_str(chunk);
+            block.arguments = parse_streaming_json_args(Some(partial.as_str()));
+            events.push(AssistantMessageEvent::ToolcallDelta {
+                content_index: position as u64,
+                delta: chunk.to_owned(),
+                partial: output.clone(),
+            });
+        }
+    } else if let Some(reasoning) = delta.and_then(|delta| delta.get("reasoningContent")) {
+        handle_reasoning_delta(reasoning, index, live, output, scratch, events);
+    }
+}
+
+/// Handle a reasoning-content delta: the thinking text and signature ride
+/// their own block, and encrypted `redactedContent` accumulates into the
+/// scratch buffer, upstream's `handleContentBlockDelta` reasoning branch.
+fn handle_reasoning_delta(
+    reasoning: &Value,
+    index: u64,
+    live: Option<usize>,
+    output: &mut AssistantMessage,
+    scratch: &mut BlockScratch,
+    events: &AssistantMessageEventStream,
+) {
+    let thinking_index = if let Some(position) = live {
+        position
+    } else {
+        output
+            .content
+            .push(AssistantBlock::Thinking(ThinkingContent {
+                thinking: String::new(),
+                thinking_signature: Some(String::new()),
+                redacted: None,
+            }));
+        let position = output.content.len() - 1;
+        scratch.live.insert(index, position);
+        events.push(AssistantMessageEvent::ThinkingStart {
+            content_index: position as u64,
+            partial: output.clone(),
+        });
+        position
+    };
+    let Some(AssistantBlock::Thinking(_)) = output.content.get(thinking_index) else {
+        return;
+    };
+    let redacted = matches!(
+        output.content.get(thinking_index),
+        Some(AssistantBlock::Thinking(block)) if block.redacted == Some(true)
+    );
+
+    // Upstream's truthiness gates: empty text and empty signatures are no-ops.
+    if let Some(text) = reasoning.get("text").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        let Some(AssistantBlock::Thinking(block)) = output.content.get_mut(thinking_index) else {
+            return;
+        };
+        block.thinking.push_str(text);
+        events.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: thinking_index as u64,
+            delta: text.to_owned(),
+            partial: output.clone(),
+        });
+    }
+
+    // `thinkingSignature` holds either an Anthropic signature or an opaque
+    // redacted payload, never both: mixing them would corrupt whichever
+    // arrived first.
+    if !redacted
+        && let Some(signature) = reasoning.get("signature").and_then(Value::as_str)
+        && !signature.is_empty()
+    {
+        let Some(AssistantBlock::Thinking(block)) = output.content.get_mut(thinking_index) else {
+            return;
+        };
+        let previous = block.thinking_signature.clone().unwrap_or_default();
+        block.thinking_signature = Some(format!("{previous}{signature}"));
+    }
+
+    if let Some(bytes) = reasoning_bytes(reasoning.get("redactedContent"))
+        && !bytes.is_empty()
+    {
+        // Encrypted reasoning from non-Anthropic models on Bedrock (e.g.
+        // OpenAI GPT-5.6). The payload is opaque, so keep it verbatim in
+        // `thinkingSignature` the way the Anthropic path stores redacted
+        // thinking, and replay it on the next turn.
+        if !redacted {
+            let Some(AssistantBlock::Thinking(block)) = output.content.get_mut(thinking_index)
+            else {
+                return;
+            };
+            block.redacted = Some(true);
+            block.thinking_signature = Some(String::new());
+            block.thinking.push_str(REDACTED_THINKING_PLACEHOLDER);
+            events.push(AssistantMessageEvent::ThinkingDelta {
+                content_index: thinking_index as u64,
+                delta: REDACTED_THINKING_PLACEHOLDER.to_owned(),
+                partial: output.clone(),
+            });
+        }
+        scratch
+            .redacted_chunks
+            .entry(index)
+            .or_default()
+            .extend_from_slice(&bytes);
+    }
+}
+
+/// The wire's redacted-reasoning bytes: the SDK adapter encodes the blob as
+/// base64, the JSON replay path as a byte array, upstream's `Uint8Array`.
+fn reasoning_bytes(value: Option<&Value>) -> Option<Vec<u8>> {
+    match value? {
+        Value::String(base64) => base64_to_bytes(base64),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_u64().and_then(|byte| u8::try_from(byte).ok()))
+            .collect::<Option<Vec<u8>>>(),
+        _ => None,
+    }
+}
+
+/// Handle `contentBlockStop`, upstream's `handleContentBlockStop`: the
+/// terminal `*_end` events carry the authoritative block content, the tool
+/// call re-parses its accumulated JSON, and redacted reasoning flushes.
+fn handle_content_block_stop(
+    event: &Value,
+    output: &mut AssistantMessage,
+    scratch: &mut BlockScratch,
+    events: &AssistantMessageEventStream,
+) {
+    let index = wire_index(event);
+    let Some(content_index) = scratch.live.remove(&index) else {
+        return;
+    };
+    let partial_json = scratch.partial_json.remove(&index);
+    match output.content.get_mut(content_index) {
+        Some(AssistantBlock::Text(block)) => {
+            events.push(AssistantMessageEvent::TextEnd {
+                content_index: content_index as u64,
+                content: block.text.clone(),
+                partial: output.clone(),
+            });
+        }
+        Some(AssistantBlock::Thinking(block)) => {
+            if let Some(chunks) = scratch.redacted_chunks.remove(&index) {
+                block.thinking_signature = Some(bytes_to_base64(&chunks));
+            }
+            events.push(AssistantMessageEvent::ThinkingEnd {
+                content_index: content_index as u64,
+                content: block.thinking.clone(),
+                partial: output.clone(),
+            });
+        }
+        Some(AssistantBlock::ToolCall(block)) => {
+            // Finalize in-place and strip the scratch buffer so replay only
+            // carries parsed arguments, upstream's `partialJson` delete.
+            block.arguments = parse_streaming_json_args(partial_json.as_deref());
+            events.push(AssistantMessageEvent::ToolcallEnd {
+                content_index: content_index as u64,
+                tool_call: block.clone(),
+                partial: output.clone(),
+            });
+        }
+        None => {}
+    }
+}
+
+/// Strips every streaming scratch buffer. Runs from the terminal paths as
+/// well as `contentBlockStop`, because a stream can settle without stopping
+/// each block, upstream's `finalizeStreamingBlock`.
+fn finalize_blocks(output: &mut AssistantMessage, scratch: &mut BlockScratch) {
+    for (index, position) in scratch.live.drain() {
+        if let Some(chunks) = scratch.redacted_chunks.remove(&index)
+            && let Some(AssistantBlock::Thinking(block)) = output.content.get_mut(position)
+        {
+            // Encodes buffered encrypted reasoning into `thinkingSignature`
+            // and drops the scratch buffer, which must never reach a
+            // persisted message: raw bytes would serialize many times their
+            // base64 size, upstream's `flushRedactedContent`.
+            block.thinking_signature = Some(bytes_to_base64(&chunks));
+        }
+    }
+    scratch.partial_json.clear();
+    scratch.redacted_chunks.clear();
+}
+
+/// Handle the `metadata` frame's usage, upstream's `handleMetadata`: the
+/// 1h cache details split out of the total cache write, the total falling
+/// back to input + output, then the model pricing.
+fn handle_metadata(event: &Value, model: &Model, output: &mut AssistantMessage) {
+    let Some(usage) = event.get("usage") else {
+        return;
+    };
+    output.usage.input = wire_u64(usage, "inputTokens");
+    output.usage.output = wire_u64(usage, "outputTokens");
+    output.usage.cache_read = wire_u64(usage, "cacheReadInputTokens");
+    output.usage.cache_write = wire_u64(usage, "cacheWriteInputTokens");
+    output.usage.cache_write_1h =
+        usage
+            .get("cacheDetails")
+            .and_then(Value::as_array)
+            .map(|details| {
+                details
+                    .iter()
+                    .filter(|detail| detail.get("ttl").and_then(Value::as_str) == Some("1h"))
+                    .map(|detail| wire_u64(detail, "inputTokens"))
+                    .sum()
+            });
+    output.usage.total_tokens = match wire_u64(usage, "totalTokens") {
+        0 => output.usage.input + output.usage.output,
+        total => total,
+    };
+    crate::models::calculate_cost(model, &mut output.usage);
+}
+
+/// The five modeled stream exceptions, upstream's else-if throws.
+const MODELED_STREAM_EXCEPTIONS: [&str; 5] = [
+    "internalServerException",
+    "modelStreamErrorException",
+    "validationException",
+    "throttlingException",
+    "serviceUnavailableException",
+];
+
+/// The modeled exception frame the item carries, if any.
+fn modeled_stream_exception(item: &Value) -> Option<Value> {
+    MODELED_STREAM_EXCEPTIONS
+        .iter()
+        .find_map(|key| item.get(*key).cloned())
+}
+
+/// The mid-stream exception's failure shape: the typed members the frame
+/// carries, upstream's thrown exception object.
+fn failure_from_exception(exception: &Value) -> BedrockStreamFailure {
+    BedrockStreamFailure {
+        name: exception
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        message: exception
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        status: None,
+        body: None,
+        request_id: None,
+    }
+}
+
+/// The tool-call arguments re-parsed from the accumulated JSON, upstream's
+/// `parseStreamingJson(block.partialJson)` shape.
+fn parse_streaming_json_args(partial: Option<&str>) -> Map<String, Value> {
+    parse_streaming_json(partial)
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
 }

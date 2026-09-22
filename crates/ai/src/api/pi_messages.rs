@@ -27,20 +27,21 @@ use std::collections::HashMap;
 use bytes::Bytes;
 use serde_json::{Value, json};
 
+use crate::api::wire_common::{call_response_hook, sse_error_message, upsert_header};
 use crate::http::client::{HttpMethod, HttpRequest};
+use crate::types::AssistantMessageDiagnostic;
 use crate::types::{
-    AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Model, ProviderStreams,
-    SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent, ToolCall,
+    AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Model, SimpleStreamOptions,
+    StopReason, StreamOptions, TextContent, ThinkingContent, ToolCall,
 };
 use crate::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
-use crate::types::AssistantMessageDiagnostic;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::provider_env::get_provider_env_value;
 
 /// The tool choice pi-messages accepts, upstream's
 /// `PiMessagesOptions["toolChoice"]`: the shared choices plus `required` and
 /// the OpenAI-style forced function.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PiMessagesToolChoice {
     /// Let the provider decide.
     Auto,
@@ -74,7 +75,7 @@ impl PiMessagesToolChoice {
 
 /// Impact summary of a server-side message rewrite (e.g. a gateway policy),
 /// upstream's `PiMessagesRewriteImpact`.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PiMessagesRewriteImpact {
     /// The policy that rewrote the context.
@@ -92,9 +93,11 @@ pub struct PiMessagesRewriteImpact {
 }
 
 /// Serialized assistant-message event as sent by a pi-messages backend,
-/// upstream's `PiMessagesEvent`: pi's own protocol without the `partial`.
-/// Terminal `reason` values are pi stop-reason subsets; `"deferred"` never
-/// appears on this wire.
+/// upstream's `PiMessagesEvent`.
+///
+/// The wire carries pi's own protocol without the `partial`. Terminal
+/// `reason` values are pi stop-reason subsets; `"deferred"` never appears on
+/// this wire.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum PiMessagesEvent {
@@ -304,32 +307,15 @@ impl From<StreamOptions> for PiMessagesStreamOptions {
 #[derive(Debug, Default)]
 pub struct PiMessagesStreams;
 
-impl ProviderStreams for PiMessagesStreams {
-    fn stream(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&StreamOptions>,
-    ) -> AssistantMessageEventStream {
-        let options = options.cloned().map(PiMessagesStreamOptions::from);
-        stream(model, context, options.as_ref())
-    }
-
-    fn stream_simple(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        stream_simple(model, context, options)
-    }
-}
+crate::api::wire_common::forward_provider_streams!(PiMessagesStreams, PiMessagesStreamOptions);
 
 /// Stream an assistant response, upstream's `stream` export: one POST of
 /// `{ model, context, options }` and an SSE rehydration of the backend's
-/// serialized assistant-message events. Every failure mode — missing key,
-/// bad URL, HTTP error, parse error, missing terminal event — settles as a
-/// terminal error event, upstream's `createErrorEvent`.
+/// serialized assistant-message events.
+///
+/// Every failure mode — missing key, bad URL, HTTP error, parse error,
+/// missing terminal event — settles as a terminal error event, upstream's
+/// `createErrorEvent`.
 #[must_use]
 pub fn stream(
     model: &Model,
@@ -392,7 +378,7 @@ struct StreamFailure {
 }
 
 impl StreamFailure {
-    fn plain(message: String) -> Self {
+    const fn plain(message: String) -> Self {
         Self {
             message,
             response_error: None,
@@ -493,13 +479,13 @@ async fn run_stream(
     // first done/error.
     let mut converter = EventConverter::new(model);
     let mut sse = crate::http::sse::SseStream::new(response.body);
-    while let Some(sse_event) = sse.next().await.map_err(|error| match error {
-        crate::http::client::HttpError::Aborted => {
-            StreamFailure::plain("Request was aborted".to_owned())
-        }
-        other => StreamFailure::plain(other.to_string()),
-    })? {
-        let Some(wire_event) = parse_wire_event(&sse_event.data).map_err(StreamFailure::plain)? else {
+    while let Some(sse_event) = sse
+        .next()
+        .await
+        .map_err(|error| StreamFailure::plain(sse_error_message(error)))?
+    {
+        let Some(wire_event) = parse_wire_event(&sse_event.data).map_err(StreamFailure::plain)?
+        else {
             continue;
         };
         let event = converter.convert(wire_event);
@@ -534,16 +520,11 @@ async fn dispatch_stream_request(
     ];
     // Caller headers override same-named defaults; a `None` value drops out
     // rather than deleting, upstream's providerHeadersToRecord spread.
-    if let Some(record) = crate::utils::headers::provider_headers_to_record(options.headers.as_ref()) {
+    if let Some(record) =
+        crate::utils::headers::provider_headers_to_record(options.headers.as_ref())
+    {
         for (name, value) in record {
-            if let Some(entry) = headers
-                .iter_mut()
-                .find(|(existing, _)| existing.eq_ignore_ascii_case(&name))
-            {
-                entry.1 = value;
-            } else {
-                headers.push((name, value));
-            }
+            upsert_header(&mut headers, &name, &value);
         }
     }
     let request = HttpRequest {
@@ -564,21 +545,13 @@ async fn dispatch_stream_request(
             other => StreamFailure::plain(other.to_string()),
         })?;
 
-    if let Some(hook) = &options.transport_options.on_response {
-        hook.call(
-            crate::types::ProviderResponse {
-                status: response.status,
-                headers: crate::utils::headers::headers_to_record(
-                    response
-                        .headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                ),
-            },
-            model.clone(),
-        )
-        .await;
-    }
+    call_response_hook(
+        &options.transport_options,
+        model,
+        response.status,
+        &response.headers,
+    )
+    .await;
 
     if !(200..300).contains(&response.status) {
         let body = crate::http::client::read_body_text(response.body)
@@ -599,7 +572,7 @@ fn parse_error_body(body: &str) -> Option<Value> {
     let parsed: Value = serde_json::from_str(body).ok()?;
     parsed
         .get("error")
-        .is_some_and(|error| error.is_object())
+        .is_some_and(Value::is_object)
         .then_some(parsed)
 }
 
@@ -637,7 +610,10 @@ fn response_error(model: &Model, url: &str, status: u16, body: &str) -> PiMessag
     } else {
         diagnostic_details.insert("body".to_owned(), json!(truncate_diagnostic_string(body)));
     }
-    diagnostic_details.insert("timestampMs".to_owned(), json!(crate::auth::resolve::now_ms()));
+    diagnostic_details.insert(
+        "timestampMs".to_owned(),
+        json!(crate::auth::resolve::now_ms()),
+    );
 
     PiMessagesResponseError {
         message: format!("{status}: {suffix}{code_suffix}"),
@@ -681,43 +657,40 @@ struct EventConverter {
 /// overwrites, and a hole past the end carries empty text placeholders (a
 /// shape only malformed streams can produce).
 fn place_content(content: &mut Vec<AssistantBlock>, index: u64, block: AssistantBlock) {
-    while content.len() < index as usize {
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
+    while content.len() < index {
         content.push(AssistantBlock::Text(TextContent {
             text: String::new(),
             text_signature: None,
         }));
     }
-    if content.len() == index as usize {
+    if content.len() == index {
         content.push(block);
     } else {
-        content[index as usize] = block;
+        content[index] = block;
     }
+}
+
+/// The accumulator position a wire content index addresses, upstream's
+/// JS array indexing.
+fn content_position(index: u64) -> usize {
+    usize::try_from(index).unwrap_or(usize::MAX)
 }
 
 impl EventConverter {
     fn new(model: &Model) -> Self {
         Self {
-            partial: AssistantMessage {
-                content: Vec::new(),
-                api: model.api.clone(),
-                provider: model.provider.clone(),
-                model: model.id.clone(),
-                response_model: None,
-                response_id: None,
-                provider_thinking_level: None,
-                diagnostics: None,
-                usage: crate::types::Usage::default(),
-                stop_reason: StopReason::Pending,
-                deferred: None,
-                error_message: None,
-                raw_stop_reason: None,
-                end_turn: None,
-                timestamp: crate::auth::resolve::now_ms(),
-            },
+            partial: crate::api::wire_common::initial_output(model),
             tool_json: HashMap::new(),
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the event conversion mirrors upstream's createEventConverter in one match"
+    )]
     fn convert(&mut self, event: PiMessagesEvent) -> AssistantMessageEvent {
         match event {
             PiMessagesEvent::Start => AssistantMessageEvent::Start {
@@ -741,8 +714,10 @@ impl EventConverter {
                 content_index,
                 delta,
             } => {
-                if let Some(AssistantBlock::Text(block)) =
-                    self.partial.content.get_mut(content_index as usize)
+                if let Some(AssistantBlock::Text(block)) = self
+                    .partial
+                    .content
+                    .get_mut(content_position(content_index))
                 {
                     block.text.push_str(&delta);
                 }
@@ -757,10 +732,12 @@ impl EventConverter {
                 content,
                 content_signature,
             } => {
-                if let Some(AssistantBlock::Text(block)) =
-                    self.partial.content.get_mut(content_index as usize)
+                if let Some(AssistantBlock::Text(block)) = self
+                    .partial
+                    .content
+                    .get_mut(content_position(content_index))
                 {
-                    block.text = content.clone();
+                    content.clone_into(&mut block.text);
                     block.text_signature = content_signature;
                 }
                 AssistantMessageEvent::TextEnd {
@@ -788,8 +765,10 @@ impl EventConverter {
                 content_index,
                 delta,
             } => {
-                if let Some(AssistantBlock::Thinking(block)) =
-                    self.partial.content.get_mut(content_index as usize)
+                if let Some(AssistantBlock::Thinking(block)) = self
+                    .partial
+                    .content
+                    .get_mut(content_position(content_index))
                 {
                     block.thinking.push_str(&delta);
                 }
@@ -805,10 +784,12 @@ impl EventConverter {
                 content_signature,
                 redacted,
             } => {
-                if let Some(AssistantBlock::Thinking(block)) =
-                    self.partial.content.get_mut(content_index as usize)
+                if let Some(AssistantBlock::Thinking(block)) = self
+                    .partial
+                    .content
+                    .get_mut(content_position(content_index))
                 {
-                    block.thinking = content.clone();
+                    content.clone_into(&mut block.thinking);
                     block.thinking_signature = content_signature;
                     block.redacted = redacted;
                 }
@@ -844,17 +825,16 @@ impl EventConverter {
                 content_index,
                 delta,
             } => {
-                let json = self
-                    .tool_json
-                    .entry(content_index)
-                    .or_default();
+                let json = self.tool_json.entry(content_index).or_default();
                 json.push_str(&delta);
                 let parsed = parse_streaming_json(Some(json.as_str()))
                     .as_object()
                     .cloned()
                     .unwrap_or_default();
-                if let Some(AssistantBlock::ToolCall(block)) =
-                    self.partial.content.get_mut(content_index as usize)
+                if let Some(AssistantBlock::ToolCall(block)) = self
+                    .partial
+                    .content
+                    .get_mut(content_position(content_index))
                 {
                     block.arguments = parsed;
                 }
@@ -874,38 +854,41 @@ impl EventConverter {
                 // without an open is a protocol violation; upstream's
                 // Object.assign on the missing index crashes into the same
                 // catch that settles the stream with an error.
-                let merged = match self.partial.content.get_mut(content_index as usize) {
+                let merged = match self
+                    .partial
+                    .content
+                    .get_mut(content_position(content_index))
+                {
                     Some(AssistantBlock::ToolCall(block)) => {
-                        block.id = tool_call.id.clone();
-                        block.name = tool_call.name.clone();
-                        block.arguments = tool_call.arguments.clone();
+                        tool_call.id.clone_into(&mut block.id);
+                        tool_call.name.clone_into(&mut block.name);
+                        tool_call.arguments.clone_into(&mut block.arguments);
                         if tool_call.thought_signature.is_some() {
-                            block.thought_signature = tool_call.thought_signature.clone();
+                            tool_call
+                                .thought_signature
+                                .clone_into(&mut block.thought_signature);
                         }
                         if tool_call.namespace.is_some() {
-                            block.namespace = tool_call.namespace.clone();
+                            block.namespace = tool_call.namespace;
                         }
                         Some(block.clone())
                     }
                     _ => None,
                 };
-                match merged {
-                    Some(tool_call) => {
-                        self.tool_json.remove(&content_index);
-                        AssistantMessageEvent::ToolcallEnd {
-                            content_index,
-                            tool_call,
-                            partial: self.partial.clone(),
-                        }
+                if let Some(tool_call) = merged {
+                    self.tool_json.remove(&content_index);
+                    AssistantMessageEvent::ToolcallEnd {
+                        content_index,
+                        tool_call,
+                        partial: self.partial.clone(),
                     }
-                    None => {
-                        let mut failing = self.partial.clone();
-                        failing.stop_reason = StopReason::Error;
-                        failing.error_message = Some("Invalid pi-messages event sequence".to_owned());
-                        AssistantMessageEvent::Error {
-                            reason: StopReason::Error,
-                            error: failing,
-                        }
+                } else {
+                    let mut failing = self.partial.clone();
+                    failing.stop_reason = StopReason::Error;
+                    failing.error_message = Some("Invalid pi-messages event sequence".to_owned());
+                    AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error: failing,
                     }
                 }
             }
@@ -960,12 +943,18 @@ impl EventConverter {
         details.insert("policyId".to_owned(), json!(rewrite.policy_id));
         details.insert("policyVersion".to_owned(), json!(rewrite.policy_version));
         details.insert("changed".to_owned(), json!(rewrite.changed));
-        details.insert("tokenCountChange".to_owned(), json!(rewrite.token_count_change));
+        details.insert(
+            "tokenCountChange".to_owned(),
+            json!(rewrite.token_count_change),
+        );
         details.insert(
             "messageCountChange".to_owned(),
             json!(rewrite.message_count_change),
         );
-        details.insert("systemPromptChanged".to_owned(), json!(rewrite.system_prompt_changed));
+        details.insert(
+            "systemPromptChanged".to_owned(),
+            json!(rewrite.system_prompt_changed),
+        );
         let diagnostic = AssistantMessageDiagnostic {
             kind: "pi_messages_rewrite".to_owned(),
             timestamp: crate::auth::resolve::now_ms(),
