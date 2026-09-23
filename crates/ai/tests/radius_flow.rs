@@ -249,3 +249,159 @@ async fn store_credential(credentials: &Arc<dyn pi_ai::auth::credential_store::C
         .await
         .expect("store");
 }
+
+/// A non-2xx gateway response with an over-long body; the loader truncates
+/// the body with the ellipsis in the error message.
+async fn serve_long_error(listener: &tokio::net::TcpListener, body: String) {
+    let (mut socket, _) = listener.accept().await.expect("accept");
+    let mut buffer = [0u8; 2048];
+    let _ = socket.read(&mut buffer).await;
+    socket
+        .write_all(
+            format!(
+                "HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write response");
+    socket.shutdown().await.expect("shutdown");
+}
+
+/// The non-2xx gateway error truncates the body at 512 chars with the
+/// ellipsis, upstream's `truncateHttpBody`.
+#[tokio::test]
+async fn the_gateway_error_body_truncates_with_the_ellipsis() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    let long_body = "x".repeat(900);
+    let server_body = long_body.clone();
+    let _server = tokio::spawn(async move { serve_long_error(&listener, server_body).await });
+
+    let gateway = format!("http://127.0.0.1:{port}");
+    let error = pi_ai::providers::radius_config::load_radius_gateway_config(
+        gateway.as_str(),
+        None,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .expect_err("the failed load");
+
+    assert!(error.message.contains(": 502: "), "{error}");
+    assert!(
+        error.message.ends_with('\u{2026}'),
+        "the body truncates with the ellipsis: {}",
+        &error.message[error.message.len() - 4..]
+    );
+    assert!(
+        error.message.contains("x".repeat(512).as_str()),
+        "512 chars of the body ride"
+    );
+}
+
+/// The gateway URL normalization, the config sanitization gate, and the
+/// credential-config extraction, upstream's radius-config helpers.
+#[test]
+fn the_radius_config_helpers_pin_their_shapes() {
+    use pi_ai::providers::radius_config::{
+        get_radius_credential_config, get_radius_models, get_radius_models_from_config,
+        normalize_radius_gateway_url, sanitize_radius_gateway_config,
+    };
+
+    assert_eq!(
+        normalize_radius_gateway_url("gateway.example/"),
+        "https://gateway.example",
+        "the scheme is added and the trailing slash strips"
+    );
+    assert_eq!(
+        normalize_radius_gateway_url("http://gateway.example//"),
+        "http://gateway.example",
+        "the plain scheme stays and the trailing slashes strip"
+    );
+
+    let config_json = serde_json::json!({
+        "baseUrl": "https://gateway.test",
+        "models": [{
+            "id": "m1",
+            "name": "M1",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1000,
+            "maxTokens": 100,
+        }],
+    });
+    let config = sanitize_radius_gateway_config(&config_json).expect("the config sanitizes");
+    let models = get_radius_models_from_config("radius", &config);
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].base_url, "https://gateway.test");
+
+    // A shape without the base URL or models arrays sanitizes to nothing.
+    assert!(sanitize_radius_gateway_config(&serde_json::json!({ "models": [] })).is_none());
+    assert!(
+        sanitize_radius_gateway_config(&serde_json::json!({
+            "baseUrl": "https://gateway.test",
+            "models": [{ "id": "m1" }],
+        }))
+        .is_some_and(|sanitized| sanitized.models.is_empty()),
+        "the invalid model entries drop"
+    );
+
+    // The credential-config extraction reads the OAuth extra block.
+    let oauth = OAuthCredentials {
+        refresh: "r".to_owned(),
+        access: "a".to_owned(),
+        expires: 1,
+        extra: BTreeMap::from([("gatewayConfig".to_owned(), config_json)]),
+    };
+    assert_eq!(get_radius_credential_config(Some(&oauth)), Some(config));
+    assert_eq!(get_radius_models("radius", Some(&oauth)).len(), 1);
+    assert!(get_radius_models("radius", None).is_empty());
+
+    // The error formats as its message.
+    let error = pi_ai::providers::radius_config::GatewayConfigError {
+        message: "Could not load Radius config from https://gateway.test".to_owned(),
+    };
+    assert_eq!(
+        error.to_string(),
+        "Could not load Radius config from https://gateway.test"
+    );
+}
+
+/// The radius provider trait surface: the identity, the auth source, the
+/// model list, and the stream delegation, upstream's provider object.
+#[tokio::test]
+async fn the_radius_provider_reports_its_identity_and_models() {
+    let provider = radius_provider(RadiusProviderOptions {
+        id: Some("radius-test".to_owned()),
+        name: Some("Radius Test".to_owned()),
+        ..Default::default()
+    });
+    assert_eq!(
+        pi_ai::models::Provider::id(provider.as_ref()),
+        "radius-test"
+    );
+    assert_eq!(
+        pi_ai::models::Provider::name(provider.as_ref()),
+        "Radius Test"
+    );
+    assert!(
+        pi_ai::models::Provider::auth(provider.as_ref())
+            .api_key
+            .is_some()
+    );
+    assert!(
+        pi_ai::models::Provider::get_models(provider.as_ref())
+            .expect("models")
+            .is_empty(),
+        "no credential means no models"
+    );
+    // The default options carry the default gateway and identity.
+    let default = radius_provider(RadiusProviderOptions::default());
+    assert_eq!(pi_ai::models::Provider::id(default.as_ref()), "radius");
+    assert_eq!(pi_ai::models::Provider::name(default.as_ref()), "Radius");
+}

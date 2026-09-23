@@ -530,6 +530,19 @@ pub enum ModelThinkingLevel {
 /// marks a level as unsupported.
 pub type ThinkingLevelMap = BTreeMap<ModelThinkingLevel, Option<String>>;
 
+impl From<ThinkingLevel> for ModelThinkingLevel {
+    fn from(level: ThinkingLevel) -> Self {
+        match level {
+            ThinkingLevel::Minimal => Self::Minimal,
+            ThinkingLevel::Low => Self::Low,
+            ThinkingLevel::Medium => Self::Medium,
+            ThinkingLevel::High => Self::High,
+            ThinkingLevel::Xhigh => Self::Xhigh,
+            ThinkingLevel::Max => Self::Max,
+        }
+    }
+}
+
 /// The thinking-control variable a chat template kwarg substitutes, upstream's
 /// `$var` discriminator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1011,6 +1024,39 @@ pub struct SimpleStreamOptions {
     pub deferred: Option<DeferredRequest>,
     /// Custom token budgets for thinking levels, token-based providers only.
     pub thinking_budgets: Option<ThinkingBudgets>,
+}
+
+impl SimpleStreamOptions {
+    /// The [`StreamOptions`] a `ProviderStreams::stream` caller passed,
+    /// restated as the simple-request shape: the base fields map one to one
+    /// and the simple-only extras (tool choice, reasoning level, the
+    /// deferred flag, thinking budgets) drop, since a `stream` request
+    /// never asked for them.
+    #[must_use]
+    pub fn from_stream(options: &StreamOptions) -> Self {
+        Self {
+            transport_options: options.transport_options.clone(),
+            api_key: options.api_key.clone(),
+            telemetry_context: options.telemetry_context.clone(),
+            env: options.env.clone(),
+            headers: options.headers.clone(),
+            timeout_ms: options.timeout_ms,
+            max_retries: options.max_retries,
+            max_retry_delay_ms: options.max_retry_delay_ms,
+            temperature: options.temperature,
+            sampling_params: options.sampling_params.clone(),
+            max_tokens: options.max_tokens,
+            transport: options.transport,
+            cache_retention: options.cache_retention,
+            session_id: options.session_id.clone(),
+            websocket_connect_timeout_ms: options.websocket_connect_timeout_ms,
+            metadata: options.metadata.clone(),
+            tool_choice: None,
+            reasoning: None,
+            deferred: None,
+            thinking_budgets: None,
+        }
+    }
 }
 
 /// Options for image-generation requests, upstream's `ImagesOptions extends
@@ -1919,6 +1965,14 @@ pub struct ModelCompat {
     /// `cache_control.ttl: "1h"`). Default: true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_long_cache_retention: Option<bool>,
+    /// vLLM scheduler priority sent as the top-level `priority` request field
+    /// (openai-completions), serialized as `vllmPriority`: lower values are
+    /// handled earlier; the server default is 0. Only meaningful when vLLM
+    /// runs with `--scheduling-policy priority`; useful for keeping
+    /// background/batch work from stalling interactive sessions. Off by
+    /// default; not set on the generated catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_priority: Option<serde_json::Number>,
     /// Whether the model supports message-anchored `additional_tools` input
     /// items (OpenAI Responses). Default: false.
     #[serde(default, skip_serializing_if = "Option::is_none")]

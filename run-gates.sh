@@ -3,6 +3,10 @@
 # Keep this gate list in sync with the CI steps in ci.yml. Mutation
 # testing is nightly only, so it is deliberately not here.
 #
+# Fast path: passing gate names runs just those gates
+# (`./run-gates.sh tests` skips the instrumented coverage rebuild for
+# everyday loops); no arguments keeps the full battery.
+#
 # The gate commands below are opaque strings that run_gates.sh evaluates
 # at runtime; shellcheck sees them out of context here.
 # shellcheck disable=SC2016,SC2027,SC2086,SC2154
@@ -22,7 +26,7 @@ add "format" "cargo fmt --all -- --check"
 add "lint" "cargo clippy --workspace --all-targets -- -D warnings"
 add "doc" "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps"
 add "tests" "cargo test --workspace"
-add "coverage" "cargo llvm-cov --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info"
+add "coverage" "cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info"
 
 add "spell-check" "typos"
 add "markdown-lint" "markdownlint-cli2 \"**/*.md\""
@@ -42,8 +46,31 @@ add "shell-lint" 'for sh in $(git ls-files "*.sh"); do shellcheck "$sh"; done'
 add "shell-format" 'for sh in $(git ls-files "*.sh"); do shfmt -d "$sh"; done'
 add "workflow-yaml-lint" "yamllint ./.github/workflows/*.yml $(find . -mindepth 2 -maxdepth 2 \( -name 'ci.yml' -o -name 'mutation.yml' \) -not -path './.github/*' | tr '\n' ' ')"
 add "workflow-lint" "actionlint ./.github/workflows/*.yml $(find . -mindepth 2 -maxdepth 2 \( -name 'ci.yml' -o -name 'mutation.yml' \) -not -path './.github/*' | tr '\n' ' ')"
+if [ "$#" -gt 0 ]; then
+	for want in "$@"; do
+		known=0
+		for name in "${names[@]}"; do
+			[ "$want" = "$name" ] && known=1
+		done
+		if [ "$known" -eq 0 ]; then
+			echo "unknown gate: $want"
+			echo "known gates: ${names[*]}"
+			exit 2
+		fi
+	done
+fi
 for i in "${!names[@]}"; do
 	name="${names[$i]}"
+	selected=1
+	if [ "$#" -gt 0 ]; then
+		selected=0
+		for want in "$@"; do
+			[ "$want" = "$name" ] && selected=1
+		done
+	fi
+	if [ "$selected" -eq 0 ]; then
+		continue
+	fi
 	cmd="${cmds[$i]}"
 	(
 		if eval "$cmd" >"$log_dir/$name.log" 2>&1; then

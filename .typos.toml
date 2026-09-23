@@ -20,3 +20,9 @@ relace = "relace"
 # the upstream tests (upstream's own FIRST/SECOND/SINGLE constants).
 SECON = "SECON"
 SINGL = "SINGL"
+# LaTeX command and environment names the latex renderer's command tables
+# carry verbatim from the upstream tests (oint = \oint, multline = AMSMath,
+# hom = \hom).
+oint = "oint"
+multline = "multline"
+hom = "hom"

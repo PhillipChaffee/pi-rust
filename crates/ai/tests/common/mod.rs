@@ -25,10 +25,12 @@ pub mod radius_fixtures;
 pub mod seam_forms;
 
 use pi_ai::types::{
-    Api, AssistantBlock, AssistantMessage, Message, ProviderId, StopReason, TextContent,
+    Api, AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Message, Model,
+    ProviderId, ProviderStreams, SimpleStreamOptions, StopReason, StreamOptions, TextContent,
     ThinkingContent, ToolResultBlock, ToolResultMessage, Usage, UsageCost, UserContent,
     UserMessage,
 };
+use pi_ai::utils::event_stream::AssistantMessageEventStream;
 
 /// A provider-shaped usage block with the given total.
 #[must_use]
@@ -137,10 +139,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use pi_ai::auth::types::{ApiKeyAuth, ApiKeyAuthInput, ProviderAuth};
-use pi_ai::types::{
-    BoxedFuture, Context, DeferredCancelOptions, DeferredFetchOptions, DeferredHandle, Model,
-    ProviderStreams, SimpleStreamOptions, StreamOptions,
-};
+use pi_ai::types::{BoxedFuture, DeferredCancelOptions, DeferredFetchOptions, DeferredHandle};
 
 /// Run a future to completion on a fresh current-thread runtime, the seam
 /// sync tests use to drive the async surface.
@@ -233,7 +232,7 @@ pub fn deferred_handle() -> DeferredHandle {
 
 /// A stream that settles immediately with the fixture message.
 #[must_use]
-pub fn end_with(model: &Model) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+pub fn end_with(model: &Model) -> AssistantMessageEventStream {
     let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
     stream.end(Some(&message_fixture(model, StopReason::Stop)));
     stream
@@ -281,7 +280,7 @@ impl ProviderStreams for DeferredStreams {
         model: &Model,
         _context: &Context,
         _options: Option<&StreamOptions>,
-    ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+    ) -> AssistantMessageEventStream {
         end_with(model)
     }
 
@@ -290,7 +289,7 @@ impl ProviderStreams for DeferredStreams {
         model: &Model,
         _context: &Context,
         _options: Option<&SimpleStreamOptions>,
-    ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+    ) -> AssistantMessageEventStream {
         end_with(model)
     }
 
@@ -299,7 +298,7 @@ impl ProviderStreams for DeferredStreams {
         model: &Model,
         handle: &DeferredHandle,
         _options: Option<&DeferredFetchOptions>,
-    ) -> Option<pi_ai::utils::event_stream::AssistantMessageEventStream> {
+    ) -> Option<AssistantMessageEventStream> {
         *self
             .fetches
             .lock()
@@ -802,6 +801,106 @@ pub fn captured_payload(captured: &CapturedPayload) -> serde_json::Value {
 /// asserting test.
 pub type CapturedPayload = Arc<Mutex<Option<serde_json::Value>>>;
 
+/// The process-wide async lock the compat registry suites share: upstream's
+/// vitest workers isolate each test file in its own process, while one Rust
+/// test binary runs the suites concurrently against the shared registry.
+pub async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static REGISTRY_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    REGISTRY_GUARD.lock().await
+}
+
+/// The registered api-registry streams that capture the api key the compat
+/// dispatch merged into the request options, upstream's registered
+/// `stream`/`streamSimple` pair in `compat-env.test.ts`.
+pub struct RegistryCapture {
+    /// The streams to register.
+    pub streams: Arc<dyn ProviderStreams>,
+    /// The captured api key slot.
+    pub key: Arc<Mutex<Option<String>>>,
+}
+
+impl RegistryCapture {
+    /// The key the dispatch merged, read after the request settles.
+    #[must_use]
+    pub fn captured_key(&self) -> Option<String> {
+        self.key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The api-key slot the capture streams read options through.
+fn capture_key(slot: &Arc<Mutex<Option<String>>>, api_key: Option<String>) {
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = api_key;
+}
+
+/// The settled capture stream, upstream's registered provider: start, done,
+/// and end with the "ok" text message.
+fn capture_settled(model: &Model) -> AssistantMessageEventStream {
+    let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
+    let mut output = message_fixture(model, StopReason::Stop);
+    output.content = vec![AssistantBlock::Text(text_block("ok"))];
+    stream.push(AssistantMessageEvent::Start {
+        partial: output.clone(),
+    });
+    stream.push(AssistantMessageEvent::Done {
+        reason: StopReason::Stop,
+        message: output.clone(),
+    });
+    stream.end(Some(&output));
+    stream
+}
+
+/// The capture streams the registry registers, both entry points capturing
+/// the merged api key.
+struct CaptureStreams {
+    key: Arc<Mutex<Option<String>>>,
+}
+
+impl ProviderStreams for CaptureStreams {
+    fn stream(
+        &self,
+        model: &Model,
+        _context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> AssistantMessageEventStream {
+        capture_key(
+            &self.key,
+            options.and_then(|options| options.api_key.clone()),
+        );
+        capture_settled(model)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        _context: &Context,
+        options: Option<&SimpleStreamOptions>,
+    ) -> AssistantMessageEventStream {
+        capture_key(
+            &self.key,
+            options.and_then(|options| options.api_key.clone()),
+        );
+        capture_settled(model)
+    }
+}
+
+/// The capture pair the compat suites register, upstream's
+/// `registerApiProvider({ api: "openai-responses", ... })` fixture.
+#[must_use]
+pub fn registry_capture() -> RegistryCapture {
+    let key = Arc::new(Mutex::new(None));
+    RegistryCapture {
+        streams: Arc::new(CaptureStreams {
+            key: Arc::clone(&key),
+        }),
+        key,
+    }
+}
+
 /// The wire options every mock-stream test injects: the mock as the
 /// transport and no credential resolution.
 #[must_use]
@@ -809,5 +908,279 @@ pub fn mock_transport(mock: &MockHttpClient) -> TransportOptions {
     TransportOptions {
         http_client: Some(Arc::new(mock.clone())),
         ..TransportOptions::default()
+    }
+}
+
+// --- The OpenAI Completions fixtures the openai-family suites share ---
+
+use pi_ai::api::openai_completions::OpenAiCompletionsOptions;
+
+/// The plain openai-completions model the retry and raw-stop-reason suites
+/// stream against, the shape upstream's shared retry-suite model carries.
+#[must_use]
+pub fn openai_completions_model() -> Model {
+    Model {
+        id: "test-model".to_owned(),
+        name: "Test Model".to_owned(),
+        api: Api::from("openai-completions"),
+        provider: ProviderId::from("opencode-go"),
+        base_url: "https://opencode.ai/zen/go/v1".to_owned(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec![pi_ai::types::Modality::Text],
+        cost: pi_ai::types::ModelCost::default(),
+        context_window: 1000,
+        max_tokens: 100,
+        sampling_params: None,
+        headers: None,
+        compat: None,
+    }
+}
+
+/// The catalog model retargeted at the openai-completions wire, the
+/// `{ ...getModel(...), api: "openai-completions" }` spread the upstream
+/// suites run for OpenAI and OpenRouter catalog entries.
+#[must_use]
+pub fn openai_catalog_model(provider: &str, id: &str) -> Model {
+    Model {
+        api: Api::from("openai-completions"),
+        ..builtin_model(provider, id)
+    }
+}
+
+/// A chunk stream's SSE body: each chunk one `data:` frame, closed by the
+/// `data: [DONE]` sentinel, the shape `data: [DONE]` ends the shared decoder
+/// on.
+#[must_use]
+pub fn openai_sse_body(chunks: &[serde_json::Value]) -> String {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for chunk in chunks {
+        let _ = write!(body, "data: {chunk}\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// The SSE response an OpenAI completions stream returns over the given
+/// chunks, the mock body the chunk-suite mounts.
+#[must_use]
+pub fn openai_sse_response(chunks: &[serde_json::Value]) -> pi_ai::http::MockResponse {
+    pi_ai::http::MockResponse::status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(openai_sse_body(chunks))
+}
+
+/// The standard final chunk the capture suites stream: an empty delta with
+/// `stop` plus the zeroed usage details block.
+#[must_use]
+pub fn openai_done_chunk() -> serde_json::Value {
+    json!({
+        "choices": [{ "delta": {}, "finish_reason": "stop" }],
+        "usage": {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "prompt_tokens_details": { "cached_tokens": 0 },
+            "completion_tokens_details": { "reasoning_tokens": 0 },
+        },
+    })
+}
+
+/// Mount the seam mock the openai-completions suites inject: the route
+/// answers `/chat/completions` with the chunks' SSE body.
+#[must_use]
+pub fn openai_mock(chunks: &[serde_json::Value]) -> MockHttpClient {
+    let mock = MockHttpClient::new();
+    openai_mock_with(&mock, chunks);
+    mock
+}
+
+/// Mount onto an existing mock, for suites that assert the recorded request.
+pub fn openai_mock_with(mock: &MockHttpClient, chunks: &[serde_json::Value]) {
+    mock.on(|request| request.url.contains("/chat/completions"))
+        .respond(openai_sse_response(chunks));
+}
+
+/// The keyed openai-completions options the mock suites send: the mock as the
+/// transport and a static test key.
+#[must_use]
+pub fn keyed_openai_options(mock: &MockHttpClient) -> OpenAiCompletionsOptions {
+    OpenAiCompletionsOptions {
+        transport_options: mock_transport(mock),
+        api_key: Some("test-key".to_owned()),
+        ..OpenAiCompletionsOptions::default()
+    }
+}
+
+/// The recorded body of the request at `index`, the shape the multi-request
+/// suites (retry sequences, second-run replays) assert on.
+#[must_use]
+pub fn recorded_body_at(mock: &MockHttpClient, index: usize) -> serde_json::Value {
+    serde_json::from_slice(
+        mock.recorded()[index]
+            .body
+            .as_ref()
+            .expect("the mock request carries a body"),
+    )
+    .expect("the request body is JSON")
+}
+
+/// Drain the event stream and settle its final message, upstream's
+/// drain-then-`result()` shape.
+///
+/// The result future joins the drain so its waiter registers before the
+/// completing event settles: the wire APIs call `end(None)` after the `done`
+/// event, which clears an already-settled result, so a `result()` awaited
+/// only after the drain would wait forever.
+pub async fn drain_and_settle(stream: &AssistantMessageEventStream) -> AssistantMessage {
+    let ((), message) = tokio::join!(
+        async { while stream.next().await.is_some() {} },
+        stream.result()
+    );
+    message
+}
+
+/// The catalog probe the live E2E suites open with: the named model rides
+/// the named wire API.
+pub fn assert_catalog_api(provider: &str, id: &str, api: &str) {
+    let model = builtin_model(provider, id);
+    assert_eq!(model.api, Api::from(api), "{provider}/{id}");
+}
+
+/// The settled message's text blocks joined, the live-probe reply reader.
+#[must_use]
+pub fn live_response_text(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantBlock::Text(text) => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Assert a live probe's settled reply carried the expected text, upstream's
+/// `responseText` containment check.
+pub fn assert_live_text_reply(message: &AssistantMessage, needle: &str) {
+    let text = live_response_text(message);
+    assert!(text.contains(needle), "got: {text}");
+}
+
+/// Assert a stream settled as a credential-setup failure that dispatched
+/// nothing: the missing-key error message and an untouched mock, the shape
+/// the wire-API credential suites pin.
+pub fn assert_setup_error_without_dispatch(result: &AssistantMessage, mock: &MockHttpClient) {
+    assert_eq!(result.stop_reason, StopReason::Error);
+    let message = result.error_message.as_deref().expect("the setup error");
+    assert!(
+        message.contains("No API key for provider"),
+        "got: {message}"
+    );
+    assert_eq!(mock.request_count(), 0);
+}
+
+/// The recorded request's named header values, duplicates and case order
+/// preserved, the multi-value header assertions' reader.
+#[must_use]
+pub fn recorded_header_values(mock: &MockHttpClient, name: &str) -> Vec<String> {
+    mock.recorded()[0]
+        .headers
+        .iter()
+        .filter(|(header, _)| header.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+        .collect()
+}
+
+// --- The OpenAI Responses fixtures the responses-family suites share ---
+
+use pi_ai::api::openai_responses::OpenAiResponsesOptions;
+
+/// The Models runtime the live E2E probes stream through, upstream's
+/// `createModels` over the builtin provider registry.
+#[must_use]
+pub fn models_runtime() -> pi_ai::models::Models {
+    let models = pi_ai::models::create_models(Some(pi_ai::models::CreateModelsOptions::default()));
+    for provider in pi_ai::providers::all::builtin_providers() {
+        models.set_provider(provider);
+    }
+    models
+}
+
+/// The minimal terminal run the capture suites stream: one
+/// `response.completed` frame naming an id and the `completed` status.
+#[must_use]
+pub fn openai_responses_completed_event() -> serde_json::Value {
+    json!({
+        "type": "response.completed",
+        "response": { "id": "resp_test", "status": "completed" },
+    })
+}
+
+/// A Responses event stream's SSE body: each event one `data:` frame, closed
+/// by the `data: [DONE]` sentinel the shared decoder skips.
+#[must_use]
+pub fn openai_responses_sse_body(events: &[serde_json::Value]) -> String {
+    use std::fmt::Write as _;
+    let mut body = String::new();
+    for event in events {
+        let _ = write!(body, "data: {event}\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// The SSE response an OpenAI Responses stream returns over the given
+/// events, the mock body the responses-family suites mount.
+#[must_use]
+pub fn openai_responses_sse_response(events: &[serde_json::Value]) -> pi_ai::http::MockResponse {
+    pi_ai::http::MockResponse::status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(openai_responses_sse_body(events))
+}
+
+/// Mount the seam mock the openai-responses suites inject: the route answers
+/// `/responses` with the events' SSE body.
+#[must_use]
+pub fn openai_responses_mock(events: &[serde_json::Value]) -> MockHttpClient {
+    let mock = MockHttpClient::new();
+    openai_responses_mock_with(&mock, events);
+    mock
+}
+
+/// Mount onto an existing mock, for suites that assert the recorded request.
+pub fn openai_responses_mock_with(mock: &MockHttpClient, events: &[serde_json::Value]) {
+    mock.on(|request| request.url.contains("/responses"))
+        .respond(openai_responses_sse_response(events));
+}
+
+/// The keyed openai-responses options the mock suites send: the mock as the
+/// transport and a static test key.
+#[must_use]
+pub fn keyed_openai_responses_options(mock: &MockHttpClient) -> OpenAiResponsesOptions {
+    OpenAiResponsesOptions {
+        transport_options: mock_transport(mock),
+        api_key: Some("test-key".to_owned()),
+        ..OpenAiResponsesOptions::default()
+    }
+}
+
+/// The event's wire name, upstream's `event.type`, the names the event-order
+/// suites assert on.
+pub const fn event_type_name(event: &AssistantMessageEvent) -> &'static str {
+    use pi_ai::types::AssistantMessageEvent as Event;
+    match event {
+        Event::Start { .. } => "start",
+        Event::TextStart { .. } => "text_start",
+        Event::TextDelta { .. } => "text_delta",
+        Event::TextEnd { .. } => "text_end",
+        Event::ThinkingStart { .. } => "thinking_start",
+        Event::ThinkingDelta { .. } => "thinking_delta",
+        Event::ThinkingEnd { .. } => "thinking_end",
+        Event::ToolcallStart { .. } => "toolcall_start",
+        Event::ToolcallDelta { .. } => "toolcall_delta",
+        Event::ToolcallEnd { .. } => "toolcall_end",
+        Event::Done { .. } => "done",
+        Event::Error { .. } => "error",
     }
 }

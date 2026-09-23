@@ -13,12 +13,30 @@ use std::sync::Arc;
 
 use crate::types::ProviderStreams;
 
+pub mod adapter_belt;
 pub mod anthropic_messages;
+pub mod azure_openai_responses;
+pub mod bedrock_converse_stream;
+pub mod bedrock_options;
+pub mod bedrock_sdk;
 pub mod constrained_sampling;
 pub mod github_copilot_headers;
+pub mod google_generative_ai;
+pub mod google_shared;
+pub mod google_vertex;
 pub mod lazy;
+pub mod mistral_conversations;
+pub mod openai_codex_responses;
+pub mod openai_completions;
+pub mod openai_prompt_cache;
+pub mod openai_responses;
+pub mod openai_responses_shared;
+pub mod openrouter_images;
+pub mod pi_messages;
+pub mod request_seam;
 pub mod simple_options;
 pub mod transform_messages;
+pub mod wire_common;
 
 /// The stub failure an unported wire-API stream reports.
 #[derive(Debug)]
@@ -96,58 +114,58 @@ pub fn anthropic_messages() -> Arc<dyn ProviderStreams> {
 /// The OpenAI Responses wire API, upstream's `openAIResponsesApi()`.
 #[must_use]
 pub fn openai_responses() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("openai-responses")
+    Arc::new(openai_responses::OpenAiResponsesStreams)
 }
 
 /// The Azure OpenAI Responses wire API, upstream's
 /// `azureOpenAIResponsesApi()`.
 #[must_use]
 pub fn azure_openai_responses() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("azure-openai-responses")
+    Arc::new(azure_openai_responses::AzureOpenAiResponsesStreams)
 }
 
 /// The OpenAI Completions wire API, upstream's `openAICompletionsApi()`.
 #[must_use]
 pub fn openai_completions() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("openai-completions")
+    Arc::new(openai_completions::OpenAiCompletionsStreams)
 }
 
 /// The Google Generative AI wire API, upstream's `googleGenerativeAIApi()`.
 #[must_use]
 pub fn google_generative_ai() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("google-generative-ai")
+    Arc::new(google_generative_ai::GoogleStreams)
 }
 
 /// The Google Vertex AI wire API, upstream's `googleVertexApi()`.
 #[must_use]
 pub fn google_vertex() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("google-vertex")
+    Arc::new(google_vertex::GoogleVertexStreams)
 }
 
 /// The Bedrock Converse Stream wire API, upstream's
 /// `bedrockConverseStreamApi()`.
 #[must_use]
 pub fn bedrock_converse_stream() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("bedrock-converse-stream")
+    Arc::new(bedrock_converse_stream::BedrockStreams)
 }
 
 /// The Mistral Conversations wire API, upstream's `mistralConversationsApi()`.
 #[must_use]
 pub fn mistral_conversations() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("mistral-conversations")
+    Arc::new(mistral_conversations::MistralStreams)
 }
 
 /// The OpenAI Codex Responses wire API, upstream's
 /// `openAICodexResponsesApi()`.
 #[must_use]
 pub fn openai_codex_responses() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("openai-codex-responses")
+    Arc::new(openai_codex_responses::OpenAiCodexResponsesStreams)
 }
 
 /// The pi-messages wire API, upstream's `piMessagesApi()`.
 #[must_use]
 pub fn pi_messages() -> Arc<dyn ProviderStreams> {
-    not_ported_streams("pi-messages")
+    Arc::new(pi_messages::PiMessagesStreams)
 }
 
 /// An API implementation map keyed by wire-API id, upstream's
@@ -189,4 +207,11 @@ impl crate::types::ProviderImages for NotPortedImages {
             ))
         })
     }
+}
+
+/// The OpenRouter image-generation wire API, upstream's registered
+/// `openrouter-images` images provider.
+#[must_use]
+pub fn openrouter_images() -> Arc<dyn crate::types::ProviderImages> {
+    Arc::new(openrouter_images::OpenRouterImages)
 }

@@ -20,14 +20,13 @@
 //!   [`crate::http::sse`] decoder; the per-API event parsing lives here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::auth::resolve::now_ms;
-use crate::http::client::{HttpByteStream, HttpError, HttpMethod, HttpRequest, HttpResponse};
+use crate::http::client::{HttpMethod, HttpRequest, HttpResponse};
 use crate::http::sse::SseStream;
 use crate::models::calculate_cost;
 use crate::types::{
@@ -38,14 +37,10 @@ use crate::types::{
 };
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::diagnostics::append_assistant_message_diagnostic;
-use crate::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
-use crate::utils::headers::headers_to_record;
+use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
 use crate::utils::pi_user_agent::get_pi_user_agent;
 use crate::utils::provider_env::get_provider_env_value;
-use crate::utils::provider_retry::{
-    ProviderRequestError, ProviderRetryOptions, retry_provider_request,
-};
 
 use crate::api::constrained_sampling::{
     get_json_schema_tool_parameters, resolve_json_schema_strict_sampling,
@@ -55,6 +50,9 @@ use crate::api::simple_options::{
     adjust_max_tokens_for_thinking, build_base_options, clamp_max_tokens_to_context,
 };
 use crate::api::transform_messages::{ToolCallIdNormalizer, transform_messages};
+use crate::api::wire_common::{
+    dispatch_with_retry, retry_options, setup_error_stream, spawn_adapter_stream, sse_error_message,
+};
 
 /// Resolve the cache retention preference, upstream's
 /// `resolveCacheRetention`: the request's value, else `PI_CACHE_RETENTION`,
@@ -375,6 +373,12 @@ impl From<StreamOptions> for AnthropicStreamOptions {
             interleaved_thinking: None,
             tool_choice: None,
         }
+    }
+}
+
+impl crate::api::wire_common::TransportCarrier for AnthropicStreamOptions {
+    fn transport_options(&self) -> &crate::types::TransportOptions {
+        &self.transport_options
     }
 }
 
@@ -772,36 +776,15 @@ pub fn stream(
     context: &Context,
     options: Option<&AnthropicStreamOptions>,
 ) -> AssistantMessageEventStream {
-    let events = assistant_message_event_stream();
-    let forward = events.clone();
-    let model = model.clone();
-    let context = context.clone();
-    let options = options.cloned();
-    tokio::spawn(async move {
-        let options = options.unwrap_or_default();
-        let mut output = initial_output(&model, &options);
-        match run_stream(&model, &context, &options, &mut output, &forward).await {
-            Ok(()) => {
-                // The done event already settled the final result.
-                forward.end(None);
-            }
-            Err(message) => {
-                let signal = options.transport_options.signal();
-                output.stop_reason = if signal.is_cancelled() {
-                    StopReason::Aborted
-                } else {
-                    StopReason::Error
-                };
-                output.error_message = Some(message);
-                forward.push(AssistantMessageEvent::Error {
-                    reason: output.stop_reason,
-                    error: output.clone(),
-                });
-                forward.end(None);
-            }
-        }
-    });
-    events
+    spawn_adapter_stream(
+        model,
+        context,
+        options.cloned(),
+        initial_output,
+        |model, context, options, output, events| {
+            Box::pin(run_stream(model, context, options, output, events))
+        },
+    )
 }
 
 /// The fresh accumulator a stream starts from, upstream's `output`: zeroed
@@ -816,23 +799,7 @@ fn initial_output(model: &Model, options: &AnthropicStreamOptions) -> AssistantM
                 .as_str()
                 .to_owned()
         });
-    AssistantMessage {
-        content: Vec::new(),
-        api: model.api.clone(),
-        provider: model.provider.clone(),
-        model: model.id.clone(),
-        response_model: None,
-        response_id: None,
-        provider_thinking_level,
-        diagnostics: None,
-        usage: crate::types::Usage::default(),
-        stop_reason: StopReason::Pending,
-        deferred: None,
-        error_message: None,
-        raw_stop_reason: None,
-        end_turn: None,
-        timestamp: now_ms(),
-    }
+    crate::api::wire_common::initial_output_with_thinking_level(model, provider_thinking_level)
 }
 
 async fn run_stream(
@@ -863,10 +830,6 @@ async fn run_stream(
 /// Execute the stream request with retries and fire the response hook,
 /// the seam-side port of upstream's `createClient` +
 /// `retryProviderRequest(create(...).asResponse())`.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the seam-side request pipeline mirrors upstream's createClient + retry sequence; splitting it would bury the retry contract"
-)]
 async fn dispatch_stream_request(
     model: &Model,
     context: &Context,
@@ -946,59 +909,16 @@ async fn dispatch_stream_request(
         timeout_ms: options.timeout_ms,
         signal: signal.clone(),
     };
-    let retry_options = ProviderRetryOptions {
-        max_retries: options.max_retries.unwrap_or(0),
-        max_retry_delay_ms: options.max_retry_delay_ms,
-        signal: Some(signal.clone()),
-        random: None,
-    };
-    let response = retry_provider_request(
-        || {
-            let client = Arc::clone(&http_client);
-            let request = request.clone();
-            async move {
-                let response = client
-                    .execute(request)
-                    .await
-                    .map_err(provider_error_from_http)?;
-                if !(200..300).contains(&response.status) {
-                    // The pinned SDK folds the body into its error message
-                    // and throws after exhausting retries.
-                    let body_text = read_body_text(response.body).await.unwrap_or_default();
-                    return Err(ProviderRequestError::new(
-                        Some(response.status),
-                        Some(headers_to_record(
-                            response
-                                .headers
-                                .iter()
-                                .map(|(name, value)| (name.as_str(), value.as_str())),
-                        )),
-                        sdk_error_message(response.status, &body_text),
-                    ));
-                }
-                Ok(response)
-            }
-        },
-        &retry_options,
+    let retry = retry_options(options.max_retries, options.max_retry_delay_ms, signal);
+    let response = dispatch_with_retry(
+        http_client,
+        request,
+        &retry,
+        sdk_error_message,
+        model,
+        &options.transport_options,
     )
-    .await
-    .map_err(|error| error.message)?;
-
-    if let Some(hook) = &options.transport_options.on_response {
-        hook.call(
-            crate::types::ProviderResponse {
-                status: response.status,
-                headers: headers_to_record(
-                    response
-                        .headers
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.as_str())),
-                ),
-            },
-            model.clone(),
-        )
-        .await;
-    }
+    .await?;
 
     Ok((response, is_oauth))
 }
@@ -1013,10 +933,7 @@ async fn iterate_anthropic_events(
     events: &AssistantMessageEventStream,
 ) -> Result<(), String> {
     let mut sse = SseStream::new(response.body);
-    while let Some(sse_event) = sse.next().await.map_err(|error| match error {
-        HttpError::Aborted => "Request was aborted".to_owned(),
-        other => other.to_string(),
-    })? {
+    while let Some(sse_event) = sse.next().await.map_err(sse_error_message)? {
         if sse_event.event.as_deref() == Some("error") {
             return Err(sse_event.data);
         }
@@ -1525,25 +1442,6 @@ fn sdk_error_message(status: u16, body: &str) -> String {
     }
 }
 
-async fn read_body_text(mut body: HttpByteStream) -> Result<String, HttpError> {
-    let mut text = String::new();
-    while let Some(chunk) = body.next_chunk().await? {
-        text.push_str(&String::from_utf8_lossy(&chunk));
-    }
-    Ok(text)
-}
-
-fn provider_error_from_http(error: HttpError) -> ProviderRequestError {
-    match error {
-        HttpError::Aborted => ProviderRequestError::aborted(),
-        HttpError::Timeout => ProviderRequestError::new(None, None, "request timed out"),
-        HttpError::Transport(message) => ProviderRequestError::new(None, None, message),
-        HttpError::InvalidUrl(url) => {
-            ProviderRequestError::new(None, None, format!("invalid URL: {url}"))
-        }
-    }
-}
-
 /// Map a pi thinking level to an Anthropic effort for adaptive thinking,
 /// upstream's `mapThinkingLevelToEffort`: the model's `thinkingLevelMap`
 /// entry when it names an effort, else the level itself with `xhigh` and
@@ -1640,18 +1538,6 @@ pub fn stream_simple(
     stream(model, context, Some(&base))
 }
 
-fn setup_error_stream(model: &Model, message: &str) -> AssistantMessageEventStream {
-    let events = assistant_message_event_stream();
-    let failure: std::io::Error = std::io::Error::other(message.to_owned());
-    let failing = crate::api::lazy::setup_error_message(model, &failure);
-    events.push(AssistantMessageEvent::Error {
-        reason: StopReason::Error,
-        error: failing.clone(),
-    });
-    events.end(Some(&failing));
-    events
-}
-
 fn is_oauth_token(api_key: &str) -> bool {
     api_key.contains("sk-ant-oat")
 }
@@ -1741,7 +1627,8 @@ fn build_client_headers(
 }
 
 /// The headers every request carries: the SDK's pinned `anthropic-version`,
-/// the JSON accept, and the direct-browser-access flag upstream sets.
+/// the JSON accept, the direct-browser-access flag upstream sets, and the
+/// JSON content type the pinned SDK sends on every request body.
 fn base_browser_headers() -> BTreeMap<String, Option<String>> {
     BTreeMap::from([
         (
@@ -1749,6 +1636,10 @@ fn base_browser_headers() -> BTreeMap<String, Option<String>> {
             Some("2023-06-01".to_owned()),
         ),
         ("accept".to_owned(), Some("application/json".to_owned())),
+        (
+            "content-type".to_owned(),
+            Some("application/json".to_owned()),
+        ),
         (
             "anthropic-dangerous-direct-browser-access".to_owned(),
             Some("true".to_owned()),
@@ -2474,23 +2365,4 @@ fn map_stop_reason(
 #[derive(Debug, Default)]
 pub struct AnthropicStreams;
 
-impl crate::types::ProviderStreams for AnthropicStreams {
-    fn stream(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&StreamOptions>,
-    ) -> AssistantMessageEventStream {
-        let options = options.cloned().map(AnthropicStreamOptions::from);
-        stream(model, context, options.as_ref())
-    }
-
-    fn stream_simple(
-        &self,
-        model: &Model,
-        context: &Context,
-        options: Option<&SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        stream_simple(model, context, options)
-    }
-}
+crate::api::wire_common::forward_provider_streams!(AnthropicStreams, AnthropicStreamOptions);

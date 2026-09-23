@@ -29,6 +29,45 @@ fn seed() -> AssistantMessage {
     message
 }
 
+/// The started-encoder fixture the frame suites drive, upstream's per-case
+/// setup: the seed partial, optionally reshaped by `configure`, fed through
+/// the `Start` event on a fresh encoder.
+fn started_encoder(
+    configure: impl FnOnce(&mut AssistantMessage),
+) -> (AssistantMessage, AssistantMessageFrameEncoder) {
+    let mut partial = seed();
+    configure(&mut partial);
+    let mut encoder = AssistantMessageFrameEncoder::default();
+    let _ = frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    );
+    (partial, encoder)
+}
+
+/// The started-frames fixture: the seed partial's `Start` frame collected,
+/// the run continuing to append.
+fn started_frames(
+    configure: impl FnOnce(&mut AssistantMessage),
+) -> (
+    AssistantMessage,
+    AssistantMessageFrameEncoder,
+    Vec<AssistantMessageFrame>,
+) {
+    let mut partial = seed();
+    configure(&mut partial);
+    let mut encoder = AssistantMessageFrameEncoder::default();
+    let frames = vec![frame(
+        &mut encoder,
+        AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        },
+    )];
+    (partial, encoder, frames)
+}
+
 fn frame(
     encoder: &mut AssistantMessageFrameEncoder,
     event: AssistantMessageEvent,
@@ -73,14 +112,7 @@ fn tool_call(name: &str, arguments: &serde_json::Value) -> ToolCall {
 
 #[test]
 fn uses_authoritative_text_end_content_and_signature() {
-    let mut partial = seed();
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let mut frames = vec![frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    )];
+    let (mut partial, mut encoder, mut frames) = started_frames(|_partial| {});
     partial.content.push(AssistantBlock::Text(text("Hello ")));
     frames.push(frame(
         &mut encoder,
@@ -149,14 +181,7 @@ fn preserves_provider_thinking_level_from_the_stream_start() {
 
 #[test]
 fn preserves_initial_and_final_thinking_metadata_including_redaction() {
-    let mut partial = seed();
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let mut frames = vec![frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    )];
+    let (mut partial, mut encoder, mut frames) = started_frames(|_partial| {});
     partial
         .content
         .push(AssistantBlock::Thinking(ThinkingContent {
@@ -308,14 +333,7 @@ fn reconciles_queued_text_events_against_one_advanced_live_partial_without_dupli
 
 #[test]
 fn trims_only_the_covered_prefix_when_a_start_snapshot_lands_inside_a_delta() {
-    let mut partial = seed();
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let mut frames = vec![frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    )];
+    let (mut partial, mut encoder, mut frames) = started_frames(|_partial| {});
     partial.content.push(AssistantBlock::Text(text("Hel")));
     frames.push(frame(
         &mut encoder,
@@ -425,14 +443,7 @@ fn checkpoints_queued_tool_json_without_replaying_covered_deltas() {
 
 #[test]
 fn resumes_legacy_grammar_tool_json_from_initial_arguments() {
-    let mut partial = seed();
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let mut frames = vec![frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    )];
+    let (mut partial, mut encoder, mut frames) = started_frames(|_partial| {});
     let mut tool = tool_call("bash", &json!({"input": "a"}));
     partial.content.push(AssistantBlock::ToolCall(tool.clone()));
     frames.push(frame(
@@ -494,14 +505,7 @@ fn resumes_legacy_grammar_tool_json_from_initial_arguments() {
 
 #[test]
 fn streams_tool_json_compactly_from_an_empty_argument_start() {
-    let mut partial = seed();
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let mut frames = vec![frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    )];
+    let (mut partial, mut encoder, mut frames) = started_frames(|_partial| {});
     let mut tool = tool_call("bash", &json!({}));
     partial.content.push(AssistantBlock::ToolCall(tool.clone()));
     frames.push(frame(
@@ -964,15 +968,9 @@ fn the_encoder_debugs_with_its_started_block_keys() {
     assert![debug.starts_with("AssistantMessageFrameEncoder"), "{debug}"];
     assert![debug.contains("blocks: []"), "{debug}"];
 
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::Text(text("hi")));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::Text(text("hi")));
+    });
     let _ = frame(
         &mut encoder,
         AssistantMessageEvent::TextStart {
@@ -1023,15 +1021,9 @@ fn rejects_events_after_a_terminal_event_and_a_second_start() {
 
 #[test]
 fn rejects_start_events_pointing_at_other_block_kinds_or_missing_blocks() {
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::Text(text("hi")));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::Text(text("hi")));
+    });
 
     let error = encoder
         .encode(AssistantMessageEvent::ThinkingStart {
@@ -1068,17 +1060,11 @@ fn rejects_start_events_pointing_at_other_block_kinds_or_missing_blocks() {
 #[test]
 fn rejects_end_events_pointing_at_other_block_kinds() {
     // text_end at a thinking block
-    let mut partial = seed();
-    partial
-        .content
-        .push(AssistantBlock::Thinking(thinking("h")));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial
+            .content
+            .push(AssistantBlock::Thinking(thinking("h")));
+    });
     let error = encoder
         .encode(AssistantMessageEvent::TextEnd {
             content_index: 0,
@@ -1092,15 +1078,9 @@ fn rejects_end_events_pointing_at_other_block_kinds() {
     ];
 
     // thinking_end at a text block
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::Text(text("h")));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::Text(text("h")));
+    });
     let error = encoder
         .encode(AssistantMessageEvent::ThinkingEnd {
             content_index: 0,
@@ -1114,15 +1094,9 @@ fn rejects_end_events_pointing_at_other_block_kinds() {
     ];
 
     // toolcall_end at a text block
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::Text(text("h")));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::Text(text("h")));
+    });
     let error = encoder
         .encode(AssistantMessageEvent::ToolcallEnd {
             content_index: 0,
@@ -1138,14 +1112,7 @@ fn rejects_end_events_pointing_at_other_block_kinds() {
 
 #[test]
 fn streams_thinking_deltas_and_ends_with_their_metadata() {
-    let mut partial = seed();
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let mut frames = vec![frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    )];
+    let (mut partial, mut encoder, mut frames) = started_frames(|_partial| {});
     partial.content.push(AssistantBlock::Thinking(thinking("")));
     frames.push(frame(
         &mut encoder,
@@ -1200,18 +1167,12 @@ fn streams_thinking_deltas_and_ends_with_their_metadata() {
 
 #[test]
 fn an_empty_toolcall_delta_after_the_snapshot_produces_no_frame() {
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::ToolCall(tool_call(
-        "read",
-        &serde_json::json!({}),
-    )));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::ToolCall(tool_call(
+            "read",
+            &serde_json::json!({}),
+        )));
+    });
     let _ = frame(
         &mut encoder,
         AssistantMessageEvent::ToolcallStart {
@@ -1252,18 +1213,12 @@ fn an_empty_toolcall_delta_after_the_snapshot_produces_no_frame() {
 fn legacy_tool_json_catches_up_through_array_and_scalar_prefix_checks() {
     // The snapshot carries an array; the delta extends it and the prefix
     // check walks the array elements.
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::ToolCall(tool_call(
-        "read",
-        &serde_json::json!({"list": [1]}),
-    )));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::ToolCall(tool_call(
+            "read",
+            &serde_json::json!({"list": [1]}),
+        )));
+    });
     let _ = frame(
         &mut encoder,
         AssistantMessageEvent::ToolcallStart {
@@ -1287,18 +1242,12 @@ fn legacy_tool_json_catches_up_through_array_and_scalar_prefix_checks() {
     ];
 
     // Scalar snapshot entries compare through the equality arm.
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::ToolCall(tool_call(
-        "read",
-        &serde_json::json!({"n": 1}),
-    )));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::ToolCall(tool_call(
+            "read",
+            &serde_json::json!({"n": 1}),
+        )));
+    });
     let _ = frame(
         &mut encoder,
         AssistantMessageEvent::ToolcallStart {
@@ -1324,18 +1273,12 @@ fn legacy_tool_json_catches_up_through_array_and_scalar_prefix_checks() {
 
 #[test]
 fn rejects_deltas_before_their_block_started_or_of_the_wrong_kind() {
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::Text(text("hi")));
-    partial
-        .content
-        .push(AssistantBlock::Thinking(thinking("ho")));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::Text(text("hi")));
+        partial
+            .content
+            .push(AssistantBlock::Thinking(thinking("ho")));
+    });
 
     let error = encoder
         .encode(AssistantMessageEvent::TextDelta {
@@ -1469,18 +1412,12 @@ fn a_checkpoint_frame_replays_the_parsed_arguments() {
 
 #[test]
 fn rejects_start_events_pointing_at_toolcall_blocks() {
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::ToolCall(tool_call(
-        "read",
-        &serde_json::json!({}),
-    )));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::ToolCall(tool_call(
+            "read",
+            &serde_json::json!({}),
+        )));
+    });
 
     let error = encoder
         .encode(AssistantMessageEvent::TextStart {
@@ -1507,18 +1444,12 @@ fn rejects_start_events_pointing_at_toolcall_blocks() {
 
 #[test]
 fn rejects_a_text_end_pointing_at_a_toolcall_block() {
-    let mut partial = seed();
-    partial.content.push(AssistantBlock::ToolCall(tool_call(
-        "read",
-        &serde_json::json!({}),
-    )));
-    let mut encoder = AssistantMessageFrameEncoder::default();
-    let _ = frame(
-        &mut encoder,
-        AssistantMessageEvent::Start {
-            partial: partial.clone(),
-        },
-    );
+    let (partial, mut encoder) = started_encoder(|partial| {
+        partial.content.push(AssistantBlock::ToolCall(tool_call(
+            "read",
+            &serde_json::json!({}),
+        )));
+    });
     let error = encoder
         .encode(AssistantMessageEvent::TextEnd {
             content_index: 0,

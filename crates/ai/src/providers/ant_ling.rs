@@ -2,28 +2,15 @@
 //! `packages/ai/src/providers/ant-ling.ts` at commit
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 
-use std::sync::Arc;
+use crate::providers::factory::env_key_provider;
 
-use crate::auth::helpers::env_api_key_auth;
-use crate::auth::types::ProviderAuth;
-use crate::models::{CreateProviderOptions, Provider, ProviderApi, create_provider};
-use crate::providers::catalog::get_builtin_models;
-
-/// The `Ant Ling` provider, upstream's `antLingProvider()`.
-#[must_use]
-pub fn ant_ling_provider() -> Arc<dyn Provider> {
-    Arc::new(create_provider(CreateProviderOptions {
-        id: "ant-ling".to_owned(),
-        name: Some("Ant Ling".to_owned()),
-        base_url: Some("https://api.ant-ling.com/v1".to_owned()),
-        auth: ProviderAuth {
-            api_key: Some(env_api_key_auth("Ant Ling API key", &["ANT_LING_API_KEY"])),
-            oauth: None,
-        },
-        models: get_builtin_models("ant-ling"),
-        api: ProviderApi::Single(crate::api::openai_completions()),
-        headers: None,
-        fetch_models: None,
-        filter_models: None,
-    }))
-}
+env_key_provider!(
+    /// The `Ant Ling` provider, upstream's `antLingProvider()`.
+    ant_ling_provider,
+    "ant-ling",
+    "Ant Ling",
+    Some("https://api.ant-ling.com/v1"),
+    "Ant Ling API key",
+    ["ANT_LING_API_KEY"],
+    crate::models::ProviderApi::Single(crate::api::openai_completions()),
+);

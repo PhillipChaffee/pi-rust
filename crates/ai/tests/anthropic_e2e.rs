@@ -13,9 +13,7 @@
 )]
 
 use pi_ai::env_api_keys::{ANTHROPIC_API_KEY_ENV, get_env_api_key};
-use pi_ai::models::{
-    CreateModelsOptions, ModelsSimpleStreamOptions, ModelsStreamOptions, WithTransforms,
-};
+use pi_ai::models::{ModelsSimpleStreamOptions, ModelsStreamOptions, WithTransforms};
 use pi_ai::types::{
     AssistantBlock, AssistantMessageEvent, CacheRetention, Context, Message, Model, ModelCompat,
     SimpleStreamOptions, StreamOptions, Tool, UserContent, UserMessage,
@@ -27,11 +25,7 @@ use common::builtin_model;
 /// The Models runtime the live probes stream through, upstream's
 /// `createModels` over the builtin provider registry.
 fn models() -> pi_ai::models::Models {
-    let models = pi_ai::models::create_models(Some(CreateModelsOptions::default()));
-    for provider in pi_ai::providers::all::builtin_providers() {
-        models.set_provider(provider);
-    }
-    models
+    common::models_runtime()
 }
 
 fn user_message(text: &str) -> Message {

@@ -2,14 +2,17 @@
 //! files whose subject is the generated catalog data (commit
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`).
 //!
-//! The suites whose remaining tests stream through a wire API (baseten,
-//! together, fireworks payloads, qwen sampling) land with their wire-API
-//! tickets; the data-shape assertions port here. Files covered:
-//! `model-catalog-types.test.ts`, `zai-coding-plan-models.test.ts`,
+//! The streaming halves of those files land with their wire-API suites: the
+//! baseten and qwen payload captures with
+//! `tests/openai_completions_conformance.rs`, the fireworks Messages payloads
+//! and deferred tools with `tests/anthropic_conformance.rs`. Files covered
+//! here: `model-catalog-types.test.ts`, `zai-coding-plan-models.test.ts`,
 //! `xiaomi-models.test.ts`, `together-models.test.ts` (data parts),
 //! `bedrock-models.test.ts`, `openrouter-cache-control-models.test.ts`,
-//! `anthropic-adaptive-thinking-models.test.ts`, and the qwen allowlist
-//! checks of `qwen-token-plan-models.test.ts`.
+//! `anthropic-adaptive-thinking-models.test.ts`, the qwen allowlist checks of
+//! `qwen-token-plan-models.test.ts`, the data parts of
+//! `baseten-models.test.ts`, and the data parts of
+//! `fireworks-models.test.ts`.
 
 #![expect(
     clippy::expect_used,
@@ -254,6 +257,306 @@ fn resolves_together_api_key_from_the_environment() {
     assert_eq!(
         get_env_api_key("together", Some(&env)),
         Some("test-together-key".to_owned())
+    );
+}
+
+// --- upstream baseten-models.test.ts (data parts) ---
+
+/// The GLM 5.2 endpoints stay text-only, upstream's input assertion.
+#[test]
+fn keeps_both_baseten_glm_5_2_endpoints_text_only() {
+    for id in ["zai-org/GLM-5.2", "zai-org/GLM-5.2-Fast"] {
+        let model = get_model("baseten", id).expect("GLM endpoint present");
+        assert_eq!(model.input, vec![pi_ai::types::Modality::Text], "{id}");
+    }
+}
+
+/// Kimi K2.6 reasons through the explicit off/high toggle: the level map
+/// maps `off` to the native spelling and nulls the unsupported levels, the
+/// compat gates `reasoning_effort` off, and the chat-template args substitute
+/// pi's thinking-enabled state.
+#[test]
+fn models_baseten_kimi_k2_6_reasoning_as_an_explicit_off_on_toggle() {
+    let model = get_model("baseten", "moonshotai/Kimi-K2.6").expect("Kimi K2.6 present");
+    let map = model.thinking_level_map.clone().expect("the level map");
+    for (level, mapped) in [
+        (pi_ai::types::ModelThinkingLevel::Off, Some("off")),
+        (pi_ai::types::ModelThinkingLevel::Minimal, None),
+        (pi_ai::types::ModelThinkingLevel::Low, None),
+        (pi_ai::types::ModelThinkingLevel::Medium, None),
+        (pi_ai::types::ModelThinkingLevel::High, Some("high")),
+        (pi_ai::types::ModelThinkingLevel::Xhigh, None),
+        (pi_ai::types::ModelThinkingLevel::Max, None),
+    ] {
+        assert_eq!(
+            map.get(&level).cloned().unwrap_or_default(),
+            mapped_entry(mapped),
+            "{level:?}"
+        );
+    }
+    let compat = model.compat.as_ref().expect("Kimi K2.6 carries compat");
+    assert_eq!(compat.supports_reasoning_effort, Some(false));
+    assert_eq!(
+        compat.thinking_format,
+        Some(pi_ai::types::ThinkingFormat::Baseten)
+    );
+    let args = compat
+        .chat_template_args
+        .as_ref()
+        .expect("the template args");
+    assert_eq!(
+        args.get("enable_thinking"),
+        Some(&pi_ai::types::ChatTemplateKwargValue::Template(
+            pi_ai::types::ChatTemplateVar {
+                var: pi_ai::types::ThinkingTemplateVar::ThinkingEnabled,
+                omit_when_off: None,
+            }
+        ))
+    );
+    assert_eq!(
+        get_supported_thinking_levels(&model),
+        vec![
+            pi_ai::types::ModelThinkingLevel::Off,
+            pi_ai::types::ModelThinkingLevel::High
+        ]
+    );
+}
+
+/// The wire entry a level-map cell pins: the mapped spelling, else the null
+/// unsupported-level marker.
+fn mapped_entry(mapped: Option<&str>) -> Option<String> {
+    mapped.map(str::to_owned)
+}
+
+/// The env-key table resolves `BASETEN_API_KEY` alone, upstream's env probe.
+#[test]
+fn resolves_baseten_api_key_from_the_environment() {
+    let env: pi_ai::types::ProviderEnv =
+        BTreeMap::from([("BASETEN_API_KEY".to_owned(), "test-baseten-key".to_owned())]);
+    assert_eq!(
+        find_env_keys("baseten", Some(&env)).map(|keys| keys.join(",")),
+        Some("BASETEN_API_KEY".to_owned())
+    );
+    assert_eq!(
+        get_env_api_key("baseten", Some(&env)),
+        Some("test-baseten-key".to_owned())
+    );
+}
+
+// --- upstream fireworks-models.test.ts (data parts) ---
+
+/// Native tool references ride only the Messages models of the Fireworks
+/// catalog: the Messages entries carry the compat flag, every other API's
+/// entries omit it.
+#[test]
+fn fireworks_enables_native_tool_references_only_on_messages_models() {
+    for model in get_models("fireworks") {
+        let compat = model.compat.as_ref().expect("fireworks compat");
+        if model.api.as_known() == Some(pi_ai::types::KnownApi::AnthropicMessages) {
+            assert_eq!(compat.supports_tool_references, Some(true), "{}", model.id);
+        } else {
+            assert_eq!(compat.supports_tool_references, None, "{}", model.id);
+        }
+    }
+}
+
+/// The default Kimi K2.6 entry rides the Anthropic-compatible Messages API
+/// with the catalog's cost and context fields, upstream's registration probe.
+#[test]
+fn fireworks_registers_the_default_kimi_k2p6_via_the_messages_api() {
+    let model =
+        get_model("fireworks", "accounts/fireworks/models/kimi-k2p6").expect("kimi-k2p6 present");
+    assert_eq!(
+        model.api.as_known(),
+        Some(pi_ai::types::KnownApi::AnthropicMessages)
+    );
+    assert_eq!(model.provider, pi_ai::types::ProviderId::from("fireworks"));
+    assert_eq!(model.base_url, "https://api.fireworks.ai/inference");
+    assert!(model.reasoning);
+    assert_eq!(
+        model.input,
+        vec![pi_ai::types::Modality::Text, pi_ai::types::Modality::Image]
+    );
+    assert_eq!(model.context_window, 262_000);
+    assert_eq!(model.max_tokens, 262_000);
+    assert_eq!(
+        model.cost.rates,
+        pi_ai::types::ModelCostRates {
+            input: 0.95,
+            output: 4.0,
+            cache_read: 0.16,
+            cache_write: 0.0,
+        }
+    );
+}
+
+/// The GLM 5.2 Fast router aligns with GLM 5.2's OpenAI-compatible config.
+#[test]
+fn fireworks_aligns_glm_5_2_fast_with_glm_5_2() {
+    let base =
+        get_model("fireworks", "accounts/fireworks/models/glm-5p2").expect("glm-5p2 present");
+    let fast = get_model("fireworks", "accounts/fireworks/routers/glm-5p2-fast")
+        .expect("glm-5p2-fast present");
+    assert_eq!(fast.api, base.api);
+    assert_eq!(fast.base_url, base.base_url);
+    assert_eq!(fast.compat, base.compat);
+    assert_eq!(fast.thinking_level_map, base.thinking_level_map);
+}
+
+/// Kimi K3 routes through the OpenAI-compatible API with the native effort
+/// controls the catalog pins, base router and fast router alike.
+#[test]
+fn fireworks_routes_kimi_k3_through_the_openai_compatible_api() {
+    let base =
+        get_model("fireworks", "accounts/fireworks/models/kimi-k3").expect("kimi-k3 present");
+    let fast = get_model("fireworks", "accounts/fireworks/routers/kimi-k3-fast")
+        .expect("kimi-k3-fast present");
+    assert_eq!(
+        base.api.as_known(),
+        Some(pi_ai::types::KnownApi::OpenaiCompletions)
+    );
+    assert_eq!(base.base_url, "https://api.fireworks.ai/inference/v1");
+    assert_eq!(base.thinking_level_map, fast.thinking_level_map);
+    let map = base.thinking_level_map.clone().expect("the kimi-k3 map");
+    assert_eq!(map.get(&pi_ai::types::ModelThinkingLevel::Off), Some(&None));
+    assert_eq!(
+        map.get(&pi_ai::types::ModelThinkingLevel::Low)
+            .cloned()
+            .unwrap_or_default(),
+        Some("low".to_owned())
+    );
+    assert_eq!(
+        map.get(&pi_ai::types::ModelThinkingLevel::Medium),
+        Some(&None)
+    );
+    assert_eq!(
+        map.get(&pi_ai::types::ModelThinkingLevel::High)
+            .cloned()
+            .unwrap_or_default(),
+        Some("high".to_owned())
+    );
+    assert_eq!(
+        map.get(&pi_ai::types::ModelThinkingLevel::Xhigh),
+        Some(&None)
+    );
+    assert_eq!(
+        map.get(&pi_ai::types::ModelThinkingLevel::Max)
+            .cloned()
+            .unwrap_or_default(),
+        Some("max".to_owned())
+    );
+    let compat = base.compat.as_ref().expect("the kimi-k3 compat");
+    assert_eq!(compat.supports_store, Some(false));
+    assert_eq!(compat.supports_developer_role, Some(false));
+    assert_eq!(
+        compat.requires_reasoning_content_on_assistant_messages,
+        Some(true)
+    );
+    assert_eq!(
+        compat.thinking_format,
+        Some(pi_ai::types::ThinkingFormat::Openai)
+    );
+    assert_eq!(
+        compat.deferred_tools_mode,
+        Some(pi_ai::types::DeferredToolsMode::Kimi)
+    );
+    assert_eq!(compat.send_session_affinity_headers, Some(true));
+    assert_eq!(compat.supports_long_cache_retention, Some(false));
+    assert_eq!(fast.base_url, base.base_url);
+}
+
+/// The accepted aliases are not distinct native effort levels: GLM 5.2
+/// exposes off/high/max, Kimi K3 low/high/max, base router and fast alike.
+#[test]
+fn fireworks_exposes_distinct_native_effort_levels() {
+    assert_eq!(
+        get_supported_thinking_levels(
+            &get_model("fireworks", "accounts/fireworks/models/glm-5p2").expect("glm-5p2 present")
+        ),
+        vec![
+            pi_ai::types::ModelThinkingLevel::Off,
+            pi_ai::types::ModelThinkingLevel::High,
+            pi_ai::types::ModelThinkingLevel::Max,
+        ]
+    );
+    assert_eq!(
+        get_supported_thinking_levels(
+            &get_model("fireworks", "accounts/fireworks/routers/glm-5p2-fast")
+                .expect("glm-5p2-fast present")
+        ),
+        vec![
+            pi_ai::types::ModelThinkingLevel::Off,
+            pi_ai::types::ModelThinkingLevel::High,
+            pi_ai::types::ModelThinkingLevel::Max,
+        ]
+    );
+    assert_eq!(
+        get_supported_thinking_levels(
+            &get_model("fireworks", "accounts/fireworks/models/kimi-k3").expect("kimi-k3 present")
+        ),
+        vec![
+            pi_ai::types::ModelThinkingLevel::Low,
+            pi_ai::types::ModelThinkingLevel::High,
+            pi_ai::types::ModelThinkingLevel::Max,
+        ]
+    );
+    assert_eq!(
+        get_supported_thinking_levels(
+            &get_model("fireworks", "accounts/fireworks/routers/kimi-k3-fast")
+                .expect("kimi-k3-fast present")
+        ),
+        vec![
+            pi_ai::types::ModelThinkingLevel::Low,
+            pi_ai::types::ModelThinkingLevel::High,
+            pi_ai::types::ModelThinkingLevel::Max,
+        ]
+    );
+}
+
+/// The toggle-only Kimi K2.6 keeps budget-based thinking: no adaptive flag,
+/// and the Messages payload sends the budget instead of native effort.
+#[test]
+fn fireworks_keeps_toggle_only_messages_models_on_budget_based_thinking() {
+    let model =
+        get_model("fireworks", "accounts/fireworks/models/kimi-k2p6").expect("kimi-k2p6 present");
+    assert_eq!(
+        model
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.force_adaptive_thinking),
+        None
+    );
+}
+
+/// The Fireworks compat carries the session-affinity and tool-field
+/// restrictions, upstream's compat probe.
+#[test]
+fn fireworks_sets_the_session_affinity_and_tool_compat() {
+    let model =
+        get_model("fireworks", "accounts/fireworks/models/kimi-k2p6").expect("kimi-k2p6 present");
+    let compat = model.compat.as_ref().expect("the compat");
+    assert_eq!(compat.send_session_affinity_headers, Some(true));
+    assert_eq!(compat.supports_eager_tool_input_streaming, Some(false));
+    assert_eq!(compat.supports_cache_control_on_tools, Some(false));
+    assert_eq!(compat.supports_long_cache_retention, Some(false));
+    assert_eq!(compat.allow_empty_signature, Some(true));
+    assert_eq!(compat.supports_tool_references, Some(true));
+}
+
+/// The env-key table resolves `FIREWORKS_API_KEY` alone, upstream's env probe.
+#[test]
+fn resolves_fireworks_api_key_from_the_environment() {
+    let env: pi_ai::types::ProviderEnv = BTreeMap::from([(
+        "FIREWORKS_API_KEY".to_owned(),
+        "test-fireworks-key".to_owned(),
+    )]);
+    assert_eq!(
+        find_env_keys("fireworks", Some(&env)).map(|keys| keys.join(",")),
+        Some("FIREWORKS_API_KEY".to_owned())
+    );
+    assert_eq!(
+        get_env_api_key("fireworks", Some(&env)),
+        Some("test-fireworks-key".to_owned())
     );
 }
 

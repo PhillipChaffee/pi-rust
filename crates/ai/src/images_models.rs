@@ -607,8 +607,9 @@ fn unwrap_models_failure(failure: ModelsFailure) -> ModelsError {
     }
 }
 
-/// Build the failing [`AssistantImages`] result, upstream's catch return.
-fn error_images(model: &ImagesModel, message: &str) -> AssistantImages {
+/// Build the failing [`AssistantImages`] result, upstream's catch return
+/// and the lazy-load error shape the builtin registration reuses.
+pub(crate) fn error_images(model: &ImagesModel, message: &str) -> AssistantImages {
     AssistantImages {
         api: model.api.clone(),
         provider: model.provider.clone(),
