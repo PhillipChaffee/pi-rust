@@ -25,6 +25,7 @@ pub mod cancellable_loader;
 pub mod editor;
 pub mod editor_component;
 pub mod h_stack;
+pub mod image;
 pub mod input;
 pub mod loader;
 pub mod markdown;

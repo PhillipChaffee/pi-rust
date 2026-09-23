@@ -1,34 +1,39 @@
-//! The cell-dimension store and the image-line probe of
-//! `packages/tui/src/terminal-image.ts` in earendil-works/pi at commit
-//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
+//! The port of `packages/tui/src/terminal-image.ts` in earendil-works/pi at
+//! commit `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`
+//! ([#51](https://github.com/PhillipChaffee/pi-rust/issues/51)).
 //!
-//! The pieces land as their consumers need them: the process-global
+//! The pieces landed as their consumers needed them: the process-global
 //! cell-dimension store the `CSI 6 ; h ; w t` response feeds,
 //! [`is_image_line`], the Kitty placement metadata registry with its crop
-//! helper the compositor consults, and — with the alternate-screen renderer
-//! ([#46](https://github.com/PhillipChaffee/pi-rust/issues/46)) — the
-//! capability cache ([`get_capabilities`]/[`set_capabilities`]), the Kitty
-//! placement extraction ([`get_kitty_image_placement`]) the placement
-//! cache drives, and the batch deletion sequences. The rest of the file —
-//! the environment capability detection and probes, `renderImage`, the
-//! image-size parsers, and the `Image` component — is the image ticket's
-//! scope ([#51](https://github.com/PhillipChaffee/pi-rust/issues/51)) and
-//! lands there.
+//! helper the compositor consults, the capability cache
+//! ([`get_capabilities`]/[`set_capabilities`]), the Kitty placement
+//! extraction ([`get_kitty_image_placement`]) the placement cache drives,
+//! and the batch deletion sequences. This module now also carries the
+//! environment capability detection ([`detect_capabilities`]) with its tmux
+//! probe and the `PI_*` env overrides, the programmatic capability
+//! overrides ([`set_capability_overrides`]), the image-id allocator, the
+//! Iterm2 encoder, the cell-size math, the PNG/JPEG/GIF/WebP size parsers,
+//! [`render_image`], and [`image_fallback`]; the `Image` component over
+//! them is [`crate::components::image::Image`].
 //!
-//! Restatement: upstream stores cell dimensions and Kitty image metadata
-//! in module globals read across TUI instances; the workspace forbids the
-//! `unsafe` a naked `static mut` would need, so the stores sit behind
-//! mutexes with the same process-wide visibility and the upstream
-//! defaults. `getCapabilities` upstream runs the environment detection on
-//! an empty cache; the detection is #51's scope, so the empty-cache answer
-//! here is the neutral default (`images: null`, no true color, no
-//! hyperlinks) — every consumer in this slice reads the cache the tests
-//! seed.
+//! Restatements: upstream stores cell dimensions, Kitty image metadata, and
+//! the capability cache in module globals read across TUI instances; the
+//! workspace forbids the `unsafe` a naked `static mut` would need, so the
+//! stores sit behind mutexes with the same process-wide visibility and the
+//! upstream defaults. Upstream's injectable `tmuxForwardsHyperlink` probe
+//! parameter stays a closure; the default probe spawns tmux through
+//! `std::process::Command` (`execSync` upstream). The env reads upstream
+//! resolves through `process.env` ride the [`crate::terminal::EnvLookup`]
+//! seam — Rust cannot mutate the process environment without the `unsafe`
+//! this workspace forbids, so suites inject map-backed lookups.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::io::Read;
 use std::sync::Mutex;
 use std::sync::PoisonError;
+
+use base64::Engine;
 
 const KITTY_PREFIX: &str = "\x1b_G";
 const ITERM2_PREFIX: &str = "\x1b]1337;File=";
@@ -333,15 +338,66 @@ pub struct TerminalCapabilities {
     pub hyperlinks: bool,
 }
 
-struct CapabilityCache {
-    cached: Option<TerminalCapabilities>,
+/// The programmatic capability overrides, upstream `setCapabilityOverrides`'s
+/// `Partial<TerminalCapabilities>` argument.
+///
+/// A field left `None` keeps the detected value, `Some(None)` carries
+/// upstream `null` (the capability off), and `Some(Some(..))` forces a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CapabilityOverrides {
+    /// Upstream `images` (`undefined` when unset).
+    pub images: Option<Option<ImageProtocol>>,
+    /// Upstream `trueColor` (`undefined` when unset).
+    pub true_color: Option<bool>,
+    /// Upstream `hyperlinks` (`undefined` when unset).
+    pub hyperlinks: Option<bool>,
+}
+
+static CAPABILITY_OVERRIDES: Mutex<CapabilityOverrides> = Mutex::new(CapabilityOverrides {
+    images: None,
+    true_color: None,
+    hyperlinks: None,
+});
+
+fn lock_capability_overrides() -> std::sync::MutexGuard<'static, CapabilityOverrides> {
+    CAPABILITY_OVERRIDES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Override the selected auto-detected capabilities, upstream
+/// `setCapabilityOverrides`: the set replaces the previous one wholesale, and
+/// an unchanged set keeps the cached capabilities valid.
+///
+/// # Panics
+///
+/// Never: a poisoned lock falls back to writing through it.
+pub fn set_capability_overrides(overrides: CapabilityOverrides) {
+    let mut current = lock_capability_overrides();
+    if *current == overrides {
+        return;
+    }
+    *current = overrides;
+    drop(current);
+    reset_capabilities_cache();
+}
+
+fn apply_capability_overrides(
+    detected: TerminalCapabilities,
+    overrides: CapabilityOverrides,
+) -> TerminalCapabilities {
+    TerminalCapabilities {
+        images: overrides.images.unwrap_or(detected.images),
+        true_color: overrides.true_color.unwrap_or(detected.true_color),
+        hyperlinks: overrides.hyperlinks.unwrap_or(detected.hyperlinks),
+    }
 }
 
 /// The cached terminal capabilities, upstream `getCapabilities`.
 ///
-/// Upstream runs the environment detection on an empty cache; the detection
-/// is the image ticket's scope (#51), so an empty cache answers the neutral
-/// default here.
+/// An empty cache runs the environment detection (with the real tmux probe
+/// unless a programmatic `hyperlinks` override replaces it) and applies the
+/// programmatic overrides.
 ///
 /// # Panics
 ///
@@ -349,7 +405,21 @@ struct CapabilityCache {
 /// module-global semantics upstream reads.
 #[must_use]
 pub fn get_capabilities() -> TerminalCapabilities {
-    lock_capabilities().cached.unwrap_or_default()
+    let mut cache = lock_capabilities();
+    if let Some(cached) = cache.cached {
+        return cached;
+    }
+    let overrides = *lock_capability_overrides();
+    let env = crate::terminal::default_env_lookup();
+    let tmux_forwards_hyperlink = || overrides.hyperlinks.unwrap_or_else(probe_tmux_hyperlinks);
+    let detected = detect_capabilities(env.as_ref(), &tmux_forwards_hyperlink);
+    let caps = apply_capability_overrides(detected, overrides);
+    cache.cached = Some(caps);
+    caps
+}
+
+struct CapabilityCache {
+    cached: Option<TerminalCapabilities>,
 }
 
 fn lock_capabilities() -> std::sync::MutexGuard<'static, CapabilityCache> {
@@ -484,4 +554,712 @@ pub fn get_kitty_image_placement(line: &str) -> Option<KittyImagePlacement> {
         ),
         sequence,
     })
+}
+
+/// How long the tmux probe waits for `tmux display-message` before giving up
+/// and answering `false`, upstream `execSync`'s `timeout: 250`.
+const TMUX_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Checks whether the attached tmux client forwards OSC 8 hyperlinks to the
+/// outer terminal, upstream `probeTmuxHyperlinks`.
+///
+/// tmux only re-emits them when its `client_termfeatures` lists
+/// `hyperlinks`, and strips them otherwise. Any failure — no tmux binary, no
+/// attached client, or the 250 ms deadline — falls back to `false`. The
+/// no-argument form runs the real `tmux display-message` command; the
+/// `_with` variant is the injection seam suites drive with a stand-in
+/// command.
+#[must_use]
+pub fn probe_tmux_hyperlinks() -> bool {
+    let mut command = std::process::Command::new("tmux");
+    command.args(["display-message", "-p", "#{client_termfeatures}"]);
+    probe_tmux_hyperlinks_with(&mut command)
+}
+
+/// [`probe_tmux_hyperlinks`] over a caller-built command.
+#[must_use]
+pub fn probe_tmux_hyperlinks_with(command: &mut std::process::Command) -> bool {
+    let Ok(child) = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(termfeatures) = wait_for_probe_output(child, TMUX_PROBE_TIMEOUT) else {
+        return false;
+    };
+    termfeatures
+        .split(',')
+        .map(str::trim)
+        .any(|feature| feature.contains("hyperlinks"))
+}
+
+/// Waits for the probe child within the deadline, upstream `execSync`'s
+/// 250 ms timeout: a non-zero exit, a read failure, or a timeout answers
+/// `None` (upstream throws into its `catch`).
+fn wait_for_probe_output(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let mut stdout = child.stdout.take()?;
+                let mut output = String::new();
+                stdout.read_to_string(&mut output).ok()?;
+                return Some(output);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    child.kill().ok()?;
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// The capability matrix the terminal environment answers, upstream
+/// `detectCapabilitiesFromEnvironment`: multiplexers come first (tmux strips
+/// OSC 8 unless its client forwards, and makes image protocols unreliable),
+/// then the per-terminal table, then the conservative default that keeps
+/// hyperlinks off so the URL never renders as swallowed escape text.
+fn detect_capabilities_from_environment(
+    env: &dyn Fn(&str) -> Option<String>,
+    tmux_forwards_hyperlink: &dyn Fn() -> bool,
+) -> TerminalCapabilities {
+    let term_program = env("TERM_PROGRAM")
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+    let terminal_emulator = env("TERMINAL_EMULATOR")
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+    let term = env("TERM")
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+    let color_term = env("COLORTERM")
+        .map(|value| value.to_lowercase())
+        .unwrap_or_default();
+    let has_true_color_hint = color_term == "truecolor" || color_term == "24bit";
+
+    if env("TMUX").is_some_and(|value| !value.is_empty()) || term.starts_with("tmux") {
+        return TerminalCapabilities {
+            images: None,
+            true_color: has_true_color_hint,
+            hyperlinks: tmux_forwards_hyperlink(),
+        };
+    }
+
+    if term.starts_with("screen") {
+        return TerminalCapabilities {
+            images: None,
+            true_color: has_true_color_hint,
+            hyperlinks: false,
+        };
+    }
+
+    let images_true_color_hyperlinks = |images: Option<ImageProtocol>| TerminalCapabilities {
+        images,
+        true_color: true,
+        hyperlinks: true,
+    };
+
+    if env("KITTY_WINDOW_ID").is_some_and(|value| !value.is_empty()) || term_program == "kitty" {
+        return images_true_color_hyperlinks(Some(ImageProtocol::Kitty));
+    }
+
+    if term_program == "ghostty"
+        || term.contains("ghostty")
+        || env("GHOSTTY_RESOURCES_DIR").is_some()
+    {
+        return images_true_color_hyperlinks(Some(ImageProtocol::Kitty));
+    }
+
+    if env("WEZTERM_PANE").is_some_and(|value| !value.is_empty()) || term_program == "wezterm" {
+        return images_true_color_hyperlinks(Some(ImageProtocol::Kitty));
+    }
+
+    if term_program == "warpterminal"
+        || env("WARP_SESSION_ID").is_some_and(|value| !value.is_empty())
+        || env("WARP_TERMINAL_SESSION_UUID").is_some_and(|value| !value.is_empty())
+    {
+        return images_true_color_hyperlinks(Some(ImageProtocol::Kitty));
+    }
+
+    if env("ITERM_SESSION_ID").is_some_and(|value| !value.is_empty()) || term_program == "iterm.app"
+    {
+        return images_true_color_hyperlinks(Some(ImageProtocol::Iterm2));
+    }
+
+    if env("WT_SESSION").is_some_and(|value| !value.is_empty()) {
+        return images_true_color_hyperlinks(None);
+    }
+
+    if term_program == "alacritty" || term_program == "vscode" || term_program == "zed" {
+        return images_true_color_hyperlinks(None);
+    }
+
+    if terminal_emulator == "jetbrains-jediterm" {
+        return TerminalCapabilities {
+            images: None,
+            true_color: true,
+            hyperlinks: false,
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows Terminal does not always set WT_SESSION, for example when
+        // it hosts a cmd.exe launched directly from Win+R. Modern Windows
+        // consoles support truecolor; keep hyperlinks off unless a positive
+        // detection above already matched.
+        return images_true_color_hyperlinks(None);
+    }
+
+    TerminalCapabilities {
+        images: None,
+        true_color: has_true_color_hint,
+        hyperlinks: false,
+    }
+}
+
+fn parse_boolean_capability_override(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// The capability matrix for the given environment, upstream
+/// `detectCapabilities`.
+///
+/// The environment detection first, then the `PI_*` env overrides
+/// (`PI_HYPERLINKS`, `PI_IMAGE_PROTOCOL`, `PI_TRUE_COLOR` — `1`/`0` force,
+/// anything else including `auto` keeps the detected value), with a forced
+/// `PI_HYPERLINKS` also standing in for the tmux probe.
+///
+/// The process-environment default rides [`crate::terminal::EnvLookup`];
+/// suites inject a map-backed lookup because Rust cannot mutate the process
+/// environment without the `unsafe` this workspace forbids.
+#[must_use]
+pub fn detect_capabilities(
+    env: &dyn Fn(&str) -> Option<String>,
+    tmux_forwards_hyperlink: &dyn Fn() -> bool,
+) -> TerminalCapabilities {
+    let hyperlinks = parse_boolean_capability_override(env("PI_HYPERLINKS").as_deref());
+    let probe = || hyperlinks.unwrap_or_else(tmux_forwards_hyperlink);
+    let detected = detect_capabilities_from_environment(env, &probe);
+    let image_protocol = env("PI_IMAGE_PROTOCOL").map(|value| value.to_lowercase());
+    let images = match image_protocol.as_deref() {
+        Some("kitty") => Some(Some(ImageProtocol::Kitty)),
+        Some("iterm2") => Some(Some(ImageProtocol::Iterm2)),
+        Some("none" | "0") => Some(None),
+        _ => None,
+    };
+    let true_color = parse_boolean_capability_override(env("PI_TRUE_COLOR").as_deref());
+    TerminalCapabilities {
+        images: images.unwrap_or(detected.images),
+        true_color: true_color.unwrap_or(detected.true_color),
+        hyperlinks: hyperlinks.unwrap_or(detected.hyperlinks),
+    }
+}
+
+/// Generate an image id for Kitty graphics placements, upstream
+/// `allocateImageId`: random ids in `[1, 0xffff_fffe]` avoid collisions
+/// between module instances (main app vs extensions).
+///
+/// Upstream draws from `Math.random()`; the port drives a process-global
+/// xorshift64* state seeded from the clock and the pid, which no test pins.
+#[must_use]
+pub fn allocate_image_id() -> u64 {
+    const ID_SPAN: u64 = 0xffff_fffe;
+    static STATE: std::sync::LazyLock<Mutex<u64>> = std::sync::LazyLock::new(|| Mutex::new(0));
+    let mut state = STATE.lock().unwrap_or_else(PoisonError::into_inner);
+    if *state == 0 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            });
+        *state = nanos ^ (u64::from(std::process::id()) << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    }
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    drop(state);
+    (x % ID_SPAN) + 1
+}
+
+/// Options for [`encode_iterm2`], upstream `encodeITerm2`'s options object.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EncodeITerm2Options {
+    /// Upstream `width` — a cell count or `"auto"`.
+    pub width: Option<ITerm2Size>,
+    /// Upstream `height` — a cell count or `"auto"`.
+    pub height: Option<ITerm2Size>,
+    /// Upstream `name`, base64-encoded into the command.
+    pub name: Option<String>,
+    /// Upstream `preserveAspectRatio`: only `Some(false)` emits the
+    /// `preserveAspectRatio=0` flag, upstream `=== false`.
+    pub preserve_aspect_ratio: Option<bool>,
+    /// Upstream `inline`: `Some(false)` emits `inline=0`, everything else
+    /// (including unset) `inline=1`, upstream `inline !== false`.
+    pub inline: Option<bool>,
+}
+
+/// An Iterm2 width or height value, upstream `number | string` where the
+/// string spelling is `"auto"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ITerm2Size {
+    /// Upstream `"auto"`.
+    Auto,
+    /// Upstream a numeric cell count.
+    Cells(usize),
+}
+
+/// Encode an Iterm2 (OSC 1337) inline-image transmission, upstream
+/// `encodeITerm2`; `size` carries the decoded payload byte length.
+#[must_use]
+pub fn encode_iterm2(base64_data: &str, options: EncodeITerm2Options) -> String {
+    let mut params: Vec<String> = vec![
+        format!("inline={}", u8::from(options.inline != Some(false))),
+        format!("size={}", iterm2_decoded_size(base64_data)),
+    ];
+
+    if let Some(width) = options.width {
+        params.push(format!("width={}", iterm2_size_param(width)));
+    }
+    if let Some(height) = options.height {
+        params.push(format!("height={}", iterm2_size_param(height)));
+    }
+    if let Some(name) = options.name {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let name_base64 = engine.encode(name.as_bytes());
+        params.push(format!("name={name_base64}"));
+    }
+    if options.preserve_aspect_ratio == Some(false) {
+        params.push("preserveAspectRatio=0".to_string());
+    }
+
+    format!("\x1b]1337;File={}:{base64_data}\x07", params.join(";"))
+}
+
+fn iterm2_size_param(size: ITerm2Size) -> String {
+    match size {
+        ITerm2Size::Auto => "auto".to_string(),
+        ITerm2Size::Cells(cells) => cells.to_string(),
+    }
+}
+
+/// The decoded byte length of a base64 payload, upstream
+/// `Buffer.byteLength(base64Data, "base64")`: `len * 3 / 4` minus the
+/// trailing `=` padding.
+fn iterm2_decoded_size(base64_data: &str) -> usize {
+    let len = base64_data.chars().count();
+    let padding = base64_data
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'=')
+        .count();
+    (len * 3 / 4).saturating_sub(padding)
+}
+
+/// The cell footprint of a rendered image, upstream `ImageCellSize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageCellSize {
+    /// Placement width in columns.
+    pub columns: usize,
+    /// Placement height in rows.
+    pub rows: usize,
+}
+
+/// Source-image pixel size, upstream `ImageDimensions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageDimensions {
+    /// Upstream `widthPx`.
+    pub width_px: u64,
+    /// Upstream `heightPx`.
+    pub height_px: u64,
+}
+
+/// Options for [`render_image`], upstream `ImageRenderOptions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ImageRenderOptions {
+    /// Upstream `maxWidthCells`, defaulting to 80.
+    pub max_width_cells: Option<usize>,
+    /// Upstream `maxHeightCells`.
+    pub max_height_cells: Option<usize>,
+    /// Upstream `preserveAspectRatio`, defaulting to true.
+    pub preserve_aspect_ratio: Option<bool>,
+    /// Upstream `imageId`: when set, reuses/replaces the existing image with
+    /// this id.
+    pub image_id: Option<u64>,
+    /// Upstream `moveCursor`: whether Kitty applies its default cursor
+    /// movement after the placement, defaulting to true.
+    pub move_cursor: Option<bool>,
+}
+
+/// A rendered inline-image transmission, upstream `renderImage`'s return
+/// value (`imageId` carries a value only on the Kitty branch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedImage {
+    /// The escape sequence to write.
+    pub sequence: String,
+    /// The placement width in columns.
+    pub columns: usize,
+    /// The placement height in rows.
+    pub rows: usize,
+    /// The Kitty image id, upstream `imageId` (`undefined` on Iterm2).
+    pub image_id: Option<u64>,
+}
+
+/// Scale an image into cell-sized Kitty or Iterm2 placements, upstream
+/// `renderImage`.
+///
+/// Answers `None` when the terminal renders no inline-image protocol. The
+/// Kitty branch registers the metadata of an explicit `image_id` so
+/// placement extraction and cropping can find it.
+#[must_use]
+pub fn render_image(
+    base64_data: &str,
+    image_dimensions: ImageDimensions,
+    options: &ImageRenderOptions,
+) -> Option<RenderedImage> {
+    let caps = get_capabilities();
+
+    let protocol = caps.images?;
+
+    let max_width_cells = options.max_width_cells.unwrap_or(80);
+    let size = calculate_image_cell_size(
+        image_dimensions,
+        max_width_cells,
+        options.max_height_cells,
+        get_cell_dimensions(),
+    );
+
+    match protocol {
+        ImageProtocol::Kitty => {
+            if let Some(image_id) = options.image_id {
+                register_kitty_image_metadata(KittyImageMetadata {
+                    image_id,
+                    columns: size.columns,
+                    rows: size.rows,
+                    width_px: image_dimensions.width_px,
+                    height_px: image_dimensions.height_px,
+                });
+            }
+            let sequence = encode_kitty(
+                base64_data,
+                EncodeKittyOptions {
+                    columns: Some(size.columns),
+                    rows: Some(size.rows),
+                    image_id: options.image_id,
+                    move_cursor: options.move_cursor,
+                },
+            );
+            Some(RenderedImage {
+                sequence,
+                columns: size.columns,
+                rows: size.rows,
+                image_id: options.image_id,
+            })
+        }
+        ImageProtocol::Iterm2 => {
+            let sequence = encode_iterm2(
+                base64_data,
+                EncodeITerm2Options {
+                    width: Some(ITerm2Size::Cells(size.columns)),
+                    height: Some(ITerm2Size::Auto),
+                    preserve_aspect_ratio: Some(options.preserve_aspect_ratio.unwrap_or(true)),
+                    ..EncodeITerm2Options::default()
+                },
+            );
+            Some(RenderedImage {
+                sequence,
+                columns: size.columns,
+                rows: size.rows,
+                image_id: None,
+            })
+        }
+    }
+}
+
+/// Compute the cell footprint of an image placement, upstream
+/// `calculateImageCellSize`.
+///
+/// The image scales uniformly to fit `max_width_cells` (and
+/// `max_height_cells` when set) against the physical cell size, and the
+/// clamped ceiling of the scaled extent is the answer.
+#[must_use]
+pub fn calculate_image_cell_size(
+    image_dimensions: ImageDimensions,
+    max_width_cells: usize,
+    max_height_cells: Option<usize>,
+    cell_dimensions: CellDimensions,
+) -> ImageCellSize {
+    let max_width = max_width_cells.max(1);
+    let max_height = max_height_cells.map(|height| height.max(1));
+    let image_width =
+        f64::from(u32::try_from(image_dimensions.width_px.max(1)).unwrap_or(u32::MAX));
+    let image_height =
+        f64::from(u32::try_from(image_dimensions.height_px.max(1)).unwrap_or(u32::MAX));
+    let cell_width = f64::from(cell_dimensions.width_px);
+    let cell_height = f64::from(cell_dimensions.height_px);
+
+    let width_scale =
+        f64::from(u32::try_from(max_width).unwrap_or(u32::MAX)) * cell_width / image_width;
+    let height_scale = max_height.map_or(width_scale, |max_height| {
+        f64::from(u32::try_from(max_height).unwrap_or(u32::MAX)) * cell_height / image_height
+    });
+    let scale = width_scale.min(height_scale);
+
+    let columns = (image_width * scale / cell_width).ceil();
+    let rows = (image_height * scale / cell_height).ceil();
+
+    // The ceilings of positive scale quotients are small positive integers;
+    // upstream computes the same conversions on JS Numbers.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the ceilings of positive scale quotients are small positive integers"
+    )]
+    let columns = columns as usize;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the ceilings of positive scale quotients are small positive integers"
+    )]
+    let rows = rows as usize;
+
+    ImageCellSize {
+        columns: columns.clamp(1, max_width),
+        rows: max_height.map_or_else(|| rows.max(1), |max_height| rows.min(max_height).max(1)),
+    }
+}
+
+/// The row count of an image scaled to `target_width_cells` columns, upstream
+/// `calculateImageRows`.
+#[must_use]
+pub fn calculate_image_rows(
+    image_dimensions: ImageDimensions,
+    target_width_cells: usize,
+    cell_dimensions: CellDimensions,
+) -> usize {
+    calculate_image_cell_size(image_dimensions, target_width_cells, None, cell_dimensions).rows
+}
+
+/// The decoded bytes of a base64 payload, upstream `Buffer.from(base64Data,
+/// "base64")`: non-alphabet characters drop, and a decode failure answers an
+/// empty buffer the same way malformed payloads do downstream.
+fn decode_image_bytes(base64_data: &str) -> Vec<u8> {
+    let filtered: String = base64_data
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '=')
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(filtered.as_bytes())
+        .unwrap_or_default()
+}
+
+/// The PNG header dimensions, upstream `getPngDimensions`: the IHDR width
+/// and height big-endian at offsets 16/20.
+#[must_use]
+pub fn get_png_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_image_bytes(base64_data);
+    if buffer.len() < 24 {
+        return None;
+    }
+    if buffer[0] != 0x89 || buffer[1] != 0x50 || buffer[2] != 0x4e || buffer[3] != 0x47 {
+        return None;
+    }
+    Some(ImageDimensions {
+        width_px: u64::from(u32::from_be_bytes([
+            buffer[16], buffer[17], buffer[18], buffer[19],
+        ])),
+        height_px: u64::from(u32::from_be_bytes([
+            buffer[20], buffer[21], buffer[22], buffer[23],
+        ])),
+    })
+}
+
+/// The JPEG SOF0-SOF2 marker dimensions, upstream `getJpegDimensions`: the
+/// walk skips non-marker bytes and stepped segments until a frame-header
+/// marker answers, truncation answers `None`.
+#[must_use]
+pub fn get_jpeg_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_image_bytes(base64_data);
+    if buffer.len() < 2 {
+        return None;
+    }
+    if buffer[0] != 0xff || buffer[1] != 0xd8 {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 9 < buffer.len() {
+        if buffer[offset] != 0xff {
+            offset += 1;
+            continue;
+        }
+        let marker = buffer[offset + 1];
+        if (0xc0..=0xc2).contains(&marker) {
+            return Some(ImageDimensions {
+                width_px: u64::from(u16::from_be_bytes([buffer[offset + 7], buffer[offset + 8]])),
+                height_px: u64::from(u16::from_be_bytes([buffer[offset + 5], buffer[offset + 6]])),
+            });
+        }
+        if offset + 3 >= buffer.len() {
+            return None;
+        }
+        let length = usize::from(u16::from_be_bytes([buffer[offset + 2], buffer[offset + 3]]));
+        if length < 2 {
+            return None;
+        }
+        offset += 2 + length;
+    }
+    None
+}
+
+/// The GIF logical screen dimensions, upstream `getGifDimensions`: little-
+/// endian u16 at offsets 6 and 8 behind the `GIF87a`/`GIF89a` signature.
+#[must_use]
+pub fn get_gif_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_image_bytes(base64_data);
+    if buffer.len() < 10 {
+        return None;
+    }
+    if buffer[..6] != *b"GIF87a" && buffer[..6] != *b"GIF89a" {
+        return None;
+    }
+    Some(ImageDimensions {
+        width_px: u64::from(u16::from_le_bytes([buffer[6], buffer[7]])),
+        height_px: u64::from(u16::from_le_bytes([buffer[8], buffer[9]])),
+    })
+}
+
+/// The WebP VP8/VP8L/VP8X chunk dimensions, upstream `getWebpDimensions`:
+/// the RIFF/WEBP headers gate first, then the chunk tag picks the parse.
+#[must_use]
+pub fn get_webp_dimensions(base64_data: &str) -> Option<ImageDimensions> {
+    let buffer = decode_image_bytes(base64_data);
+    if buffer.len() < 30 {
+        return None;
+    }
+    if buffer[..4] != *b"RIFF" || buffer[8..12] != *b"WEBP" {
+        return None;
+    }
+    match &buffer[12..16] {
+        b"VP8 " => Some(ImageDimensions {
+            width_px: u64::from(u16::from_le_bytes([buffer[26], buffer[27]]) & 0x3fff),
+            height_px: u64::from(u16::from_le_bytes([buffer[28], buffer[29]]) & 0x3fff),
+        }),
+        b"VP8L" => {
+            let bits = u32::from_le_bytes([buffer[21], buffer[22], buffer[23], buffer[24]]);
+            Some(ImageDimensions {
+                width_px: u64::from(bits & 0x3fff) + 1,
+                height_px: u64::from((bits >> 14) & 0x3fff) + 1,
+            })
+        }
+        b"VP8X" => Some(ImageDimensions {
+            width_px: u64::from(
+                u32::from(buffer[24])
+                    | (u32::from(buffer[25]) << 8)
+                    | (u32::from(buffer[26]) << 16),
+            ) + 1,
+            height_px: u64::from(
+                u32::from(buffer[27])
+                    | (u32::from(buffer[28]) << 8)
+                    | (u32::from(buffer[29]) << 16),
+            ) + 1,
+        }),
+        _ => None,
+    }
+}
+
+/// Dispatch an image payload to its format parser by MIME type, upstream
+/// `getImageDimensions`.
+#[must_use]
+pub fn get_image_dimensions(base64_data: &str, mime_type: &str) -> Option<ImageDimensions> {
+    match mime_type {
+        "image/png" => get_png_dimensions(base64_data),
+        "image/jpeg" => get_jpeg_dimensions(base64_data),
+        "image/gif" => get_gif_dimensions(base64_data),
+        "image/webp" => get_webp_dimensions(base64_data),
+        _ => None,
+    }
+}
+
+/// Shorten home-prefixed absolute paths to `~/...` for compact display,
+/// upstream `shortenImagePath`.
+fn shorten_image_path(filename: &str) -> String {
+    let Some(home) = std::env::home_dir().and_then(|home| home.into_os_string().into_string().ok())
+    else {
+        return filename.to_string();
+    };
+    if !home.is_empty()
+        && (filename == home
+            || filename.starts_with(&format!("{home}/"))
+            || filename.starts_with(&format!("{home}\\")))
+    {
+        return format!("~{}", &filename[home.len()..]);
+    }
+    filename.to_string()
+}
+
+/// The `file://` URL of an absolute path, upstream `pathToFileURL(filename)
+/// .href`: each byte outside the URL unreserved set percent-encodes, path
+/// separators stay.
+fn file_url(path: &str) -> String {
+    const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut url = String::from("file://");
+    for byte in path.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                url.push(byte as char);
+            }
+            _ => {
+                url.push('%');
+                url.push(HEX_DIGITS[usize::from(byte >> 4)] as char);
+                url.push(HEX_DIGITS[usize::from(byte & 0x0f)] as char);
+            }
+        }
+    }
+    url
+}
+
+/// Text fallback when the terminal cannot render inline images, upstream
+/// `imageFallback`.
+///
+/// Absolute paths show shortened (`~/...`) and, when OSC 8 hyperlinks are
+/// available, linked to `file://` so the full path remains openable.
+#[must_use]
+pub fn image_fallback(
+    mime_type: &str,
+    dimensions: Option<ImageDimensions>,
+    filename: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(filename) = filename {
+        let display = shorten_image_path(filename);
+        if get_capabilities().hyperlinks && std::path::Path::new(filename).is_absolute() {
+            parts.push(hyperlink(&display, &file_url(filename)));
+        } else {
+            parts.push(display);
+        }
+    }
+    parts.push(format!("[{mime_type}]"));
+    if let Some(dimensions) = dimensions {
+        parts.push(format!("{}x{}", dimensions.width_px, dimensions.height_px));
+    }
+    format!("[Image: {}]", parts.join(" "))
 }

@@ -40,6 +40,15 @@ libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 signal-hook = "0.4"
 
+# readkey: the physical-modifier probe of upstream's darwin N-API helper
+# (`isModifierPressed` reading CGEventSourceFlagsState's combined-session
+# state, native/darwin/src/darwin-platform.m at the pin); readkey wraps that
+# exact call with the unsafe encapsulated, which this workspace forbids
+# writing itself. macOS-only: upstream loads no modifier helper on Linux, and
+# Windows is out of this effort's scope (map ticket "Decide the Rust stack").
+[target.'cfg(target_os = "macos")'.dependencies]
+readkey = "0.2.2"
+
 [lints]
 workspace = true
 
