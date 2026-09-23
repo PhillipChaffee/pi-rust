@@ -20,6 +20,10 @@ relace = "relace"
 # the upstream tests (upstream's own FIRST/SECOND/SINGLE constants).
 SECON = "SECON"
 SINGL = "SINGL"
+# The exact pi #1022 failing tool-call id the tool-call-id-normalization
+# live suite pins verbatim from the upstream tests; typos splits the base64
+# id body and flags the "UE" fragment.
+UE = "UE"
 # LaTeX command and environment names the latex renderer's command tables
 # carry verbatim from the upstream tests (oint = \oint, multline = AMSMath,
 # hom = \hom).
