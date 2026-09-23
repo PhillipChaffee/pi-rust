@@ -1355,3 +1355,45 @@ async fn unknown_deferred_handles_fail_in_band() {
         Some(format!("Unknown faux deferred response: {mismatched_id}").as_str())
     );
 }
+
+/// The registration unregisters its own entries and the compat dispatch then
+/// settles with its no-provider error, upstream's "unregisters the provider";
+/// the registration surface's scripting views ride the same case.
+#[tokio::test]
+async fn unregisters_the_provider() {
+    let _guard = common::registry_guard().await;
+    let registration =
+        pi_ai::compat::register_faux_provider(RegisterFauxProviderOptions::default());
+    // The default core's api id is random, upstream's `randomId("faux")`.
+    assert!(registration.api().starts_with("faux:"));
+    assert_eq!(registration.models().len(), 1);
+    assert!(
+        registration
+            .model("faux-1")
+            .is_some_and(|model| model.id == "faux-1")
+    );
+
+    registration.set_responses([response("hello")]);
+    assert_eq!(registration.get_pending_response_count(), 1);
+    registration.append_responses([response("again")]);
+    assert_eq!(registration.get_pending_response_count(), 2);
+
+    let model = registration.first_model();
+    let context = basic_context();
+    let message = pi_ai::compat::complete(&model, &context, None).await;
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    assert_eq!(registration.state().call_count(), 1);
+    assert_eq!(registration.get_pending_response_count(), 1);
+
+    registration.unregister();
+    let message = pi_ai::compat::complete(&model, &context, None).await;
+    assert_eq!(message.stop_reason, StopReason::Error);
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some(format!("No API provider registered for api: {}", registration.api()).as_str())
+    );
+
+    // Unregistering again is a no-op: the source-scoped removal has nothing
+    // left to drop, upstream's idempotent filter.
+    registration.unregister();
+}

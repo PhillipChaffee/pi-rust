@@ -785,7 +785,12 @@ fn build_request_headers(
     session_id: Option<&str>,
     options_headers: Option<&ProviderHeaders>,
 ) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = vec![("User-Agent".to_owned(), get_pi_user_agent())];
+    let mut headers: Vec<(String, String)> = vec![
+        ("User-Agent".to_owned(), get_pi_user_agent()),
+        // The pinned OpenAI SDK's JSON content type; explicit headers
+        // override it and a `None` option suppresses it.
+        ("content-type".to_owned(), "application/json".to_owned()),
+    ];
     if let Some(model_headers) = &model.headers {
         for (name, value) in model_headers {
             headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));

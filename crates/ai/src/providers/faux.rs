@@ -16,10 +16,11 @@
 //! crate's `CancellationToken`; chunk cuts land on UTF-8 char boundaries
 //! where upstream slices UTF-16 units (the suites' fixtures are ASCII, where
 //! the two agree); string lengths in the token estimates are byte lengths.
-//! The registry-glue entry (`registerFauxProvider` over the compat
-//! api-registry, with its `FauxProviderRegistration` wrapper) lands with the
-//! compat child — [`faux_provider`] builds the standalone `Provider` and
-//! [`create_faux_core`] exposes the pieces registration wraps.
+//! The registry-glue entry lives with the compat surface:
+//! [`faux_provider`] builds the standalone `Provider`, [`create_faux_core`]
+//! exposes the pieces compat's `register_faux_provider` wraps, and
+//! [`FauxProviderRegistration`] is the registration handle that function
+//! hands back over the compat api-registry.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -1562,5 +1563,87 @@ impl FauxProviderHandle {
     #[must_use]
     pub fn get_pending_response_count(&self) -> usize {
         self.core.get_pending_response_count()
+    }
+}
+
+/// A faux provider registered into the compat api-registry, upstream's
+/// `FauxProviderRegistration`.
+///
+/// The core's scripting surface plus the `unregister` scoped to the source
+/// id the registration was made under. Constructed only by
+/// [`crate::compat::register_faux_provider`], upstream's definition site.
+pub struct FauxProviderRegistration {
+    core: FauxCore,
+    source_id: String,
+}
+
+impl std::fmt::Debug for FauxProviderRegistration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FauxProviderRegistration")
+            .field("api", &self.core.api())
+            .field("source_id", &self.source_id)
+            .finish()
+    }
+}
+
+impl FauxProviderRegistration {
+    /// The registration handle, upstream's object literal in
+    /// `registerFauxProvider`.
+    pub(crate) const fn new(core: FauxCore, source_id: String) -> Self {
+        Self { core, source_id }
+    }
+
+    /// The wire-API id the registration serves, upstream's `api`.
+    #[must_use]
+    pub fn api(&self) -> &str {
+        self.core.api()
+    }
+
+    /// The faux models, upstream's `models`.
+    #[must_use]
+    pub fn models(&self) -> &[Model] {
+        self.core.models()
+    }
+
+    /// The first model, upstream's `getModel()`.
+    #[must_use]
+    pub fn first_model(&self) -> Model {
+        self.core.first_model()
+    }
+
+    /// One model by id, upstream's `getModel(id)`.
+    #[must_use]
+    pub fn model(&self, model_id: &str) -> Option<Model> {
+        self.core.model(model_id)
+    }
+
+    /// The shared observable state, upstream's `state`.
+    #[must_use]
+    pub fn state(&self) -> &FauxProviderState {
+        self.core.state()
+    }
+
+    /// Replace the queued responses, upstream's `setResponses`.
+    pub fn set_responses<I: IntoIterator<Item = FauxResponseStep>>(&self, responses: I) {
+        self.core.set_responses(responses);
+    }
+
+    /// Append queued responses, upstream's `appendResponses`.
+    pub fn append_responses<I: IntoIterator<Item = FauxResponseStep>>(&self, responses: I) {
+        self.core.append_responses(responses);
+    }
+
+    /// How many responses remain queued, upstream's
+    /// `getPendingResponseCount()`.
+    #[must_use]
+    pub fn get_pending_response_count(&self) -> usize {
+        self.core.get_pending_response_count()
+    }
+
+    /// Remove the registration, upstream's `unregister`: every api-registry
+    /// entry made under this registration's source id is dropped, so the
+    /// compat dispatch falls back to its no-provider error.
+    pub fn unregister(&self) {
+        crate::compat::unregister_api_providers(&self.source_id);
     }
 }
