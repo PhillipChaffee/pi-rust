@@ -447,6 +447,7 @@ fn renders_a_proportional_glyph_scrollbar_with_an_expanded_active_thumb() {
             scrollbar_track_style: Some(track_color_for.clone()),
             scrollbar_thumb_style: Some(thumb_color_for.clone()),
             scrollbar_hide_delay_ms: Some(10),
+            manual_hide_timer: true,
             ..ScrollViewOptions::default()
         },
     );
@@ -493,7 +494,9 @@ fn renders_a_proportional_glyph_scrollbar_with_an_expanded_active_thumb() {
     );
 
     scroll_view.set_scrollbar_active(false);
-    std::thread::sleep(std::time::Duration::from_millis(60));
+    // Upstream slept out the real 10 ms timer here; the drive replaces the
+    // wait so no frame can race the fire (#78).
+    scroll_view.fire_scrollbar_hide_timer();
     let lines = render();
     assert_eq!(visible(&lines), source_lines[2..6]);
 
