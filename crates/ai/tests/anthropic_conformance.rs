@@ -21,7 +21,8 @@ use pi_ai::api::anthropic_messages::{
 use pi_ai::http::MockHttpClient;
 use pi_ai::types::{
     AssistantBlock, CacheRetention, Context, Message, Modality, Model, ModelCompat,
-    SimpleStreamOptions, StopReason, TextContent, ThinkingLevel, Tool,
+    SimpleStreamOptions, StopReason, TextContent, ThinkingContent, ThinkingLevel, Tool, ToolCall,
+    ToolResultBlock, ToolResultMessage, UserContent, UserMessage,
 };
 use serde_json::{Value, json};
 
@@ -1199,7 +1200,7 @@ fn simple_tool() -> Tool {
 /// off, and capture the request body, the shape the tool-result suites share.
 async fn capture_tool_result_turn(
     model: &Model,
-    result_content: Vec<pi_ai::types::ToolResultBlock>,
+    result_content: Vec<ToolResultBlock>,
     tools: Vec<Tool>,
 ) -> Value {
     capture_tool_result_turn_with_names(model, result_content, tools, None).await
@@ -1208,7 +1209,7 @@ async fn capture_tool_result_turn(
 /// The variant the deferred-reference suites drive, with load markers.
 async fn capture_tool_result_turn_with_names(
     model: &Model,
-    result_content: Vec<pi_ai::types::ToolResultBlock>,
+    result_content: Vec<ToolResultBlock>,
     tools: Vec<Tool>,
     added_tool_names: Option<Vec<String>>,
 ) -> Value {
@@ -1238,11 +1239,11 @@ async fn tool_results_join_text_and_route_images_into_block_arrays() {
     let body = capture_tool_result_turn(
         &model,
         vec![
-            pi_ai::types::ToolResultBlock::Text(TextContent {
+            ToolResultBlock::Text(TextContent {
                 text: "first".to_owned(),
                 text_signature: None,
             }),
-            pi_ai::types::ToolResultBlock::Text(TextContent {
+            ToolResultBlock::Text(TextContent {
                 text: "second".to_owned(),
                 text_signature: None,
             }),
@@ -1268,12 +1269,10 @@ async fn image_only_tool_results_gain_the_placeholder_text_block() {
             input: vec![Modality::Text, Modality::Image],
             ..simple_anthropic_model()
         },
-        vec![pi_ai::types::ToolResultBlock::Image(
-            pi_ai::types::ImageContent {
-                data: "aGVsbG8=".to_owned(),
-                mime_type: "image/png".to_owned(),
-            },
-        )],
+        vec![ToolResultBlock::Image(pi_ai::types::ImageContent {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        })],
         vec![simple_tool()],
     )
     .await;
@@ -1301,8 +1300,8 @@ async fn user_image_blocks_convert_to_base64_sources_and_cache_control_lands_on_
     };
     let context = Context {
         system_prompt: None,
-        messages: vec![Message::User(pi_ai::types::UserMessage {
-            content: pi_ai::types::UserContent::Blocks(vec![
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Blocks(vec![
                 pi_ai::types::UserBlock::Text(TextContent {
                     text: "what is this?".to_owned(),
                     text_signature: None,
@@ -1348,7 +1347,7 @@ async fn deferred_tool_results_carry_tool_reference_blocks() {
     };
     let body = capture_tool_result_turn_with_names(
         &model,
-        vec![pi_ai::types::ToolResultBlock::Text(TextContent {
+        vec![ToolResultBlock::Text(TextContent {
             text: "loaded".to_owned(),
             text_signature: None,
         })],
@@ -1528,23 +1527,20 @@ async fn copilot_requests_carry_the_bearer_and_dynamic_headers() {
 /// vision input adds the Copilot-Vision-Request header.
 #[tokio::test]
 async fn copilot_headers_flip_to_agent_and_carry_vision() {
-    let (initiator, vision) =
-        copilot_header_probe(vec![Message::ToolResult(pi_ai::types::ToolResultMessage {
-            tool_call_id: "call_1".to_owned(),
-            tool_name: "read".to_owned(),
-            content: vec![pi_ai::types::ToolResultBlock::Image(
-                pi_ai::types::ImageContent {
-                    data: "aGVsbG8=".to_owned(),
-                    mime_type: "image/png".to_owned(),
-                },
-            )],
-            details: None,
-            usage: None,
-            added_tool_names: None,
-            is_error: false,
-            timestamp: 1,
-        })])
-        .await;
+    let (initiator, vision) = copilot_header_probe(vec![Message::ToolResult(ToolResultMessage {
+        tool_call_id: "call_1".to_owned(),
+        tool_name: "read".to_owned(),
+        content: vec![ToolResultBlock::Image(pi_ai::types::ImageContent {
+            data: "aGVsbG8=".to_owned(),
+            mime_type: "image/png".to_owned(),
+        })],
+        details: None,
+        usage: None,
+        added_tool_names: None,
+        is_error: false,
+        timestamp: 1,
+    })])
+    .await;
     assert_eq!(initiator, Some("agent".to_owned()));
     assert_eq!(vision.as_deref(), Some("true"));
 }
@@ -1724,4 +1720,471 @@ async fn request_metadata_carries_the_user_id() {
     let model = simple_anthropic_model();
     let payload = capture_simple_payload(&model, user_context(), options).await;
     assert_eq!(payload["metadata"], json!({ "user_id": "user_1" }));
+}
+
+// ---------------------------------------------------------------------------
+// Fireworks deferred tools (upstream fireworks-deferred-tools.test.ts and the
+// payload parts of fireworks-models.test.ts)
+// ---------------------------------------------------------------------------
+
+/// The conversation the discovery scenarios stream, upstream's
+/// `discoveryContext`: a discovery tool call whose result carries the loaded
+/// tool names.
+fn fireworks_discovery_messages(
+    model: &Model,
+    discovery_name: &str,
+    added_tool_names: Option<Vec<String>>,
+) -> Vec<Message> {
+    let mut assistant = common::assistant_message_with_content(
+        model.api.0.as_str(),
+        model.provider.0.as_str(),
+        model.id.as_str(),
+        vec![
+            AssistantBlock::Thinking(ThinkingContent {
+                thinking: "Find a lookup tool.".to_owned(),
+                thinking_signature: Some(String::new()),
+                redacted: None,
+            }),
+            AssistantBlock::ToolCall(ToolCall {
+                id: "search1".to_owned(),
+                name: discovery_name.to_owned(),
+                arguments: json!({ "query": "lookup" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+                thought_signature: None,
+                namespace: None,
+            }),
+        ],
+    );
+    assistant.stop_reason = StopReason::ToolUse;
+    let result = ToolResultMessage {
+        tool_call_id: "search1".to_owned(),
+        tool_name: discovery_name.to_owned(),
+        content: vec![ToolResultBlock::Text(TextContent {
+            text: "Found lookup.".to_owned(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        added_tool_names,
+        is_error: false,
+        timestamp: 0,
+    };
+    vec![
+        Message::User(UserMessage {
+            content: UserContent::Text("Look up alpha.".to_owned()),
+            timestamp: 0,
+        }),
+        Message::Assistant(assistant),
+        Message::ToolResult(result),
+    ]
+}
+
+fn fireworks_lookup_tool() -> Tool {
+    Tool {
+        name: "lookup".to_owned(),
+        description: "Look up a synthetic key".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "key": { "type": "string" } },
+            "required": ["key"],
+        }),
+        constrained_sampling: None,
+    }
+}
+
+fn fireworks_discovery_tool(name: &str) -> Tool {
+    Tool {
+        name: name.to_owned(),
+        description: "Find tools".to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"],
+        }),
+        constrained_sampling: None,
+    }
+}
+
+/// Capture the request body the model produces for the given context,
+/// retention off, upstream's `capture` through the seam mock.
+async fn capture_fireworks_payload(model: &Model, context: &Context) -> Value {
+    let mock = MockHttpClient::new();
+    common::anthropic_mock_with(&mock, &minimal_done_events());
+    let mut options = common::keyed_anthropic_options(&mock);
+    options.cache_retention = Some(CacheRetention::None);
+    let _ = stream(model, context, Some(&options)).result().await;
+    recorded_request_body(&mock)
+}
+
+/// The inbound `tool_use_tool` events the Fireworks wire replays, the
+/// `tool_use` block id prefix the gateway keeps.
+fn fireworks_tool_use_events() -> Vec<(&'static str, String)> {
+    vec![
+        common::message_start_event(
+            "msg_lookup",
+            json!({ "input_tokens": 100, "output_tokens": 0 }),
+        ),
+        common::block_start_event(
+            0,
+            json!({ "type": "tool_use", "id": "tool_use_tool_1", "name": "lookup", "input": {} }),
+        ),
+        common::block_delta_event(
+            0,
+            json!({ "type": "input_json_delta", "partial_json": "{\"key\":\"alpha\"}" }),
+        ),
+        common::block_stop_event(0),
+        common::message_delta_event(
+            json!({ "stop_reason": "tool_use" }),
+            Some(json!({ "output_tokens": 10 })),
+        ),
+        common::message_stop_event(),
+    ]
+}
+
+/// Fireworks thinking support alone does not enable tool references: a
+/// discovery result's markers serialize into `tool_reference` blocks with the
+/// `defer_loading` tool definitions, and the inbound `tool_use_tool` id
+/// survives the round trip, upstream's per-model discovery case.
+///
+/// Long by construction: one context drives three discovery spellings, so
+/// the body reads as one upstream `it.each` leg.
+#[tokio::test]
+async fn fireworks_serializes_discovery_and_replay() {
+    let model = builtin_model("fireworks", "accounts/fireworks/models/kimi-k2p6");
+    for discovery_name in ["ToolSearch", "tool_search", "discover_tools"] {
+        let tools = vec![
+            fireworks_discovery_tool(discovery_name),
+            fireworks_lookup_tool(),
+        ];
+        let context = Context {
+            system_prompt: None,
+            messages: fireworks_discovery_messages(
+                &model,
+                discovery_name,
+                Some(vec!["lookup".to_owned()]),
+            ),
+            tools: Some(tools.clone()),
+        };
+        let payload = capture_fireworks_payload(&model, &context).await;
+
+        assert_eq!(
+            payload["tools"],
+            json!([
+                {
+                    "name": discovery_name,
+                    "description": "Find tools",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "query": { "type": "string" } },
+                        "required": ["query"],
+                    },
+                },
+                {
+                    "name": "lookup",
+                    "description": "Look up a synthetic key",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "key": { "type": "string" } },
+                        "required": ["key"],
+                    },
+                    "defer_loading": true,
+                },
+            ])
+        );
+        let messages = payload["messages"].as_array().expect("messages");
+        assert!(messages[1]["content"].as_array().expect("content").iter().any(
+            |block| block == &json!({ "type": "thinking", "thinking": "Find a lookup tool.", "signature": "" })
+        ));
+        assert_eq!(
+            messages[2]["content"],
+            json!([
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "search1",
+                    "content": [{ "type": "tool_reference", "tool_name": "lookup" }],
+                    "is_error": false,
+                },
+                { "type": "text", "text": "Found lookup." },
+            ])
+        );
+
+        // Fireworks unwraps `tool_use_tool` on the wire, even when the id
+        // retains that prefix.
+        let mock = MockHttpClient::new();
+        common::anthropic_mock_with(&mock, &fireworks_tool_use_events());
+        let mut options = common::keyed_anthropic_options(&mock);
+        options.cache_retention = Some(CacheRetention::None);
+        let response = stream(&model, &context, Some(&options)).result().await;
+        assert_eq!(response.stop_reason, StopReason::ToolUse);
+        let tool_call = response.content.iter().find_map(|block| match block {
+            AssistantBlock::ToolCall(tool_call) => Some(tool_call.clone()),
+            _ => None,
+        });
+        assert_eq!(tool_call.expect("tool call").id, "tool_use_tool_1");
+    }
+}
+
+/// References deduplicate across multiple results and preserve ordinary
+/// text, upstream's dedup case.
+#[tokio::test]
+async fn fireworks_deduplicates_references_across_multiple_results() {
+    let model = builtin_model("fireworks", "accounts/fireworks/models/kimi-k2p6");
+    let mut messages =
+        fireworks_discovery_messages(&model, "tool_search", Some(vec!["lookup".to_owned()]));
+    let mut assistant = common::assistant_message_with_content(
+        model.api.0.as_str(),
+        model.provider.0.as_str(),
+        model.id.as_str(),
+        vec![
+            AssistantBlock::Thinking(ThinkingContent {
+                thinking: "Find a lookup tool.".to_owned(),
+                thinking_signature: Some(String::new()),
+                redacted: None,
+            }),
+            AssistantBlock::ToolCall(ToolCall {
+                id: "search1".to_owned(),
+                name: "tool_search".to_owned(),
+                arguments: json!({ "query": "lookup" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+                thought_signature: None,
+                namespace: None,
+            }),
+            AssistantBlock::ToolCall(ToolCall {
+                id: "search2".to_owned(),
+                name: "tool_search".to_owned(),
+                arguments: json!({ "query": "lookup" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+                thought_signature: None,
+                namespace: None,
+            }),
+        ],
+    );
+    assistant.stop_reason = StopReason::ToolUse;
+    messages[1] = Message::Assistant(assistant);
+    messages.push(Message::ToolResult(ToolResultMessage {
+        tool_call_id: "search2".to_owned(),
+        tool_name: "tool_search".to_owned(),
+        content: vec![ToolResultBlock::Text(TextContent {
+            text: "Already loaded.".to_owned(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        added_tool_names: Some(vec![
+            "lookup".to_owned(),
+            "lookup".to_owned(),
+            "missing".to_owned(),
+        ]),
+        is_error: false,
+        timestamp: 0,
+    }));
+    let context = Context {
+        system_prompt: None,
+        messages,
+        tools: Some(vec![
+            fireworks_discovery_tool("tool_search"),
+            fireworks_lookup_tool(),
+        ]),
+    };
+
+    let payload = capture_fireworks_payload(&model, &context).await;
+    let tool_turn = &payload["messages"][2]["content"];
+    assert_eq!(
+        tool_turn[0]["content"],
+        json!([{ "type": "tool_reference", "tool_name": "lookup" }])
+    );
+    assert_eq!(tool_turn[1]["content"], json!("Already loaded."));
+    assert_eq!(tool_turn[2]["text"], json!("Found lookup."));
+}
+
+/// The scenarios upstream lists as non-discovery: without a discovery call,
+/// without markers, without the immediate tool, after the tool is already
+/// used, and with the compat flag off, the schemas stay normal.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the five scenarios read as one upstream it.each leg over a shared fixture"
+)]
+#[tokio::test]
+async fn fireworks_keeps_normal_schemas_outside_discovery() {
+    let model = builtin_model("fireworks", "accounts/fireworks/models/kimi-k2p6");
+
+    // no-discovery: the conversation stops before the assistant turn.
+    let context = Context {
+        system_prompt: None,
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text("Look up alpha.".to_owned()),
+            timestamp: 0,
+        })],
+        tools: Some(vec![
+            fireworks_discovery_tool("tool_search"),
+            fireworks_lookup_tool(),
+        ]),
+    };
+    let payload = capture_fireworks_payload(&model, &context).await;
+    assert!(
+        payload["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .all(|tool| tool.get("defer_loading").is_none())
+    );
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("stringified")
+            .contains("tool_reference")
+    );
+
+    // no-markers: the result carries no addedToolNames.
+    let context = Context {
+        system_prompt: None,
+        messages: fireworks_discovery_messages(&model, "tool_search", None),
+        tools: Some(vec![
+            fireworks_discovery_tool("tool_search"),
+            fireworks_lookup_tool(),
+        ]),
+    };
+    let payload = capture_fireworks_payload(&model, &context).await;
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("stringified")
+            .contains("tool_reference")
+    );
+
+    // no-immediate: only the discovery tool is listed.
+    let context = Context {
+        system_prompt: None,
+        messages: fireworks_discovery_messages(
+            &model,
+            "tool_search",
+            Some(vec!["lookup".to_owned()]),
+        ),
+        tools: Some(vec![fireworks_discovery_tool("tool_search")]),
+    };
+    let payload = capture_fireworks_payload(&model, &context).await;
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("stringified")
+            .contains("tool_reference")
+    );
+
+    // already-used: the lookup tool ran before the discovery call.
+    let mut assistant_used = common::assistant_message_with_content(
+        model.api.0.as_str(),
+        model.provider.0.as_str(),
+        model.id.as_str(),
+        vec![AssistantBlock::ToolCall(ToolCall {
+            id: "earlier".to_owned(),
+            name: "lookup".to_owned(),
+            arguments: json!({ "key": "before" })
+                .as_object()
+                .cloned()
+                .expect("object"),
+            thought_signature: None,
+            namespace: None,
+        })],
+    );
+    assistant_used.stop_reason = StopReason::ToolUse;
+    let earlier_result = ToolResultMessage {
+        tool_call_id: "earlier".to_owned(),
+        tool_name: "lookup".to_owned(),
+        content: vec![ToolResultBlock::Text(TextContent {
+            text: "BEFORE".to_owned(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        added_tool_names: None,
+        is_error: false,
+        timestamp: 0,
+    };
+    let mut discovery = assistant_used;
+    discovery.content.push(AssistantBlock::ToolCall(ToolCall {
+        id: "search1".to_owned(),
+        name: "tool_search".to_owned(),
+        arguments: json!({ "query": "lookup" })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        thought_signature: None,
+        namespace: None,
+    }));
+    let mut messages = vec![
+        Message::User(UserMessage {
+            content: UserContent::Text("Look up alpha.".to_owned()),
+            timestamp: 0,
+        }),
+        Message::Assistant(discovery),
+        Message::ToolResult(earlier_result),
+    ];
+    messages.push(Message::ToolResult(ToolResultMessage {
+        tool_call_id: "search1".to_owned(),
+        tool_name: "tool_search".to_owned(),
+        content: vec![ToolResultBlock::Text(TextContent {
+            text: "Found lookup.".to_owned(),
+            text_signature: None,
+        })],
+        details: None,
+        usage: None,
+        added_tool_names: Some(vec!["lookup".to_owned()]),
+        is_error: false,
+        timestamp: 0,
+    }));
+    let context = Context {
+        system_prompt: None,
+        messages,
+        tools: Some(vec![
+            fireworks_discovery_tool("tool_search"),
+            fireworks_lookup_tool(),
+        ]),
+    };
+    let payload = capture_fireworks_payload(&model, &context).await;
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("stringified")
+            .contains("tool_reference")
+    );
+
+    // disabled: the compat flag drops the feature outright.
+    let mut model = model;
+    let mut compat = model.compat.take().expect("kimi-k2p6 compat");
+    compat.supports_tool_references = Some(false);
+    model.compat = Some(compat);
+    let context = Context {
+        system_prompt: None,
+        messages: fireworks_discovery_messages(
+            &model,
+            "tool_search",
+            Some(vec!["lookup".to_owned()]),
+        ),
+        tools: Some(vec![
+            fireworks_discovery_tool("tool_search"),
+            fireworks_lookup_tool(),
+        ]),
+    };
+    let payload = capture_fireworks_payload(&model, &context).await;
+    assert!(
+        !serde_json::to_string(&payload)
+            .expect("stringified")
+            .contains("tool_reference")
+    );
+}
+
+/// The toggle-only Kimi K2.6 keeps budget-based thinking on the wire: the
+/// enabled payload spends the budget, no native effort rides, upstream's
+/// fireworks-models budget case.
+#[tokio::test]
+async fn fireworks_toggle_only_kimi_k2p6_keeps_budget_based_thinking() {
+    let model = builtin_model("fireworks", "accounts/fireworks/models/kimi-k2p6");
+    let payload = capture_reasoning_or_disabled(model.clone(), Some(ThinkingLevel::High)).await;
+    assert_eq!(
+        payload["thinking"],
+        json!({ "type": "enabled", "budget_tokens": 16384, "display": "summarized" })
+    );
+    assert_eq!(payload.get("output_config"), None);
 }

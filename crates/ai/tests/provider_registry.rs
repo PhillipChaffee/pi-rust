@@ -940,6 +940,20 @@ fn opencode_session_header_follows_the_session_id() {
         Some(&Some("already".to_owned()))
     );
 
+    // An explicit null override also suppresses the generated header, the
+    // caller-value-preserved case upstream's null fixture pins.
+    let sent = dispatched(
+        streams.as_ref(),
+        &StreamOptions {
+            session_id: Some("session-1".to_owned()),
+            headers: Some(BTreeMap::from([("X-OpenCode-Session".to_owned(), None)])),
+            ..StreamOptions::default()
+        },
+        &recorded,
+    );
+    let headers = sent.headers.expect("headers");
+    assert_eq!(headers.get("X-OpenCode-Session"), Some(&None));
+
     let sent = dispatched(streams.as_ref(), &StreamOptions::default(), &recorded);
     assert!(sent.headers.is_none(), "no session id means no header");
 }

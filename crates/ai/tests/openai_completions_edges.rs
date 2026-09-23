@@ -2602,3 +2602,70 @@ async fn cache_control_walks_past_its_missing_text_targets() {
         .count();
     assert![stamps == 0, "no target carries the marker"];
 }
+
+// ---------------------------------------------------------------------------
+// AI-gateway binding sentinel (upstream cloudflare-ai-binding.test.ts, the
+// portable case)
+// ---------------------------------------------------------------------------
+
+/// The portable half of `test/cloudflare-ai-binding.test.ts`'s end-to-end
+/// header contract: the gateway-binding sentinel in `cf-aig-authorization`
+/// satisfies the request-auth check, and the explicit `null` caller headers
+/// remove the adapter's own `Authorization` and any `x-api-key` before
+/// dispatch, so neither rides the wire.
+///
+/// Restatement: the Workers-runtime `AiBinding` fetch wrapper upstream wraps
+/// has no Rust counterpart; the custom seam client plays the binding's
+/// canned 400, and the wire assertions read the recorded request.
+#[tokio::test]
+async fn the_gateway_binding_sentinel_keeps_placeholder_auth_off_the_wire() {
+    use std::collections::BTreeMap;
+
+    let mock = MockHttpClient::new();
+    mock.on(|_request| true).respond(
+        pi_ai::http::MockResponse::status(400)
+            .with_body(r#"{"error":{"type":"bad_request","message":"stubbed"}}"#),
+    );
+    let mut model = common::openai_catalog_model("openai", "gpt-4o-mini");
+    model.base_url = "https://workers-binding.ai/ai-gateway/gateways/my-gateway/openai".to_owned();
+
+    let options = OpenAiCompletionsOptions {
+        transport_options: TransportOptions {
+            http_client: Some(std::sync::Arc::new(mock.clone())),
+            ..TransportOptions::default()
+        },
+        headers: Some(BTreeMap::from([
+            (
+                "cf-aig-authorization".to_owned(),
+                Some("Bearer cloudflare-gateway-binding".to_owned()),
+            ),
+            ("Authorization".to_owned(), None),
+            ("x-api-key".to_owned(), None),
+        ])),
+        max_retries: Some(0),
+        ..OpenAiCompletionsOptions::default()
+    };
+
+    let result = stream(&model, &done_context(), Some(&options))
+        .result()
+        .await;
+    assert_eq!(result.stop_reason, StopReason::Error);
+
+    let recorded = mock.recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        recorded[0].url,
+        "https://workers-binding.ai/ai-gateway/gateways/my-gateway/openai/chat/completions"
+    );
+    let names: Vec<&String> = recorded[0].headers.iter().map(|(name, _)| name).collect();
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("x-api-key"))
+    );
+}

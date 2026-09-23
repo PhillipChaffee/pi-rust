@@ -209,6 +209,67 @@ fn redacted_bytes() -> Vec<u8> {
         .expect("the redacted fixture decodes")
 }
 
+// --- upstream bedrock-response-headers.test.ts ---
+
+/// The response hook fires before stream consumption with the seam reply's
+/// metadata, ported from `test/bedrock-response-headers.test.ts`: a reply
+/// whose event stream is empty still settles the hook with the status and
+/// request id, upstream's raw-Smithy-header forwarding.
+///
+/// Restatement: the seam reply carries `$metadata` (status + request id), so
+/// the hook reads `x-amzn-requestid`; the raw bifrost headers the Smithy
+/// response exposes beyond `$metadata` are not in the seam surface and ride
+/// no assertion.
+#[tokio::test]
+async fn the_response_hook_fires_before_stream_consumption() {
+    let model = common::builtin_model(
+        "amazon-bedrock",
+        "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    );
+    let runtime: Arc<dyn BedrockRuntime> = MockBedrockRuntime::with(Outcome::Events {
+        request_id: Some(String::from("req-123")),
+        status: Some(200),
+        events: Vec::new(),
+    });
+
+    let responses: Arc<Mutex<Vec<pi_ai::types::ProviderResponse>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let hook_responses = Arc::clone(&responses);
+    let mut options = options_with(&MockBedrockRuntime::failing_send());
+    options.runtime = Some(runtime);
+    options.cache_retention = Some(CacheRetention::None);
+    options.transport_options.on_response =
+        Some(pi_ai::types::OnResponse::new(move |response, _model| {
+            let responses = Arc::clone(&hook_responses);
+            Box::pin(async move {
+                responses
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(response);
+            })
+        }));
+
+    let result = stream_bedrock(&model, &context("hello"), Some(&options))
+        .result()
+        .await;
+
+    // The fake reply's empty event stream fails the run; the hook still
+    // fired before stream consumption, upstream's header-callback contract.
+    assert_eq!(result.stop_reason, StopReason::Error);
+    let responses = responses
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].status, 200);
+    assert_eq!(
+        responses[0]
+            .headers
+            .get("x-amzn-requestid")
+            .map(String::as_str),
+        Some("req-123")
+    );
+}
+
 // --- upstream bedrock-raw-stop-reason.test.ts ---
 
 /// Raw Bedrock stop reasons survive on successful stops, and provider error

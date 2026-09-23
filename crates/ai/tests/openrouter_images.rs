@@ -363,6 +363,34 @@ async fn a_failed_dispatch_surfaces_the_provider_error() {
     ];
 }
 
+/// Port-added: the provider-error-body passthrough regression, ported from
+/// `test/provider-error-body-passthrough.test.ts` — a 403 from a gateway
+/// carrying the real reason in the body must surface both the status and the
+/// body reason, not the opaque "no body" message.
+#[tokio::test]
+async fn a_403_with_a_body_surfaces_the_body_reason() {
+    let (base_url, _captured, _headers) = spawn_status_server(
+        "HTTP/1.1 403 Forbidden",
+        r#"{"error": "blocked by gateway WAF"}"#,
+    )
+    .await;
+    let model = openrouter_images_model(&base_url, vec![Modality::Image]);
+
+    let api = pi_ai::api::openrouter_images();
+    let output = api
+        .generate_images(&model, &images_context(), Some(&images_options()))
+        .await
+        .expect("generate_images resolves");
+
+    assert_eq!(output.stop_reason, ImagesStopReason::Error);
+    let message = output.error_message.expect("the provider failure");
+    assert![message.contains("403"), "{message}"];
+    assert![
+        message.contains("blocked by gateway WAF"),
+        "the body reason must not be swallowed: {message}"
+    ];
+}
+
 /// Port-added: caller headers merge over the model's, `None` values suppress
 /// entries — read off the captured request head.
 #[tokio::test]
