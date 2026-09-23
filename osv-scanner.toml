@@ -30,6 +30,11 @@ name = "pi-tui"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/tui/Cargo.toml"
 
+[[PackageOverrides]]
+name = "pi-agent-core"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/agent/Cargo.toml"
+
 
 # aws-smithy-types 1.8.0 ships a license file osv-scanner cannot parse
 # (UNKNOWN); the crate is Apache-2.0 per the aws-sdk-rust repo. The override
