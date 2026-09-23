@@ -758,7 +758,7 @@ impl ProcessTerminal {
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn native_shift_pressed() -> bool {
+    const fn native_shift_pressed() -> bool {
         false
     }
 

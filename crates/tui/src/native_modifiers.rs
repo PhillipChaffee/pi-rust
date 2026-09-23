@@ -45,26 +45,20 @@ pub enum ModifierKey {
 /// `isNativeModifierPressed`: an absent helper or a failed probe answers
 /// `false`, upstream's catch around the native call.
 #[must_use]
+#[cfg(target_os = "macos")]
 pub fn is_native_modifier_pressed(key: ModifierKey) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        use readkey::Keycode;
-        match key {
-            ModifierKey::Shift => Keycode::Shift.is_pressed() || Keycode::RightShift.is_pressed(),
-            ModifierKey::Command => {
-                Keycode::Command.is_pressed() || Keycode::RightCommand.is_pressed()
-            }
-            ModifierKey::Control => {
-                Keycode::Control.is_pressed() || Keycode::RightControl.is_pressed()
-            }
-            ModifierKey::Option => {
-                Keycode::Option.is_pressed() || Keycode::RightOption.is_pressed()
-            }
-        }
+    use readkey::Keycode;
+    match key {
+        ModifierKey::Shift => Keycode::Shift.is_pressed() || Keycode::RightShift.is_pressed(),
+        ModifierKey::Command => Keycode::Command.is_pressed() || Keycode::RightCommand.is_pressed(),
+        ModifierKey::Control => Keycode::Control.is_pressed() || Keycode::RightControl.is_pressed(),
+        ModifierKey::Option => Keycode::Option.is_pressed() || Keycode::RightOption.is_pressed(),
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = key;
-        false
-    }
+}
+
+#[must_use]
+#[cfg(not(target_os = "macos"))]
+pub const fn is_native_modifier_pressed(key: ModifierKey) -> bool {
+    let _ = key;
+    false
 }
