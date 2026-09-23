@@ -824,6 +824,7 @@ fn keeps_truncated_scroll_indicators_within_width_and_preserves_their_color_issu
         &tui,
         EditorTheme {
             border_color: Rc::clone(&border_color),
+            select_list: tui_support::default_select_list_theme(),
         },
     );
     let width = usize::from(width);
@@ -1026,7 +1027,13 @@ fn does_not_exceed_terminal_width_with_emoji_at_wrap_boundary() {
 fn shows_cursor_at_end_of_line_before_wrap_wraps_on_next_char() {
     let width: usize = 10;
     for padding_x in [0usize, 1] {
-        let editor = editor_with_options((width + padding_x) as u16, EditorOptions { padding_x });
+        let editor = editor_with_options(
+            (width + padding_x) as u16,
+            EditorOptions {
+                padding_x,
+                ..EditorOptions::default()
+            },
+        );
 
         // Type 9 chars → fills layoutWidth exactly, cursor at end on same line
         for ch in "aaaaaaaaa".chars() {

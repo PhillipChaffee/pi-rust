@@ -18,10 +18,6 @@
 //!   stand-in — a cached, capability-gated render that registers the same
 //!   cell metadata the real component's `renderImage` does, so the renderer
 //!   sees identical placement lines.
-//! - `SelectList` is #49's scope; the vertical-redispatch regression test's
-//!   essence is the horizontal container's miss behavior, so a
-//!   [`ClickList`] stand-in with the same custom-handleMouse shape drives it
-//!   until #49 lands the real list.
 
 #![expect(
     clippy::expect_used,
@@ -49,7 +45,8 @@ use pi_tui::alt_screen_search::{
 };
 use pi_tui::components::{
     FollowMode, HStack, MouseRegion, ScrollView, ScrollViewOptions, ScrollViewScrollbar,
-    StackChild, StackEntryOptions, StackOptions, Text, VStack,
+    SelectItem, SelectList, SelectListColorFn, SelectListTheme, StackChild, StackEntryOptions,
+    StackOptions, Text, VStack,
 };
 use pi_tui::keybindings::{Keybindings, KeybindingsConfig, KeybindingsManager, set_keybindings};
 use pi_tui::layout_node::Basis;
@@ -352,30 +349,17 @@ impl Component for TestImage {
     }
 }
 
-/// The `SelectList` stand-in for #49's scope: a mouse-aware list that fires
-/// on clicks within its visible rows — including clicks outside its column,
-/// exactly the shape the vertical-redispatch regression guards.
-struct ClickList {
-    selections: Cell<usize>,
-}
-
-impl Component for ClickList {
-    fn render(&self, _width: usize) -> Vec<String> {
-        vec!["A".to_string(), "B".to_string()]
+/// The identity select-list theme, upstream's inline test theme in the
+/// vertical-redispatch regression.
+fn identity_select_list_theme() -> SelectListTheme {
+    let identity: SelectListColorFn = Rc::new(ToString::to_string);
+    SelectListTheme {
+        selected_prefix: Rc::clone(&identity),
+        selected_text: Rc::clone(&identity),
+        description: Rc::clone(&identity),
+        scroll_info: Rc::clone(&identity),
+        no_match: identity,
     }
-
-    fn handle_mouse(&self, event: &TuiMouseEvent) -> Option<TuiMouseEventResult> {
-        if event.event_type != TuiMouseEventType::Click {
-            return None;
-        }
-        self.selections.set(self.selections.get() + 1);
-        Some(TuiMouseEventResult {
-            handled: true,
-            ..TuiMouseEventResult::default()
-        })
-    }
-
-    fn invalidate(&self) {}
 }
 
 fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
@@ -831,13 +815,35 @@ fn does_not_vertically_redispatch_misses_through_horizontal_layout_containers() 
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let terminal = VirtualTerminal::new(20, 2);
     let (tui, _alt) = new_tui(terminal.clone(), TuiAltScreenConfig::default());
-    let list = Rc::new(ClickList {
-        selections: Cell::new(0),
-    });
+    // The real select list (#49), upstream `list.onSelect = () => …`: a
+    // confirmed click counts. The click below misses into the sibling text,
+    // so the count must stay zero.
+    let selections = Rc::new(Cell::new(0));
+    let counter = Rc::clone(&selections);
+    let list = SelectList::new(
+        vec![
+            SelectItem {
+                value: "a".to_string(),
+                label: "A".to_string(),
+                description: None,
+            },
+            SelectItem {
+                value: "b".to_string(),
+                label: "B".to_string(),
+                description: None,
+            },
+        ],
+        2,
+        identity_select_list_theme(),
+    );
+    *list.on_select.borrow_mut() = Some(Rc::new(move |_item| {
+        counter.set(counter.get() + 1);
+    }));
+    let list = Rc::new(list);
     tui.set_layout_root(Some(HStack::new(
         vec![
             StackChild::entry(
-                list.clone(),
+                list,
                 StackEntryOptions {
                     basis: Some(Basis::Cells(10)),
                     ..StackEntryOptions::default()
@@ -859,7 +865,7 @@ fn does_not_vertically_redispatch_misses_through_horizontal_layout_containers() 
     terminal.send_input("\x1b[<0;15;1M");
     terminal.send_input("\x1b[<0;15;1m");
     wait_for_render(&tui);
-    assert_eq!(list.selections.get(), 0);
+    assert_eq!(selections.get(), 0);
     tui.stop(TuiStopOptions::default());
 }
 
@@ -1959,22 +1965,8 @@ fn crops_a_kitty_image_whose_first_line_is_above_the_viewport() {
     let terminal = RecordingTerminal::new(20, 3);
     let (tui, alt) = new_recording_tui(terminal.clone(), TuiAltScreenConfig::default());
     let image_id = 123;
-    let image_line = encode_kitty(
-        "AAAA",
-        EncodeKittyOptions {
-            columns: Some(2),
-            rows: Some(3),
-            image_id: Some(image_id),
-            move_cursor: Some(false),
-        },
-    );
-    register_kitty_image_metadata(KittyImageMetadata {
-        image_id,
-        columns: 2,
-        rows: 3,
-        width_px: 100,
-        height_px: 100,
-    });
+    let (image_line, metadata) = tui_support::kitty_fixture(image_id);
+    register_kitty_image_metadata(metadata);
     tui.add_child(Rc::new(FixtureComponent {
         lines: RefCell::new(vec![
             "before".to_string(),
