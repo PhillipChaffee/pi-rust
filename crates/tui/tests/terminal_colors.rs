@@ -283,7 +283,7 @@ fn consumes_osc_11_replies_before_input_listeners_and_focused_component_dispatch
 }
 
 #[test]
-fn consumes_unparseable_strict_osc_11_replies_and_resolves_undefined() {
+fn consumes_unparsable_strict_osc_11_replies_and_resolves_undefined() {
     let QueryHarness {
         terminal,
         tui,
