@@ -745,10 +745,20 @@ impl ProcessTerminal {
         }
     }
 
-    /// The native modifier probe restated: no native helper exists in the
-    /// Rust port, which is the same false upstream answers without its N-API
-    /// platform helper loaded.
-    const fn native_shift_pressed() -> bool {
+    /// The native modifier probe, upstream `isNativeModifierPressed("shift")`
+    /// over the N-API platform helper: the replacement reads the same
+    /// `CGEventSourceFlagsState` combined-session state through `readkey` on
+    /// macOS (#51); every other platform loads no helper upstream and answers
+    /// `false` the same way.
+    #[cfg(target_os = "macos")]
+    fn native_shift_pressed() -> bool {
+        crate::native_modifiers::is_native_modifier_pressed(
+            crate::native_modifiers::ModifierKey::Shift,
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn native_shift_pressed() -> bool {
         false
     }
 

@@ -47,8 +47,17 @@
 //!   ([#45](https://github.com/PhillipChaffee/pi-rust/issues/45)): the
 //!   three-strategy main-screen render into scrollback with the bounded
 //!   writer; the alternate-screen renderer lands with #46.
-//! - [`terminal_image`] — the cell-dimension store and [`terminal_image::is_image_line`]
-//!   the TUI core consumes; the rest of terminal-image lands with #51.
+//! - [`terminal_image`] — the terminal-image surface
+//!   ([#51](https://github.com/PhillipChaffee/pi-rust/issues/51)): the
+//!   capability matrix with its tmux probe and `PI_*` env overrides and the
+//!   programmatic override seam, the cell-dimension store, the image-line
+//!   probe, the Kitty/Iterm2 encoders and placement machinery, the
+//!   cell-size math, the PNG/JPEG/GIF/WebP size parsers, [`terminal_image::render_image`],
+//!   and [`terminal_image::image_fallback`].
+//! - [`native_modifiers`] — the physical-modifier probe replacing upstream's
+//!   darwin N-API helper ([#51](https://github.com/PhillipChaffee/pi-rust/issues/51)); the
+//!   clipboard replacement (`arboard`) lands with its consumer in the
+//!   coding-agent port.
 //! - [`kill_ring`] — the Emacs-style kill/yank ring ([`kill_ring::KillRing`]),
 //!   and [`undo_stack`] — the snapshot stack ([`undo_stack::UndoStack`]).
 //! - [`word_navigation`] — [`word_navigation::find_word_backward`] /
@@ -100,6 +109,7 @@ pub mod kill_ring;
 pub mod latex;
 pub mod layout;
 pub mod layout_node;
+pub mod native_modifiers;
 pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;
