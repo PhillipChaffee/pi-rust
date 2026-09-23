@@ -22,7 +22,11 @@
 //!   it. The thread only flips the transient-visibility atomic and calls
 //!   the captured render request; an in-flight fire after a re-arm may
 //!   land one extra request, as upstream's `clearTimeout` timing is also
-//!   best-effort.
+//!   best-effort. The manual mode
+//!   ([`ScrollViewOptions::manual_hide_timer`]) swaps the thread for a
+//!   pending flag the harness drives: Node's suites could fake timers
+//!   over the `setTimeout`, and the wall-clock thread raced the coverage
+//!   gate's parallel load (#78).
 //! - The `axis` option's runtime check disappears into the type: upstream
 //!   throws for anything but `"vertical"`, and only the vertical axis
 //!   exists here.
@@ -86,6 +90,13 @@ pub struct ScrollViewOptions {
     /// Transient-hide delay in milliseconds, upstream
     /// `scrollbarHideDelayMs` (default 1000).
     pub scrollbar_hide_delay_ms: Option<u64>,
+    /// Arm the hide timer only for a driven fire
+    /// ([`ScrollView::fire_scrollbar_hide_timer`]), the fake-timer mode
+    /// for tests. Upstream had no equivalent — its `setTimeout` rode the
+    /// JS event loop, and Node suites could fake timers over it. Off by
+    /// default: the worker thread then fires after the delay, and the
+    /// delay is not consulted while this is set.
+    pub manual_hide_timer: bool,
 }
 
 impl std::fmt::Debug for ScrollViewOptions {
@@ -104,6 +115,7 @@ impl std::fmt::Debug for ScrollViewOptions {
                 &self.scrollbar_thumb_style.is_some(),
             )
             .field("scrollbar_hide_delay_ms", &self.scrollbar_hide_delay_ms)
+            .field("manual_hide_timer", &self.manual_hide_timer)
             .finish()
     }
 }
@@ -145,6 +157,11 @@ pub struct ScrollViewState {
     scrollbar_active: Cell<bool>,
     transient_scrollbar_visible: Arc<AtomicBool>,
     hide_worker: std::cell::RefCell<Option<HideWorker>>,
+    /// The manual mode's armed timer, upstream's pending `setTimeout`
+    /// callback: set by the arm, cleared by every `clearTimeout` path,
+    /// fired by [`ScrollView::fire_scrollbar_hide_timer`]. The threaded
+    /// mode keeps the armed state in `hide_worker`.
+    hide_pending: Cell<bool>,
     request_render_callback: std::cell::RefCell<Option<RenderRequest>>,
     follow_end: bool,
     primary: bool,
@@ -152,6 +169,7 @@ pub struct ScrollViewState {
     track_style: ColorFn,
     thumb_style: ColorFn,
     scrollbar_hide_delay_ms: u64,
+    manual_hide_timer: bool,
 }
 
 impl std::fmt::Debug for ScrollViewState {
@@ -185,6 +203,7 @@ impl ScrollViewState {
             scrollbar_active: Cell::new(false),
             transient_scrollbar_visible: Arc::new(AtomicBool::new(false)),
             hide_worker: std::cell::RefCell::new(None),
+            hide_pending: Cell::new(false),
             request_render_callback: std::cell::RefCell::new(None),
             follow_end: options
                 .follow
@@ -200,6 +219,7 @@ impl ScrollViewState {
                 .clone()
                 .unwrap_or_else(default_thumb_style),
             scrollbar_hide_delay_ms: options.scrollbar_hide_delay_ms.unwrap_or(1000),
+            manual_hide_timer: options.manual_hide_timer,
         }
     }
 
@@ -209,9 +229,11 @@ impl ScrollViewState {
             .saturating_sub(self.viewport_height.get())
     }
 
-    /// Clear the hide worker, upstream's `clearTimeout`.
+    /// Clear the armed hide timer, upstream's `clearTimeout`: the worker
+    /// in the threaded mode, the pending flag in the manual mode.
     fn clear_hide_timer(&self) {
         self.hide_worker.take();
+        self.hide_pending.set(false);
     }
 
     /// Mark scrollbar activity and arm the hide timer, upstream
@@ -226,6 +248,10 @@ impl ScrollViewState {
             .store(true, Ordering::Relaxed);
         self.clear_hide_timer();
         if self.scrollbar_active.get() {
+            return;
+        }
+        if self.manual_hide_timer {
+            self.hide_pending.set(true);
             return;
         }
         let request_render = self.request_render_callback.borrow().clone();
@@ -244,6 +270,20 @@ impl ScrollViewState {
             }
         });
         self.hide_worker.replace(Some(HideWorker { stop }));
+    }
+
+    /// The manual mode's driven fire, upstream's timer callback running
+    /// where a fake clock says the delay elapsed: the pending flag clears,
+    /// the visibility flips, and the current render request runs inline on
+    /// the calling thread, where the event loop would have run it. A
+    /// no-op when nothing is armed.
+    fn fire_pending_hide_timer(&self) {
+        if !self.hide_pending.replace(false) {
+            return;
+        }
+        self.transient_scrollbar_visible
+            .store(false, Ordering::Relaxed);
+        self.request_render();
     }
 
     fn hide_transient_scrollbar(&self) {
@@ -579,6 +619,16 @@ impl ScrollView {
     /// `setScrollbarActive`.
     pub fn set_scrollbar_active(&self, active: bool) {
         self.state.set_scrollbar_active(active);
+    }
+
+    /// Fire the armed hide timer now, the drive behind
+    /// [`ScrollViewOptions::manual_hide_timer`]: the harness stand-in for
+    /// a fake clock advancing past the delay, upstream's fake-timer
+    /// advance over the `setTimeout` arm. A no-op in the threaded mode or
+    /// when the timer was cleared since the arm; the fire runs the current
+    /// render request on the calling thread.
+    pub fn fire_scrollbar_hide_timer(&self) {
+        self.state.fire_pending_hide_timer();
     }
 
     /// Scroll to an absolute offset, upstream `ScrollView.scrollTo`.

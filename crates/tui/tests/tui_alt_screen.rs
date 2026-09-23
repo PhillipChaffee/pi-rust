@@ -989,6 +989,7 @@ fn reveals_an_auto_scrollbar_when_the_pointer_enters_its_hidden_track() {
             primary: true,
             scrollbar: Some(ScrollViewScrollbar::Auto),
             scrollbar_hide_delay_ms: Some(20),
+            manual_hide_timer: true,
             ..ScrollViewOptions::default()
         },
     );
@@ -998,8 +999,8 @@ fn reveals_an_auto_scrollbar_when_the_pointer_enters_its_hidden_track() {
     assert!(!scroll_view.is_scrollbar_visible());
 
     terminal.send_input("\x1b[<35;10;3M");
-    // A forced flush: the reveal frame must land before the 20 ms hide
-    // worker fires, which the throttled wait's sleep races.
+    // A forced flush: the reveal frame rides this pump turn, and the
+    // manual hide timer leaves nothing racing it.
     render_and_flush(&tui);
     assert!(scroll_view.is_scrollbar_visible());
     assert!(scroll_view.is_scrollbar_active());
@@ -1011,7 +1012,12 @@ fn reveals_an_auto_scrollbar_when_the_pointer_enters_its_hidden_track() {
     );
 
     terminal.send_input("\x1b[<35;9;3M");
-    flush_until(&tui, || !scroll_view.is_scrollbar_visible());
+    // The drive rides the wait's retry body: the move-off-track dispatch
+    // arms the timer during a pump, and the next probe fires it.
+    flush_until(&tui, || {
+        scroll_view.fire_scrollbar_hide_timer();
+        !scroll_view.is_scrollbar_visible()
+    });
     tui.stop(TuiStopOptions::default());
 }
 
