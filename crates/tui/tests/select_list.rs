@@ -16,11 +16,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use pi_tui::components::{SelectItem, SelectList, SelectListTheme};
-use pi_tui::tui::{
-    Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventResult, TuiMouseEventType,
-};
+use pi_tui::tui::{Component, TuiMouseEventResult, TuiMouseEventType};
 use pi_tui::utils::visible_width;
-use tui_support::mouse_event;
+use tui_support::{mouse_event, mouse_move, mouse_wheel};
 
 const ITEM_COUNT_FOR_SCROLL: usize = 12;
 
@@ -59,42 +57,6 @@ fn item(value: &str, label: &str, description: &str) -> SelectItem {
 fn visible_index_of(line: &str, text: &str) -> usize {
     let index = line.find(text).expect("text present in rendered line");
     visible_width(&line[..index])
-}
-
-const fn mouse_move(x: u16, y: u16) -> TuiMouseEvent {
-    TuiMouseEvent {
-        event_type: TuiMouseEventType::Move,
-        button: TuiMouseButton::None,
-        x,
-        y,
-        screen_x: x,
-        screen_y: y,
-        width: 80,
-        height: 10,
-        shift: false,
-        alt: false,
-        ctrl: false,
-        wheel_delta: None,
-        click_count: None,
-    }
-}
-
-const fn mouse_wheel(x: u16, y: u16, wheel_delta: i32) -> TuiMouseEvent {
-    TuiMouseEvent {
-        event_type: TuiMouseEventType::Wheel,
-        button: TuiMouseButton::Left,
-        x,
-        y,
-        screen_x: x,
-        screen_y: y,
-        width: 80,
-        height: 10,
-        shift: false,
-        alt: false,
-        ctrl: false,
-        wheel_delta: Some(wheel_delta),
-        click_count: None,
-    }
 }
 
 fn press_result(result: Option<TuiMouseEventResult>) -> bool {

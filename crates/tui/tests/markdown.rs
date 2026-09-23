@@ -1319,17 +1319,21 @@ fn does_not_add_a_trailing_blank_line_when_blockquote_is_last_rendered_block() {
 
 // --- Blockquotes with multiline content --------------------------------------
 
-#[test]
-fn applies_consistent_styling_to_all_lines_in_lazy_continuation_blockquote() {
-    // Markdown "lazy continuation" - second line without > is still part of
-    // the quote.
+/// The multiline-blockquote styling assertions the lazy-continuation and
+/// explicit tests share: exactly two quoted lines, italic Foo and bar, and
+/// the styled color's own SGR code absent from both.
+fn assert_multiline_quote_styling(
+    source: &str,
+    color: pi_tui::components::ColorFn,
+    forbidden: &str,
+) {
     let markdown = Markdown::with_style(
-        ">Foo\nbar",
+        source,
         0,
         0,
         default_markdown_theme(),
         DefaultTextStyle {
-            color: Some(tui_support::chalk_magenta()),
+            color: Some(color),
             ..DefaultTextStyle::default()
         },
     );
@@ -1361,62 +1365,25 @@ fn applies_consistent_styling_to_all_lines_in_lazy_continuation_blockquote() {
         "bar line should have italic: {bar_line}"
     );
     assert!(
-        !foo_line.contains("\x1b[35m"),
-        "Foo line should NOT have magenta color: {foo_line}"
+        !foo_line.contains(forbidden),
+        "Foo line should NOT have the color {forbidden}: {foo_line}"
     );
     assert!(
-        !bar_line.contains("\x1b[35m"),
-        "bar line should NOT have magenta color: {bar_line}"
+        !bar_line.contains(forbidden),
+        "bar line should NOT have the color {forbidden}: {bar_line}"
     );
 }
 
 #[test]
-fn applies_consistent_styling_to_explicit_multiline_blockquote() {
-    let markdown = Markdown::with_style(
-        ">Foo\n>bar",
-        0,
-        0,
-        default_markdown_theme(),
-        DefaultTextStyle {
-            color: Some(tui_support::chalk_cyan()),
-            ..DefaultTextStyle::default()
-        },
-    );
-    let lines = markdown.render(80);
-    let plain_lines = stripped(&lines);
-    let quoted_line_count = plain_lines
-        .iter()
-        .filter(|line| line.starts_with("│ "))
-        .count();
-    assert_eq!(
-        quoted_line_count, 2,
-        "expected 2 quoted lines, got: {plain_lines:?}"
-    );
+fn applies_consistent_styling_to_all_lines_in_lazy_continuation_blockquote() {
+    // Markdown "lazy continuation" - second line without > is still part of
+    // the quote.
+    assert_multiline_quote_styling(">Foo\nbar", tui_support::chalk_magenta(), "\x1b[35m");
+}
 
-    let foo_line = lines
-        .iter()
-        .find(|line| line.contains("Foo"))
-        .expect("Foo line");
-    let bar_line = lines
-        .iter()
-        .find(|line| line.contains("bar"))
-        .expect("bar line");
-    assert!(
-        foo_line.contains("\x1b[3m"),
-        "Foo line should have italic: {foo_line}"
-    );
-    assert!(
-        bar_line.contains("\x1b[3m"),
-        "bar line should have italic: {bar_line}"
-    );
-    assert!(
-        !foo_line.contains("\x1b[36m"),
-        "Foo line should NOT have cyan color: {foo_line}"
-    );
-    assert!(
-        !bar_line.contains("\x1b[36m"),
-        "bar line should NOT have cyan color: {bar_line}"
-    );
+#[test]
+fn applies_consistent_styling_to_explicit_multiline_blockquote() {
+    assert_multiline_quote_styling(">Foo\n>bar", tui_support::chalk_cyan(), "\x1b[36m");
 }
 
 #[test]

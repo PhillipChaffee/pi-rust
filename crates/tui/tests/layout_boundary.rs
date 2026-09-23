@@ -11,6 +11,9 @@
     reason = "test fixtures fail loudly when the engine misbehaves; expecting keeps the failure modes readable, and the type-inferred Defaults stay terse in fixtures"
 )]
 
+#[path = "tui_support/mod.rs"]
+mod tui_support;
+
 use std::rc::Rc;
 
 use pi_tui::components::{
@@ -23,8 +26,8 @@ use pi_tui::layout::{
 };
 use pi_tui::layout_node::{Basis, LayoutNode, LayoutViewport, StackAlign, StackKind};
 use pi_tui::terminal_image::{
-    EncodeKittyOptions, KittyImageMetadata, crop_kitty_image_line, encode_kitty,
-    get_kitty_image_metadata, register_kitty_image_metadata,
+    EncodeKittyOptions, crop_kitty_image_line, encode_kitty, get_kitty_image_metadata,
+    register_kitty_image_metadata,
 };
 use pi_tui::tui::{CURSOR_MARKER, Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventType};
 use pi_tui::utils::strip_terminal_sequences;
@@ -412,22 +415,8 @@ fn set_scrollbar_transitions_drive_visibility_and_reserved_width() {
 #[test]
 fn crop_guards_return_the_line_unchanged() {
     let image_id = 7;
-    let image_line = encode_kitty(
-        "AAAA",
-        EncodeKittyOptions {
-            columns: Some(2),
-            rows: Some(3),
-            image_id: Some(image_id),
-            move_cursor: Some(false),
-        },
-    );
-    register_kitty_image_metadata(KittyImageMetadata {
-        image_id,
-        columns: 2,
-        rows: 3,
-        width_px: 100,
-        height_px: 100,
-    });
+    let (image_line, metadata) = tui_support::kitty_fixture(image_id);
+    register_kitty_image_metadata(metadata);
     // Full crop is a no-op.
     assert_eq!(crop_kitty_image_line(&image_line, 0, 3), image_line);
     // Zero visible rows keeps the line.

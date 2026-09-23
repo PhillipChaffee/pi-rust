@@ -53,7 +53,7 @@ use unicode_width::UnicodeWidthChar;
 use pi_tui::components::ColorFn;
 use pi_tui::components::{Editor, EditorTheme, MarkdownTheme, SelectListTheme};
 use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
-use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
+use pi_tui::terminal_image::{EncodeKittyOptions, KittyImageMetadata, encode_kitty};
 use pi_tui::tui::{
     Component, Focusable, Tui, TuiConfig, TuiMouseButton, TuiMouseEvent, TuiMouseEventType,
     TuiRenderer,
@@ -922,6 +922,73 @@ pub const fn mouse_event(
         wheel_delta: None,
         click_count: None,
     }
+}
+
+/// The select/settings suites' move event: `mouse("move", x, y, 80, 10)`
+/// with no button held.
+#[must_use]
+pub const fn mouse_move(x: u16, y: u16) -> TuiMouseEvent {
+    TuiMouseEvent {
+        event_type: TuiMouseEventType::Move,
+        button: TuiMouseButton::None,
+        x,
+        y,
+        screen_x: x,
+        screen_y: y,
+        width: 80,
+        height: 10,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        wheel_delta: None,
+        click_count: None,
+    }
+}
+
+/// The select/settings suites' wheel event: `mouse("wheel", x, y, 80, 10)`
+/// carrying the wheel delta.
+#[must_use]
+pub const fn mouse_wheel(x: u16, y: u16, wheel_delta: i32) -> TuiMouseEvent {
+    TuiMouseEvent {
+        event_type: TuiMouseEventType::Wheel,
+        button: TuiMouseButton::Left,
+        x,
+        y,
+        screen_x: x,
+        screen_y: y,
+        width: 80,
+        height: 10,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        wheel_delta: Some(wheel_delta),
+        click_count: None,
+    }
+}
+
+/// The crop tests' 2×3-cell placement fixture: the `AAAA` Kitty line and
+/// its 100×100-pixel metadata, the shape the layout/alt-screen/layout
+/// crop sites share.
+#[must_use]
+pub fn kitty_fixture(image_id: u64) -> (String, KittyImageMetadata) {
+    (
+        encode_kitty(
+            "AAAA",
+            EncodeKittyOptions {
+                columns: Some(2),
+                rows: Some(3),
+                image_id: Some(image_id),
+                move_cursor: Some(false),
+            },
+        ),
+        KittyImageMetadata {
+            image_id,
+            columns: 2,
+            rows: 3,
+            width_px: 100,
+            height_px: 100,
+        },
+    )
 }
 
 /// The suites' environment closure, `map.get(key)` closed over a clone.

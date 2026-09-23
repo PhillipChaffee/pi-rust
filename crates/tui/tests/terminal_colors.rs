@@ -3,11 +3,6 @@
 //! suites and the `TUI.queryTerminalBackgroundColor` describe block, which
 //! drives `Tui::query_terminal_background_color` through the shared harness.
 
-#![expect(
-    clippy::expect_used,
-    reason = "the reply is sent synchronously before the receive runs; an empty channel is a port regression that must panic loudly"
-)]
-
 #[path = "tui_support/mod.rs"]
 mod tui_support;
 
@@ -21,28 +16,7 @@ use pi_tui::terminal_colors::{
 };
 use pi_tui::tui::{Component, Tui, TuiConfig};
 
-use tui_support::VirtualTerminal;
-
-/// Upstream's `InputRecorder`: a focused child that records every dispatch.
-struct InputRecorder {
-    inputs: RefCell<Vec<String>>,
-}
-
-impl Component for InputRecorder {
-    fn render(&self, _width: usize) -> Vec<String> {
-        Vec::new()
-    }
-
-    fn handle_input(&self, data: &str) {
-        self.inputs.borrow_mut().push(data.to_string());
-    }
-
-    fn wants_input(&self) -> bool {
-        true
-    }
-
-    fn invalidate(&self) {}
-}
+use tui_support::{FocusableOverlay, VirtualTerminal};
 
 #[test]
 fn parses_16_bit_osc_11_rgb_responses() {
@@ -203,24 +177,77 @@ fn overlong_hex_channels_are_rejected() {
 
 // === the OSC 11 query block, upstream's `TUI.queryTerminalBackgroundColor` ===
 
-fn recorder() -> Rc<InputRecorder> {
-    Rc::new(InputRecorder {
-        inputs: RefCell::new(Vec::new()),
-    })
-}
-
-fn focus_recorder(tui: &Tui, recorder: &Rc<InputRecorder>) {
+/// The OSC 11 sinks: the focused `FocusableOverlay` recorder child and the
+/// recording input listener, the wiring every query test performs.
+fn wire_query_sinks(tui: &Tui) -> (Rc<FocusableOverlay>, Rc<RefCell<Vec<String>>>) {
+    let recorder = FocusableOverlay::new(&[]);
     let focus_target: Rc<dyn Component> = recorder.clone();
     tui.add_child(Rc::clone(&focus_target));
     tui.set_focus(Some(focus_target));
-}
-
-fn recording_listener(tui: &Tui, sink: &Rc<RefCell<Vec<String>>>) {
-    let listener_sink = Rc::clone(sink);
+    let listener_inputs = Rc::new(RefCell::new(Vec::<String>::new()));
+    let sink = Rc::clone(&listener_inputs);
     tui.add_input_listener(Rc::new(move |data| {
-        listener_sink.borrow_mut().push(data.to_string());
+        sink.borrow_mut().push(data.to_string());
         None
     }));
+    (recorder, listener_inputs)
+}
+
+/// A wired harness started against the default clock, the shape upstream's
+/// listener-and-recorder tests construct.
+struct QueryHarness {
+    terminal: VirtualTerminal,
+    tui: Rc<Tui>,
+    recorder: Rc<FocusableOverlay>,
+    listener_inputs: Rc<RefCell<Vec<String>>>,
+}
+
+fn query_harness() -> QueryHarness {
+    let terminal = VirtualTerminal::new(80, 24);
+    let tui = tui_support::new_test_tui(terminal.clone());
+    let (recorder, listener_inputs) = wire_query_sinks(&tui);
+    tui.start();
+    QueryHarness {
+        terminal,
+        tui,
+        recorder,
+        listener_inputs,
+    }
+}
+
+/// The query tests' settled read: the reply path sends synchronously, so an
+/// empty channel is a port regression that must panic loudly.
+#[expect(
+    clippy::expect_used,
+    reason = "the reply is sent synchronously before the receive runs; an empty channel is a port regression that must panic loudly"
+)]
+fn settled(query: &std::sync::mpsc::Receiver<Option<RgbColor>>) -> Option<RgbColor> {
+    query.try_recv().expect("the reply settles the query")
+}
+
+/// No listener or focused-component dispatch happened, upstream's
+/// `deepStrictEqual(listenerInputs, [])` / `deepStrictEqual(component.inputs, [])` pair.
+fn assert_no_dispatch(recorder: &FocusableOverlay, listener_inputs: &[String]) {
+    assert!(listener_inputs.is_empty());
+    assert!(recorder.inputs().is_empty());
+}
+
+/// The white-reply half of the plain-query tests: the `#ffffff` reply and
+/// its settled expectation, shared by the write-probe and the
+/// non-matching-dispatch tests.
+fn send_white_reply(
+    terminal: &VirtualTerminal,
+    query: &std::sync::mpsc::Receiver<Option<RgbColor>>,
+) {
+    terminal.send_input("\x1b]11;#ffffff\x07");
+    assert_eq!(
+        settled(query),
+        Some(RgbColor {
+            r: 255,
+            g: 255,
+            b: 255
+        })
+    );
 }
 
 #[test]
@@ -232,71 +259,55 @@ fn writes_osc_11_query_and_resolves_with_the_parsed_rgb_reply() {
     let query = tui.query_terminal_background_color(1000);
     assert!(terminal.write_log().contains("\x1b]11;?\x07"));
 
-    terminal.send_input("\x1b]11;#ffffff\x07");
-    assert_eq!(
-        query.try_recv().expect("the reply settles the query"),
-        Some(RgbColor {
-            r: 255,
-            g: 255,
-            b: 255
-        })
-    );
+    send_white_reply(&terminal, &query);
 
     tui_support::stop(&tui);
 }
 
 #[test]
 fn consumes_osc_11_replies_before_input_listeners_and_focused_component_dispatch() {
-    let terminal = VirtualTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal.clone());
-    let recorder = recorder();
-    focus_recorder(&tui, &recorder);
-    let listener_inputs = Rc::new(RefCell::new(Vec::<String>::new()));
-    recording_listener(&tui, &listener_inputs);
-    tui.start();
+    let QueryHarness {
+        terminal,
+        tui,
+        recorder,
+        listener_inputs,
+    } = query_harness();
 
     let query = tui.query_terminal_background_color(1000);
     terminal.send_input("\x1b]11;#000000\x07");
 
-    assert_eq!(
-        query.try_recv().expect("the reply settles the query"),
-        Some(RgbColor { r: 0, g: 0, b: 0 })
-    );
-    assert!(listener_inputs.borrow().is_empty());
-    assert!(recorder.inputs.borrow().is_empty());
+    assert_eq!(settled(&query), Some(RgbColor { r: 0, g: 0, b: 0 }));
+    assert_no_dispatch(&recorder, &listener_inputs.borrow());
 
     tui_support::stop(&tui);
 }
 
 #[test]
 fn consumes_unparseable_strict_osc_11_replies_and_resolves_undefined() {
-    let terminal = VirtualTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal.clone());
-    let recorder = recorder();
-    focus_recorder(&tui, &recorder);
-    let listener_inputs = Rc::new(RefCell::new(Vec::<String>::new()));
-    recording_listener(&tui, &listener_inputs);
-    tui.start();
+    let QueryHarness {
+        terminal,
+        tui,
+        recorder,
+        listener_inputs,
+    } = query_harness();
 
     let query = tui.query_terminal_background_color(1000);
     terminal.send_input("\x1b]11;not-a-color\x07");
 
-    assert_eq!(query.try_recv().expect("the reply settles the query"), None);
-    assert!(listener_inputs.borrow().is_empty());
-    assert!(recorder.inputs.borrow().is_empty());
+    assert_eq!(settled(&query), None);
+    assert_no_dispatch(&recorder, &listener_inputs.borrow());
 
     tui_support::stop(&tui);
 }
 
 #[test]
 fn dispatches_non_matching_input_normally_while_waiting_for_an_osc_11_reply() {
-    let terminal = VirtualTerminal::new(80, 24);
-    let tui = tui_support::new_test_tui(terminal.clone());
-    let recorder = recorder();
-    focus_recorder(&tui, &recorder);
-    let listener_inputs = Rc::new(RefCell::new(Vec::<String>::new()));
-    recording_listener(&tui, &listener_inputs);
-    tui.start();
+    let QueryHarness {
+        terminal,
+        tui,
+        recorder,
+        listener_inputs,
+    } = query_harness();
 
     let query = tui.query_terminal_background_color(1000);
     terminal.send_input("x");
@@ -305,17 +316,9 @@ fn dispatches_non_matching_input_normally_while_waiting_for_an_osc_11_reply() {
         "non-matching input must not settle the query"
     );
     assert_eq!(*listener_inputs.borrow(), vec!["x".to_string()]);
-    assert_eq!(*recorder.inputs.borrow(), vec!["x".to_string()]);
+    assert_eq!(recorder.inputs(), vec!["x".to_string()]);
 
-    terminal.send_input("\x1b]11;#ffffff\x07");
-    assert_eq!(
-        query.try_recv().expect("the reply settles the query"),
-        Some(RgbColor {
-            r: 255,
-            g: 255,
-            b: 255
-        })
-    );
+    send_white_reply(&terminal, &query);
 
     tui_support::stop(&tui);
 }
@@ -331,23 +334,16 @@ fn keeps_consuming_a_late_osc_11_reply_after_timeout() {
         clock: Some(Box::new(move || clock_now.get())),
         ..TuiConfig::default()
     });
-    let recorder = recorder();
-    focus_recorder(&tui, &recorder);
-    let listener_inputs = Rc::new(RefCell::new(Vec::<String>::new()));
-    recording_listener(&tui, &listener_inputs);
+    let (recorder, listener_inputs) = wire_query_sinks(&tui);
     tui.start();
 
     let query = tui.query_terminal_background_color(1);
     now.set(now.get() + Duration::from_millis(5));
     tui_support::render_and_flush(&tui);
-    assert_eq!(
-        query.try_recv().expect("the deadline settles the query"),
-        None
-    );
+    assert_eq!(settled(&query), None);
 
     terminal.send_input("\x1b]11;#ffffff\x07");
-    assert!(listener_inputs.borrow().is_empty());
-    assert!(recorder.inputs.borrow().is_empty());
+    assert_no_dispatch(&recorder, &listener_inputs.borrow());
 
     tui_support::stop(&tui);
 }

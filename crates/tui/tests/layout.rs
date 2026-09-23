@@ -15,6 +15,9 @@
     reason = "test fixtures fail loudly when the engine misbehaves; expecting keeps the failure modes readable, and the long scrollbar suite mirrors its upstream test block for block"
 )]
 
+#[path = "tui_support/mod.rs"]
+mod tui_support;
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -26,9 +29,7 @@ use pi_tui::layout::{
     LayoutRect, get_layout_boxes_at, get_scroll_view_box, get_scroll_views_at, render_layout_frame,
 };
 use pi_tui::layout_node::Basis;
-use pi_tui::terminal_image::{
-    EncodeKittyOptions, KittyImageMetadata, encode_kitty, register_kitty_image_metadata,
-};
+use pi_tui::terminal_image::register_kitty_image_metadata;
 use pi_tui::tui::{Component, RenderRequest};
 use pi_tui::utils::strip_terminal_sequences;
 
@@ -279,22 +280,8 @@ fn omits_gaps_around_invisible_entries() {
 #[test]
 fn crops_kitty_images_at_a_scroll_view_s_lower_boundary() {
     let image_id = 124;
-    let image_line = encode_kitty(
-        "AAAA",
-        EncodeKittyOptions {
-            columns: Some(2),
-            rows: Some(3),
-            image_id: Some(image_id),
-            move_cursor: Some(false),
-        },
-    );
-    register_kitty_image_metadata(KittyImageMetadata {
-        image_id,
-        columns: 2,
-        rows: 3,
-        width_px: 100,
-        height_px: 100,
-    });
+    let (image_line, metadata) = tui_support::kitty_fixture(image_id);
+    register_kitty_image_metadata(metadata);
     let transcript = ScrollView::new(
         Rc::new(CountingContent {
             render_count: Rc::new(Cell::new(0)),

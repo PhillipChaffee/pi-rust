@@ -21,8 +21,8 @@ use pi_tui::components::{
     SettingItem, SettingsList, SettingsListOptions, SettingsListTheme, SettingsSelectedColorFn,
     SettingsSubmenuDone, SettingsSubmenuDoneOptions,
 };
-use pi_tui::tui::{Component, TuiMouseButton, TuiMouseEvent, TuiMouseEventType};
-use tui_support::mouse_event;
+use pi_tui::tui::{Component, TuiMouseEventType};
+use tui_support::{mouse_event, mouse_move, mouse_wheel};
 
 /// The identity theme with the `> ` cursor, upstream `testTheme`.
 fn test_theme() -> SettingsListTheme {
@@ -57,42 +57,6 @@ fn setting_item(id: &str, label: &str, current_value: &str) -> SettingItem {
         current_value: current_value.to_string(),
         values: Some(vec!["off".to_string(), "on".to_string()]),
         submenu: None,
-    }
-}
-
-const fn mouse_move(x: u16, y: u16) -> TuiMouseEvent {
-    TuiMouseEvent {
-        event_type: TuiMouseEventType::Move,
-        button: TuiMouseButton::None,
-        x,
-        y,
-        screen_x: x,
-        screen_y: y,
-        width: 80,
-        height: 10,
-        shift: false,
-        alt: false,
-        ctrl: false,
-        wheel_delta: None,
-        click_count: None,
-    }
-}
-
-const fn mouse_wheel(x: u16, y: u16, wheel_delta: i32) -> TuiMouseEvent {
-    TuiMouseEvent {
-        event_type: TuiMouseEventType::Wheel,
-        button: TuiMouseButton::Left,
-        x,
-        y,
-        screen_x: x,
-        screen_y: y,
-        width: 80,
-        height: 10,
-        shift: false,
-        alt: false,
-        ctrl: false,
-        wheel_delta: Some(wheel_delta),
-        click_count: None,
     }
 }
 

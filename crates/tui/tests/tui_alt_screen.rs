@@ -1965,22 +1965,8 @@ fn crops_a_kitty_image_whose_first_line_is_above_the_viewport() {
     let terminal = RecordingTerminal::new(20, 3);
     let (tui, alt) = new_recording_tui(terminal.clone(), TuiAltScreenConfig::default());
     let image_id = 123;
-    let image_line = encode_kitty(
-        "AAAA",
-        EncodeKittyOptions {
-            columns: Some(2),
-            rows: Some(3),
-            image_id: Some(image_id),
-            move_cursor: Some(false),
-        },
-    );
-    register_kitty_image_metadata(KittyImageMetadata {
-        image_id,
-        columns: 2,
-        rows: 3,
-        width_px: 100,
-        height_px: 100,
-    });
+    let (image_line, metadata) = tui_support::kitty_fixture(image_id);
+    register_kitty_image_metadata(metadata);
     tui.add_child(Rc::new(FixtureComponent {
         lines: RefCell::new(vec![
             "before".to_string(),
