@@ -1,0 +1,32 @@
+[package]
+name = "pi-agent-core"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-abstracted agent runtime: the agent loop, Agent class, and harness runtime, ported from @earendil-works/pi-agent-core"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["agent", "llm", "coding-agent", "ai", "streaming"]
+categories = ["development-tools"]
+
+[dependencies]
+# The dominant upstream edge: message/model/usage types, the EventStream the
+# loop returns, the StreamFn contract's `Models.streamSimple` shape, and the
+# tool-argument validation the preflight runs.
+pi-ai = { path = "../ai" }
+# The AgentMessage extension surface and custom-message persistence are owned
+# JSON; the crate serializes its wire-faithful shapes with serde.
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+# The abort plumbing the stack decision pins: hook and tool signatures carry
+# the same cancellation token pi-ai's transport options do.
+tokio-util = { version = "0.7", default-features = false }
+
+[dev-dependencies]
+# macros: the test attribute macro; rt: the current-thread runtime the
+# single-threaded substrate expects; time: the paused clock for ordered
+# settlement tests.
+tokio = { version = "1.47", features = ["macros", "rt", "time"] }
+
+[lints]
+workspace = true
