@@ -25,10 +25,12 @@ pub mod radius_fixtures;
 pub mod seam_forms;
 
 use pi_ai::types::{
-    Api, AssistantBlock, AssistantMessage, Message, ProviderId, StopReason, TextContent,
+    Api, AssistantBlock, AssistantMessage, AssistantMessageEvent, Context, Message, Model,
+    ProviderId, ProviderStreams, SimpleStreamOptions, StopReason, StreamOptions, TextContent,
     ThinkingContent, ToolResultBlock, ToolResultMessage, Usage, UsageCost, UserContent,
     UserMessage,
 };
+use pi_ai::utils::event_stream::AssistantMessageEventStream;
 
 /// A provider-shaped usage block with the given total.
 #[must_use]
@@ -137,10 +139,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use pi_ai::auth::types::{ApiKeyAuth, ApiKeyAuthInput, ProviderAuth};
-use pi_ai::types::{
-    BoxedFuture, Context, DeferredCancelOptions, DeferredFetchOptions, DeferredHandle, Model,
-    ProviderStreams, SimpleStreamOptions, StreamOptions,
-};
+use pi_ai::types::{BoxedFuture, DeferredCancelOptions, DeferredFetchOptions, DeferredHandle};
 
 /// Run a future to completion on a fresh current-thread runtime, the seam
 /// sync tests use to drive the async surface.
@@ -233,7 +232,7 @@ pub fn deferred_handle() -> DeferredHandle {
 
 /// A stream that settles immediately with the fixture message.
 #[must_use]
-pub fn end_with(model: &Model) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+pub fn end_with(model: &Model) -> AssistantMessageEventStream {
     let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
     stream.end(Some(&message_fixture(model, StopReason::Stop)));
     stream
@@ -281,7 +280,7 @@ impl ProviderStreams for DeferredStreams {
         model: &Model,
         _context: &Context,
         _options: Option<&StreamOptions>,
-    ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+    ) -> AssistantMessageEventStream {
         end_with(model)
     }
 
@@ -290,7 +289,7 @@ impl ProviderStreams for DeferredStreams {
         model: &Model,
         _context: &Context,
         _options: Option<&SimpleStreamOptions>,
-    ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+    ) -> AssistantMessageEventStream {
         end_with(model)
     }
 
@@ -299,7 +298,7 @@ impl ProviderStreams for DeferredStreams {
         model: &Model,
         handle: &DeferredHandle,
         _options: Option<&DeferredFetchOptions>,
-    ) -> Option<pi_ai::utils::event_stream::AssistantMessageEventStream> {
+    ) -> Option<AssistantMessageEventStream> {
         *self
             .fetches
             .lock()
@@ -802,6 +801,106 @@ pub fn captured_payload(captured: &CapturedPayload) -> serde_json::Value {
 /// asserting test.
 pub type CapturedPayload = Arc<Mutex<Option<serde_json::Value>>>;
 
+/// The process-wide async lock the compat registry suites share: upstream's
+/// vitest workers isolate each test file in its own process, while one Rust
+/// test binary runs the suites concurrently against the shared registry.
+pub async fn registry_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static REGISTRY_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    REGISTRY_GUARD.lock().await
+}
+
+/// The registered api-registry streams that capture the api key the compat
+/// dispatch merged into the request options, upstream's registered
+/// `stream`/`streamSimple` pair in `compat-env.test.ts`.
+pub struct RegistryCapture {
+    /// The streams to register.
+    pub streams: Arc<dyn ProviderStreams>,
+    /// The captured api key slot.
+    pub key: Arc<Mutex<Option<String>>>,
+}
+
+impl RegistryCapture {
+    /// The key the dispatch merged, read after the request settles.
+    #[must_use]
+    pub fn captured_key(&self) -> Option<String> {
+        self.key
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// The api-key slot the capture streams read options through.
+fn capture_key(slot: &Arc<Mutex<Option<String>>>, api_key: Option<String>) {
+    *slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = api_key;
+}
+
+/// The settled capture stream, upstream's registered provider: start, done,
+/// and end with the "ok" text message.
+fn capture_settled(model: &Model) -> AssistantMessageEventStream {
+    let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
+    let mut output = message_fixture(model, StopReason::Stop);
+    output.content = vec![AssistantBlock::Text(text_block("ok"))];
+    stream.push(AssistantMessageEvent::Start {
+        partial: output.clone(),
+    });
+    stream.push(AssistantMessageEvent::Done {
+        reason: StopReason::Stop,
+        message: output.clone(),
+    });
+    stream.end(Some(&output));
+    stream
+}
+
+/// The capture streams the registry registers, both entry points capturing
+/// the merged api key.
+struct CaptureStreams {
+    key: Arc<Mutex<Option<String>>>,
+}
+
+impl ProviderStreams for CaptureStreams {
+    fn stream(
+        &self,
+        model: &Model,
+        _context: &Context,
+        options: Option<&StreamOptions>,
+    ) -> AssistantMessageEventStream {
+        capture_key(
+            &self.key,
+            options.and_then(|options| options.api_key.clone()),
+        );
+        capture_settled(model)
+    }
+
+    fn stream_simple(
+        &self,
+        model: &Model,
+        _context: &Context,
+        options: Option<&SimpleStreamOptions>,
+    ) -> AssistantMessageEventStream {
+        capture_key(
+            &self.key,
+            options.and_then(|options| options.api_key.clone()),
+        );
+        capture_settled(model)
+    }
+}
+
+/// The capture pair the compat suites register, upstream's
+/// `registerApiProvider({ api: "openai-responses", ... })` fixture.
+#[must_use]
+pub fn registry_capture() -> RegistryCapture {
+    let key = Arc::new(Mutex::new(None));
+    RegistryCapture {
+        streams: Arc::new(CaptureStreams {
+            key: Arc::clone(&key),
+        }),
+        key,
+    }
+}
+
 /// The wire options every mock-stream test injects: the mock as the
 /// transport and no credential resolution.
 #[must_use]
@@ -933,9 +1032,7 @@ pub fn recorded_body_at(mock: &MockHttpClient, index: usize) -> serde_json::Valu
 /// completing event settles: the wire APIs call `end(None)` after the `done`
 /// event, which clears an already-settled result, so a `result()` awaited
 /// only after the drain would wait forever.
-pub async fn drain_and_settle(
-    stream: &pi_ai::utils::event_stream::AssistantMessageEventStream,
-) -> AssistantMessage {
+pub async fn drain_and_settle(stream: &AssistantMessageEventStream) -> AssistantMessage {
     let ((), message) = tokio::join!(
         async { while stream.next().await.is_some() {} },
         stream.result()
@@ -1070,7 +1167,7 @@ pub fn keyed_openai_responses_options(mock: &MockHttpClient) -> OpenAiResponsesO
 
 /// The event's wire name, upstream's `event.type`, the names the event-order
 /// suites assert on.
-pub const fn event_type_name(event: &pi_ai::types::AssistantMessageEvent) -> &'static str {
+pub const fn event_type_name(event: &AssistantMessageEvent) -> &'static str {
     use pi_ai::types::AssistantMessageEvent as Event;
     match event {
         Event::Start { .. } => "start",

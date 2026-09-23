@@ -1627,7 +1627,8 @@ fn build_client_headers(
 }
 
 /// The headers every request carries: the SDK's pinned `anthropic-version`,
-/// the JSON accept, and the direct-browser-access flag upstream sets.
+/// the JSON accept, the direct-browser-access flag upstream sets, and the
+/// JSON content type the pinned SDK sends on every request body.
 fn base_browser_headers() -> BTreeMap<String, Option<String>> {
     BTreeMap::from([
         (
@@ -1635,6 +1636,10 @@ fn base_browser_headers() -> BTreeMap<String, Option<String>> {
             Some("2023-06-01".to_owned()),
         ),
         ("accept".to_owned(), Some("application/json".to_owned())),
+        (
+            "content-type".to_owned(),
+            Some("application/json".to_owned()),
+        ),
         (
             "anthropic-dangerous-direct-browser-access".to_owned(),
             Some("true".to_owned()),
