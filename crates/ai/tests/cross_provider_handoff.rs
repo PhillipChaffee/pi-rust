@@ -9,10 +9,6 @@
 //! providers the local credential store and env carry.
 
 #![expect(
-    clippy::expect_used,
-    reason = "the tests pin live outcomes; an unexpected shape panics the test by design"
-)]
-#![expect(
     clippy::too_many_lines,
     reason = "the fixture and handoff drivers mirror upstream's flat structure"
 )]
@@ -30,19 +26,14 @@
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pi_ai::auth::resolve::now_ms;
-use pi_ai::auth::types::{Credential, OAuthCredentials};
-use pi_ai::cli::{load_credentials, save_credentials};
 use pi_ai::compat::{complete_simple, get_env_api_key, get_model};
-use pi_ai::providers::all::builtin_providers;
 use pi_ai::types::{
     Api, AssistantBlock, Context, Message, Model, ProviderHeaders, SimpleStreamOptions, StopReason,
     ThinkingLevel, ToolResultBlock, ToolResultMessage, UserContent, UserMessage,
 };
-use tokio_util::sync::CancellationToken;
 
 mod common;
 
@@ -265,96 +256,17 @@ struct CachedContext {
     generated_at: i64,
 }
 
-/// The credential store the OAuth probes resolve through, upstream's
-/// `AUTH_PATH` under the user's home.
-fn auth_store() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("the test environment carries HOME")
-        .join(".pi")
-        .join("agent")
-        .join("auth.json")
-}
-
-/// The api key a probe uses, upstream's `getApiKey`: the pi credential store
-/// first — refreshing an expired OAuth token and saving it back — then the
-/// provider's env vars.
-async fn resolve_api_key(provider: &str) -> Option<String> {
-    let path = auth_store();
-    let storage = load_credentials(&path.to_string_lossy());
-    let stored = match storage.get(provider) {
-        Some(credential) => match credential.api_key() {
-            Some(key) => Some(key.to_owned()),
-            None => match credential.as_oauth() {
-                Some(oauth) => resolve_oauth_key(provider, &path, oauth).await,
-                None => None,
-            },
-        },
-        None => None,
-    };
-    stored.or_else(|| get_env_api_key(provider, None))
-}
-
-/// The credential store's OAuth arm, upstream's `resolveApiKey`: refresh an
-/// expired token and save it back, then derive the request key.
-async fn resolve_oauth_key(
-    provider: &str,
-    path: &Path,
-    stored: &OAuthCredentials,
-) -> Option<String> {
-    let flow = builtin_providers()
-        .into_iter()
-        .find(|candidate| candidate.id() == provider)?
-        .auth()
-        .oauth
-        .clone()?;
-    let mut current = stored.clone();
-    if now_ms() >= current.expires {
-        let refreshed = (flow.refresh)(current, CancellationToken::new())
-            .await
-            .inspect_err(|error| println!("{error}"))
-            .ok()?;
-        save_credentials(path, provider, &Credential::OAuth(refreshed.clone())).ok()?;
-        current = refreshed;
-    }
-    (flow.to_auth)(current).await.ok()?.api_key
-}
-
-/// Whether Azure OpenAI credentials are present, upstream's
-/// `azure-utils.hasAzureOpenAICredentials`.
-fn has_azure_openai_credentials() -> bool {
-    let has_key = std::env::var("AZURE_OPENAI_API_KEY").is_ok_and(|value| !value.is_empty());
-    let has_base_url = ["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME"]
-        .into_iter()
-        .any(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()));
-    has_key && has_base_url
-}
-
-/// Whether Cloudflare Workers AI credentials are present, upstream's
-/// `cloudflare-utils.hasCloudflareWorkersAICredentials`.
-fn has_cloudflare_workers_ai_credentials() -> bool {
-    std::env::var("CLOUDFLARE_API_KEY").is_ok_and(|value| !value.is_empty())
-        && std::env::var("CLOUDFLARE_ACCOUNT_ID").is_ok_and(|value| !value.is_empty())
-}
-
-/// Whether Cloudflare AI Gateway credentials are present, upstream's
-/// `cloudflare-utils.hasCloudflareAiGatewayCredentials`.
-fn has_cloudflare_ai_gateway_credentials() -> bool {
-    has_cloudflare_workers_ai_credentials()
-        && std::env::var("CLOUDFLARE_GATEWAY_ID").is_ok_and(|value| !value.is_empty())
-}
-
 /// The sync credential check the suite gates with, upstream's `hasApiKey`:
 /// env vars only, with the azure and cloudflare deployments' multi-var gates.
 fn has_api_key(pair: &ProviderModelPair) -> bool {
     if pair.provider == "azure-openai-responses" {
-        return has_azure_openai_credentials();
+        return common::live::has_azure_openai_credentials();
     }
     if pair.provider == "cloudflare-workers-ai" {
-        return has_cloudflare_workers_ai_credentials();
+        return common::live::has_cloudflare_workers_ai_credentials();
     }
     if pair.provider == "cloudflare-ai-gateway" {
-        if !has_cloudflare_ai_gateway_credentials() {
+        if !common::live::has_cloudflare_ai_gateway_credentials() {
             return false;
         }
         return pair
@@ -609,7 +521,7 @@ async fn fixtures() -> tokio::sync::MutexGuard<'static, FixtureState> {
     if !state.built {
         println!("\n=== Generating Fixtures ===\n");
         for candidate in &PROVIDER_MODEL_PAIRS {
-            let Some(api_key) = resolve_api_key(candidate.provider).await else {
+            let Some(api_key) = common::live::resolve_api_key(candidate.provider).await else {
                 println!(
                     "[{}] Skipping - no auth for {}",
                     candidate.label, candidate.provider
@@ -699,7 +611,7 @@ async fn should_handle_cross_provider_handoffs_for_each_target() {
 
     let mut results: Vec<(String, bool, Option<String>)> = Vec::new();
     for target_pair in &state.available {
-        let Some(api_key) = resolve_api_key(target_pair.provider).await else {
+        let Some(api_key) = common::live::resolve_api_key(target_pair.provider).await else {
             println!("[Target: {}] Skipping - no auth", target_pair.label);
             continue;
         };
