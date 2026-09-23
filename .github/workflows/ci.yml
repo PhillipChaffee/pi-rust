@@ -70,7 +70,10 @@ jobs:
           sudo mv /tmp/nextestx/cargo-nextest /usr/local/bin/
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # One full pass instead of two: cargo-nextest does not run doctests, so
+      # the coverage run below carries the other 3371 tests and this step
+      # carries the 9 doctests — the libtest run's only unique content.
+      - run: cargo test --doc --workspace
       # Gate AND report in one pass: llvm-cov writes the report before it
       # evaluates the fail-under switches (lines, regions, functions), so the
       # upload below can still run on a gate failure (measured: exit 1 with
@@ -107,6 +110,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           fetch-depth: 0
+      # The cargo steps here resolve the registry index and refresh the
+      # RustSec advisory DB (~/.cargo/advisory-dbs) on every run; the cache
+      # turns both fetches incremental. The DB stays current because the
+      # advisories gate pulls its delta before evaluating.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
+        with:
+          cache-directories: ~/.cargo/advisory-dbs
       - name: Install pinned hygiene tools
         run: |
           # Pinned hygiene tools: one download per tool, no installer actions.
