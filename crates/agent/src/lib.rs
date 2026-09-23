@@ -18,6 +18,7 @@
 //! [`Agent`]: https://github.com/PhillipChaffee/pi-rust/issues/88
 #![forbid(unsafe_code)]
 
+pub mod harness;
 pub mod search;
 pub mod stream_fn;
 pub mod types;

@@ -124,6 +124,27 @@ impl DynSpanHandle {
     pub fn start_span(&self, options: SpanOptions, body: BoxedSpanBody) -> ErasedSpanFuture {
         self.0.start_span(options, body)
     }
+
+    /// The dispatch handle that parents child spans off this span,
+    /// upstream's `withTelemetryContext(span, context)` half: the span
+    /// becomes the erased context later call sites fetch from the chord
+    /// `Context` (the pi-agent-core harness carries its telemetry parent
+    /// as a context value).
+    #[must_use]
+    pub fn telemetry_handle(&self) -> TelemetryHandle {
+        TelemetryHandle(Arc::new(SpanAsContext(self.clone())))
+    }
+}
+
+/// The span-as-parent adapter: one [`DynSpanHandle`] viewed as a
+/// [`DynTelemetryContext`], so child spans nest through the dispatch
+/// handle.
+struct SpanAsContext(DynSpanHandle);
+
+impl DynTelemetryContext for SpanAsContext {
+    fn start_span(&self, options: SpanOptions, body: BoxedSpanBody) -> ErasedSpanFuture {
+        self.0.start_span(options, body)
+    }
 }
 
 /// Object-safe mirror of the span-start contract for runtime-selected

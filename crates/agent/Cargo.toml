@@ -14,6 +14,13 @@ categories = ["development-tools"]
 # loop returns, the StreamFn contract's `Models.streamSimple` shape, and the
 # tool-argument validation the preflight runs.
 pi-ai = { path = "../ai" }
+# The harness Context seam: chord's ported Context/ContextKey/AbortSignal is
+# the explicit invocation context every harness API carries (map ticket
+# "pi-agent-core: harness foundations").
+pi-chord = { path = "../chord", package = "pi-chord" }
+# The telemetry schema vocabulary and the dispatch handle cross crate
+# boundaries per ADR 0004.
+pi-telemetry = { path = "../telemetry" }
 # The AgentMessage extension surface and custom-message persistence are owned
 # JSON; the crate serializes its wire-faithful shapes with serde.
 serde = { version = "1.0.219", features = ["derive"] }
@@ -21,12 +28,26 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 # The abort plumbing the stack decision pins: hook and tool signatures carry
 # the same cancellation token pi-ai's transport options do.
 tokio-util = { version = "0.7", default-features = false }
+# tokio: the async substrate the stack decision pins. sync: the channels and
+# watch/oneshot primitives the ordered delivery tails collapse into; time: the
+# output publisher's trailing timer and the shell exec timeout; process: the
+# nodejs execution environment's child processes; fs: the environment's file
+# operations; io-util: the child stdout/stderr readers.
+tokio = { version = "1.47", default-features = false, features = [
+  "sync",
+  "time",
+  "process",
+  "fs",
+  "io-util",
+] }
 
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the
 # single-threaded substrate expects; time: the paused clock for ordered
-# settlement tests.
-tokio = { version = "1.47", features = ["macros", "rt", "time"] }
+# settlement tests; process: the nodejs execution environment's shell probes.
+tokio = { version = "1.47", features = ["macros", "rt", "time", "process", "test-util"] }
+# tempfile: the execution-environment suites' scratch roots.
+tempfile = "3"
 
 [lints]
 workspace = true
