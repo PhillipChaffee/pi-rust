@@ -5,6 +5,8 @@
 //! registry ([`all`]), and one file per provider mirrors upstream's factory
 //! files. The shared helpers port next to their providers: [`cloudflare_auth`]
 //! and [`cloudflare_stream`], [`opencode_headers`], and [`radius_config`].
+//! [`faux`] is the in-memory fake provider, and [`images`] registers the
+//! builtin image-API providers.
 
 pub mod all;
 pub mod amazon_bedrock;
@@ -20,12 +22,14 @@ pub mod cloudflare_stream;
 pub mod cloudflare_workers_ai;
 pub mod deepseek;
 pub mod factory;
+pub mod faux;
 pub mod fireworks;
 pub mod github_copilot;
 pub mod google;
 pub mod google_vertex;
 pub mod groq;
 pub mod huggingface;
+pub mod images;
 pub mod kimi_coding;
 pub mod minimax;
 pub mod minimax_cn;
