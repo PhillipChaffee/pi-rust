@@ -267,7 +267,10 @@ fn set_padding_x_round_trips_and_requests_a_render() {
     let editor = Editor::with_options(
         &tui,
         tui_support::default_editor_theme(),
-        EditorOptions { padding_x: 0 },
+        EditorOptions {
+            padding_x: 0,
+            ..EditorOptions::default()
+        },
     );
     assert_eq!(editor.get_padding_x(), 0);
 
@@ -283,7 +286,10 @@ fn padding_shifts_the_content_and_the_cursor_overflow_folds_the_right_pad() {
     let editor = Editor::with_options(
         &tui,
         tui_support::default_editor_theme(),
-        EditorOptions { padding_x: 2 },
+        EditorOptions {
+            padding_x: 2,
+            ..EditorOptions::default()
+        },
     );
     editor.set_text("word");
     let lines = Component::render(&editor, 20);

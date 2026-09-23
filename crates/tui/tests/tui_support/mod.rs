@@ -51,9 +51,9 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthChar;
 
 use pi_tui::components::ColorFn;
-use pi_tui::components::{EditorTheme, MarkdownTheme};
+use pi_tui::components::{Editor, EditorTheme, MarkdownTheme, SelectListTheme};
 use pi_tui::terminal::{EnvLookup, InputHandler, ResizeHandler, Terminal};
-use pi_tui::terminal_image::{EncodeKittyOptions, encode_kitty};
+use pi_tui::terminal_image::{EncodeKittyOptions, KittyImageMetadata, encode_kitty};
 use pi_tui::tui::{
     Component, Focusable, Tui, TuiConfig, TuiMouseButton, TuiMouseEvent, TuiMouseEventType,
     TuiRenderer,
@@ -924,6 +924,73 @@ pub const fn mouse_event(
     }
 }
 
+/// The select/settings suites' move event: `mouse("move", x, y, 80, 10)`
+/// with no button held.
+#[must_use]
+pub const fn mouse_move(x: u16, y: u16) -> TuiMouseEvent {
+    TuiMouseEvent {
+        event_type: TuiMouseEventType::Move,
+        button: TuiMouseButton::None,
+        x,
+        y,
+        screen_x: x,
+        screen_y: y,
+        width: 80,
+        height: 10,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        wheel_delta: None,
+        click_count: None,
+    }
+}
+
+/// The select/settings suites' wheel event: `mouse("wheel", x, y, 80, 10)`
+/// carrying the wheel delta.
+#[must_use]
+pub const fn mouse_wheel(x: u16, y: u16, wheel_delta: i32) -> TuiMouseEvent {
+    TuiMouseEvent {
+        event_type: TuiMouseEventType::Wheel,
+        button: TuiMouseButton::Left,
+        x,
+        y,
+        screen_x: x,
+        screen_y: y,
+        width: 80,
+        height: 10,
+        shift: false,
+        alt: false,
+        ctrl: false,
+        wheel_delta: Some(wheel_delta),
+        click_count: None,
+    }
+}
+
+/// The crop tests' 2×3-cell placement fixture: the `AAAA` Kitty line and
+/// its 100×100-pixel metadata, the shape the layout/alt-screen/layout
+/// crop sites share.
+#[must_use]
+pub fn kitty_fixture(image_id: u64) -> (String, KittyImageMetadata) {
+    (
+        encode_kitty(
+            "AAAA",
+            EncodeKittyOptions {
+                columns: Some(2),
+                rows: Some(3),
+                image_id: Some(image_id),
+                move_cursor: Some(false),
+            },
+        ),
+        KittyImageMetadata {
+            image_id,
+            columns: 2,
+            rows: 3,
+            width_px: 100,
+            height_px: 100,
+        },
+    )
+}
+
 /// The suites' environment closure, `map.get(key)` closed over a clone.
 #[must_use]
 pub fn env_lookup(map: &HashMap<String, String>) -> EnvLookup {
@@ -986,12 +1053,52 @@ pub fn new_editor_test_tui(columns: u16, rows: u16) -> Rc<Tui> {
 }
 
 /// The editor suites' theme, upstream test-themes.ts `defaultEditorTheme`:
-/// the border color is chalk's dim. The select-list entry of the upstream
-/// theme lands with the autocomplete child (#49).
+/// the border color is chalk's dim, and the autocomplete dropdown theme is
+/// upstream test-themes.ts `defaultSelectListTheme`.
 #[must_use]
 pub fn default_editor_theme() -> EditorTheme {
     EditorTheme {
         border_color: Rc::new(|text| format!("\x1b[2m{text}\x1b[22m")),
+        select_list: default_select_list_theme(),
+    }
+}
+
+/// Let the editor's autocomplete worker settle and apply its result,
+/// upstream `flushAutocomplete` (microtask + setImmediate): the port's
+/// request runs on a worker thread, so the flush spins until the pipeline
+/// is idle and then drains.
+///
+/// # Panics
+/// Panics if the pipeline does not settle within five seconds — a hung
+/// provider or a lost request.
+pub fn flush_autocomplete(editor: &Editor) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !editor.autocomplete_idle() {
+        assert!(
+            std::time::Instant::now() <= deadline,
+            "autocomplete pipeline did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    editor.drain_autocomplete();
+}
+
+/// The suites' select-list theme, upstream test-themes.ts
+/// `defaultSelectListTheme` (chalk, level 3): the selected prefix blue,
+/// the selected text bold, the description, scroll info, and no-match
+/// lines dim.
+#[must_use]
+pub fn default_select_list_theme() -> SelectListTheme {
+    let chalked = |style: &'static ChalkStyle| {
+        let styled = chalk_one(style);
+        Rc::new(move |text: &str| styled(text))
+    };
+    SelectListTheme {
+        selected_prefix: chalked(&CHALK_BLUE),
+        selected_text: chalked(&CHALK_BOLD),
+        description: chalked(&CHALK_DIM),
+        scroll_info: chalked(&CHALK_DIM),
+        no_match: chalked(&CHALK_DIM),
     }
 }
 

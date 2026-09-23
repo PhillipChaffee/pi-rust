@@ -1,12 +1,43 @@
-//! 1:1 port of the pure-utils tests from
-//! `packages/tui/test/tab-width.test.ts` (upstream pin
-//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`).
-//!
-//! The fourth upstream test ("keeps tab-containing overlays on one physical
-//! terminal row") needs `TuiMainScreen`, the overlay API, and the headless
-//! virtual terminal; it rides with the main-screen renderer port ticket.
+//! 1:1 port of `packages/tui/test/tab-width.test.ts` (upstream pin
+//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`): the pure-utils tests and
+//! the tab-containing overlay test through the shared harness.
 
+#[path = "tui_support/mod.rs"]
+mod tui_support;
+
+use std::rc::Rc;
+
+use pi_tui::tui::{Component, OverlayOptions, SizeValue};
 use pi_tui::utils::{extract_segments, normalize_terminal_output, slice_with_width, visible_width};
+
+use tui_support::VirtualTerminal;
+
+/// The fourth test's full-viewport content, upstream `FullViewportContent`:
+/// three lines padded to the full width so the overlay row stands out.
+struct FullViewportContent;
+
+impl Component for FullViewportContent {
+    fn render(&self, width: usize) -> Vec<String> {
+        ["base 0", "base 1", "base 2"]
+            .iter()
+            .map(|line| format!("{line:<width$}"))
+            .collect()
+    }
+
+    fn invalidate(&self) {}
+}
+
+/// The fourth test's status overlay, upstream `TabStatusOverlay`: one line
+/// whose tab must never reach the terminal as a raw `\t`.
+struct TabStatusOverlay;
+
+impl Component for TabStatusOverlay {
+    fn render(&self, _width: usize) -> Vec<String> {
+        vec!["\tX".to_string()]
+    }
+
+    fn invalidate(&self) {}
+}
 
 #[test]
 fn keeps_slice_helper_widths_consistent_with_visible_width() {
@@ -47,4 +78,30 @@ fn keeps_tabs_inside_terminal_control_sequences_byte_identical() {
             format!("{control_sequence}label   text")
         );
     }
+}
+
+#[test]
+fn keeps_tab_containing_overlays_on_one_physical_terminal_row() {
+    let terminal = VirtualTerminal::new(16, 3);
+    let tui = tui_support::new_test_tui(terminal.clone());
+    tui.add_child(Rc::new(FullViewportContent));
+    let _ = tui.show_overlay(
+        Rc::new(TabStatusOverlay),
+        Some(OverlayOptions {
+            width: Some(SizeValue::Cells(4)),
+            row: Some(SizeValue::Cells(1)),
+            col: Some(SizeValue::Cells(4)),
+            ..OverlayOptions::default()
+        }),
+    );
+    tui.start();
+
+    tui_support::wait_for_render(&tui);
+    assert_eq!(
+        terminal.get_viewport(),
+        ["base 0          ", "base   X        ", "base 2          "]
+    );
+    assert!(!terminal.write_log().contains('\t'));
+
+    tui_support::stop(&tui);
 }

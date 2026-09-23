@@ -1,8 +1,7 @@
 //! Boundary tests for the #42 component slice, added where upstream's
-//! behavioral suites ride with other tickets (box and spacer ride with the
-//! layout engine's stack tests, #44; loader behavior rides with the TUI
-//! core's render tests, #43). These bind the 95% coverage gate now; the
-//! riding suites land with their tickets.
+//! behavioral suites leave branches untested; the box, spacer, and loader
+//! components have no upstream behavioral suite at all (only the excluded
+//! `chat-simple.ts` demo drives the loader), so their contracts bind here.
 #![expect(
     clippy::expect_used,
     reason = "a failed dispatch or missing target in a fixture is a test-environment failure; expecting keeps the assertions readable"

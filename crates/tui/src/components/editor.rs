@@ -13,15 +13,18 @@
 //!   code units; cursors, chunk boundaries, and paste-marker spans are byte
 //!   offsets end to end.
 //! - The autocomplete machinery — provider hooks, trigger/debounce
-//!   patterns, the request pipeline, and the `SelectList` dropdown — is the
-//!   autocomplete child's scope
-//!   ([#49](https://github.com/PhillipChaffee/pi-rust/issues/49)) and is
-//!   absent here: `handleInput` drops the autocomplete dispatch block and
-//!   the bare-Tab trigger, `insertCharacter` drops the trigger tail, the
-//!   delete/cursor paths drop the picker refresh, and the trigger-context
-//!   helpers ship with #49. `EditorOptions` carries no
-//!   `autocompleteMaxVisible` and [`EditorTheme`] carries no `selectList`
-//!   theme yet.
+//!   patterns, the request pipeline, and the `SelectList` dropdown —
+//!   integrates [`crate::autocomplete::AutocompleteProvider`] (#49).
+//!   Restatements: the request pipeline runs on one worker thread per
+//!   editor (upstream's `setTimeout` debounce + `autocompleteRequestTask`
+//!   serialization), whose results the host drains through
+//!   [`Editor::drain_autocomplete`] / [`Editor::autocomplete_idle`] —
+//!   upstream resolves them on the event loop before the next paint;
+//!   `AbortSignal` becomes a `CancellationToken` per the stack decision;
+//!   `this.autocompleteAbort` becomes the worker's active-token slot; and
+//!   `onSelect` on the dropdown list is applied by the editor after the
+//!   mouse dispatch, because the callback would need a handle on the
+//!   non-`Rc` editor.
 //! - `Intl.Segmenter` becomes [`crate::utils::grapheme_segments`] /
 //!   [`crate::utils::word_segments`] wrapped by
 //!   [`crate::word_navigation::SegmentData`]; the editor's paste-marker
@@ -44,9 +47,22 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::sync::LazyLock;
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use regex::{Captures, Regex};
+use tokio_util::sync::CancellationToken;
 
+use crate::autocomplete::{
+    ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS, AutocompleteItem, AutocompleteProvider,
+    AutocompleteQueryOptions, AutocompleteSuggestions, DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS,
+    build_debounce_pattern, build_trigger_pattern,
+};
+use crate::components::select_list::{
+    SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme,
+};
 use crate::keybindings::get_keybindings;
 use crate::keys::{KeyParser, decode_printable_key};
 use crate::kill_ring::{KillRing, KillRingPushOptions};
@@ -405,19 +421,33 @@ pub type EditorColorFn = Rc<dyn Fn(&str) -> String>;
 /// The submit/change callback, upstream `onSubmit?` / `onChange?`.
 pub type EditorCallback = Rc<dyn Fn(&str)>;
 
-/// The editor theme, upstream `EditorTheme`. The `selectList` entry lands
-/// with the autocomplete child (#49).
+/// The editor theme, upstream `EditorTheme`.
 #[derive(Clone)]
 pub struct EditorTheme {
     /// Border color function, upstream `borderColor`.
     pub border_color: EditorColorFn,
+    /// The dropdown theme for autocomplete suggestions, upstream
+    /// `selectList`.
+    pub select_list: SelectListTheme,
 }
 
 /// Construction options, upstream `EditorOptions`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct EditorOptions {
     /// Horizontal padding, upstream `paddingX`.
     pub padding_x: usize,
+    /// Maximum rows visible in the autocomplete dropdown, upstream
+    /// `autocompleteMaxVisible`; clamped into `[3, 20]`, default 5.
+    pub autocomplete_max_visible: usize,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self {
+            padding_x: 0,
+            autocomplete_max_visible: 5,
+        }
+    }
 }
 
 /// The last mutation the editor performed, upstream `lastAction`.
@@ -436,6 +466,285 @@ enum LastAction {
 enum JumpDirection {
     Forward,
     Backward,
+}
+
+/// Whether the open autocomplete picker came from a forced (Tab) or a
+/// natural trigger, upstream `"regular" | "force" | null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutocompleteMode {
+    Regular,
+    Force,
+}
+
+/// The options of one autocomplete request, upstream's inline
+/// `{ force, explicitTab }` objects.
+#[derive(Debug, Clone, Copy)]
+struct AutocompleteRequestOptions {
+    force: bool,
+    explicit_tab: bool,
+}
+
+/// One queued autocomplete request, upstream's `requestAutocomplete` call
+/// plus the snapshot `startAutocompleteRequest` captures.
+struct AutocompleteRequest {
+    generation: u64,
+    provider: Arc<dyn AutocompleteProvider>,
+    lines: Vec<String>,
+    cursor_line: usize,
+    cursor_col: usize,
+    force: bool,
+    explicit_tab: bool,
+    token: CancellationToken,
+    debounce_ms: u64,
+    snapshot_text: String,
+    snapshot_line: usize,
+    snapshot_col: usize,
+}
+
+/// A completed request handed back to the editor, upstream
+/// `runAutocompleteRequest`'s continuation.
+struct AutocompleteResult {
+    generation: u64,
+    token: CancellationToken,
+    force: bool,
+    explicit_tab: bool,
+    suggestions: Option<AutocompleteSuggestions>,
+    snapshot_text: String,
+    snapshot_line: usize,
+    snapshot_col: usize,
+}
+
+/// Worker state behind the mutex, upstream's debounce timer,
+/// `autocompleteRequestTask` serialization, and `autocompleteAbort` slot.
+struct AutocompleteWorkerState {
+    pending: Option<AutocompleteRequest>,
+    generation: u64,
+    active_token: Option<CancellationToken>,
+    shutdown: bool,
+    busy: bool,
+}
+
+/// The shared worker handles, upstream's event-loop scheduling.
+struct AutocompleteWorkerShared {
+    state: Mutex<AutocompleteWorkerState>,
+    signal: Condvar,
+    results_tx: mpsc::Sender<AutocompleteResult>,
+}
+
+impl AutocompleteWorkerShared {
+    /// Lock the worker mutex. A poisoned mutex means a worker-thread panic
+    /// already happened; upstream's event loop has no poisoning concept, so
+    /// the port surfaces it rather than guessing.
+    #[expect(
+        clippy::expect_used,
+        reason = "a poisoned worker mutex means a thread panicked mid-request; surfacing beats silently desynchronizing the editor"
+    )]
+    fn lock(&self) -> std::sync::MutexGuard<'_, AutocompleteWorkerState> {
+        self.state
+            .lock()
+            .expect("autocomplete worker mutex poisoned")
+    }
+
+    /// Wait on the shared condvar, re-locking on wake.
+    #[expect(
+        clippy::expect_used,
+        reason = "the same poisoned-mutex contract as lock()"
+    )]
+    fn wait<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, AutocompleteWorkerState>,
+    ) -> std::sync::MutexGuard<'a, AutocompleteWorkerState> {
+        self.signal
+            .wait(guard)
+            .expect("autocomplete worker mutex poisoned")
+    }
+
+    /// Wait with a timeout, re-locking on wake.
+    #[expect(
+        clippy::expect_used,
+        reason = "the same poisoned-mutex contract as lock()"
+    )]
+    fn wait_timeout<'a>(
+        &self,
+        guard: std::sync::MutexGuard<'a, AutocompleteWorkerState>,
+        timeout: Duration,
+    ) -> std::sync::MutexGuard<'a, AutocompleteWorkerState> {
+        self.signal
+            .wait_timeout(guard, timeout)
+            .expect("autocomplete worker mutex poisoned")
+            .0
+    }
+}
+
+/// The editor's channel to its worker thread, upstream's `setTimeout` +
+/// promise chain; dropped with the editor, which shuts the worker down.
+struct AutocompleteChannel {
+    shared: Arc<AutocompleteWorkerShared>,
+    results: mpsc::Receiver<AutocompleteResult>,
+}
+
+/// The slash-command dropdown layout, upstream
+/// `SLASH_COMMAND_SELECT_LIST_LAYOUT`.
+const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = SelectListLayoutOptions {
+    min_primary_column_width: Some(12),
+    max_primary_column_width: Some(32),
+    truncate_primary: None,
+};
+
+/// The editor's initial trigger characters, upstream's
+/// `[...DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS]` spread.
+fn default_trigger_characters() -> Vec<String> {
+    DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS
+        .iter()
+        .map(|char| (*char).to_string())
+        .collect()
+}
+
+/// Whether the in-flight request was replaced (a newer request queued) or
+/// abandoned (cancel, shutdown): the generation moved on, a newer request
+/// sits queued, or the worker is shutting down.
+const fn is_superseded(state: &AutocompleteWorkerState, request_generation: u64) -> bool {
+    state.generation != request_generation || state.pending.is_some() || state.shutdown
+}
+
+/// The autocomplete worker: one thread per editor, upstream's debounce
+/// timer and request-task serialization on the event loop. Requests are
+/// replaced (debounce restart) or abandoned (cancel) through the
+/// generation counter; provider calls are serialized; results flow to the
+/// editor's receiver where the host drains them.
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the thread entry point owns its Arc handle; taking a reference would borrow from a local"
+)]
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the condvar wait releases the mutex while parked; the guard drops at each loop exit"
+)]
+fn run_autocomplete_worker(shared: Arc<AutocompleteWorkerShared>) {
+    loop {
+        // Take the newest pending request, waiting for work.
+        let request = {
+            let mut state = shared.lock();
+            loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(request) = state.pending.take() {
+                    state.busy = true;
+                    break request;
+                }
+                state = shared.wait(state);
+            }
+        };
+        let request_generation = request.generation;
+
+        // The debounce, upstream's setTimeout: a newer request or a cancel
+        // abandons this one before the provider runs.
+        if request.debounce_ms > 0 {
+            let deadline = Instant::now() + Duration::from_millis(request.debounce_ms);
+            let mut superseded = false;
+            while !superseded {
+                let mut state = shared.lock();
+                if is_superseded(&state, request_generation) {
+                    superseded = true;
+                    state.busy = false;
+                    shared.signal.notify_all();
+                    drop(state);
+                    break;
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    drop(state);
+                    break;
+                };
+                let mut state = shared.wait_timeout(state, remaining);
+                if is_superseded(&state, request_generation) {
+                    superseded = true;
+                    state.busy = false;
+                    shared.signal.notify_all();
+                    drop(state);
+                    break;
+                }
+                drop(state);
+            }
+            if superseded {
+                continue;
+            }
+        }
+
+        if request.token.is_cancelled() {
+            let mut state = shared.lock();
+            state.busy = false;
+            shared.signal.notify_all();
+            drop(state);
+            continue;
+        }
+
+        let options = AutocompleteQueryOptions {
+            signal: request.token.clone(),
+            force: request.force,
+        };
+        let suggestions = request.provider.get_suggestions(
+            &request.lines,
+            request.cursor_line,
+            request.cursor_col,
+            &options,
+        );
+
+        // Upstream clears `autocompleteAbort` once the provider returns; a
+        // newer request owns the slot by then.
+        {
+            let mut state = shared.lock();
+            if state.generation == request_generation {
+                state.active_token = None;
+            }
+            drop(state);
+        }
+
+        let _ = shared.results_tx.send(AutocompleteResult {
+            generation: request_generation,
+            token: request.token.clone(),
+            force: request.force,
+            explicit_tab: request.explicit_tab,
+            suggestions,
+            snapshot_text: request.snapshot_text,
+            snapshot_line: request.snapshot_line,
+            snapshot_col: request.snapshot_col,
+        });
+
+        let mut state = shared.lock();
+        state.busy = false;
+        shared.signal.notify_all();
+        drop(state);
+    }
+}
+
+/// Spawn the worker thread for a fresh editor, upstream's implicit
+/// event-loop scheduling; the editor's `Drop` shuts it down.
+fn spawn_autocomplete_worker(
+    results_tx: mpsc::Sender<AutocompleteResult>,
+) -> Arc<AutocompleteWorkerShared> {
+    let shared = Arc::new(AutocompleteWorkerShared {
+        state: Mutex::new(AutocompleteWorkerState {
+            pending: None,
+            generation: 0,
+            active_token: None,
+            shutdown: false,
+            busy: false,
+        }),
+        signal: Condvar::new(),
+        results_tx,
+    });
+    let thread_shared = Arc::clone(&shared);
+    let spawned = thread::Builder::new()
+        .name("editor-autocomplete".to_string())
+        .spawn(move || run_autocomplete_worker(thread_shared));
+    if spawned.is_err() {
+        // No worker thread: mark the shared state shut down so requests
+        // queue nowhere and the drain sees nothing.
+        let mut state = shared.lock();
+        state.shutdown = true;
+    }
+    shared
 }
 
 /// Cursor placement when replacing the whole text, upstream
@@ -460,6 +769,7 @@ pub struct Editor {
     // Store last render geometry for cursor navigation and mouse hit-testing.
     last_width: Cell<usize>,
     rendered_visible_line_count: Cell<usize>,
+    rendered_autocomplete_height: Cell<usize>,
 
     // Vertical scrolling support
     scroll_offset: Cell<usize>,
@@ -467,6 +777,23 @@ pub struct Editor {
     /// Border color function (can be changed dynamically), upstream
     /// `borderColor`.
     pub border_color: EditorColorFn,
+    /// The construction theme, upstream `this.theme`: its dropdown theme
+    /// colors every autocomplete list the editor opens.
+    theme: EditorTheme,
+
+    // Autocomplete support, upstream's `autocomplete*` fields: the provider
+    // handle, the trigger/debounce patterns rebuilt per provider, the open
+    // dropdown list, and the generation counter discarding stale results.
+    autocomplete_provider: RefCell<Option<Arc<dyn AutocompleteProvider>>>,
+    autocomplete_trigger_characters: RefCell<Vec<String>>,
+    autocomplete_trigger_pattern: RefCell<Option<Regex>>,
+    autocomplete_debounce_pattern: RefCell<Option<Regex>>,
+    autocomplete_list: RefCell<Option<SelectList>>,
+    autocomplete_state: Cell<Option<AutocompleteMode>>,
+    autocomplete_prefix: RefCell<String>,
+    autocomplete_max_visible: Cell<usize>,
+    autocomplete_start_token: Cell<u64>,
+    autocomplete_channel: RefCell<Option<AutocompleteChannel>>,
 
     // Paste tracking for large pastes
     pastes: RefCell<HashMap<u32, String>>,
@@ -523,6 +850,7 @@ impl Editor {
     /// Upstream's `new Editor(tui, theme, options)`.
     #[must_use]
     pub fn with_options(tui: &Rc<Tui>, theme: EditorTheme, options: EditorOptions) -> Self {
+        let max_visible = options.autocomplete_max_visible.clamp(3, 20);
         Self {
             state: RefCell::new(EditorState {
                 lines: vec![String::new()],
@@ -534,8 +862,24 @@ impl Editor {
             padding_x: Cell::new(options.padding_x),
             last_width: Cell::new(80),
             rendered_visible_line_count: Cell::new(1),
+            rendered_autocomplete_height: Cell::new(0),
             scroll_offset: Cell::new(0),
-            border_color: theme.border_color,
+            border_color: theme.border_color.clone(),
+            theme,
+            autocomplete_provider: RefCell::new(None),
+            autocomplete_trigger_characters: RefCell::new(default_trigger_characters()),
+            autocomplete_trigger_pattern: RefCell::new(Some(build_trigger_pattern(
+                &default_trigger_characters(),
+            ))),
+            autocomplete_debounce_pattern: RefCell::new(Some(build_debounce_pattern(
+                &default_trigger_characters(),
+            ))),
+            autocomplete_list: RefCell::new(None),
+            autocomplete_state: Cell::new(None),
+            autocomplete_prefix: RefCell::new(String::new()),
+            autocomplete_max_visible: Cell::new(max_visible),
+            autocomplete_start_token: Cell::new(0),
+            autocomplete_channel: RefCell::new(None),
             pastes: RefCell::new(HashMap::new()),
             paste_counter: Cell::new(0),
             paste_buffer: RefCell::new(String::new()),
@@ -580,6 +924,471 @@ impl Editor {
             self.padding_x.set(padding);
             self.request_render();
         }
+    }
+
+    // ============================================================
+    // Autocomplete support, upstream's autocomplete methods (#49)
+    // ============================================================
+
+    /// The dropdown's maximum visible rows, upstream
+    /// `getAutocompleteMaxVisible`.
+    #[must_use]
+    pub const fn get_autocomplete_max_visible(&self) -> usize {
+        self.autocomplete_max_visible.get()
+    }
+
+    /// Set the dropdown's maximum visible rows, upstream
+    /// `setAutocompleteMaxVisible`: clamped into `[3, 20]`, re-render on
+    /// change.
+    pub fn set_autocomplete_max_visible(&self, max_visible: usize) {
+        let new_max_visible = max_visible.clamp(3, 20);
+        if self.autocomplete_max_visible.get() != new_max_visible {
+            self.autocomplete_max_visible.set(new_max_visible);
+            self.request_render();
+        }
+    }
+
+    /// Install the autocomplete provider, upstream
+    /// `setAutocompleteProvider`: cancels any open picker, stores the
+    /// provider, and rebuilds the trigger characters.
+    pub fn set_autocomplete_provider(&self, provider: Arc<dyn AutocompleteProvider>) {
+        self.ensure_autocomplete_worker();
+        self.cancel_autocomplete();
+        *self.autocomplete_provider.borrow_mut() = Some(provider);
+        let trigger_characters = self
+            .autocomplete_provider
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |provider| provider.trigger_characters());
+        self.set_autocomplete_trigger_characters(&trigger_characters);
+    }
+
+    /// Whether a picker is open, upstream `isShowingAutocomplete`.
+    #[must_use]
+    pub const fn is_showing_autocomplete(&self) -> bool {
+        self.autocomplete_state.get().is_some()
+    }
+
+    /// Whether the autocomplete request pipeline has nothing queued or
+    /// running. Upstream's equivalent is awaiting the event loop; the
+    /// host's flush helper (and tests) poll this before draining.
+    ///
+    /// # Panics
+    /// Panics if the worker mutex was poisoned — a worker thread panicked
+    /// mid-request.
+    #[must_use]
+    pub fn autocomplete_idle(&self) -> bool {
+        let channel_guard = self.autocomplete_channel.borrow();
+        let Some(channel) = channel_guard.as_ref() else {
+            return true;
+        };
+        let state = channel.shared.lock();
+        state.shutdown || (!state.busy && state.pending.is_none())
+    }
+
+    /// Apply completed autocomplete results, upstream's promise
+    /// continuations running on the event loop: stale generations and
+    /// stale snapshots are discarded, an empty suggestion set closes the
+    /// picker, a single forced Tab suggestion auto-applies without a menu,
+    /// and everything else opens the dropdown. Called before each render
+    /// (the pre-paint resumption point) and callable by the host pump.
+    pub fn drain_autocomplete(&self) {
+        let results: Vec<AutocompleteResult> = {
+            let channel_guard = self.autocomplete_channel.borrow();
+            let Some(channel) = channel_guard.as_ref() else {
+                return;
+            };
+            let mut results = Vec::new();
+            while let Ok(result) = channel.results.try_recv() {
+                results.push(result);
+            }
+            results
+        };
+
+        for result in results {
+            // Upstream's `isAutocompleteRequestCurrent`: not aborted, still
+            // the newest request, and the editor text/cursor unchanged
+            // since.
+            if result.token.is_cancelled()
+                || result.generation != self.autocomplete_start_token.get()
+            {
+                continue;
+            }
+            let current = {
+                let state = self.state.borrow();
+                state.cursor_line == result.snapshot_line
+                    && state.cursor_col == result.snapshot_col
+                    && self.get_text() == result.snapshot_text
+            };
+            if !current {
+                continue;
+            }
+
+            let Some(suggestions) = result.suggestions else {
+                self.cancel_autocomplete();
+                self.request_render();
+                continue;
+            };
+            if suggestions.items.is_empty() {
+                self.cancel_autocomplete();
+                self.request_render();
+                continue;
+            }
+
+            // A forced Tab query resolving to exactly one suggestion
+            // applies it directly without showing the menu.
+            if result.force && result.explicit_tab && suggestions.items.len() == 1 {
+                let item = &suggestions.items[0];
+                self.apply_selected_completion(item, &suggestions.prefix);
+                self.fire_on_change();
+                self.request_render();
+                continue;
+            }
+
+            let mode = if result.force {
+                AutocompleteMode::Force
+            } else {
+                AutocompleteMode::Regular
+            };
+            self.apply_autocomplete_suggestions(&suggestions, mode);
+            self.request_render();
+        }
+    }
+
+    /// Spawn the worker thread on first provider install, upstream's
+    /// implicit event-loop scheduling.
+    fn ensure_autocomplete_worker(&self) {
+        if self.autocomplete_channel.borrow().is_some() {
+            return;
+        }
+        let (results_tx, results) = mpsc::channel();
+        let shared = spawn_autocomplete_worker(results_tx);
+        *self.autocomplete_channel.borrow_mut() = Some(AutocompleteChannel { shared, results });
+    }
+
+    /// Set the trigger characters, upstream `setAutocompleteTriggerCharacters`:
+    /// the defaults plus single non-`/`, non-whitespace additions; the
+    /// trigger and debounce patterns rebuild with them.
+    fn set_autocomplete_trigger_characters(&self, trigger_characters: &[String]) {
+        let mut next: Vec<String> = DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS
+            .iter()
+            .map(|char| (*char).to_string())
+            .collect();
+        for character in trigger_characters {
+            let single_char = character.chars().count() == 1;
+            if !single_char
+                || character == "/"
+                || character.chars().next().is_some_and(is_whitespace_char)
+                || next.contains(character)
+            {
+                continue;
+            }
+            next.push(character.clone());
+        }
+        self.autocomplete_trigger_characters
+            .borrow_mut()
+            .clone_from(&next);
+        *self.autocomplete_trigger_pattern.borrow_mut() = Some(build_trigger_pattern(&next));
+        *self.autocomplete_debounce_pattern.borrow_mut() = Some(build_debounce_pattern(&next));
+    }
+
+    /// The debounce delay for a request, upstream
+    /// `getAutocompleteDebounceMs`: explicit Tab and forced queries run
+    /// immediately; symbol-triggered tokens wait
+    /// [`ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS`].
+    fn get_autocomplete_debounce_ms(&self, options: AutocompleteRequestOptions) -> u64 {
+        if options.explicit_tab || options.force {
+            return 0;
+        }
+
+        let current_line = {
+            let state = self.state.borrow();
+            state.lines[state.cursor_line].clone()
+        };
+        let text_before_cursor =
+            &current_line[..self.state.borrow().cursor_col.min(current_line.len())];
+        let is_attachment = self
+            .autocomplete_debounce_pattern
+            .borrow()
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_match(text_before_cursor));
+        if is_attachment {
+            ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS
+        } else {
+            0
+        }
+    }
+
+    /// Queue an autocomplete request, upstream `requestAutocomplete`:
+    /// forced queries pass the provider's file-completion gate, then the
+    /// previous request is cancelled and the new one queued (debounced or
+    /// immediate).
+    fn request_autocomplete(&self, options: AutocompleteRequestOptions) {
+        let Some(provider) = self.autocomplete_provider.borrow().clone() else {
+            return;
+        };
+
+        if options.force {
+            let (lines, cursor_line, cursor_col) = {
+                let state = self.state.borrow();
+                (state.lines.clone(), state.cursor_line, state.cursor_col)
+            };
+            let should_trigger =
+                provider.should_trigger_file_completion(&lines, cursor_line, cursor_col);
+            if !should_trigger {
+                return;
+            }
+        }
+
+        self.cancel_autocomplete_request();
+        let generation = self.autocomplete_start_token.get() + 1;
+        self.autocomplete_start_token.set(generation);
+
+        let debounce_ms = self.get_autocomplete_debounce_ms(options);
+        let (snapshot_text, snapshot_line, snapshot_col) = {
+            let state = self.state.borrow();
+            (self.get_text(), state.cursor_line, state.cursor_col)
+        };
+        let lines = self.state.borrow().lines.clone();
+        let request = AutocompleteRequest {
+            generation,
+            provider,
+            lines,
+            cursor_line: snapshot_line,
+            cursor_col: snapshot_col,
+            force: options.force,
+            explicit_tab: options.explicit_tab,
+            token: CancellationToken::new(),
+            debounce_ms,
+            snapshot_text,
+            snapshot_line,
+            snapshot_col,
+        };
+        let token = request.token.clone();
+
+        let channel_guard = self.autocomplete_channel.borrow();
+        let Some(channel) = channel_guard.as_ref() else {
+            return;
+        };
+        let mut state = channel.shared.lock();
+        state.pending = Some(request);
+        state.generation = generation;
+        state.active_token = Some(token);
+        channel.shared.signal.notify_all();
+        drop(state);
+    }
+
+    /// Invalidate the in-flight request, upstream
+    /// `cancelAutocompleteRequest`: bump the generation, clear the pending
+    /// queue, abort the active token.
+    fn cancel_autocomplete_request(&self) {
+        self.autocomplete_start_token
+            .set(self.autocomplete_start_token.get() + 1);
+        if let Some(channel) = self.autocomplete_channel.borrow().as_ref() {
+            let mut state = channel.shared.lock();
+            state.pending = None;
+            if let Some(token) = state.active_token.take() {
+                token.cancel();
+            }
+            channel.shared.signal.notify_all();
+            drop(state);
+        }
+    }
+
+    /// Drop the picker UI, upstream `clearAutocompleteUi`.
+    fn clear_autocomplete_ui(&self) {
+        self.autocomplete_state.set(None);
+        *self.autocomplete_list.borrow_mut() = None;
+        *self.autocomplete_prefix.borrow_mut() = String::new();
+    }
+
+    /// Cancel the request and the picker, upstream `cancelAutocomplete`.
+    fn cancel_autocomplete(&self) {
+        self.cancel_autocomplete_request();
+        self.clear_autocomplete_ui();
+    }
+
+    /// Natural trigger, upstream `tryTriggerAutocomplete`.
+    fn try_trigger_autocomplete(&self, explicit_tab: bool) {
+        self.request_autocomplete(AutocompleteRequestOptions {
+            force: false,
+            explicit_tab,
+        });
+    }
+
+    /// Tab completion dispatch, upstream `handleTabCompletion`: a
+    /// token-started slash command re-runs the command query, everything
+    /// else forces a file query.
+    fn handle_tab_completion(&self) {
+        if self.autocomplete_provider.borrow().is_none() {
+            return;
+        }
+
+        let current_line = self.state.borrow().lines[self.state.borrow().cursor_line].clone();
+        let before_cursor =
+            current_line[..self.state.borrow().cursor_col.min(current_line.len())].to_string();
+
+        if self.is_in_slash_command_context(&before_cursor)
+            && !before_cursor.trim_start().contains(' ')
+        {
+            self.handle_slash_command_completion();
+        } else {
+            self.force_file_autocomplete(true);
+        }
+    }
+
+    /// Slash-command Tab completion, upstream
+    /// `handleSlashCommandCompletion`.
+    fn handle_slash_command_completion(&self) {
+        self.request_autocomplete(AutocompleteRequestOptions {
+            force: false,
+            explicit_tab: true,
+        });
+    }
+
+    /// Forced file query, upstream `forceFileAutocomplete`.
+    fn force_file_autocomplete(&self, explicit_tab: bool) {
+        self.request_autocomplete(AutocompleteRequestOptions {
+            force: true,
+            explicit_tab,
+        });
+    }
+
+    /// Refresh an open picker for the new text/cursor, upstream
+    /// `updateAutocomplete`.
+    fn update_autocomplete(&self) {
+        if self.autocomplete_state.get().is_none() || self.autocomplete_provider.borrow().is_none()
+        {
+            return;
+        }
+        let force = self.autocomplete_state.get() == Some(AutocompleteMode::Force);
+        self.request_autocomplete(AutocompleteRequestOptions {
+            force,
+            explicit_tab: false,
+        });
+    }
+
+    /// The best preselected row for a suggestion set, upstream
+    /// `getBestAutocompleteMatchIndex`: exact value wins, then the first
+    /// value starting with the prefix, else none (case-sensitive,
+    /// `value` only).
+    #[expect(
+        clippy::unused_self,
+        reason = "upstream's getBestAutocompleteMatchIndex is an editor method; the port keeps the shape"
+    )]
+    fn get_best_autocomplete_match_index(
+        &self,
+        items: &[AutocompleteItem],
+        prefix: &str,
+    ) -> Option<usize> {
+        if prefix.is_empty() {
+            return None;
+        }
+
+        let mut first_prefix_index = None;
+
+        for (index, item) in items.iter().enumerate() {
+            if item.value == prefix {
+                return Some(index); // Exact match always wins
+            }
+            if first_prefix_index.is_none() && item.value.starts_with(prefix) {
+                first_prefix_index = Some(index);
+            }
+        }
+
+        first_prefix_index
+    }
+
+    /// Build the dropdown list, upstream `createAutocompleteList`: the
+    /// slash-command layout for `/` prefixes. Upstream wires the list's
+    /// `onSelect` to apply the clicked completion; the port applies it in
+    /// the editor's mouse dispatch because the callback would need a
+    /// handle on the non-`Rc` editor.
+    fn create_autocomplete_list(&self, prefix: &str, items: &[AutocompleteItem]) -> SelectList {
+        let layout = if prefix.starts_with('/') {
+            SLASH_COMMAND_SELECT_LIST_LAYOUT
+        } else {
+            SelectListLayoutOptions::default()
+        };
+        let select_items: Vec<SelectItem> = items.iter().map(|item| item.clone().into()).collect();
+        SelectList::with_layout(
+            select_items,
+            self.autocomplete_max_visible.get(),
+            self.theme.select_list.clone(),
+            layout,
+        )
+    }
+
+    /// Apply a suggestion set to the UI, upstream
+    /// `applyAutocompleteSuggestions`.
+    fn apply_autocomplete_suggestions(
+        &self,
+        suggestions: &AutocompleteSuggestions,
+        mode: AutocompleteMode,
+    ) {
+        self.autocomplete_prefix
+            .borrow_mut()
+            .clone_from(&suggestions.prefix);
+        let list = self.create_autocomplete_list(&suggestions.prefix, &suggestions.items);
+
+        if let Some(best_match_index) =
+            self.get_best_autocomplete_match_index(&suggestions.items, &suggestions.prefix)
+        {
+            list.set_selected_index(best_match_index);
+        }
+
+        *self.autocomplete_list.borrow_mut() = Some(list);
+        self.autocomplete_state.set(Some(mode));
+    }
+
+    /// Splice a selected completion into the text, upstream's
+    /// `applyCompletion` call shared by the Tab, confirm, click, and
+    /// auto-apply paths: undo snapshot, action reset, splice, cursor. The
+    /// prefix is the open picker's (`autocompletePrefix`) except for the
+    /// auto-apply path, which passes the fresh suggestion set's prefix —
+    /// upstream's exact arguments.
+    fn apply_selected_completion(&self, item: &AutocompleteItem, prefix: &str) {
+        let Some(provider) = self.autocomplete_provider.borrow().clone() else {
+            return;
+        };
+        self.push_undo_snapshot();
+        self.last_action.set(LastAction::None);
+        let (lines, cursor_line, cursor_col) = {
+            let state = self.state.borrow();
+            (state.lines.clone(), state.cursor_line, state.cursor_col)
+        };
+        let result = provider.apply_completion(&lines, cursor_line, cursor_col, item, prefix);
+        {
+            let mut state = self.state.borrow_mut();
+            state.lines = result.lines;
+            state.cursor_line = result.cursor_line;
+        }
+        self.set_cursor_col(result.cursor_col);
+    }
+
+    /// Whether the cursor sits where a slash command can start, upstream
+    /// `isAtStartOfMessage`.
+    fn is_at_start_of_message(&self) -> bool {
+        if !self.is_slash_menu_allowed() {
+            return false;
+        }
+        let current_line = self.state.borrow().lines[self.state.borrow().cursor_line].clone();
+        let before_cursor =
+            current_line[..self.state.borrow().cursor_col.min(current_line.len())].to_string();
+        let trimmed = before_cursor.trim();
+        trimmed.is_empty() || trimmed == "/"
+    }
+
+    /// Slash menus live on the first editor line only, upstream
+    /// `isSlashMenuAllowed`.
+    fn is_slash_menu_allowed(&self) -> bool {
+        self.state.borrow().cursor_line == 0
+    }
+
+    /// Whether the text before the cursor is inside a slash command
+    /// context, upstream `isInSlashCommandContext`.
+    fn is_in_slash_command_context(&self, text_before_cursor: &str) -> bool {
+        self.is_slash_menu_allowed() && text_before_cursor.trim_start().starts_with('/')
     }
 
     /// Add a prompt to history for up/down arrow navigation, upstream
@@ -724,6 +1533,10 @@ impl Editor {
     /// the wrapped visible rows with the inverse-video cursor, and the
     /// scroll-adjusted slice of layout lines.
     fn render_impl(&self, width: usize) -> Vec<String> {
+        // Completed autocomplete requests resume before the paint, the
+        // event loop's continuation slot.
+        self.drain_autocomplete();
+
         let max_padding = (width.saturating_sub(1)) / 2;
         let padding_x = self.padding_x.get().min(max_padding);
         let content_width = (width.saturating_sub(padding_x * 2)).max(1);
@@ -847,6 +1660,21 @@ impl Editor {
             .len()
             .saturating_sub(scroll_offset + visible_lines.len());
         result.push(self.render_bottom_border(width, lines_below));
+
+        // Add autocomplete list if active
+        self.rendered_autocomplete_height.set(0);
+        if self.autocomplete_state.get().is_some()
+            && let Some(list) = self.autocomplete_list.borrow().as_ref()
+        {
+            let autocomplete_result = list.render(content_width);
+            self.rendered_autocomplete_height
+                .set(autocomplete_result.len());
+            for line in autocomplete_result {
+                let line_width = visible_width(&line);
+                let line_padding = " ".repeat(content_width.saturating_sub(line_width));
+                result.push(format!("{left_padding}{line}{line_padding}{right_padding}"));
+            }
+        }
 
         result
     }
@@ -996,6 +1824,7 @@ impl Editor {
 
     /// Replace the whole text, upstream `setText`.
     pub fn set_text(&self, text: &str) {
+        self.cancel_autocomplete();
         self.last_action.set(LastAction::None);
         self.exit_history_browsing();
         let normalized = self.normalize_text(text);
@@ -1017,6 +1846,7 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        self.cancel_autocomplete();
         self.push_undo_snapshot();
         self.last_action.set(LastAction::None);
         self.exit_history_browsing();
@@ -1085,9 +1915,8 @@ impl Editor {
 
     /// Insert one character at the cursor, upstream `insertCharacter`:
     /// fish-style undo coalescing (consecutive word chars coalesce into one
-    /// undo unit; each space is separately undoable), then the insert and
-    /// the change notification. The autocomplete trigger tail ships with
-    /// the autocomplete child (#49).
+    /// undo unit; each space is separately undoable), then the insert, the
+    /// change notification, and the autocomplete trigger tail.
     fn insert_character(&self, char: &str) {
         self.exit_history_browsing();
 
@@ -1109,12 +1938,65 @@ impl Editor {
         self.set_cursor_col(new_col);
 
         self.fire_on_change();
+
+        // Check if we should trigger or update autocomplete
+        if self.autocomplete_state.get().is_none() {
+            let current_line = self.state.borrow().lines[self.state.borrow().cursor_line].clone();
+            let text_before_cursor =
+                current_line[..self.state.borrow().cursor_col.min(current_line.len())].to_string();
+
+            // Auto-trigger for "/" at the start of a line (slash commands)
+            if char == "/" && self.is_at_start_of_message() {
+                self.try_trigger_autocomplete(false);
+            }
+            // Auto-trigger for symbol-based completion like @, #, or
+            // provider triggers at token boundaries
+            else if self
+                .autocomplete_trigger_characters
+                .borrow()
+                .iter()
+                .any(|trigger| trigger == char)
+            {
+                let symbol_len = char.len();
+                let before_symbol =
+                    &text_before_cursor[..text_before_cursor.len().saturating_sub(symbol_len)];
+                let char_before_symbol = before_symbol.chars().last();
+                if before_symbol.is_empty()
+                    || char_before_symbol == Some(' ')
+                    || char_before_symbol == Some('\t')
+                {
+                    self.try_trigger_autocomplete(false);
+                }
+            }
+            // Also auto-trigger when typing letters in a slash command or
+            // symbol completion context
+            else if char
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || ".-_".contains(character))
+                && !char.is_empty()
+            {
+                // A slash command (with or without arguments) or a
+                // symbol-trigger (@, #, provider) context
+                if self.is_in_slash_command_context(&text_before_cursor)
+                    || self
+                        .autocomplete_trigger_pattern
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.is_match(&text_before_cursor))
+                {
+                    self.try_trigger_autocomplete(false);
+                }
+            }
+        } else {
+            self.update_autocomplete();
+        }
     }
 
     /// Route a bracketed paste through the editor, upstream `handlePaste`:
     /// control-byte decoding, cleaning, the file-path space, and the
     /// large-paste marker registry.
     fn handle_paste(&self, pasted_text: &str) {
+        self.cancel_autocomplete();
         self.exit_history_browsing();
         self.last_action.set(LastAction::None);
 
@@ -1202,6 +2084,7 @@ impl Editor {
 
     /// Split the current line at the cursor, upstream `addNewLine`.
     fn add_new_line(&self) {
+        self.cancel_autocomplete();
         self.exit_history_browsing();
         self.last_action.set(LastAction::None);
 
@@ -1255,6 +2138,7 @@ impl Editor {
     /// Submit the current text, upstream `submitValue`: paste markers
     /// expand, the editor resets to empty, and undo history clears.
     fn submit_value(&self) {
+        self.cancel_autocomplete();
         let joined = self.state.borrow().lines.join("\n");
         let result = self.expand_paste_markers(&joined).trim().to_string();
 
@@ -1282,7 +2166,8 @@ impl Editor {
 
     /// Delete one grapheme before the cursor (or merge with the previous
     /// line at column 0), upstream `handleBackspace`, including the
-    /// paste-marker registry shift when the deleted grapheme is a marker.
+    /// paste-marker registry shift when the deleted grapheme is a marker,
+    /// and the autocomplete update-or-retrigger tail.
     fn handle_backspace(&self) {
         self.exit_history_browsing();
         self.last_action.set(LastAction::None);
@@ -1371,6 +2256,27 @@ impl Editor {
         }
 
         self.fire_on_change();
+
+        // Update or re-trigger autocomplete after backspace
+        if self.autocomplete_state.get().is_some() {
+            self.update_autocomplete();
+        } else {
+            // If autocomplete was cancelled (no matches), re-trigger if
+            // we're in a completable context
+            let current_line = self.state.borrow().lines[self.state.borrow().cursor_line].clone();
+            let text_before_cursor =
+                current_line[..self.state.borrow().cursor_col.min(current_line.len())].to_string();
+            // Slash-command or symbol-trigger (@, #, provider) context
+            if self.is_in_slash_command_context(&text_before_cursor)
+                || self
+                    .autocomplete_trigger_pattern
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.is_match(&text_before_cursor))
+            {
+                self.try_trigger_autocomplete(false);
+            }
+        }
     }
 
     /// Set the cursor column and clear the sticky-column state, upstream
@@ -1807,6 +2713,9 @@ impl Editor {
 
     /// Delete one grapheme at the cursor (or merge with the next line at
     /// line end), upstream `handleForwardDelete`.
+    /// Delete one grapheme after the cursor (or merge with the next line at
+    /// line end), upstream `handleForwardDelete`, with the same
+    /// autocomplete update-or-retrigger tail as backspace.
     fn handle_forward_delete(&self) {
         self.exit_history_browsing();
         self.last_action.set(LastAction::None);
@@ -1846,6 +2755,25 @@ impl Editor {
         }
 
         self.fire_on_change();
+
+        // Update or re-trigger autocomplete after forward delete
+        if self.autocomplete_state.get().is_some() {
+            self.update_autocomplete();
+        } else {
+            let current_line = self.state.borrow().lines[self.state.borrow().cursor_line].clone();
+            let text_before_cursor =
+                current_line[..self.state.borrow().cursor_col.min(current_line.len())].to_string();
+            // Slash-command or symbol-trigger (@, #, provider) context
+            if self.is_in_slash_command_context(&text_before_cursor)
+                || self
+                    .autocomplete_trigger_pattern
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.is_match(&text_before_cursor))
+            {
+                self.try_trigger_autocomplete(false);
+            }
+        }
     }
 
     /// Map visual lines to logical positions, upstream
@@ -1990,6 +2918,19 @@ impl Editor {
                     self.set_cursor_col(prev_line.len());
                 }
             }
+        }
+
+        // Keep an open autocomplete picker in sync with the new cursor
+        // position: cursor movement changes the text before the cursor, so
+        // a picker computed for the old position is stale. Re-query so it
+        // refreshes — or closes when the new position yields no
+        // suggestions — mirroring insertCharacter()/handleBackspace().
+        // Without this, arrowing left from `/cmd ` back into the command
+        // name leaves the argument picker showing against a `/cmd` prefix
+        // (and a Tab there would concatenate the stale suggestion onto the
+        // partial command name).
+        if self.autocomplete_state.get().is_some() {
+            self.update_autocomplete();
         }
     }
 
@@ -2318,14 +3259,17 @@ impl Editor {
         }
     }
 
-    /// The raw input dispatch, upstream `Editor.handleInput`. The
-    /// autocomplete dispatch block and the bare-Tab completion trigger ship
-    /// with the autocomplete child (#49).
+    /// The raw input dispatch, upstream `Editor.handleInput`. Completed
+    /// autocomplete requests resume here (upstream's event-loop
+    /// continuations run between keystrokes), then the autocomplete
+    /// dispatch block intercepts the open-picker keys.
     #[expect(
         clippy::too_many_lines,
         reason = "mirrors upstream's one dispatch chain branch for branch; splitting it would detach the port from the upstream method it mirrors"
     )]
     pub fn handle_input(&self, data: &str) {
+        self.drain_autocomplete();
+
         // Handle character jump mode (awaiting next character to jump to)
         if let Some(direction) = self.jump_mode.get() {
             // Cancel if the hotkey is pressed again
@@ -2391,6 +3335,66 @@ impl Editor {
             return;
         }
 
+        // Handle autocomplete mode
+        if self.autocomplete_state.get().is_some() {
+            if self.matches(&data, "tui.select.cancel") {
+                self.cancel_autocomplete();
+                return;
+            }
+
+            if self.matches(&data, "tui.select.up") || self.matches(&data, "tui.select.down") {
+                if let Some(list) = self.autocomplete_list.borrow().as_ref() {
+                    list.handle_input(&data);
+                }
+                return;
+            }
+
+            if self.matches(&data, "tui.input.tab") {
+                let selected = self
+                    .autocomplete_list
+                    .borrow()
+                    .as_ref()
+                    .and_then(SelectList::get_selected_item);
+                if let Some(selected) = selected
+                    && self.autocomplete_provider.borrow().is_some()
+                {
+                    let prefix = self.autocomplete_prefix.borrow().clone();
+                    self.apply_selected_completion(&selected.into(), &prefix);
+                    self.cancel_autocomplete();
+                    self.fire_on_change();
+                }
+                return;
+            }
+
+            if self.matches(&data, "tui.select.confirm") {
+                let selected = self
+                    .autocomplete_list
+                    .borrow()
+                    .as_ref()
+                    .and_then(SelectList::get_selected_item);
+                if let Some(selected) = selected
+                    && self.autocomplete_provider.borrow().is_some()
+                {
+                    let prefix = self.autocomplete_prefix.borrow().clone();
+                    self.apply_selected_completion(&selected.into(), &prefix);
+
+                    self.cancel_autocomplete();
+                    if self.autocomplete_prefix.borrow().starts_with('/') {
+                        // Fall through to submit
+                    } else {
+                        self.fire_on_change();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Tab - trigger completion
+        if self.matches(&data, "tui.input.tab") && self.autocomplete_state.get().is_none() {
+            self.handle_tab_completion();
+            return;
+        }
+
         // Deletion actions
         if self.matches(&data, "tui.editor.deleteToLineEnd") {
             self.delete_to_end_of_line();
@@ -2434,10 +3438,12 @@ impl Editor {
         // Dedicated history actions always browse entries instead of moving
         // the cursor.
         if self.matches(&data, "tui.editor.historyPrevious") {
+            self.cancel_autocomplete();
             self.navigate_history(-1);
             return;
         }
         if self.matches(&data, "tui.editor.historyNext") {
+            self.cancel_autocomplete();
             self.navigate_history(1);
             return;
         }
@@ -2587,7 +3593,69 @@ impl Editor {
     /// stay unhandled so the renderer's screen-level text selection can run
     /// over the editor rows. The autocomplete-dropdown region dispatch ships
     /// with the autocomplete child (#49).
+    /// Mouse cursor placement, upstream `Editor.handleMouse`: the open
+    /// autocomplete dropdown's region dispatches into its list (clicks
+    /// apply the clicked suggestion); presses/drag/releases over the editor
+    /// rows stay unhandled so the renderer's screen-level text selection
+    /// can run (drag to select, release to copy); clicks inside the visible
+    /// editor rows map to a logical position. The renderer synthesizes a
+    /// click when press and release land on the same cell without
+    /// movement, which is the gesture that positions the cursor.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors upstream's handleMouse branch for branch; splitting it would detach the port from the upstream method it mirrors"
+    )]
     fn handle_mouse_impl(&self, event: &TuiMouseEvent) -> Option<TuiMouseEventResult> {
+        // The dropdown renders after the bottom border: top border row +
+        // visible rows + bottom border = the picker's first row.
+        let autocomplete_start_row = self.rendered_visible_line_count.get() + 2;
+        if self.autocomplete_state.get().is_some()
+            && self.autocomplete_list.borrow().is_some()
+            && usize::from(event.y) >= autocomplete_start_row
+            && usize::from(event.y)
+                < autocomplete_start_row + self.rendered_autocomplete_height.get()
+        {
+            let max_padding = (usize::from(event.width).saturating_sub(1)) / 2;
+            let padding_x = self.padding_x.get().min(max_padding);
+            let content_width = usize::from(event.width)
+                .saturating_sub(padding_x * 2)
+                .max(1);
+            let translated = TuiMouseEvent {
+                x: event
+                    .x
+                    .saturating_sub(u16::try_from(padding_x).unwrap_or(u16::MAX)),
+                y: event.y - u16::try_from(autocomplete_start_row).unwrap_or(u16::MAX),
+                width: u16::try_from(content_width).unwrap_or(u16::MAX),
+                height: u16::try_from(self.rendered_autocomplete_height.get()).unwrap_or(u16::MAX),
+                ..event.clone()
+            };
+            let result = self
+                .autocomplete_list
+                .borrow()
+                .as_ref()
+                .and_then(|list| list.handle_mouse(&translated))?;
+            // Upstream wires the list's `onSelect` to apply the clicked
+            // completion; the port applies it after the dispatch because
+            // the callback would need a handle on the non-`Rc` editor.
+            if translated.event_type == TuiMouseEventType::Click {
+                let selected = self
+                    .autocomplete_list
+                    .borrow()
+                    .as_ref()
+                    .and_then(SelectList::get_selected_item);
+                if let Some(selected) = selected {
+                    let prefix = self.autocomplete_prefix.borrow().clone();
+                    self.apply_selected_completion(&selected.into(), &prefix);
+                }
+                self.cancel_autocomplete();
+                self.fire_on_change();
+            }
+            return Some(TuiMouseEventResult {
+                focus: true,
+                ..result
+            });
+        }
+
         // Leave press/drag/release unhandled so the renderer's screen-level
         // text selection can run over the editor rows (drag to select,
         // release to copy). The renderer synthesizes a click when press and
@@ -2645,6 +3713,9 @@ impl Editor {
         self.set_cursor_col(visual_line.start_col + target_index);
         self.last_action.set(LastAction::None);
         self.exit_history_browsing();
+        if self.autocomplete_state.get().is_some() {
+            self.update_autocomplete();
+        }
         Some(TuiMouseEventResult {
             handled: true,
             focus: true,
@@ -2704,6 +3775,24 @@ impl Focusable for Editor {
 
     fn is_focused(&self) -> bool {
         self.focused.get()
+    }
+}
+
+impl Drop for Editor {
+    fn drop(&mut self) {
+        // Shut the autocomplete worker down: clear its queue, cancel the
+        // active request, wake it. A provider call already running finishes
+        // and the worker exits on the next loop.
+        if let Some(channel) = self.autocomplete_channel.borrow().as_ref() {
+            let mut state = channel.shared.lock();
+            state.pending = None;
+            state.shutdown = true;
+            if let Some(token) = state.active_token.take() {
+                token.cancel();
+            }
+            channel.shared.signal.notify_all();
+            drop(state);
+        }
     }
 }
 
