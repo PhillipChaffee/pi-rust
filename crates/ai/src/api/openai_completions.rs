@@ -783,14 +783,33 @@ fn build_request_headers(
     context: &Context,
     compat: &CompletionsCompat,
     session_id: Option<&str>,
+    api_key: &str,
     options_headers: Option<&ProviderHeaders>,
 ) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = vec![
-        ("User-Agent".to_owned(), get_pi_user_agent()),
-        // The pinned OpenAI SDK's JSON content type; explicit headers
-        // override it and a `None` option suppresses it.
-        ("content-type".to_owned(), "application/json".to_owned()),
-    ];
+    // The credential header participates in the caller-header merge, the
+    // pinned SDK's `defaultHeaders` behavior: an explicit value overrides
+    // the bearer placeholder and a `null` removes it entirely, so a
+    // gateway-binding sentinel can own the auth without the placeholder
+    // riding the wire.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let caller_authorization = options_headers.and_then(|headers| {
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .map(|(_, value)| value.clone())
+    });
+    match caller_authorization {
+        Some(value) => {
+            if let Some(value) = value {
+                headers.push(("Authorization".to_owned(), value));
+            }
+        }
+        None => headers.push(("Authorization".to_owned(), format!("Bearer {api_key}"))),
+    }
+    headers.push(("User-Agent".to_owned(), get_pi_user_agent()));
+    // The pinned OpenAI SDK's JSON content type; explicit headers
+    // override it and a `None` option suppresses it.
+    headers.push(("content-type".to_owned(), "application/json".to_owned()));
     if let Some(model_headers) = &model.headers {
         for (name, value) in model_headers {
             headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
@@ -2154,14 +2173,14 @@ async fn dispatch_stream_request(
     session_id: Option<&str>,
     payload: Map<String, Value>,
 ) -> Result<HttpResponse, StreamFailure> {
-    let mut headers = vec![("Authorization".to_owned(), format!("Bearer {api_key}"))];
-    headers.extend(build_request_headers(
+    let headers = build_request_headers(
         model,
         context,
         compat,
         session_id,
+        api_key,
         options.headers.as_ref(),
-    ));
+    );
 
     let mut payload = payload;
     if let Some(hook) = &options.transport_options.on_payload

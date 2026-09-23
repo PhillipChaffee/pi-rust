@@ -3715,3 +3715,71 @@ async fn continues_to_explicitly_disable_reasoning_for_optional_models() {
 
     assert_eq!(payload["reasoning"], json!({ "effort": "none" }));
 }
+
+// ---------------------------------------------------------------------------
+// baseten chat-template args (upstream baseten-models.test.ts payload parts)
+// ---------------------------------------------------------------------------
+
+/// The baseten catalog entries stream through the completions wire: the
+/// chat-template args substitute pi's thinking state and `reasoning_effort`
+/// follows the compat gate, upstream's `onPayload` captures.
+#[tokio::test]
+async fn baseten_kimi_k2_6_sends_the_template_toggle_without_an_effort() {
+    let model = builtin_model("baseten", "moonshotai/Kimi-K2.6");
+    let payload = capture_keyed_simple(
+        &model,
+        &Context {
+            system_prompt: Some("sys".to_owned()),
+            messages: vec![user_message_now("hi")],
+            ..Context::default()
+        },
+        |options| options.reasoning = Some(ThinkingLevel::High),
+    )
+    .await;
+
+    assert_eq!(
+        payload["chat_template_args"],
+        json!({ "enable_thinking": true })
+    );
+    assert_eq!(payload.get("reasoning_effort"), None);
+}
+
+#[tokio::test]
+async fn baseten_sends_the_template_toggle_with_the_reasoning_effort() {
+    let model = builtin_model("baseten", "zai-org/GLM-5.2");
+    let payload = capture_keyed_simple(
+        &model,
+        &Context {
+            messages: vec![user_message_now("test")],
+            ..Context::default()
+        },
+        |options| options.reasoning = Some(ThinkingLevel::High),
+    )
+    .await;
+
+    assert_eq!(
+        payload["chat_template_args"],
+        json!({ "enable_thinking": true })
+    );
+    assert_eq!(payload["reasoning_effort"], json!("high"));
+}
+
+#[tokio::test]
+async fn baseten_disables_the_opt_in_reasoning_when_thinking_is_off() {
+    let model = builtin_model("baseten", "zai-org/GLM-5.2");
+    let payload = capture_keyed_simple(
+        &model,
+        &Context {
+            messages: vec![user_message_now("test")],
+            ..Context::default()
+        },
+        |_| (),
+    )
+    .await;
+
+    assert_eq!(
+        payload["chat_template_args"],
+        json!({ "enable_thinking": false })
+    );
+    assert_eq!(payload["reasoning_effort"], json!("none"));
+}

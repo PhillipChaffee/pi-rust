@@ -313,14 +313,30 @@ fn resolve_azure_config(
 /// no session-affinity headers.
 fn build_request_headers(
     model: &Model,
+    api_key: &str,
     options_headers: Option<&ProviderHeaders>,
 ) -> Vec<(String, String)> {
-    let mut headers: Vec<(String, String)> = vec![
-        ("User-Agent".to_owned(), get_pi_user_agent()),
-        // The pinned OpenAI SDK's JSON content type, overridable like the
-        // completions adapter's.
-        ("content-type".to_owned(), "application/json".to_owned()),
-    ];
+    // The credential header participates in the caller-header merge, the
+    // pinned SDK's `defaultHeaders` behavior, like the completions adapter's.
+    let mut headers: Vec<(String, String)> = Vec::new();
+    let caller_api_key = options_headers.and_then(|headers| {
+        headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("api-key"))
+            .map(|(_, value)| value.clone())
+    });
+    match caller_api_key {
+        Some(value) => {
+            if let Some(value) = value {
+                headers.push(("api-key".to_owned(), value));
+            }
+        }
+        None => headers.push(("api-key".to_owned(), api_key.to_owned())),
+    }
+    headers.push(("User-Agent".to_owned(), get_pi_user_agent()));
+    // The pinned OpenAI SDK's JSON content type, overridable like the
+    // completions adapter's.
+    headers.push(("content-type".to_owned(), "application/json".to_owned()));
     if let Some(model_headers) = &model.headers {
         for (name, value) in model_headers {
             headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
@@ -602,8 +618,7 @@ async fn dispatch_stream_request(
 ) -> Result<crate::http::client::HttpResponse, String> {
     let (base_url, api_version) = resolve_azure_config(model, options)?;
     let url = azure_responses_url(&base_url, &api_version);
-    let mut headers = vec![("api-key".to_owned(), api_key.to_owned())];
-    headers.extend(build_request_headers(model, options.headers.as_ref()));
+    let headers = build_request_headers(model, api_key, options.headers.as_ref());
 
     let mut payload = payload;
     if let Some(hook) = &options.transport_options.on_payload
