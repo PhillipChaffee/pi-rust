@@ -1067,3 +1067,23 @@ pub fn keyed_openai_responses_options(mock: &MockHttpClient) -> OpenAiResponsesO
         ..OpenAiResponsesOptions::default()
     }
 }
+
+/// The event's wire name, upstream's `event.type`, the names the event-order
+/// suites assert on.
+pub const fn event_type_name(event: &pi_ai::types::AssistantMessageEvent) -> &'static str {
+    use pi_ai::types::AssistantMessageEvent as Event;
+    match event {
+        Event::Start { .. } => "start",
+        Event::TextStart { .. } => "text_start",
+        Event::TextDelta { .. } => "text_delta",
+        Event::TextEnd { .. } => "text_end",
+        Event::ThinkingStart { .. } => "thinking_start",
+        Event::ThinkingDelta { .. } => "thinking_delta",
+        Event::ThinkingEnd { .. } => "thinking_end",
+        Event::ToolcallStart { .. } => "toolcall_start",
+        Event::ToolcallDelta { .. } => "toolcall_delta",
+        Event::ToolcallEnd { .. } => "toolcall_end",
+        Event::Done { .. } => "done",
+        Event::Error { .. } => "error",
+    }
+}

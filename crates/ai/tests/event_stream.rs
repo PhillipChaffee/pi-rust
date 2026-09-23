@@ -8,6 +8,8 @@
 
 mod common;
 
+use common::event_type_name;
+
 use common::bare_assistant_message;
 use pi_ai::types::{AssistantMessageEvent, StopReason};
 use pi_ai::utils::event_stream::{
@@ -136,23 +138,6 @@ async fn the_assistant_stream_resolves_to_done_and_error_messages() {
         failing.result().await.error_message,
         Some(String::from("setup failed"))
     );
-}
-
-const fn event_type_name(event: &AssistantMessageEvent) -> &'static str {
-    match event {
-        AssistantMessageEvent::Start { .. } => "start",
-        AssistantMessageEvent::TextStart { .. } => "text_start",
-        AssistantMessageEvent::TextDelta { .. } => "text_delta",
-        AssistantMessageEvent::TextEnd { .. } => "text_end",
-        AssistantMessageEvent::ThinkingStart { .. } => "thinking_start",
-        AssistantMessageEvent::ThinkingDelta { .. } => "thinking_delta",
-        AssistantMessageEvent::ThinkingEnd { .. } => "thinking_end",
-        AssistantMessageEvent::ToolcallStart { .. } => "toolcall_start",
-        AssistantMessageEvent::ToolcallDelta { .. } => "toolcall_delta",
-        AssistantMessageEvent::ToolcallEnd { .. } => "toolcall_end",
-        AssistantMessageEvent::Done { .. } => "done",
-        AssistantMessageEvent::Error { .. } => "error",
-    }
 }
 
 #[tokio::test]

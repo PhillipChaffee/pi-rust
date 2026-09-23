@@ -48,6 +48,8 @@ pub mod cli;
 pub mod env_api_keys;
 pub mod http;
 pub mod image_models;
+pub mod images;
+pub mod images_api_registry;
 pub mod images_models;
 pub mod model_data;
 pub mod models;
