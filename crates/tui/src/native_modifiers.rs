@@ -56,6 +56,9 @@ pub fn is_native_modifier_pressed(key: ModifierKey) -> bool {
     }
 }
 
+/// Whether the modifier is physically pressed right now: no platform helper
+/// loads off macOS, so the answer is `false`, upstream without its N-API
+/// module.
 #[must_use]
 #[cfg(not(target_os = "macos"))]
 pub const fn is_native_modifier_pressed(key: ModifierKey) -> bool {
