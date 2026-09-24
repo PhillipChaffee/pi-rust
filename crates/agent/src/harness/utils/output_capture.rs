@@ -10,15 +10,13 @@
 //! emitting the replacement character for invalid bytes like its
 //! non-fatal mode.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use serde_json::Value as JsonValue;
 
 use crate::harness::context::Context;
 use crate::harness::types::{
-    ShellOutputCaptureOptions, ShellOutputLimits, ShellOutputMetadata, ShellOutputRetention,
+    ShellOutputCaptureOptions, ShellOutputMetadata, ShellOutputRetention,
     ShellOutputUpdate, ShellOutputView,
 };
 use crate::harness::utils::adaptive_publisher::{AdaptivePublisher, AdaptivePublisherOptions};
@@ -132,8 +130,6 @@ struct CaptureShared {
 /// `OutputCapture`.
 pub struct OutputCapture {
     shared: Arc<CaptureShared>,
-    context: Context,
-    on_update: Option<Arc<dyn Fn(&ShellOutputUpdate, &Context) + Send + Sync>>,
     publisher: AdaptivePublisher<ShellOutputView, ShellOutputUpdate>,
 }
 
@@ -160,7 +156,7 @@ impl OutputCapture {
         let retain = options.map_or(ShellOutputRetention::Tail, |capture| {
             capture.limits.retain.unwrap_or_default()
         });
-        if !max_bytes.is_finite() || max_bytes == 0 {
+        if max_bytes == 0 {
             return Err("Output maxBytes must be a positive finite number".to_owned());
         }
         if max_lines == 0 {
@@ -201,12 +197,7 @@ impl OutputCapture {
             min_interval_ms: Some(OUTPUT_MIN_EMIT_INTERVAL_MS),
             target_bytes_per_second: Some(OUTPUT_TARGET_BYTES_PER_SECOND),
         });
-        Ok(Self {
-            shared,
-            context,
-            on_update: handlers.on_update,
-            publisher,
-        })
+        Ok(Self { shared, publisher })
     }
 
     /// Whether the captured total crossed either limit, upstream's
@@ -331,11 +322,10 @@ let pending = self
             };
             buffer.buffer_bytes = utf8_byte_length(&buffer.text);
         }
+        drop(buffer);
+        // The publisher's flush re-snapshots the buffer, so the buffer
+        // lock must be released before marking dirty.
         self.publisher.mark_dirty();
-    }
-
-    fn total_lines_of(buffer: &CaptureBuffer) -> u64 {
-        total_lines(buffer)
     }
 }
 
@@ -373,15 +363,6 @@ fn snapshot_of(shared: &CaptureShared) -> ShellOutputView {
     let total_lines = total_lines(&buffer);
     let truncated =
         buffer.total_bytes > shared.max_bytes || total_lines > shared.max_lines;
-    let truncated_by = if truncated {
-        Some(if total_lines > shared.max_lines {
-            crate::harness::types::TruncatedBy::Lines
-        } else {
-            crate::harness::types::TruncatedBy::Bytes
-        })
-    } else {
-        None
-    };
 let mut truncation = retained.metadata.clone();
     truncation.truncated = truncated;
     truncation.truncated_by = truncated_by_for(truncated, total_lines, shared.max_lines);
@@ -554,7 +535,7 @@ fn find_from(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 /// `sanitizeShellOutput`.
 #[must_use]
 pub fn sanitize_shell_output(text: &str) -> String {
-    text.chars().filter(|c| !is_invalid_shell_output_char(c)).collect()
+    text.chars().filter(|c| !is_invalid_shell_output_char(*c)).collect()
 }
 
 fn trim_to_last_utf8_bytes(text: &str, max_bytes: u64) -> String {

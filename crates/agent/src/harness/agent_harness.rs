@@ -7,23 +7,23 @@
 
 use std::collections::BTreeMap;
 
-use pi_ai::types::{AssistantMessage, AssistantMessageEvent, DeferredHandle, ImageContent, Message, Model, RetryPolicy, ToolResultMessage, Usage};
+use pi_ai::types::{
+    AssistantMessage, AssistantMessageEvent, DeferredHandle, ImageContent, Message, Model,
+    ToolResultMessage, Usage,
+};
 use pi_ai::types::BoxedFuture;
+use pi_ai::utils::retry::RetryPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use crate::harness::compaction::types::{
-    BranchPreparation, BranchSummaryResult, CompactResult, CompactionPreparation,
-    CompactionSettings,
-};
+use crate::harness::compaction::types::{BranchPreparation, BranchSummaryResult, CompactResult, CompactionSettings};
 use crate::harness::context::Context;
-use crate::harness::result::HarnessError;
 use crate::harness::session::types::{
-    Entry, EntryProjector, LaneConfiguration, OperationError, OperationResultRecord,
-    Session, SessionStats, UsageRow,
+    BranchScan, CompactionReason, Entry, EntryProjector, LaneConfiguration, ModelIdentity,
+    OperationError, OperationKind, OperationResultRecord, Session, SessionStats, UsageRow,
 };
-use crate::harness::types::{AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch, AgentHarnessTool, AgentToolResult};
+use crate::harness::types::{AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch};
 use crate::types::{AgentMessage, AgentToolResult as AgentToolResultAlias, QueueMode, ThinkingLevel};
 
 /// The tool result alias the harness surface uses, upstream's
@@ -131,6 +131,212 @@ pub struct AbortRequestOutcome {
     pub follow_up: Vec<AgentMessage>,
 }
 
+/// The abort result, upstream's `AbortResult`.
+pub type AbortResult = Result<AbortOutcome, crate::harness::result::HarnessError>;
+
+/// The abort success value, upstream's
+/// `{ operationId, steer, followUp }`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AbortOutcome {
+    /// The operation id the abort settled.
+    pub operation_id: String,
+    /// Messages steered out of the aborted run.
+    pub steer: Vec<AgentMessage>,
+    /// Follow-up messages left queued.
+    pub follow_up: Vec<AgentMessage>,
+}
+
+/// The abort-request result, upstream's `AbortRequestResult`.
+pub type AbortRequestResult = Result<AbortRequestOutcome, crate::harness::result::HarnessError>;
+
+/// Navigation options, upstream's `NavigateOptions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavigateOptions {
+    /// Whether to summarize the abandoned branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarize: Option<bool>,
+    /// An optional label for the target entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Caller instructions for the optional summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+}
+
+/// Compaction options, upstream's `compact`'s
+/// `{ customInstructions? } | undefined`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactRequestOptions {
+    /// Caller instructions for the summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+}
+
+/// The prompt messages a run may replay, upstream's
+/// `prompt: AgentMessage | AgentMessage[]` plus the text prompt's images.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PromptMessagesPayload {
+    /// A plain text prompt, with optional images.
+    #[serde(rename_all = "camelCase")]
+    Text {
+        /// The prompt text.
+        prompt: String,
+        /// The attached images.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Vec<ImageContent>>,
+    },
+    /// One prebuilt message.
+    Message(AgentMessage),
+    /// Several prebuilt messages.
+    Messages(Vec<AgentMessage>),
+}
+
+/// The operations a lane admits, upstream's `OperationRequest`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OperationRequest {
+    /// A model run over a text or prebuilt prompt, wire
+    /// `"kind": "prompt"`.
+    #[serde(rename = "prompt", rename_all = "camelCase")]
+    Prompt {
+        /// A caller-supplied operation id, when one is pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// The prompt payload.
+        #[serde(flatten)]
+        prompt: PromptMessagesPayload,
+    },
+    /// A skill invocation, wire `"kind": "skill"`.
+    #[serde(rename = "skill", rename_all = "camelCase")]
+    Skill {
+        /// A caller-supplied operation id, when one is pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// The skill name.
+        name: String,
+        /// Caller instructions appended to the skill's prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        additional_instructions: Option<String>,
+    },
+    /// A prompt-template invocation, wire `"kind": "prompt_template"`.
+    #[serde(rename = "prompt_template", rename_all = "camelCase")]
+    PromptTemplate {
+        /// A caller-supplied operation id, when one is pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// The template name.
+        name: String,
+        /// The template arguments.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Vec<String>>,
+    },
+    /// A compaction, wire `"kind": "compaction"`.
+    #[serde(rename = "compaction", rename_all = "camelCase")]
+    Compaction {
+        /// A caller-supplied operation id, when one is pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// Caller instructions for the summary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        custom_instructions: Option<String>,
+    },
+    /// A navigation, wire `"kind": "navigation"`.
+    #[serde(rename = "navigation", rename_all = "camelCase")]
+    Navigation {
+        /// A caller-supplied operation id, when one is pinned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        /// The target entry id; `None` targets the branch root.
+        target_id: Option<String>,
+        /// The navigation options.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        options: Option<NavigateOptions>,
+    },
+}
+
+/// One admitted operation, upstream's `OperationAdmission`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationAdmission {
+    /// The durable operation id.
+    pub operation_id: String,
+    /// The operation kind.
+    pub kind: OperationKind,
+    /// Unix epoch milliseconds when the operation was admitted.
+    pub started_at: i64,
+}
+
+/// The admission error union, upstream's `OperationAdmissionError`. The
+/// taxonomy collapses the union into [`crate::harness::result::HarnessError`];
+/// admission produces `lane_busy`, `invalid_message`, `unknown_skill`,
+/// `unknown_template`, `nothing_to_compact`, `invalid_navigation`,
+/// `unknown_target`, and `closed`.
+pub type OperationAdmissionError = crate::harness::result::HarnessError;
+
+/// The admission result, upstream's `OperationAdmissionResult`.
+pub type OperationAdmissionResult = Result<OperationAdmission, OperationAdmissionError>;
+
+/// Drive options, upstream's `DriveOptions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DriveOptions {
+    /// The operation to drive.
+    pub operation_id: String,
+    /// Whether to resolve a retry wait by waiting it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for_retry: Option<bool>,
+    /// Whether to resolve a deferred suspension by polling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_deferred: Option<bool>,
+}
+
+/// The drive outcomes, upstream's `DriveOutcome`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DriveOutcome {
+    /// The operation settled, wire `"kind": "settled"`.
+    #[serde(rename = "settled", rename_all = "camelCase")]
+    Settled {
+        /// The settled record.
+        outcome: OperationResultRecord,
+    },
+    /// The operation waits on a caller decision, wire
+    /// `"kind": "waiting"`.
+    #[serde(rename = "waiting", rename_all = "camelCase")]
+    Waiting {
+        /// The waiting operation's id.
+        operation_id: String,
+        /// Which decision the drive waits on.
+        #[serde(flatten)]
+        reason: DriveWaitReason,
+    },
+}
+
+/// The wait reasons a drive outcome carries, upstream's `DriveOutcome`'s
+/// `"retry"` and `"deferred"` halves.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum DriveWaitReason {
+    /// A retry wait, wire `"reason": "retry"`.
+    #[serde(rename = "retry", rename_all = "camelCase")]
+    Retry {
+        /// Unix epoch milliseconds the retry starts at.
+        not_before: i64,
+    },
+    /// A deferred suspension, wire `"reason": "deferred"`.
+    #[serde(rename = "deferred", rename_all = "camelCase")]
+    Deferred {
+        /// The deferred handle the run suspended on.
+        deferred: DeferredHandle,
+    },
+}
+
+/// The drive result, upstream's `DriveResult`.
+pub type DriveResult = Result<DriveOutcome, crate::harness::result::HarnessError>;
+
 /// The watch handle contract, upstream's `WatchHandle<T>`.
 pub trait WatchHandle<T>: Send + Sync {
     /// The current snapshot, upstream's `WatchHandle.snapshot`.
@@ -145,13 +351,63 @@ pub trait WatchHandle<T>: Send + Sync {
 
     /// Resnapshots the watch: drop in-flight events, mark the boundary,
     /// then hold new events until the boundary, upstream's `resnapshot`.
-    fn resnapshot(
+    fn resnapshot<'a>(
         &self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<T, crate::harness::result::HarnessError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<T, crate::harness::events::ListenerError>>;
 
     /// Unsubscribes the watcher, upstream's `unsubscribe`.
     fn unsubscribe(&self);
+}
+
+/// The live operation statuses, upstream's `OperationStatus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationStatus {
+    /// The operation runs.
+    #[serde(rename = "running")]
+    Running,
+    /// The operation waits on a caller decision.
+    #[serde(rename = "open")]
+    Open,
+    /// Cancellation was requested.
+    #[serde(rename = "aborting")]
+    Aborting,
+}
+
+/// One admitted operation's identity view, upstream's
+/// `CurrentOperationInfo`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentOperationInfo {
+    /// The operation id.
+    pub id: String,
+    /// The operation kind.
+    pub kind: OperationKind,
+    /// Unix epoch milliseconds when the operation was admitted.
+    pub started_at: i64,
+    /// The live status.
+    pub status: OperationStatus,
+    /// The model identity the operation captured, when one was
+    /// snapshotted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_model: Option<ModelIdentity>,
+}
+
+/// The execution view one lane reports, upstream's `LaneExecutionInfo`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneExecutionInfo {
+    /// The lane name.
+    pub lane: String,
+    /// The lane tip id, when any.
+    pub tip_id: Option<String>,
+    /// The configured model identity.
+    pub configured_model: ModelIdentity,
+    /// The live operation, when one is admitted.
+    pub current: Option<CurrentOperationInfo>,
+    /// The last operation id, when one settled.
+    pub last_operation_id: Option<String>,
 }
 
 /// One lane's identity view, upstream's `LaneInfo`.
@@ -211,9 +467,11 @@ pub struct OpenOperation {
 }
 
 /// One queued lane item, upstream's `LaneQueuedItem`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum LaneQueuedItem {
-    /// A queued message.
+    /// A queued message, wire `"type": "message"`.
+    #[serde(rename = "message")]
     Message {
         /// The inbox entry id.
         entry_id: String,
@@ -222,7 +480,8 @@ pub enum LaneQueuedItem {
         /// The queued message.
         message: AgentMessage,
     },
-    /// A queued custom write.
+    /// A queued custom write, wire `"type": "custom"`.
+    #[serde(rename = "custom")]
     Custom {
         /// The inbox entry id.
         entry_id: String,
@@ -273,7 +532,7 @@ pub struct LiveOperationView {
     /// The live status.
     pub status: OperationStatus,
     /// The live retry view, when the operation is retrying.
-    pub retry: Option<LiveRetryView>,
+    pub retry: Option<RetryView>,
     /// The live deferred view, when suspended.
     pub deferred: Option<DeferredView>,
     /// The streaming assistant message, when one streams.
@@ -562,7 +821,7 @@ pub enum HarnessEventPayload {
         /// The run id.
         run_id: String,
         /// The compaction trigger.
-        reason: crate::harness::compaction::types::CompactionReason,
+        reason: CompactionReason,
         /// Unix epoch milliseconds when compaction started.
         started_at: i64,
     },
@@ -572,7 +831,7 @@ pub enum HarnessEventPayload {
         /// The run id.
         run_id: String,
         /// The compaction trigger.
-        reason: crate::harness::compaction::types::CompactionReason,
+        reason: CompactionReason,
         /// Unix epoch milliseconds when compaction ended.
         ended_at: i64,
         /// The terminal status and error.
@@ -940,13 +1199,114 @@ impl HarnessEventPayload {
     }
 }
 
+/// The event type discriminators, upstream's
+/// `HarnessEventType = HarnessEvent["type"]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessEventType {
+    /// A run invocation admitted.
+    RunStart,
+    /// A run resumed.
+    RunResume,
+    /// A run suspended on a deferred response.
+    RunSuspend,
+    /// Cancellation requested.
+    OperationAbort,
+    /// A run ended.
+    RunEnd,
+    /// A fault occurred.
+    Fault,
+    /// A hook handler or event listener failed.
+    HandlerError,
+    /// A turn started.
+    TurnStart,
+    /// A turn ended.
+    TurnEnd,
+    /// A retry was scheduled.
+    RetryScheduled,
+    /// A retry attempt started.
+    RetryStart,
+    /// A retry attempt ended.
+    RetryEnd,
+    /// A message was appended.
+    MessageStart,
+    /// A message updated mid-stream.
+    MessageUpdate,
+    /// A message settled.
+    MessageEnd,
+    /// A tool started.
+    ToolStart,
+    /// A tool published a partial result.
+    ToolUpdate,
+    /// A tool settled.
+    ToolEnd,
+    /// An entry committed.
+    EntryAdded,
+    /// Queues changed.
+    QueueUpdate,
+    /// A value changed.
+    ValueUpdate,
+    /// A configuration property changed.
+    ConfigUpdate,
+    /// Compaction started.
+    CompactionStart,
+    /// Compaction ended.
+    CompactionEnd,
+    /// A navigation started.
+    NavigationStart,
+    /// A navigation ended.
+    NavigationEnd,
+    /// A lane was created.
+    LaneCreated,
+    /// Usage was recorded.
+    Usage,
+}
+
+impl HarnessEventType {
+    /// The wire discriminator, upstream's `HarnessEventType` values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RunStart => "run_start",
+            Self::RunResume => "run_resume",
+            Self::RunSuspend => "run_suspend",
+            Self::OperationAbort => "operation_abort",
+            Self::RunEnd => "run_end",
+            Self::Fault => "fault",
+            Self::HandlerError => "handler_error",
+            Self::TurnStart => "turn_start",
+            Self::TurnEnd => "turn_end",
+            Self::RetryScheduled => "retry_scheduled",
+            Self::RetryStart => "retry_start",
+            Self::RetryEnd => "retry_end",
+            Self::MessageStart => "message_start",
+            Self::MessageUpdate => "message_update",
+            Self::MessageEnd => "message_end",
+            Self::ToolStart => "tool_start",
+            Self::ToolUpdate => "tool_update",
+            Self::ToolEnd => "tool_end",
+            Self::EntryAdded => "entry_added",
+            Self::QueueUpdate => "queue_update",
+            Self::ValueUpdate => "value_update",
+            Self::ConfigUpdate => "config_update",
+            Self::CompactionStart => "compaction_start",
+            Self::CompactionEnd => "compaction_end",
+            Self::NavigationStart => "navigation_start",
+            Self::NavigationEnd => "navigation_end",
+            Self::LaneCreated => "lane_created",
+            Self::Usage => "usage",
+        }
+    }
+}
+
 /// The event listener contract, upstream's `EventListener<TEvent>`: the
 /// failure channel restates upstream's throw, and delivery isolates it
 /// into a `handler_error` event.
 pub type EventListener = Arc<
-    dyn Fn(&HarnessEvent, &Context) -> BoxedFuture<'_, Result<(), crate::harness::events::ListenerError>>
-        + Send
-        + Sync,
+    dyn for<'a> Fn(&'a HarnessEvent, &'a Context)
+        -> BoxedFuture<'a, Result<(), crate::harness::events::ListenerError>>
+    + Send
+    + Sync,
 >;
 
 /// The subscription contract, upstream's `Events`.
@@ -1074,7 +1434,7 @@ pub enum HookEvent {
     /// Before a compaction runs, upstream's `before_compaction`.
     BeforeCompaction {
         /// The compaction trigger.
-        reason: crate::harness::compaction::types::CompactionReason,
+        reason: CompactionReason,
         /// The prepared inputs.
         preparation: crate::harness::compaction::types::CompactionPreparation,
         /// Caller instructions for the summary.
@@ -1294,7 +1654,10 @@ pub struct HookInvocation {
 
 /// The hook handler contract, upstream's `HookHandler<TName>`.
 pub type HookHandler = Arc<
-    dyn Fn(&HookInvocation, &Context) -> BoxedFuture<'_, Result<HookResult, HookFailure>> + Send + Sync,
+    dyn for<'a> Fn(&'a HookInvocation, &'a Context)
+        -> BoxedFuture<'a, Result<HookResult, HookFailure>>
+    + Send
+    + Sync,
 >;
 
 /// The error a hook handler surfaces, upstream's handler throw.
@@ -1321,9 +1684,9 @@ pub struct HookOptions {
 /// [`crate::harness::types::ToolContext`].
 pub struct AgentHarnessOptions {
     /// The session to attach to.
-    pub session: std::sync::Arc<dyn Session>,
+    pub session: Arc<dyn Session>,
     /// The models runtime.
-    pub models: std::sync::Arc<pi_ai::models::Models>,
+    pub models: Arc<pi_ai::models::Models>,
     /// The model runs use.
     pub model: Model,
     /// The reasoning level. Defaults to upstream's `off`.
@@ -1387,7 +1750,7 @@ impl std::fmt::Debug for SystemPromptSource {
 
 /// The transcript-to-provider converter, upstream's `toProviderMessages`.
 pub type ToProviderMessages = Arc<
-    dyn Fn(&[AgentMessage], &Context) -> BoxedFuture<'_, Vec<Message>> + Send + Sync,
+    dyn for<'a> Fn(&'a [AgentMessage], &'a Context) -> BoxedFuture<'a, Vec<Message>> + Send + Sync,
 >;
 
 impl std::fmt::Debug for AgentHarnessOptions {
@@ -1410,14 +1773,14 @@ pub trait AgentLane: Send + Sync {
     /// Scan the branch path, upstream's `findEntries`.
     fn find_entries(
         &self,
-        query: Option<&crate::harness::session::types::BranchScan>,
+        query: Option<&BranchScan>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<Entry>, LaneOperationError>>;
 
     /// First match on the branch path, upstream's `findEntry`.
     fn find_entry(
         &self,
-        query: Option<&crate::harness::session::types::BranchScan>,
+        query: Option<&BranchScan>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Option<Entry>, LaneOperationError>>;
 
@@ -1677,7 +2040,7 @@ pub trait AgentHarness: Send + Sync {
         &self,
         name: &str,
         context: &Context,
-    ) -> BoxedFuture<'_, Result<std::sync::Arc<dyn AgentLane>, LaneOperationError>>;
+    ) -> BoxedFuture<'_, Result<Arc<dyn AgentLane>, LaneOperationError>>;
 
     /// Acquire one lane with options, upstream's `lane(name, options)`.
     fn lane_with_options(
@@ -1685,7 +2048,7 @@ pub trait AgentHarness: Send + Sync {
         name: &str,
         options: AcquireLaneOptions,
         context: &Context,
-    ) -> BoxedFuture<'_, Result<std::sync::Arc<dyn AgentLane>, LaneOperationError>>;
+    ) -> BoxedFuture<'_, Result<Arc<dyn AgentLane>, LaneOperationError>>;
 
     /// The lane identity views, upstream's `lanes`.
     fn lanes(&self, context: &Context) -> BoxedFuture<'_, Result<Vec<LaneInfo>, LaneOperationError>>;

@@ -10,17 +10,15 @@
 //! type parameter: a `Value<LaneConfiguration>` cannot be passed where a
 //! `Value<OperationMeta>` is expected.
 
-use pi_ai::types::{AssistantMessageFrame, Usage};
+use pi_ai::utils::assistant_message_frame::AssistantMessageFrame;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::harness::compaction::types::FileOperations;
 use crate::harness::session::types::{
     DurableStructuralPreparation, LaneConfiguration, LaneState, OperationMeta,
     OperationResultRecord, OperationState, PendingEntry, SessionError,
 };
 use crate::harness::types::AgentHarnessStreamOptions;
-use crate::types::{AgentMessage, AgentToolResult};
 
 /// The base of both address kinds, upstream's `StoredAddressBase`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,7 +256,7 @@ pub fn list<T>(namespace: &str, key: &str) -> Result<ValueList<T>, SessionError>
 ///
 /// # Errors
 /// Payload serialization failures.
-pub fn set_value<T: serde::Serialize>(
+pub fn set_value<T: Serialize>(
     address: &Value<T>,
     next: T,
 ) -> Result<ValueSetWrite, SessionError> {
@@ -289,7 +287,7 @@ pub fn delete_value<T>(address: &Value<T>) -> ValueDeleteWrite {
 ///
 /// # Errors
 /// Payload serialization failures.
-pub fn append_list<T: serde::Serialize>(
+pub fn append_list<T: Serialize>(
     address: &ValueList<T>,
     element: T,
 ) -> Result<ListAppendWrite, SessionError> {
@@ -546,18 +544,6 @@ pub struct ListAddress {
     /// The list key.
     pub key: String,
 }
-
-/// The list cursor, upstream's `ListCursor`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ListCursor {
-    /// The sequence the cursor sits at.
-    pub seq: u64,
-}
-
-/// The file operations a durable preparation records, upstream's
-/// `DurableFileOperations` — sorted vectors on the wire.
-pub type DurableFileOperations = FileOperations;
 
 /// The internal marker the `unreachable_value` helpers feed; the fixed
 /// harness namespaces never fail validation, so the fallback never

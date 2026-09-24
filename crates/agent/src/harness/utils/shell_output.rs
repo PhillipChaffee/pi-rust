@@ -5,6 +5,8 @@
 //! the execution environment; this module folds the published view changes
 //! into the final [`ShellCaptureResult`] callers consume.
 
+use std::sync::{Arc, Mutex};
+
 use crate::harness::context::Context;
 use crate::harness::types::{
     ExecutionEnv, ExecutionError, ShellExecOptions, ShellOutputView,
@@ -46,7 +48,7 @@ pub struct ShellCaptureOptions {
     /// Called with each incremental chunk and a progress getter. A
     /// metadata-only update and a post-cap replacement carry no new
     /// incremental chunk.
-    pub on_chunk: Option<std::sync::Arc<OnShellChunk>>,
+    pub on_chunk: Option<Arc<OnShellChunk>>,
     /// Return shell execution failures with captured output instead of as
     /// a failed [`Result`].
     pub return_execution_errors: bool,
@@ -71,7 +73,7 @@ pub type OnShellChunk = dyn Fn(&str, &dyn Fn() -> ShellCaptureProgress, &Context
 
 /// The bounded final view one shell capture returns, upstream's
 /// `ShellCaptureResult`.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct ShellCaptureResult {
     /// The retained output text.
     pub output: String,
@@ -115,8 +117,8 @@ pub async fn execute_shell_with_capture(
 ) -> Result<ShellCaptureResult, ExecutionError> {
     let options = options.unwrap_or_default();
     let on_chunk = options.on_chunk.clone();
-    let shared_output: std::sync::Arc<std::sync::Mutex<Option<ShellOutputView>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let shared_output: Arc<Mutex<Option<ShellOutputView>>> =
+        Arc::new(Mutex::new(None));
     let capture_output = Arc::clone(&shared_output);
     let exec_options = ShellExecOptions {
         cwd: options.cwd.clone(),

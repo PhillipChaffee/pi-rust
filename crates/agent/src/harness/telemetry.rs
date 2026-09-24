@@ -30,10 +30,11 @@ use pi_telemetry::DynSpanHandle;
 use pi_telemetry::schema::{IntoSpanAttributes, SpanDefinition};
 use pi_telemetry::{SpanBodyFailure, SpanOptions};
 
+pub use pi_telemetry::schema::TelemetryAttributeDefinition;
+pub use pi_telemetry::typed::{SchemaSpan, TypedSpanStarter};
 pub use pi_telemetry::{
-    AttributeValue, DynSpanHandle as TelemetrySpanHandle, ExactTelemetryAttributes, SchemaSpan,
-    SpanAttributes, SpanOptions as SpanStartOptions, SpanStatus, TelemetryAttributeDefinition,
-    TelemetryContext, TelemetryHandle, TelemetrySpan, TypedSpanStarter,
+    AttributeValue, DynSpanHandle as TelemetrySpanHandle, SpanAttributes,
+    SpanOptions as SpanStartOptions, SpanStatus, TelemetryContext, TelemetryHandle, TelemetrySpan,
 };
 
 use crate::harness::context::{get_telemetry_context, with_telemetry_context, Context};
@@ -45,7 +46,7 @@ pi_telemetry::define_telemetry_schema! {
         spans: {
             /// One logical request to an AI provider, upstream's
             /// `"pi.ai.request"`.
-            request => "One logical request to an AI provider" {
+            request as "pi.ai.request" => "One logical request to an AI provider" {
                 parents: [any],
                 start_attributes: {
                     "pi.ai.operation" operation as AiOperation: string required values [
@@ -92,7 +93,7 @@ pi_telemetry::define_telemetry_schema! {
         spans: {
             /// One admitted in-process run invocation, upstream's
             /// `"pi.harness.run"`.
-            run => "One admitted in-process run invocation" {
+            run as "pi.harness.run" => "One admitted in-process run invocation" {
                 parents: [root_or_external],
                 start_attributes: {
                     "pi.session.id" session_id: string required description: "Session id",
@@ -112,7 +113,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One admitted in-process manual compaction invocation,
             /// upstream's `"pi.harness.compaction"`.
-            compaction => "One admitted in-process manual compaction invocation" {
+            compaction as "pi.harness.compaction" => "One admitted in-process manual compaction invocation" {
                 parents: [root_or_external],
                 start_attributes: {
                     "pi.session.id" session_id: string required description: "Session id",
@@ -132,7 +133,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One admitted in-process navigation invocation, upstream's
             /// `"pi.harness.navigation"`.
-            navigation => "One admitted in-process navigation invocation" {
+            navigation as "pi.harness.navigation" => "One admitted in-process navigation invocation" {
                 parents: [root_or_external],
                 start_attributes: {
                     "pi.session.id" session_id: string required description: "Session id",
@@ -151,7 +152,7 @@ pi_telemetry::define_telemetry_schema! {
                 status: { default ok, error_when "The navigation fails or throws" },
             },
             /// One run checkpoint, upstream's `"pi.harness.checkpoint"`.
-            checkpoint => "One run checkpoint" {
+            checkpoint as "pi.harness.checkpoint" => "One run checkpoint" {
                 parents: [spans "pi.harness.run"],
                 start_attributes: {
                     "pi.lane.name" lane_name: string required description: "Lane name",
@@ -165,7 +166,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One assistant response and its tool batch, upstream's
             /// `"pi.harness.turn"`.
-            turn => "One assistant response and its tool batch" {
+            turn as "pi.harness.turn" => "One assistant response and its tool batch" {
                 parents: [spans "pi.harness.run"],
                 start_attributes: {
                     "pi.lane.name" lane_name: string required description: "Lane name",
@@ -176,7 +177,7 @@ pi_telemetry::define_telemetry_schema! {
                 status: { default ok, error_when "Turn work throws" },
             },
             /// One durable retry attempt, upstream's `"pi.harness.step"`.
-            step => "One durable retry attempt" {
+            step as "pi.harness.step" => "One durable retry attempt" {
                 parents: [spans "pi.harness.turn", "pi.harness.checkpoint", "pi.harness.compaction", "pi.harness.navigation"],
                 start_attributes: {
                     "pi.lane.name" lane_name: string required description: "Lane name",
@@ -199,7 +200,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One raw phase-2 tool execution, upstream's
             /// `"pi.harness.tool"`.
-            tool => "One raw phase-2 tool execution" {
+            tool as "pi.harness.tool" => "One raw phase-2 tool execution" {
                 parents: [spans "pi.harness.turn", "pi.harness.run"],
                 start_attributes: {
                     "pi.lane.name" lane_name: string required description: "Lane name",
@@ -219,7 +220,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One registered hook handler invocation, upstream's
             /// `"pi.harness.hook"`.
-            hook => "One registered hook handler invocation" {
+            hook as "pi.harness.hook" => "One registered hook handler invocation" {
                 parents: [any],
                 start_attributes: {
                     "pi.lane.name" lane_name: string required description: "Lane name",
@@ -241,7 +242,7 @@ pi_telemetry::define_telemetry_schema! {
                 status: { default ok, error_when "The handler throws" },
             },
             /// One retry delay, upstream's `"pi.harness.sleep"`.
-            sleep => "One retry delay" {
+            sleep as "pi.harness.sleep" => "One retry delay" {
                 parents: [spans "pi.harness.run", "pi.harness.compaction", "pi.harness.navigation", "pi.harness.turn", "pi.harness.checkpoint"],
                 start_attributes: {
                     "pi.operation.id" operation_id: string required description: "Durable operation id",
@@ -256,7 +257,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One passive event listener invocation, upstream's
             /// `"pi.harness.event_handler"`.
-            event_handler => "One passive event listener invocation" {
+            event_handler as "pi.harness.event_handler" => "One passive event listener invocation" {
                 parents: [any],
                 start_attributes: {
                     "pi.event.type" event_type as HarnessEventSpanType: string required values [
@@ -278,7 +279,7 @@ pi_telemetry::define_telemetry_schema! {
             },
             /// One committed session transaction, upstream's
             /// `"pi.session.write"`.
-            session_write => "One committed session transaction" {
+            session_write as "pi.session.write" => "One committed session transaction" {
                 parents: [any],
                 start_attributes: {
                     "pi.session.id" session_id: string required description: "Session id",
@@ -322,20 +323,20 @@ macro_rules! agent_telemetry_starter {
 /// # Errors
 /// Propagates the body's `Err` value unchanged, after span settlement.
 pub fn start_ai_span<N, T, E, Fut, F>(
-    name: N,
+    _name: N,
     attributes: N::Start,
     body: F,
     context: &Context,
 ) -> impl Future<Output = Result<T, E>> + Send
 where
-    N: pi_telemetry::schema::SpanDefinition,
+    N: SpanDefinition,
     F: FnOnce(TelemetrySpanView, Context) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, E>> + Send,
+    Fut: Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
     E: SpanBodyFailure + Send + 'static,
 {
     start_typed_span(
-        pi_telemetry::schema::SpanDefinition::NAME,
+        N::NAME,
         attributes.into_span_attributes(),
         body,
         context,
@@ -347,20 +348,20 @@ where
 /// # Errors
 /// Propagates the body's `Err` value unchanged, after span settlement.
 pub fn start_harness_span<N, T, E, Fut, F>(
-    name: N,
+    _name: N,
     attributes: N::Start,
     body: F,
     context: &Context,
 ) -> impl Future<Output = Result<T, E>> + Send
 where
-    N: pi_telemetry::schema::SpanDefinition,
+    N: SpanDefinition,
     F: FnOnce(TelemetrySpanView, Context) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, E>> + Send,
+    Fut: Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
     E: SpanBodyFailure + Send + 'static,
 {
     start_typed_span(
-        pi_telemetry::schema::SpanDefinition::NAME,
+        N::NAME,
         attributes.into_span_attributes(),
         body,
         context,
@@ -373,26 +374,33 @@ where
 pub type TelemetrySpanView = DynSpanHandle;
 
 fn start_typed_span<T, E, Fut, F>(
-    name: &str,
+    name: &'static str,
     attributes: SpanAttributes,
     body: F,
     context: &Context,
 ) -> impl Future<Output = Result<T, E>> + Send
 where
     F: FnOnce(TelemetrySpanView, Context) -> Fut + Send + 'static,
-    Fut: Future<Output = Result<T, E>> + Send,
+    Fut: Future<Output = Result<T, E>> + Send + 'static,
     T: Send + 'static,
     E: SpanBodyFailure + Send + 'static,
 {
-    let parent = get_telemetry_context(context);
-    let outer_context = context.clone();
-    parent.start_span(
-        SpanOptions::new(name).with_attributes(attributes),
-        move |span| {
-            let child_context = with_telemetry_context(span.telemetry_handle(), &outer_context);
-            async move { body(span, child_context).await }
-        },
-    )
+    // The span starter's future borrows its parent handle, so the handle
+    // lives inside the returned future rather than in this frame.
+    Box::pin(async move {
+        let parent = get_telemetry_context(context);
+        let outer_context = context.clone();
+        parent
+            .start_span(
+                SpanOptions::new(name).with_attributes(attributes),
+                move |span| {
+                    let child_context =
+                        with_telemetry_context(span.telemetry_handle(), &outer_context);
+                    async move { body(span, child_context).await }
+                },
+            )
+            .await
+    })
 }
 
 #[cfg(test)]

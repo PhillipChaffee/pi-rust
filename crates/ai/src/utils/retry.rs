@@ -16,6 +16,7 @@
 use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::types::{AssistantMessage, StopReason};
@@ -130,7 +131,8 @@ static RETRYABLE_PROVIDER_ERROR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Retry policy: bounded attempts with exponential backoff.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RetryPolicy {
     /// Whether retries are enabled.
     pub enabled: bool,

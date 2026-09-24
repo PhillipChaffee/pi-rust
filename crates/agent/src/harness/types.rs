@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use pi_ai::types::{BoxedFuture, CacheRetention, DeferredRequest, ProviderHeaders, Transport};
 use serde::{Deserialize, Serialize};
@@ -168,7 +169,7 @@ pub struct AgentHarnessTool {
     pub prepare_arguments: Option<crate::types::AgentToolPrepareArguments>,
     /// Execute the tool call with the context resolved for the current turn
     /// snapshot.
-    pub execute: std::sync::Arc<AgentHarnessToolExecuteFn>,
+    pub execute: Arc<AgentHarnessToolExecuteFn>,
     /// Recovery policy for an effect whose outcome is unknown.
     pub replay: Option<ToolReplay>,
     /// Per-tool execution-mode override; omitted, the config's mode applies.
@@ -209,7 +210,7 @@ pub enum AgentHarnessToolContextSource {
     Static(ToolContext),
     /// A provider resolved per turn snapshot.
     Resolved(
-        std::sync::Arc<
+        Arc<
             dyn Fn(&Context) -> BoxedFuture<'static, ToolContext> + Send + Sync,
         >,
     ),
@@ -226,7 +227,8 @@ impl fmt::Debug for AgentHarnessToolContextSource {
 
 /// Curated provider request options owned by the harness and snapshotted
 /// per turn, upstream's `AgentHarnessStreamOptions`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentHarnessStreamOptions {
     /// Preferred transport forwarded to the stream function.
     pub transport: Option<Transport>,
@@ -237,7 +239,7 @@ pub struct AgentHarnessStreamOptions {
     /// Optional cap for provider-requested retry delays.
     pub max_retry_delay_ms: Option<u64>,
     /// Additional request headers merged with auth and lifecycle headers.
-    pub headers: Option<ProviderHeaders>,
+    pub headers: Option<BTreeMap<String, String>>,
     /// Provider metadata forwarded with requests.
     pub metadata: Option<BTreeMap<String, JsonValue>>,
     /// Provider cache retention hint.
@@ -254,7 +256,8 @@ pub struct AgentHarnessStreamOptions {
 /// value, and `Some(Some(value))` to set it. `headers` and `metadata`
 /// merge per key, where a `None` value deletes one key; a map-level
 /// `Some(None)` clears the whole map.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentHarnessStreamOptionsPatch {
     /// Preferred transport patch.
     pub transport: Option<Option<Transport>>,
@@ -355,7 +358,10 @@ impl std::error::Error for FileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source
             .as_ref()
-            .map(|source| &**source as &(dyn std::error::Error + 'static))
+            .map(|source| {
+                let coerced: &(dyn std::error::Error + 'static) = &**source;
+                coerced
+            })
     }
 }
 
@@ -416,7 +422,10 @@ impl std::error::Error for ExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source
             .as_ref()
-            .map(|source| &**source as &(dyn std::error::Error + 'static))
+            .map(|source| {
+                let coerced: &(dyn std::error::Error + 'static) = &**source;
+                coerced
+            })
     }
 }
 
@@ -469,7 +478,10 @@ impl std::error::Error for CompactionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source
             .as_ref()
-            .map(|source| &**source as &(dyn std::error::Error + 'static))
+            .map(|source| {
+                let coerced: &(dyn std::error::Error + 'static) = &**source;
+                coerced
+            })
     }
 }
 
@@ -523,7 +535,10 @@ impl std::error::Error for BranchSummaryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.source
             .as_ref()
-            .map(|source| &**source as &(dyn std::error::Error + 'static))
+            .map(|source| {
+                let coerced: &(dyn std::error::Error + 'static) = &**source;
+                coerced
+            })
     }
 }
 
@@ -568,13 +583,13 @@ pub struct ReadTextLinesOptions {
 pub trait TextLineReader: Send {
     /// Read the next line, or `None` at end of file. A torn final record
     /// reports `terminated: false`.
-    fn read_line(
-        &mut self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<TextLine>, FileError>>;
+    fn read_line<'a>(
+        &'a mut self,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<Option<TextLine>, FileError>>;
 
     /// Release the open file. Best-effort; never fails.
-    fn close(&mut self, context: &Context) -> BoxedFuture<'_, ()>;
+    fn close<'a>(&'a mut self, context: &'a Context) -> BoxedFuture<'a, ()>;
 }
 
 /// Options for [`FileSystem::create_dir`], upstream's
@@ -622,142 +637,142 @@ pub trait FileSystem: Send + Sync {
 
     /// Return an absolute addressed path without requiring it to exist and
     /// without resolving symlinks.
-    fn absolute_path(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, FileError>>;
+    fn absolute_path<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<String, FileError>>;
 
     /// Join path segments in the filesystem namespace without requiring the
     /// result to exist.
-    fn join_path(
-        &self,
-        parts: &[String],
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, FileError>>;
+    fn join_path<'a>(
+        &'a self,
+        parts: &'a [String],
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<String, FileError>>;
 
     /// Read a UTF-8 text file.
-    fn read_text_file(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, FileError>>;
+    fn read_text_file<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<String, FileError>>;
 
     /// Open a UTF-8 text file for pull-based line reading.
-    fn open_text_line_reader(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Box<dyn TextLineReader>, FileError>>;
+    fn open_text_line_reader<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<Box<dyn TextLineReader>, FileError>>;
 
     /// Read UTF-8 text lines. Implementations should stop once `max_lines`
     /// lines have been read.
-    fn read_text_lines(
-        &self,
-        path: &str,
+    fn read_text_lines<'a>(
+        &'a self,
+        path: &'a str,
         options: Option<ReadTextLinesOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<String>, FileError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<Vec<String>, FileError>>;
 
     /// Read a binary file.
-    fn read_binary_file(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<u8>, FileError>>;
+    fn read_binary_file<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<Vec<u8>, FileError>>;
 
     /// Create or overwrite a file, creating parent directories when
     /// supported.
-    fn write_file(
-        &self,
-        path: &str,
+    fn write_file<'a>(
+        &'a self,
+        path: &'a str,
         content: FileContent,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), FileError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<(), FileError>>;
 
     /// Create or append to a file, creating parent directories when
     /// supported.
-    fn append_file(
-        &self,
-        path: &str,
+    fn append_file<'a>(
+        &'a self,
+        path: &'a str,
         content: FileContent,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), FileError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<(), FileError>>;
 
     /// Atomically rename a file, replacing the destination when it exists.
     /// Does not copy across filesystems.
-    fn rename_file(
-        &self,
-        source_path: &str,
-        destination_path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), FileError>>;
+    fn rename_file<'a>(
+        &'a self,
+        source_path: &'a str,
+        destination_path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<(), FileError>>;
 
     /// Return metadata for the addressed path without following symlinks.
-    fn file_info(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<FileInfo, FileError>>;
+    fn file_info<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<FileInfo, FileError>>;
 
     /// List direct children of a directory without following symlinks.
-    fn list_dir(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<FileInfo>, FileError>>;
+    fn list_dir<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<Vec<FileInfo>, FileError>>;
 
     /// Return the canonical path for an existing path, resolving symlinks
     /// where supported.
-    fn canonical_path(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, FileError>>;
+    fn canonical_path<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<String, FileError>>;
 
     /// Return `false` for missing paths. Other errors, such as permission
     /// failures, return a [`FileError`].
-    fn exists(
-        &self,
-        path: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<bool, FileError>>;
+    fn exists<'a>(
+        &'a self,
+        path: &'a str,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<bool, FileError>>;
 
     /// Create a directory. Defaults to `recursive: true`.
-    fn create_dir(
-        &self,
-        path: &str,
+    fn create_dir<'a>(
+        &'a self,
+        path: &'a str,
         options: Option<CreateDirOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), FileError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<(), FileError>>;
 
     /// Remove a file or directory. Defaults to `recursive: false` and
     /// `force: false`.
-    fn remove(
-        &self,
-        path: &str,
+    fn remove<'a>(
+        &'a self,
+        path: &'a str,
         options: Option<RemoveOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), FileError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<(), FileError>>;
 
     /// Create a temporary directory and return its absolute path. Defaults
     /// to prefix `"tmp-"`.
-    fn create_temp_dir(
-        &self,
-        prefix: Option<&str>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, FileError>>;
+    fn create_temp_dir<'a>(
+        &'a self,
+        prefix: Option<&'a str>,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<String, FileError>>;
 
     /// Create a temporary file and return its absolute path. Defaults to
     /// prefix `""` and suffix `""`.
-    fn create_temp_file(
-        &self,
+    fn create_temp_file<'a>(
+        &'a self,
         options: Option<TempFileOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, FileError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<String, FileError>>;
 
     /// Release filesystem resources. Best-effort; never fails.
-    fn cleanup(&self, context: &Context) -> BoxedFuture<'_, ()>;
+    fn cleanup<'a>(&'a self, context: &'a Context) -> BoxedFuture<'a, ()>;
 }
 
 /// File content for the write operations, upstream's `string | Uint8Array`.
@@ -962,7 +977,7 @@ pub struct ShellExecOptions {
     /// `on_update` are both absent.
     pub capture: Option<ShellOutputCaptureOptions>,
     /// Called with bounded output changes.
-    pub on_update: Option<std::sync::Arc<OnShellOutputUpdate>>,
+    pub on_update: Option<Arc<OnShellOutputUpdate>>,
 }
 
 impl fmt::Debug for ShellExecOptions {
@@ -982,15 +997,15 @@ impl fmt::Debug for ShellExecOptions {
 pub trait Shell: Send + Sync {
     /// Execute a shell command in the filesystem cwd unless
     /// `options.cwd` is provided.
-    fn exec(
-        &self,
-        command: &str,
+    fn exec<'a>(
+        &'a self,
+        command: &'a str,
         options: Option<ShellExecOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<ShellExecResult, ExecutionError>>;
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<ShellExecResult, ExecutionError>>;
 
     /// Release shell resources. Best-effort; never fails.
-    fn cleanup(&self, context: &Context) -> BoxedFuture<'_, ()>;
+    fn cleanup<'a>(&'a self, context: &'a Context) -> BoxedFuture<'a, ()>;
 }
 
 /// Filesystem and process execution environment used by the harness,

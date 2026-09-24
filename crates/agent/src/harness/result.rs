@@ -14,7 +14,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::agent_harness::OperationKind;
+use crate::harness::session::types::OperationKind;
 
 /// The tagged harness operation errors, upstream's `TaggedError` family in
 /// `result.ts` (`LaneBusy`, `Closed`, `InvalidNavigation`, and friends).

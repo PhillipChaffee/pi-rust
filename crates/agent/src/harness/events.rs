@@ -67,7 +67,9 @@ impl ResnapshotBoundary {
 }
 
 type BusListener = Arc<
-    dyn Fn(&HarnessEvent, &Context) -> BoxedFuture<'_, Result<(), ListenerError>> + Send + Sync,
+    dyn for<'a> Fn(&'a HarnessEvent, &'a Context) -> BoxedFuture<'a, Result<(), ListenerError>>
+        + Send
+        + Sync,
 >;
 
 /// The job types the ordered tail carries.
@@ -133,7 +135,7 @@ impl BusCore {
                             done,
                         } => {
                             for (event, context) in &batch {
-                                deliver(event, &recipients, true, context).await;
+                                deliver(&core, event, &recipients, true, context).await;
                             }
                             let _ = done.send(());
                         }
@@ -195,11 +197,12 @@ impl HarnessEventBus {
             return Box::pin(async {});
         }
         let (done, receiver) = oneshot::channel();
+        let recipients = self.snapshot_recipients_union(&events);
         BusCore::push_job(
             &self.core,
             BusJob::Deliver {
                 batch: events,
-                recipients: self.snapshot_recipients_union(&events),
+                recipients,
                 done,
             },
         );
@@ -244,10 +247,7 @@ impl HarnessEventBus {
             let listener = Arc::clone(&listener);
             Arc::new(move |event, context| {
                 let listener = Arc::clone(&listener);
-                Box::pin(async move {
-                    listener(event, context).await;
-                    Ok(())
-                })
+                Box::pin(async move { listener(event, context).await })
             })
         };
         let mut core = self.core.lock().expect("bus core lock");
@@ -293,10 +293,10 @@ impl HarnessEventBus {
         context: &Context,
     ) -> Result<Arc<BufferedEventWatcher<T>>, String>
     where
-        T: Send + Sync + 'static,
-        F: FnOnce(&Context) -> Fut,
-        Fut: std::future::Future<Output = Result<T, TError>>,
-        TError: Into<ListenerError>,
+        T: Send + Sync + 'static + Clone,
+        F: Fn(&Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, TError>> + Send,
+        TError: Into<ListenerError> + std::error::Error + Send + Sync + 'static,
     {
         if let Some(closed_error) = self.closed_error() {
             return Err(closed_error);
@@ -382,7 +382,9 @@ impl HarnessEventBus {
                     recovery: false,
                     payload,
                 };
-                HarnessEventBus { core }.emit(emitted, &context);
+                // The bus holds its delivery tail synchronously; the
+                // dropped future is only a completion signal.
+                let _ = HarnessEventBus { core }.emit(emitted, &context);
             })
         };
         let watcher = Arc::new(BufferedEventWatcher {
@@ -435,13 +437,10 @@ impl HarnessEventBus {
     }
 }
 
-/// The event filter a watch subscribes with, upstream's
-/// `filter: (event) => boolean`.
-pub type WatchFilter = Arc<dyn Fn(&HarnessEvent) -> bool + Send + Sync>;
-
 /// Delivers one event to its recipients with isolated failures, upstream's
 /// `deliver`.
 async fn deliver(
+    core: &Arc<Mutex<BusCore>>,
     event: &HarnessEvent,
     recipients: &[BusListener],
     report_errors: bool,
@@ -467,14 +466,34 @@ async fn deliver(
                     recovery: false,
                     payload,
                 };
-                // Recipients bind at failure time; their failures are not
-                // reported further.
-                deliver(&handler_error, recipients, false, context).await;
+                // Recipients bind at failure time to the handler_error
+                // event's own audience; their failures are not reported
+                // further, and the recursion boxes through one level so
+                // the future stays finite.
+                let handler_recipients = snapshot_recipients(core, &handler_error);
+                Box::pin(deliver(core, &handler_error, &handler_recipients, false, context)).await;
             }
         }
     }
 }
 
+/// The listeners one delivered event binds, upstream's
+/// `snapshotRecipients`.
+fn snapshot_recipients(core: &Mutex<BusCore>, event: &HarnessEvent) -> Vec<BusListener> {
+    let bound = core.lock().expect("bus core lock");
+    let mut union: Vec<BusListener> = Vec::new();
+    if let Some(list) = bound.listeners.get(&event.payload.event_type()) {
+        for listener in list {
+            union.push(Arc::clone(listener));
+        }
+    }
+    for listener in &bound.watch_listeners {
+        union.push(Arc::clone(listener));
+    }
+    union
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WatcherPhase {
     Buffering,
     Started,
@@ -482,7 +501,6 @@ enum WatcherPhase {
 }
 
 struct ResnapshotHold {
-    reached: oneshot::Receiver<()>,
     resolve: Option<oneshot::Sender<()>>,
     held: VecDeque<(HarnessEvent, Context)>,
     phase: ResnapshotPhase,
@@ -490,6 +508,7 @@ struct ResnapshotHold {
 
 /// The resnapshot hold phases, upstream's `"dropping" | "holding"`: drops
 /// arrive before the boundary, holds after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResnapshotPhase {
     Dropping,
     Holding,
@@ -524,17 +543,42 @@ pub struct BufferedEventWatcher<T> {
     _snapshot: PhantomData<fn(T) -> T>,
 }
 
+impl<T> std::fmt::Debug for BufferedEventWatcher<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferedEventWatcher").finish_non_exhaustive()
+    }
+}
+
+impl<T> Clone for BufferedEventWatcher<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            filter: Arc::clone(&self.filter),
+            bus: self.bus.clone(),
+            self_weak: self.self_weak.clone(),
+            _snapshot: PhantomData,
+        }
+    }
+}
+
 /// A cloneable weak self reference; the watcher installs itself after the
 /// bus holds its subscription, so boundary barriers can reach it.
-#[derive(Clone)]
 struct OnceLockWeak<T> {
-    cell: std::sync::Mutex<Option<Weak<T>>>,
+    cell: Mutex<Option<Weak<T>>>,
+}
+
+impl<T> Clone for OnceLockWeak<T> {
+    fn clone(&self) -> Self {
+        Self {
+            cell: Mutex::new(self.cell.lock().expect("self weak lock").clone()),
+        }
+    }
 }
 
 impl<T> OnceLockWeak<T> {
     fn new() -> Self {
         Self {
-            cell: std::sync::Mutex::new(None),
+            cell: Mutex::new(None),
         }
     }
 
@@ -559,22 +603,6 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
             .lock()
             .expect("watcher state lock")
             .snapshot = Some(snapshot);
-    }
-
-    /// The current snapshot, upstream's `WatchHandle.snapshot`.
-    ///
-    /// # Panics
-    /// When no snapshot was installed; upstream's typed handle always
-    /// carries one.
-    #[must_use]
-    pub fn snapshot(&self) -> T {
-        self.shared
-            .state
-            .lock()
-            .expect("watcher state lock")
-            .snapshot
-            .clone()
-            .expect("watcher snapshot")
     }
 
     /// Starts delivering buffered events to the listener; callable once,
@@ -615,85 +643,6 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
         }
     }
 
-    /// Resnapshots the watch, upstream's `resnapshot`.
-    ///
-    /// # Errors
-    /// An unsubscribed watcher, a non-resnapshotting watcher, an
-    /// in-progress resnapshot, a capture that never marked its boundary,
-    /// or the capture's own failure.
-    pub fn resnapshot(&self, context: &Context) -> BoxedFuture<'_, Result<T, String>> {
-        Box::pin(async move {
-            let (callback, reached) = {
-                let mut state = self.shared.state.lock().expect("watcher state lock");
-                if state.phase == WatcherPhase::Unsubscribed {
-                    return Err("WatchHandle is unsubscribed".to_owned());
-                }
-                let Some(callback) = state.resnapshot_callback.clone() else {
-                    return Err("WatchHandle does not support resnapshot".to_owned());
-                };
-                if state.resnapshot_state.is_some() {
-                    return Err("WatchHandle resnapshot is already in progress".to_owned());
-                }
-let (resolve, reached) = oneshot::channel();
-                state.epoch += 1;
-                state.resnapshot_state = Some(ResnapshotHold {
-                    reached,
-                    resolve: Some(resolve),
-                    held: VecDeque::new(),
-                    phase: ResnapshotPhase::Dropping,
-                });
-                (callback, reached)
-            };
-            let snapshot = callback(context, self.boundary()).await;
-            let marked = {
-                let mut state = self.shared.state.lock().expect("watcher state lock");
-                let marked = state
-                    .resnapshot_state
-                    .as_ref()
-                    .is_some_and(|hold| hold.phase == ResnapshotPhase::Holding);
-                if !marked {
-                    // The capture never marked its boundary; release the
-                    // hold and report, upstream's "did not mark" throw.
-                    let held = state
-                        .resnapshot_state
-                        .take()
-                        .map_or_else(VecDeque::new, |hold| hold.held);
-                    drop(state);
-                    for (event, context) in held {
-                        self.push(event, context);
-                    }
-                    return Err("Resnapshot capture did not mark its boundary".to_owned());
-                }
-                marked
-            };
-            let _ = marked;
-            let _ = reached.await;
-            let (snapshot, held) = {
-                let mut state = self.shared.state.lock().expect("watcher state lock");
-                let held = state
-                    .resnapshot_state
-                    .take()
-                    .map_or_else(VecDeque::new, |hold| hold.held);
-                (snapshot, held)
-            };
-            match snapshot {
-                Ok(snapshot) => {
-                    self.set_snapshot(snapshot.clone());
-                    for (event, context) in held {
-                        self.push(event, context);
-                    }
-                    Ok(snapshot)
-                }
-                Err(error) => {
-                    for (event, context) in held {
-                        self.push(event, context);
-                    }
-                    Err(error.to_string())
-                }
-            }
-        })
-    }
-
     /// Pushes one event into the watcher's pipeline, upstream's `push`.
     pub fn push(&self, event: HarnessEvent, context: Context) {
         let action = {
@@ -711,10 +660,14 @@ let (resolve, reached) = oneshot::channel();
                     None
                 }
                 WatcherPhase::Buffering => {
-                    state.buffer.push_back((event, context, state.epoch));
+                    let epoch = state.epoch;
+                    state.buffer.push_back((event, context, epoch));
                     None
                 }
-                WatcherPhase::Started => Some((event, context, state.epoch)),
+                WatcherPhase::Started => {
+                    let epoch = state.epoch;
+                    Some((event, context, epoch))
+                }
             }
         };
         if let Some((event, context, epoch)) = action {
@@ -818,7 +771,124 @@ fn boundary(&self) -> ResnapshotBoundary {
     }
 }
 
-impl<T: Send + Sync + 'static> WatchHandle<T> for BufferedEventWatcher<T> {
+impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
+/// The current snapshot, upstream's `WatchHandle.snapshot`.
+    ///
+    /// # Panics
+    /// When no snapshot was installed; upstream's typed handle always
+    /// carries one.
+    #[must_use]
+    pub fn snapshot(&self) -> T {
+        self.shared
+            .state
+            .lock()
+            .expect("watcher state lock")
+            .snapshot
+            .clone()
+            .expect("watcher snapshot")
+    }
+
+    /// Resnapshots the watch, upstream's `resnapshot`.
+    ///
+    /// # Errors
+    /// An unsubscribed watcher, a non-resnapshotting watcher, an
+    /// in-progress resnapshot, a capture that never marked its boundary,
+    /// or the capture's own failure.
+    ///
+    /// The snapshot reads need [`T`]'s `Clone`; the mutation surface keeps
+    /// the un-`Clone`d bound.
+    pub fn resnapshot<'a>(
+        &self,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<T, ListenerError>> {
+        // The future owns a watcher clone so its only borrow is the
+        // context reference the signature elides to.
+        let this = self.clone();
+        Box::pin(async move {
+            let (callback, reached) = {
+                let mut state = this.shared.state.lock().expect("watcher state lock");
+                if state.phase == WatcherPhase::Unsubscribed {
+                    return Err(ListenerError::from("WatchHandle is unsubscribed"));
+                }
+                let Some(callback) = state.resnapshot_callback.clone() else {
+                    return Err(ListenerError::from("WatchHandle does not support resnapshot"));
+                };
+                if state.resnapshot_state.is_some() {
+                    return Err(ListenerError::from(
+                        "WatchHandle resnapshot is already in progress",
+                    ));
+                }
+                let (resolve, reached) = oneshot::channel();
+                state.epoch += 1;
+                state.resnapshot_state = Some(ResnapshotHold {
+                    resolve: Some(resolve),
+                    held: VecDeque::new(),
+                    phase: ResnapshotPhase::Dropping,
+                });
+                (callback, reached)
+            };
+            // The capture's mark call is synchronous; the boundary flip
+            // rides the bus tail, so "did the capture mark" is its own
+            // flag, upstream's local `marked`.
+            let marked = Arc::new(AtomicBool::new(false));
+            let boundary = {
+                let inner = this.boundary();
+                let flag = Arc::clone(&marked);
+                ResnapshotBoundary {
+                    mark: Arc::new(move || {
+                        flag.store(true, Ordering::Release);
+                        inner.mark();
+                    }),
+                }
+            };
+            let snapshot = callback(context, boundary).await;
+            if !marked.load(Ordering::Acquire) {
+                // The capture never marked its boundary; release the
+                // hold and report, upstream's "did not mark" throw.
+                let held = {
+                    let mut state = this.shared.state.lock().expect("watcher state lock");
+                    state
+                        .resnapshot_state
+                        .take()
+                        .map_or_else(VecDeque::new, |hold| hold.held)
+                };
+                for (event, context) in held {
+                    this.push(event, context);
+                }
+                return Err(ListenerError::from(
+                    "Resnapshot capture did not mark its boundary",
+                ));
+            }
+            let _ = reached.await;
+            let (snapshot, held) = {
+                let mut state = this.shared.state.lock().expect("watcher state lock");
+                let held = state
+                    .resnapshot_state
+                    .take()
+                    .map_or_else(VecDeque::new, |hold| hold.held);
+                (snapshot, held)
+            };
+            match snapshot {
+                Ok(snapshot) => {
+                    this.set_snapshot(snapshot.clone());
+                    for (event, context) in held {
+                        this.push(event, context);
+                    }
+                    Ok(snapshot)
+                }
+                Err(error) => {
+                    for (event, context) in held {
+                        this.push(event, context);
+                    }
+                    Err(error)
+                }
+            }
+        })
+    }
+
+}
+
+impl<T: Send + Sync + 'static + Clone> WatchHandle<T> for BufferedEventWatcher<T> {
     fn snapshot(&self) -> T {
         BufferedEventWatcher::snapshot(self)
     }
@@ -831,7 +901,10 @@ impl<T: Send + Sync + 'static> WatchHandle<T> for BufferedEventWatcher<T> {
         BufferedEventWatcher::start(self, listener);
     }
 
-    fn resnapshot(&self, context: &Context) -> BoxedFuture<'_, Result<T, String>> {
+    fn resnapshot<'a>(
+        &self,
+        context: &'a Context,
+    ) -> BoxedFuture<'a, Result<T, ListenerError>> {
         BufferedEventWatcher::resnapshot(self, context)
     }
 

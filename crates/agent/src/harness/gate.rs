@@ -10,22 +10,28 @@
 //! controller's abort reason carries the fixed message, since chord's Rust
 //! port models abort reasons as strings.
 
-use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::pin::Pin;
 
 use pi_chord::context::AbortSignal;
 
-/// The cancellation future [`GateControl::begin_abort`] carries, upstream's
+/// The cancellation promise [`GateControl::begin_abort`] carries, upstream's
 /// `Promise<void>`: the abort path awaits it while aborted effects settle.
-pub type Cancellation = Pin<Arc<dyn Future<Output = ()> + Send>>;
+/// A watch receiver restates the promise's one-shot settlement — every
+/// clone resolves when the abort work sends or the sender drops — and
+/// stays cloneable and awaitable where a boxed future is single-consumer.
+pub type Cancellation = tokio::sync::watch::Receiver<()>;
 
 /// The expected internal control flow when cancellation wins effect
 /// admission, upstream's `AbortRequested` error class.
-#[derive(Clone, Debug)]
 pub struct AbortRequested {
     /// The cancellation future the abort path awaits.
     pub cancellation: Cancellation,
+}
+
+impl std::fmt::Debug for AbortRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AbortRequested").finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Display for AbortRequested {
@@ -114,16 +120,15 @@ impl Gate {
     /// Returns [`GateRejection::AbortRequested`] when cancellation won the
     /// admission race and [`GateRejection::Closed`] when the gate closed.
     pub fn admit<T>(&self, invoke: impl FnOnce() -> T) -> Result<T, GateRejection> {
-        match &*self.shared.state.lock().expect("gate state lock") {
-            GateState::Aborting { cancellation } => {
-                return Err(GateRejection::AbortRequested(AbortRequested {
-                    cancellation: Arc::clone(cancellation),
-                }));
-            }
+        let cancellation = match &*self.shared.state.lock().expect("gate state lock") {
+            GateState::Aborting { cancellation } => Some(cancellation.clone()),
             GateState::Closed { error } => {
                 return Err(GateRejection::Closed(GateClosedError(error.clone())));
             }
-            GateState::Open => {}
+            GateState::Open => None,
+        };
+        if let Some(cancellation) = cancellation {
+            return Err(GateRejection::AbortRequested(AbortRequested { cancellation }));
         }
         Ok(invoke())
     }

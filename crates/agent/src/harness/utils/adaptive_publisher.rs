@@ -71,7 +71,7 @@ impl<TValue, TUpdate> std::fmt::Debug for AdaptivePublisher<TValue, TUpdate> {
     }
 }
 
-impl<TValue, TUpdate> AdaptivePublisher<TValue, TUpdate> {
+impl<TValue: Send + 'static, TUpdate: Send + 'static> AdaptivePublisher<TValue, TUpdate> {
     /// Builds a publisher over the supplied callbacks.
     #[must_use]
     pub fn new(options: AdaptivePublisherOptions<TValue, TUpdate>) -> Self {
@@ -127,7 +127,7 @@ impl<TValue, TUpdate> AdaptivePublisher<TValue, TUpdate> {
     }
 }
 
-impl<TValue, TUpdate> PublisherCore<TValue, TUpdate> {
+impl<TValue: Send + 'static, TUpdate: Send + 'static> PublisherCore<TValue, TUpdate> {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PublisherState<TValue>> {
         self.state.lock().expect("publisher state lock")
     }
@@ -153,7 +153,7 @@ impl<TValue, TUpdate> PublisherCore<TValue, TUpdate> {
         *timer = Some(handle);
     }
 
-    fn flush(&self, force: bool) {
+fn flush(self: &Arc<Self>, force: bool) {
         let update = {
             let mut state = self.lock_state();
             if state.disposed || !state.dirty {

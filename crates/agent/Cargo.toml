@@ -51,3 +51,9 @@ tempfile = "3"
 
 [lints]
 workspace = true
+# The process-tree kill the nodejs execution environment performs on abort,
+# timeout, and cleanup: the workspace forbids the unsafe raw libc/libuv-
+# equivalent calls, so the signal rides nix's safe wrapper, matching the tui
+# crate's signal handling.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["signal"] }

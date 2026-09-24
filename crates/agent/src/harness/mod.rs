@@ -14,6 +14,7 @@ pub mod agent_harness;
 pub mod compaction;
 pub mod config;
 pub mod context;
+pub mod env;
 pub mod events;
 pub mod gate;
 pub mod hooks;

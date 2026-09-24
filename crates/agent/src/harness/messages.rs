@@ -9,7 +9,6 @@
 //! [`convert_to_llm`] matches on the role discriminators exactly as
 //! upstream's switch does.
 
-use std::collections::BTreeMap;
 
 use pi_ai::types::{ImageContent, Message, TextContent, UserBlock, UserContent, UserMessage};
 use serde::{Deserialize, Serialize};
@@ -276,7 +275,7 @@ pub fn parse_date_millis(date: &str) -> i64 {
         let parse_two = |slice: Option<&str>| {
             slice
                 .and_then(|slice| slice.get(0..2))
-                .and_then(|pair| u32::from_str_radix(slice, 10).ok())
+                .and_then(|pair| u32::from_str_radix(pair, 10).ok())
         };
         let Some(parsed_hour) = parse_two(Some(rest)) else {
             return invalid;
@@ -297,23 +296,24 @@ pub fn parse_date_millis(date: &str) -> i64 {
                 };
                 second = parsed_second;
                 let after_second = &after_minute[2..];
-                let (fraction, offset_part) = after_second
-                    .strip_prefix('.')
-                    .map_or(("", after_second), |fraction| {
-                        let digits: String = fraction
-                            .chars()
-                            .take_while(char::is_ascii_digit)
-                            .collect();
-                        (digits.as_str(), &fraction[digits.len()..])
-                    });
+                let (fraction, offset_part) =
+                    after_second
+                        .strip_prefix('.')
+                        .map_or((String::new(), after_second.to_owned()), |fraction| {
+                            let digits: String = fraction
+                                .chars()
+                                .take_while(|c| c.is_ascii_digit())
+                                .collect();
+                            (digits.clone(), fraction[digits.len()..].to_owned())
+                        });
 if !fraction.is_empty() {
-                    let mut scaled = fraction.to_owned();
+                    let mut scaled = fraction;
                     while scaled.len() < 3 {
                         scaled.push('0');
                     }
                     millis = scaled[..3].parse::<i64>().unwrap_or(0);
                 }
-                offset_ms = parse_offset(offset_part).unwrap_or(i64::MIN);
+                offset_ms = parse_offset(&offset_part).unwrap_or(i64::MIN);
                 if offset_ms == i64::MIN && !offset_part.is_empty() && offset_part != "Z" && offset_part != "z" {
                     return invalid;
                 }
@@ -324,7 +324,10 @@ if !fraction.is_empty() {
                 };
             }
         } else {
-            offset_ms = parse_offset(after_hour)?;
+            offset_ms = match parse_offset(after_hour) {
+                Ok(offset_ms) => offset_ms,
+                Err(()) => return invalid,
+            };
         }
     }
 
@@ -420,8 +423,11 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<Message> {
                             blocks
                                 .into_iter()
                                 .map(|block| match block {
-                                    CustomMessageBlock::Text(TextContent { text }) => {
-                                        UserBlock::Text(TextContent { text })
+                                    CustomMessageBlock::Text(TextContent { text, .. }) => {
+                                        UserBlock::Text(TextContent {
+                                            text,
+                                            text_signature: None,
+                                        })
                                     }
                                     CustomMessageBlock::Image(image) => UserBlock::Image(image),
                                 })

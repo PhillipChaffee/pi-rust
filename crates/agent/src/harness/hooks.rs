@@ -14,25 +14,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pi_ai::types::BoxedFuture;
+use pi_telemetry::schema::IntoSpanAttributes;
 use serde_json::Value as JsonValue;
 
 use crate::harness::agent_harness::{
-    HookEvent, HookHandler, HookOptions, HookResult, HookInvocation, StepKind,
+    HookEvent, HookHandler, HookInvocation, HookName, HookResult,
 };
 use crate::harness::context::{with_abort_signal, Context};
 use crate::harness::gate::Gate;
 use crate::harness::result::HarnessError;
-use crate::harness::types::{AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch};
+use crate::harness::types::AgentHarnessStreamOptions;
 use crate::types::AgentMessage;
 
 /// The error reporter the registry forwards handler failures to, upstream's
 /// `HookErrorReporter`.
 pub type HookErrorReporter = Arc<
-    dyn Fn(Box<dyn std::error::Error + Send + Sync>, HookName, &str, &Context) -> BoxedFuture<'_, ()>
-        + Send
-        + Sync,
+    dyn for<'a> Fn(Box<dyn std::error::Error + Send + Sync>, HookName, &'a str, &'a Context)
+        -> BoxedFuture<'a, ()>
+    + Send
+    + Sync,
 >;
 
+#[derive(Clone)]
 struct HookRegistration {
     id: Option<String>,
     handler: HookHandler,
@@ -216,11 +219,13 @@ impl HookRegistry {
             )),
             HookName::BeforeCompaction => Ok(HookResult::BeforeCompaction(
                 self.first_structural(HookName::BeforeCompaction, &event, context)
-                    .await,
+                    .await
+                    .and_then(first_structural_compaction),
             )),
             HookName::BeforeNavigation => Ok(HookResult::BeforeNavigation(
                 self.first_structural(HookName::BeforeNavigation, &event, context)
-                    .await,
+                    .await
+                    .and_then(first_structural_navigation),
             )),
         }
     }
@@ -258,6 +263,35 @@ impl HookRegistry {
         (!injected.is_empty()).then_some(crate::harness::agent_harness::BeforeRunResult {
             messages: injected,
         })
+    }
+
+    async fn before_run_end(
+        &self,
+        event: &HookInvocation,
+        context: &Context,
+    ) -> Option<crate::harness::agent_harness::FollowUpResult> {
+        let HookEvent::BeforeRunEnd { run_id: _, messages: _ } = &event.event else {
+            return None;
+        };
+        let mut follow_up: Option<String> = None;
+        for registration in self.registrations_for(HookName::BeforeRunEnd) {
+            let current = HookInvocation {
+                lane: event.lane.clone(),
+                run_id: event.run_id.clone(),
+                event: event.event.clone(),
+            };
+            match (registration.handler)(&current, context).await {
+                Ok(HookResult::BeforeRunEnd(Some(result))) => {
+                    follow_up = Some(result.follow_up);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    (self.report_error)(error, HookName::BeforeRunEnd, &event.lane, context)
+                        .await;
+                }
+            }
+        }
+        follow_up.map(|follow_up| crate::harness::agent_harness::FollowUpResult { follow_up })
     }
 
     async fn before_tool(
@@ -299,9 +333,11 @@ impl HookRegistry {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    (self.report_error)(error, HookName::BeforeTool, &event.lane, context).await;
+                    let reason = error.to_string();
+                    (self.report_error)(Box::new(error), HookName::BeforeTool, &event.lane, context)
+                        .await;
                     block = Some(crate::harness::agent_harness::ToolBlock {
-                        reason: error.to_string(),
+                        reason,
                         terminate: None,
                     });
                     break;
@@ -542,7 +578,8 @@ impl HookRegistry {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    (self.report_error)(error, HookName::AfterTool, &event.lane, context).await;
+                    (self.report_error)(Box::new(error), HookName::AfterTool, &event.lane, context)
+                        .await;
                 }
             }
         }
@@ -671,8 +708,13 @@ impl From<crate::harness::gate::GateRejection> for HookRunError {
             crate::harness::gate::GateRejection::Closed(error) => Self::Closed(HarnessError::Closed {
                 message: error.0,
             }),
-            crate::harness::gate::GateRejection::Aborted(reason) => Self::Aborted(reason),
         }
+    }
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for HookRunError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::Handler(error)
     }
 }
 
@@ -695,6 +737,22 @@ impl StructuralField {
     }
 }
 
+/// Narrows a first-match result to `before_compaction`'s payload.
+fn first_structural_compaction(result: HookResult) -> Option<crate::harness::agent_harness::CompactionHookResult> {
+    match result {
+        HookResult::BeforeCompaction(result) => result,
+        _ => None,
+    }
+}
+
+/// Narrows a first-match result to `before_navigation`'s payload.
+fn first_structural_navigation(result: HookResult) -> Option<crate::harness::agent_harness::NavigationHookResult> {
+    match result {
+        HookResult::BeforeNavigation(result) => result,
+        _ => None,
+    }
+}
+
 /// Invokes one tool-hook registration under one telemetry span, upstream's
 /// `invokeToolRegistration`: the span carries the lane, operation id, hook
 /// name, and optional registration id, and records the blocked/completed/
@@ -704,7 +762,7 @@ async fn invoke_tool_registration(
     registration: &HookRegistration,
     event: &HookInvocation,
     context: &Context,
-) -> Result<HookResult, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<HookResult, HookRunError> {
     let attributes = crate::harness::telemetry::harness_schema::hook::Start {
         lane_name: event.lane.clone(),
         operation_id: Some(event.run_id.clone()),
@@ -738,7 +796,7 @@ async fn invoke_tool_registration(
                 }
                 .into_span_attributes(),
             );
-            result
+            result.map_err(HookRunError::from)
         },
         context,
     )
@@ -786,7 +844,7 @@ pub fn apply_stream_options_patch(
                 for (key, entry) in entries {
                     match entry {
                         Some(value) => {
-                            headers.insert(key.clone(), Some(value.clone()));
+                            headers.insert(key.clone(), value.clone());
                         }
                         None => {
                             headers.remove(key);
@@ -879,7 +937,8 @@ fn map_patch<V: PartialEq + Clone>(
     let Some(value_map) = value else {
         return None;
     };
-    let base_map = base.unwrap_or(&BTreeMap::new());
+    let empty = BTreeMap::new();
+    let base_map = base.unwrap_or(&empty);
     let mut patch = BTreeMap::new();
     for key in base_map.keys() {
         if !value_map.contains_key(key) {

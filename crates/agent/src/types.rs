@@ -12,6 +12,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions, Tool,
     ToolCall, ToolResultMessage, Usage,
@@ -56,7 +58,8 @@ pub type StreamFn = Arc<
 ///   execute concurrently. `tool_execution_end` is emitted in tool completion
 ///   order after each tool is finalized, while tool-result message artifacts
 ///   are emitted later in assistant source order.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolExecutionMode {
     /// Execute tool calls one by one.
     Sequential,
@@ -71,7 +74,8 @@ pub enum ToolExecutionMode {
 /// - `All`: drain and inject every queued message at that point.
 /// - `OneAtATime`: drain and inject only the oldest queued message, leaving
 ///   the rest queued for later drain points.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum QueueMode {
     /// Drain and inject every queued message at each drain point.
     #[default]
@@ -86,7 +90,8 @@ pub enum QueueMode {
 /// `Xhigh` and `Max` are only supported by selected model families; use
 /// model thinking-level metadata from pi-ai to detect support for a concrete
 /// model.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
     /// No thinking.
     #[default]
@@ -100,6 +105,7 @@ pub enum ThinkingLevel {
     /// High thinking budget.
     High,
     /// Extra-high budget, selected model families only.
+    #[serde(rename = "xhigh")]
     Xhigh,
     /// Maximum budget, selected model families only.
     Max,
@@ -427,7 +433,7 @@ impl CustomAgentMessage {
     }
 }
 
-impl serde::Serialize for CustomAgentMessage {
+impl Serialize for CustomAgentMessage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
         let mut map = serializer.serialize_map(Some(self.data.len() + 2))?;
@@ -440,7 +446,7 @@ impl serde::Serialize for CustomAgentMessage {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for CustomAgentMessage {
+impl<'de> Deserialize<'de> for CustomAgentMessage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut object = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
         let role = object
@@ -523,7 +529,8 @@ pub struct AgentState {
 /// serializes tool details into the tool-result message's JSON details.
 /// Authoring-side tools with typed details restate over this struct with
 /// their own `T` (the tools child carries that surface).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentToolResult<TDetails = serde_json::Value> {
     /// Text or image content returned to the model.
     pub content: Vec<AgentToolContent>,
@@ -572,7 +579,8 @@ pub type AgentToolExecuteFn = dyn for<'a> Fn(
 
 /// Recovery policy for an effect whose durable intent exists but whose
 /// outcome is unknown, upstream's `replay?: "never" | "safe"`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolReplay {
     /// The effect must not re-run; recovery reports it as unknown.
     Never,
