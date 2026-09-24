@@ -14,7 +14,9 @@
 #![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
 
 use crate::harness::types::TruncatedBy;
-use crate::harness::utils::truncate::{truncate_head, truncate_tail, utf8_byte_length, TruncationOptions};
+use crate::harness::utils::truncate::{
+    format_size, truncate_head, truncate_line, truncate_tail, utf8_byte_length, TruncationOptions,
+};
 
 fn options(max_bytes: u64, max_lines: u64) -> TruncationOptions {
     TruncationOptions {
@@ -140,4 +142,29 @@ fn matches_the_reference_tail_semantics_over_multi_byte_inputs() {
         }
     }
     check(&alphabet, String::new(), 2);
+}
+
+/// The line-limited head truncation keeps complete lines and reports the
+/// lines discriminator; `formatSize` renders the human sizes.
+#[test]
+fn the_line_limited_head_truncation_and_format_size() {
+    let result = truncate_head("one\ntwo\nthree\nfour", options(1_000, 2));
+    assert_eq!(result.content, "one\ntwo");
+    assert_eq!(result.metadata.truncated_by, Some(TruncatedBy::Lines));
+    assert_eq!(result.metadata.output_lines, 2);
+    assert_eq!(format_size(512), "512B");
+    assert_eq!(format_size(2_048), "2.0KB");
+    assert_eq!(format_size(3 * 1024 * 1024), "3.0MB");
+}
+
+/// `truncate_line` keeps an ellipsis-bounded prefix, upstream's
+/// `truncateLine`.
+#[test]
+fn truncate_line_appends_the_truncated_suffix() {
+    let kept = truncate_line("hello world", 20);
+    assert_eq!(kept.text, "hello world");
+    assert!(!kept.was_truncated);
+    let cut = truncate_line("hello world", 5);
+    assert_eq!(cut.text, "hello... [truncated]");
+    assert!(cut.was_truncated);
 }
