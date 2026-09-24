@@ -21,12 +21,17 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 # The abort plumbing the stack decision pins: hook and tool signatures carry
 # the same cancellation token pi-ai's transport options do.
 tokio-util = { version = "0.7", default-features = false }
+# rt: `agent_loop` fires its run on a spawned task (upstream's `void
+# runAgentLoop(...)`) and parallel tool execution spawns one task per
+# prepared call — the runtime the workspace stack pins.
+tokio = { version = "1.47", default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the
 # single-threaded substrate expects; time: the paused clock for ordered
-# settlement tests.
-tokio = { version = "1.47", features = ["macros", "rt", "time"] }
+# settlement tests; sync: the oneshot/Notify release gates the tool
+# execution-order tests drive; test-util: the clock pause itself.
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "time", "test-util"] }
 
 [lints]
 workspace = true
