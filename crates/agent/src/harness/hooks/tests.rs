@@ -311,18 +311,18 @@ async fn before_request_folds_stream_option_patches() {
             HookName::BeforeRequest,
             handler(|_event| {
                 HookResult::BeforeRequest(Some(crate::harness::agent_harness::BeforeRequestResult {
-                    stream_options: crate::harness::types::AgentHarnessStreamOptionsPatch {
+                    stream_options: AgentHarnessStreamOptionsPatch {
                         timeout_ms: Some(Some(2_000)),
-                        ..crate::harness::types::AgentHarnessStreamOptionsPatch::default()
+                        ..AgentHarnessStreamOptionsPatch::default()
                     },
                 }))
             }),
             HookOptions::default(),
         )
         .expect("register");
-    let original = crate::harness::types::AgentHarnessStreamOptions {
+    let original = AgentHarnessStreamOptions {
         timeout_ms: Some(1_000),
-        ..crate::harness::types::AgentHarnessStreamOptions::default()
+        ..AgentHarnessStreamOptions::default()
     };
     let result = run(
         &registry,
@@ -561,7 +561,7 @@ async fn before_drive_runs_fail_closed() {
     registry
         .on(
             HookName::BeforeDrive,
-            std::sync::Arc::new(|_event: &HookInvocation, _context| {
+            Arc::new(|_event: &HookInvocation, _context| {
                 Box::pin(async {
                     Err(Box::<dyn std::error::Error + Send + Sync>::from("drive handler failed"))
                 })
