@@ -150,6 +150,9 @@ pub async fn execute_shell_with_capture(
                 _ => None,
             };
             *slot = Some(next);
+            // The progress getter re-locks the shared view, so the update
+            // slot's guard must release before the callback runs.
+            drop(slot);
             if let (Some(chunk), Some(on_chunk)) = (chunk, on_chunk.as_ref()) {
                 let getter_output = Arc::clone(&capture_output);
                 on_chunk(
