@@ -200,6 +200,11 @@ impl AgentHarnessTool {
     }
 }
 
+/// The resolved-context provider, upstream's `toolContext` provider over
+/// one turn snapshot.
+pub type ToolContextProvider =
+    Arc<dyn Fn(&Context) -> BoxedFuture<'static, ToolContext> + Send + Sync>;
+
 /// Static tool context or provider resolved for each turn snapshot,
 /// upstream's `AgentHarnessToolContextSource<TContext>`.
 ///
@@ -209,11 +214,7 @@ pub enum AgentHarnessToolContextSource {
     /// One static context value shared by every turn.
     Static(ToolContext),
     /// A provider resolved per turn snapshot.
-    Resolved(
-        Arc<
-            dyn Fn(&Context) -> BoxedFuture<'static, ToolContext> + Send + Sync,
-        >,
-    ),
+    Resolved(ToolContextProvider),
 }
 
 impl fmt::Debug for AgentHarnessToolContextSource {
@@ -227,7 +228,7 @@ impl fmt::Debug for AgentHarnessToolContextSource {
 
 /// Curated provider request options owned by the harness and snapshotted
 /// per turn, upstream's `AgentHarnessStreamOptions`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentHarnessStreamOptions {
     /// Preferred transport forwarded to the stream function.
@@ -256,7 +257,7 @@ pub struct AgentHarnessStreamOptions {
 /// value, and `Some(Some(value))` to set it. `headers` and `metadata`
 /// merge per key, where a `None` value deletes one key; a map-level
 /// `Some(None)` clears the whole map.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentHarnessStreamOptionsPatch {
     /// Preferred transport patch.
@@ -356,12 +357,10 @@ impl fmt::Display for FileError {
 
 impl std::error::Error for FileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| {
-                let coerced: &(dyn std::error::Error + 'static) = &**source;
-                coerced
-            })
+        self.source.as_ref().map(|source| {
+            let coerced: &(dyn std::error::Error + 'static) = &**source;
+            coerced
+        })
     }
 }
 
@@ -420,12 +419,10 @@ impl fmt::Display for ExecutionError {
 
 impl std::error::Error for ExecutionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| {
-                let coerced: &(dyn std::error::Error + 'static) = &**source;
-                coerced
-            })
+        self.source.as_ref().map(|source| {
+            let coerced: &(dyn std::error::Error + 'static) = &**source;
+            coerced
+        })
     }
 }
 
@@ -476,12 +473,10 @@ impl fmt::Display for CompactionError {
 
 impl std::error::Error for CompactionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| {
-                let coerced: &(dyn std::error::Error + 'static) = &**source;
-                coerced
-            })
+        self.source.as_ref().map(|source| {
+            let coerced: &(dyn std::error::Error + 'static) = &**source;
+            coerced
+        })
     }
 }
 
@@ -533,18 +528,16 @@ impl fmt::Display for BranchSummaryError {
 
 impl std::error::Error for BranchSummaryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source
-            .as_ref()
-            .map(|source| {
-                let coerced: &(dyn std::error::Error + 'static) = &**source;
-                coerced
-            })
+        self.source.as_ref().map(|source| {
+            let coerced: &(dyn std::error::Error + 'static) = &**source;
+            coerced
+        })
     }
 }
 
 /// Metadata for one filesystem object in a [`FileSystem`], upstream's
 /// `FileInfo`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileInfo {
     /// Basename of [`path`](FileInfo::path).
     pub name: String,
@@ -816,7 +809,7 @@ pub enum ShellOutputRetention {
 
 /// Source-side limits for one combined shell output view, upstream's
 /// `ShellOutputLimits`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShellOutputLimits {
     /// Maximum retained bytes.
     pub max_bytes: u64,
@@ -829,7 +822,7 @@ pub struct ShellOutputLimits {
 
 /// Bounded shell capture requested by the caller, upstream's
 /// `ShellOutputCaptureOptions`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellOutputCaptureOptions {
     /// The bounds of the retained view.
     pub limits: ShellOutputLimits,
@@ -840,9 +833,10 @@ pub struct ShellOutputCaptureOptions {
 
 /// Truncation metadata without a duplicate copy of the retained text,
 /// upstream's `ShellOutputTruncation = Omit<TruncationResult, "content">`.
+///
 /// The fields mirror pi-ai's truncate belt's `TruncationResult` minus its
 /// `content` copy; `TruncationResult` itself derefs to this type.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellOutputTruncation {
     /// Whether truncation occurred.
@@ -881,7 +875,7 @@ pub enum TruncatedBy {
 
 /// Metadata accompanying a bounded shell output view, upstream's
 /// `ShellOutputMetadata`.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellOutputMetadata {
     /// Truncation metadata without a duplicate copy of the retained text.
@@ -895,7 +889,7 @@ pub struct ShellOutputMetadata {
 }
 
 /// Complete bounded shell output view, upstream's `ShellOutputView`.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellOutputView {
     /// Metadata accompanying the view.
@@ -906,7 +900,7 @@ pub struct ShellOutputView {
 
 /// Incremental source-side change to one bounded shell output view,
 /// upstream's `ShellOutputUpdate`.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum ShellOutputUpdate {
     /// The view was replaced wholesale.
@@ -940,7 +934,7 @@ pub enum ShellOutputUpdate {
 
 /// Bounded shell completion, upstream's `ShellExecResult`. Output text is
 /// delivered through [`ShellExecOptions::on_update`].
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ShellExecResult {
     /// Process exit code, or `128 + signal` for a signal-killed process.

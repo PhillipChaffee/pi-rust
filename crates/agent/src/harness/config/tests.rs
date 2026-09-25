@@ -6,12 +6,12 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use pi_ai::utils::retry::RetryPolicy;
 
-use crate::harness::compaction::types::{create_file_ops, DEFAULT_COMPACTION_SETTINGS};
-use crate::harness::config::{default_retry_policy, validate_compaction_settings, validate_retry_policy, validate_tool_names};
+use crate::harness::compaction::types::{DEFAULT_COMPACTION_SETTINGS, create_file_ops};
+use crate::harness::config::{
+    default_retry_policy, validate_compaction_settings, validate_retry_policy, validate_tool_names,
+};
 
 /// The default retry policy normalizes over pi-ai's `RetryPolicy` with
 /// upstream's defaults.
@@ -29,8 +29,7 @@ fn tool_names_must_be_unique_and_non_empty() {
     assert!(validate_tool_names(&["read", "write"]).is_ok());
     let error = validate_tool_names(&["read", "read"]).expect_err("duplicates error");
     assert!(error.contains("read"));
-    let error = validate_tool_names(&["read", "read"])
-        .expect_err("duplicates error");
+    let error = validate_tool_names(&["read", "read"]).expect_err("duplicates error");
     assert!(error.contains("Duplicate tool name"));
 }
 
@@ -68,5 +67,8 @@ fn compaction_settings_must_be_positive() {
 /// `createFileOps` builds the empty sorted-vector wire form.
 #[test]
 fn create_file_ops_builds_the_empty_sets() {
-    assert_eq!(create_file_ops(), crate::harness::compaction::types::FileOperations::default());
+    assert_eq!(
+        create_file_ops(),
+        crate::harness::compaction::types::FileOperations::default()
+    );
 }

@@ -35,7 +35,7 @@ pub struct TruncationOptions {
 /// The full truncation result, upstream's `TruncationResult`: the retained
 /// content plus the [`ShellOutputTruncation`] metadata (derefs to it, and
 /// serializes flat like upstream's single object).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TruncationResult {
     /// The truncated content.
     pub content: String,
@@ -81,6 +81,10 @@ fn split_lines_for_counting(content: &str) -> Vec<&str> {
 
 /// Formats bytes as a human-readable size, upstream's `formatSize`.
 #[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the label is human-readable; precision beyond 2^53 bytes is invisible at KB/MB scale"
+)]
 pub fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes}B")

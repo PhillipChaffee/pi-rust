@@ -13,11 +13,10 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-
 use crate::harness::context::Context;
 use crate::harness::types::{
-    ShellOutputCaptureOptions, ShellOutputMetadata, ShellOutputRetention,
-    ShellOutputUpdate, ShellOutputView,
+    ShellOutputCaptureOptions, ShellOutputMetadata, ShellOutputRetention, ShellOutputUpdate,
+    ShellOutputView,
 };
 use crate::harness::utils::adaptive_publisher::{AdaptivePublisher, AdaptivePublisherOptions};
 use crate::harness::utils::truncate::{
@@ -35,15 +34,18 @@ pub const OUTPUT_TARGET_BYTES_PER_SECOND: u64 = 100 * 1024;
 /// drops, upstream's `INVALID_SHELL_OUTPUT` regex
 /// `[\x00-\x08\x0b-\x1f\ufff9-\ufffb]`.
 #[must_use]
-pub fn is_invalid_shell_output_char(c: char) -> bool {
+pub const fn is_invalid_shell_output_char(c: char) -> bool {
     matches!(c, '\u{0}'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{fff9}'..='\u{fffb}')
 }
+
+/// The bounded-view update listener, upstream's `onUpdate`.
+pub type ShellUpdateListener = Arc<dyn Fn(&ShellOutputUpdate, &Context) + Send + Sync>;
 
 /// The handlers [`OutputCapture`] reports through, upstream's
 /// `OutputCaptureHandlers`.
 pub struct OutputCaptureHandlers {
     /// Called with bounded view updates; `None` suppresses publication.
-    pub on_update: Option<Arc<dyn Fn(&ShellOutputUpdate, &Context) + Send + Sync>>,
+    pub on_update: Option<ShellUpdateListener>,
     /// Receives publisher and callback failures; the shell exec maps them
     /// onto its `callback_error` outcome.
     pub on_error: Arc<dyn Fn(String) + Send + Sync>,
@@ -62,7 +64,7 @@ struct StreamingDecoder {
 }
 
 impl StreamingDecoder {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             pending: Vec::new(),
         }
@@ -81,7 +83,7 @@ impl StreamingDecoder {
                 }
                 Err(error) => {
                     let valid = error.valid_up_to();
-                    out.push_str(&String::from_utf8_lossy(&self.pending[..valid]).into_owned());
+                    out.push_str(&String::from_utf8_lossy(&self.pending[..valid]));
                     match error.error_len() {
                         Some(invalid_len) => {
                             out.push('\u{fffd}');
@@ -180,7 +182,7 @@ impl OutputCapture {
         });
         let snapshot_shared = Arc::clone(&shared);
         let publish_on_update = handlers.on_update.clone();
-        let publish_context = context.clone();
+        let publish_context = context;
         let publisher = AdaptivePublisher::new(AdaptivePublisherOptions {
             snapshot: Arc::new(move || snapshot_of(&snapshot_shared)),
             update: Arc::new(update_from),
@@ -204,7 +206,11 @@ impl OutputCapture {
     /// `truncated` getter.
     #[must_use]
     pub fn truncated(&self) -> bool {
-        let buffer = self.shared.buffer.lock().expect("capture buffer lock");
+        let buffer = self
+            .shared
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         buffer.total_bytes > self.shared.max_bytes || total_lines(&buffer) > self.shared.max_lines
     }
 
@@ -213,7 +219,11 @@ impl OutputCapture {
     /// appends the text, upstream's string push.
     pub fn push(&mut self, chunk: Chunk<'_>) {
         {
-            let buffer = self.shared.buffer.lock().expect("capture buffer lock");
+            let buffer = self
+                .shared
+                .buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if buffer.disposed {
                 return;
             }
@@ -224,7 +234,7 @@ impl OutputCapture {
                     .shared
                     .decoder
                     .lock()
-                    .expect("capture decoder lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .decode(&[], true);
                 if flushed.is_empty() {
                     text.to_owned()
@@ -236,7 +246,7 @@ impl OutputCapture {
                 .shared
                 .decoder
                 .lock()
-                .expect("capture decoder lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .decode(bytes, false),
         };
         if !text.is_empty() {
@@ -247,16 +257,20 @@ impl OutputCapture {
     /// Flushes the decoder's pending raw-byte tail into the view.
     pub fn finish(&mut self) {
         {
-            let buffer = self.shared.buffer.lock().expect("capture buffer lock");
+            let buffer = self
+                .shared
+                .buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if buffer.disposed {
                 return;
             }
         }
-let pending = self
+        let pending = self
             .shared
             .decoder
             .lock()
-            .expect("capture decoder lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .decode(&[], true);
         if !pending.is_empty() {
             self.append_text(&pending);
@@ -266,11 +280,20 @@ let pending = self
     /// Records the spill path in the metadata and republishes immediately.
     pub fn set_spill_path(&mut self, path: &str) {
         {
-            let mut spill = self.shared.spill_path.lock().expect("capture spill lock");
-            let buffer = self.shared.buffer.lock().expect("capture buffer lock");
+            let mut spill = self
+                .shared
+                .spill_path
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let buffer = self
+                .shared
+                .buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if buffer.disposed || spill.as_deref() == Some(path) {
                 return;
             }
+            drop(buffer);
             *spill = Some(path.to_owned());
         }
         self.publisher.mark_dirty();
@@ -291,7 +314,11 @@ let pending = self
     /// Stops the capture; later pushes and flushes are ignored.
     pub fn dispose(&mut self) {
         self.publisher.dispose();
-        self.shared.buffer.lock().expect("capture buffer lock").disposed = true;
+        self.shared
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .disposed = true;
     }
 
     fn append_text(&self, text: &str) {
@@ -299,17 +326,21 @@ let pending = self
             return;
         }
         let text_bytes = utf8_byte_length(text);
-        let mut buffer = self.shared.buffer.lock().expect("capture buffer lock");
+        let mut buffer = self
+            .shared
+            .buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if buffer.disposed {
             return;
         }
         buffer.total_bytes += text_bytes;
         buffer.newlines += u64::try_from(text.matches('\n').count()).unwrap_or(u64::MAX);
         buffer.ends_with_newline = text.ends_with('\n');
-        buffer.current_line_bytes = match text.rfind('\n') {
-            None => buffer.current_line_bytes + text_bytes,
-            Some(last_newline) => utf8_byte_length(&text[last_newline + 1..]),
-        };
+        buffer.current_line_bytes = text.rfind('\n').map_or_else(
+            || buffer.current_line_bytes + text_bytes,
+            |last_newline| utf8_byte_length(&text[last_newline + 1..]),
+        );
         buffer.text.push_str(text);
         buffer.buffer_bytes += text_bytes;
 
@@ -331,7 +362,7 @@ let pending = self
 
 /// The chunk variants [`OutputCapture::push`] accepts, upstream's
 /// `string | Uint8Array` parameter.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum Chunk<'a> {
     /// Decoded text appended directly.
     Text(&'a str),
@@ -342,7 +373,10 @@ pub enum Chunk<'a> {
 /// Recomputes the bounded view from the shared state; the publisher's
 /// snapshot callback and the public [`OutputCapture::snapshot`] share it.
 fn snapshot_of(shared: &CaptureShared) -> ShellOutputView {
-    let buffer = shared.buffer.lock().expect("capture buffer lock");
+    let buffer = shared
+        .buffer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let retained = if shared.retain == ShellOutputRetention::Head {
         truncate_head(
             &buffer.text,
@@ -361,14 +395,17 @@ fn snapshot_of(shared: &CaptureShared) -> ShellOutputView {
         )
     };
     let total_lines = total_lines(&buffer);
-    let truncated =
-        buffer.total_bytes > shared.max_bytes || total_lines > shared.max_lines;
-let mut truncation = retained.metadata.clone();
+    let truncated = buffer.total_bytes > shared.max_bytes || total_lines > shared.max_lines;
+    let mut truncation = retained.metadata.clone();
     truncation.truncated = truncated;
     truncation.truncated_by = truncated_by_for(truncated, total_lines, shared.max_lines);
     truncation.total_bytes = buffer.total_bytes;
     truncation.total_lines = total_lines;
-    let spill_path = shared.spill_path.lock().expect("capture spill lock").clone();
+    let spill_path = shared
+        .spill_path
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let last_line_bytes = if retained.metadata.last_line_partial {
         Some(buffer.current_line_bytes)
     } else {
@@ -384,7 +421,7 @@ let mut truncation = retained.metadata.clone();
     }
 }
 
-fn truncated_by_for(
+const fn truncated_by_for(
     truncated: bool,
     total_lines: u64,
     max_lines: u64,
@@ -413,10 +450,18 @@ pub fn apply_shell_output_update(
     match update {
         ShellOutputUpdate::Replace { output } => output.clone(),
         ShellOutputUpdate::Append { text, metadata } => ShellOutputView {
-            text: format!("{}{}", current.map_or(String::new(), |view| view.text.clone()), text),
+            text: format!(
+                "{}{}",
+                current.map_or(String::new(), |view| view.text.clone()),
+                text
+            ),
             metadata: metadata.clone(),
         },
-        ShellOutputUpdate::Slide { drop, text, metadata } => {
+        ShellOutputUpdate::Slide {
+            drop,
+            text,
+            metadata,
+        } => {
             let previous = current.map_or(String::new(), |view| view.text.clone());
             let start = (*drop).min(previous.len());
             ShellOutputView {
@@ -434,7 +479,10 @@ pub fn apply_shell_output_update(
 /// Derives the incremental update between two views, upstream's
 /// `updateFrom`.
 #[must_use]
-pub fn update_from(previous: Option<&ShellOutputView>, current: &ShellOutputView) -> Option<ShellOutputUpdate> {
+pub fn update_from(
+    previous: Option<&ShellOutputView>,
+    current: &ShellOutputView,
+) -> Option<ShellOutputUpdate> {
     let Some(previous) = previous else {
         return Some(ShellOutputUpdate::Replace {
             output: current.clone(),
@@ -448,9 +496,7 @@ pub fn update_from(previous: Option<&ShellOutputView>, current: &ShellOutputView
     if current.text == previous.text {
         return Some(ShellOutputUpdate::Metadata { metadata });
     }
-    if current.text.len() > previous.text.len()
-        && current.text.starts_with(&previous.text)
-    {
+    if current.text.len() > previous.text.len() && current.text.starts_with(&previous.text) {
         return Some(ShellOutputUpdate::Append {
             text: current.text[previous.text.len()..].to_owned(),
             metadata,
@@ -459,11 +505,12 @@ pub fn update_from(previous: Option<&ShellOutputView>, current: &ShellOutputView
     let shared = suffix_prefix_overlap(
         &previous.text,
         &current.text,
-        (previous.text.len())
-            .min(current.text.len())
-            .min(current.metadata.truncation.max_bytes.saturating_mul(2) as usize),
+        (previous.text.len()).min(current.text.len()).min(
+            usize::try_from(current.metadata.truncation.max_bytes.saturating_mul(2))
+                .unwrap_or(usize::MAX),
+        ),
     );
-if shared > 0 {
+    if shared > 0 {
         return Some(ShellOutputUpdate::Slide {
             drop: previous.text.len() - shared,
             text: current.text[shared..].to_owned(),
@@ -504,7 +551,7 @@ fn suffix_prefix_overlap(before: &str, after: &str, scan: usize) -> usize {
             }
             let overlap_length = tail.len() - found;
             if overlap_length <= after_bytes.len()
-                && &after_bytes[..overlap_length] == &tail[found..]
+                && after_bytes[..overlap_length] == tail[found..]
                 && after.is_char_boundary(overlap_length)
                 && before.is_char_boundary(before_bytes.len() - overlap_length)
             {
@@ -535,7 +582,9 @@ fn find_from(haystack: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 /// `sanitizeShellOutput`.
 #[must_use]
 pub fn sanitize_shell_output(text: &str) -> String {
-    text.chars().filter(|c| !is_invalid_shell_output_char(*c)).collect()
+    text.chars()
+        .filter(|c| !is_invalid_shell_output_char(*c))
+        .collect()
 }
 
 fn trim_to_last_utf8_bytes(text: &str, max_bytes: u64) -> String {

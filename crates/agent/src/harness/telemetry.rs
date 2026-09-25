@@ -37,7 +37,7 @@ pub use pi_telemetry::{
     SpanOptions as SpanStartOptions, SpanStatus, TelemetryContext, TelemetryHandle, TelemetrySpan,
 };
 
-use crate::harness::context::{get_telemetry_context, with_telemetry_context, Context};
+use crate::harness::context::{Context, get_telemetry_context, with_telemetry_context};
 
 pi_telemetry::define_telemetry_schema! {
     /// The AI-request vocabulary, upstream's `AI_TELEMETRY_SCHEMA`.
@@ -315,10 +315,11 @@ macro_rules! agent_telemetry_starter {
     };
 }
 
-/// Starts an AI-request span with the typed start attributes, fetching the
-/// telemetry parent from the harness context and handing the body the
-/// span plus a context whose telemetry parent is the span, upstream's
+/// Starts an AI-request span with the typed start attributes, upstream's
 /// `startAiSpan`.
+///
+/// The parent fetch reads the harness context; the body receives the span
+/// plus a context whose telemetry parent is the span.
 ///
 /// # Errors
 /// Propagates the body's `Err` value unchanged, after span settlement.
@@ -335,12 +336,7 @@ where
     T: Send + 'static,
     E: SpanBodyFailure + Send + 'static,
 {
-    start_typed_span(
-        N::NAME,
-        attributes.into_span_attributes(),
-        body,
-        context,
-    )
+    start_typed_span(N::NAME, attributes.into_span_attributes(), body, context)
 }
 
 /// Starts a harness span, upstream's `startHarnessSpan`.
@@ -360,12 +356,7 @@ where
     T: Send + 'static,
     E: SpanBodyFailure + Send + 'static,
 {
-    start_typed_span(
-        N::NAME,
-        attributes.into_span_attributes(),
-        body,
-        context,
-    )
+    start_typed_span(N::NAME, attributes.into_span_attributes(), body, context)
 }
 
 /// The typed span view the harness start helpers hand their bodies: the

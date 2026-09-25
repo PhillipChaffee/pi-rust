@@ -3,12 +3,6 @@
 //! Upstream exercises them through the environment and runtime suites;
 //! upstream has no dedicated unit file.
 
-#![expect(
-    clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use crate::harness::types::{
     ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileKind, ReadTextLinesOptions,
     RemoveOptions, ShellExecOptions, TempFileOptions, TextLine, ToolContext,
@@ -55,6 +49,11 @@ fn the_option_debug_impls_surface_their_fields() {
     };
     let debug = format!("{text_line:?}");
     assert!(debug.contains("line"));
-    let _ = (FileKind::File, ReadTextLinesOptions::default(), RemoveOptions::default(), TempFileOptions::default());
+    let _ = (
+        FileKind::File,
+        ReadTextLinesOptions::default(),
+        RemoveOptions::default(),
+        TempFileOptions::default(),
+    );
     assert!(ToolContext::None.is_none());
 }

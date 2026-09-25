@@ -11,13 +11,11 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use pi_telemetry::schema::{IntoSpanAttributes, TelemetrySchema};
 use pi_telemetry::{NOOP_TELEMETRY_CONTEXT, TelemetryHandle};
 
 use crate::harness::context::{background_context, with_telemetry_context};
-use crate::harness::telemetry::{harness_schema, ai_schema, start_ai_span, start_harness_span};
+use crate::harness::telemetry::{ai_schema, harness_schema, start_ai_span, start_harness_span};
 
 /// Both schemas carry upstream's span vocabularies in declaration order;
 /// the composed schema list binds ai first, harness second.
@@ -84,9 +82,7 @@ async fn starts_ai_and_harness_spans_through_one_composed_typed_starter() {
                         },
                         |request_span, _child| async move {
                             request_span.set_attributes(ai_schema::request::End {
-                                response_stop_reason: Some(
-                                    ai_schema::request::AiStopReason::Stop,
-                                ),
+                                response_stop_reason: Some(ai_schema::request::AiStopReason::Stop),
                                 response_model: None,
                                 response_id: None,
                                 http_status_code: None,
@@ -131,23 +127,25 @@ async fn starts_ai_and_harness_spans_through_the_harness_context() {
             deferred: None,
         },
         |span, _child_context| async move {
-            span.set_attributes(ai_schema::request::End {
-                response_model: None,
-                response_id: None,
-                response_stop_reason: Some(ai_schema::request::AiStopReason::ToolUse),
-                http_status_code: None,
-                usage_input_tokens: None,
-                usage_output_tokens: None,
-                usage_cache_read_tokens: None,
-                usage_cache_write_tokens: None,
-                usage_reasoning_tokens: None,
-                usage_total_tokens: None,
-                usage_cost: None,
-                stream_chunk_count: None,
-                stream_time_to_first_chunk_ms: None,
-                error_type: None,
-            }
-            .into_span_attributes());
+            span.set_attributes(
+                ai_schema::request::End {
+                    response_model: None,
+                    response_id: None,
+                    response_stop_reason: Some(ai_schema::request::AiStopReason::ToolUse),
+                    http_status_code: None,
+                    usage_input_tokens: None,
+                    usage_output_tokens: None,
+                    usage_cache_read_tokens: None,
+                    usage_cache_write_tokens: None,
+                    usage_reasoning_tokens: None,
+                    usage_total_tokens: None,
+                    usage_cost: None,
+                    stream_chunk_count: None,
+                    stream_time_to_first_chunk_ms: None,
+                    error_type: None,
+                }
+                .into_span_attributes(),
+            );
             Ok::<(), std::io::Error>(())
         },
         &context,
@@ -165,12 +163,14 @@ async fn starts_ai_and_harness_spans_through_the_harness_context() {
             operation_kind: harness_schema::run::RunKind::Run,
         },
         |span, _child_context| async move {
-            span.set_attributes(harness_schema::run::End {
-                operation_outcome: Some(harness_schema::run::RunOutcome::Completed),
-                error_code: None,
-                error_type: None,
-            }
-            .into_span_attributes());
+            span.set_attributes(
+                harness_schema::run::End {
+                    operation_outcome: Some(harness_schema::run::RunOutcome::Completed),
+                    error_code: None,
+                    error_type: None,
+                }
+                .into_span_attributes(),
+            );
             Ok::<(), std::io::Error>(())
         },
         &context,

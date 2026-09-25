@@ -6,16 +6,13 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use std::sync::{Arc, Mutex};
 
 use pi_chord::context::background_context;
 
 use crate::harness::env::nodejs::NodeExecutionEnv;
 use crate::harness::utils::shell_output::ShellCaptureProgress;
-use crate::harness::utils::shell_output::{execute_shell_with_capture, ShellCaptureOptions};
+use crate::harness::utils::shell_output::{ShellCaptureOptions, execute_shell_with_capture};
 
 fn env_at(root: &std::path::Path) -> NodeExecutionEnv {
     NodeExecutionEnv::new(root.to_string_lossy().into_owned(), None, None)
@@ -27,15 +24,20 @@ fn env_at(root: &std::path::Path) -> NodeExecutionEnv {
 async fn executes_with_capture_folds_and_spills() {
     let root = tempfile::tempdir().expect("temp root");
     let env = env_at(root.path());
-    let result = execute_shell_with_capture(&env, "yes line | head -n 15000", None, &background_context())
-        .await
-        .expect("capture");
+    let result = execute_shell_with_capture(
+        &env,
+        "yes line | head -n 15000",
+        None,
+        &background_context(),
+    )
+    .await
+    .expect("capture");
     assert!(result.truncated);
     let full_output_path = result.full_output_path.clone().expect("spill");
     let full_output = read_text_file(&env, &full_output_path).await;
     assert!(full_output.split('\n').count() > 10_000);
     assert!(result.output.len() < full_output.len());
-    assert_eq!(result.truncation.truncated, true);
+    assert!(result.truncation.truncated);
 }
 
 /// The per-chunk callback reports incremental chunks, and the progress

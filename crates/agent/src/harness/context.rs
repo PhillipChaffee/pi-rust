@@ -11,8 +11,8 @@
 //! chord crate's Rust model to record as an ADR.
 
 pub use pi_chord::context::{
-    AbortController, AbortReason, AbortSignal, AwaitWithContext, Context, ContextKey,
-    WaitAborted, await_with_context, background_context, create_context_key, placeholder_context,
+    AbortController, AbortReason, AbortSignal, AwaitWithContext, Context, ContextKey, WaitAborted,
+    await_with_context, background_context, create_context_key, placeholder_context,
     with_abort_signal, with_cancel, with_context_value, without_abort_signal,
 };
 

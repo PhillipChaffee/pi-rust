@@ -6,8 +6,6 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use serde_json::json;
 
 use crate::harness::session::values as stored_values;
@@ -21,8 +19,8 @@ fn address_validation_rejects_the_bad_components() {
     let error =
         stored_values::validate_address("ns\0", "key").expect_err("a NUL in the namespace errors");
     assert_eq!(error.0, "Value namespace must not contain \\u0000");
-    let error = stored_values::validate_address("ns", "ke\0y")
-        .expect_err("a NUL in the key errors");
+    let error =
+        stored_values::validate_address("ns", "ke\0y").expect_err("a NUL in the key errors");
     assert_eq!(error.0, "Value key must not contain \\u0000");
     assert!(stored_values::validate_address("ns", "key").is_ok());
 }
@@ -38,28 +36,23 @@ fn the_list_read_resolver_defaults_and_clamps() {
         crate::harness::session::types::EntryScanOrder::Asc
     );
     assert_eq!(resolved.limit, 1_000);
-    let error = stored_values::resolve_list_read_options(Some(
-        stored_values::ListReadOptions {
-            limit: Some(0),
-            ..stored_values::ListReadOptions::default()
-        },
-    ))
+    let error = stored_values::resolve_list_read_options(Some(stored_values::ListReadOptions {
+        limit: Some(0),
+        ..stored_values::ListReadOptions::default()
+    }))
     .expect_err("a zero limit errors");
     assert_eq!(error.0, "List read limit must be a positive safe integer");
-    let clamped = stored_values::resolve_list_read_options(Some(
-        stored_values::ListReadOptions {
-            limit: Some(50_000),
-            ..stored_values::ListReadOptions::default()
-        },
-    ))
+    let clamped = stored_values::resolve_list_read_options(Some(stored_values::ListReadOptions {
+        limit: Some(50_000),
+        ..stored_values::ListReadOptions::default()
+    }))
     .expect("a large limit clamps to the floor");
     assert_eq!(clamped.limit, 10_000);
-    let beyond_safe_integer = stored_values::resolve_list_read_options(Some(
-        stored_values::ListReadOptions {
+    let beyond_safe_integer =
+        stored_values::resolve_list_read_options(Some(stored_values::ListReadOptions {
             limit: Some(9_007_199_254_740_992),
             ..stored_values::ListReadOptions::default()
-        },
-    ));
+        }));
     assert!(beyond_safe_integer.is_err());
 }
 
@@ -102,13 +95,34 @@ fn the_fixed_addresses_carry_upstream_namespaces() {
             key: "main".to_owned(),
         }
     );
-    assert_eq!(stored_values::lane_config("main").address.namespace, "pi.lane.config");
-    assert_eq!(stored_values::lane_state("main").address.namespace, "pi.lane.state");
-    assert_eq!(stored_values::operation_result("run").address.namespace, "pi.result");
-    assert_eq!(stored_values::operation_meta("run").address.namespace, "pi.op.meta");
-    assert_eq!(stored_values::operation_state("run").address.namespace, "pi.op.state");
-    assert_eq!(stored_values::session_name().address.namespace, "pi.session.name");
-    assert_eq!(stored_values::entry_label("entry").address.namespace, "pi.entry.label");
+    assert_eq!(
+        stored_values::lane_config("main").address.namespace,
+        "pi.lane.config"
+    );
+    assert_eq!(
+        stored_values::lane_state("main").address.namespace,
+        "pi.lane.state"
+    );
+    assert_eq!(
+        stored_values::operation_result("run").address.namespace,
+        "pi.result"
+    );
+    assert_eq!(
+        stored_values::operation_meta("run").address.namespace,
+        "pi.op.meta"
+    );
+    assert_eq!(
+        stored_values::operation_state("run").address.namespace,
+        "pi.op.state"
+    );
+    assert_eq!(
+        stored_values::session_name().address.namespace,
+        "pi.session.name"
+    );
+    assert_eq!(
+        stored_values::entry_label("entry").address.namespace,
+        "pi.entry.label"
+    );
     let frames = stored_values::pending_assistant_frames("op", "response");
     assert_eq!(frames.address.namespace, "pi.pending.assistant_frame");
     assert_eq!(frames.address.key, "op:response");

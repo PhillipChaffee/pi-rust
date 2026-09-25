@@ -9,20 +9,16 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use std::sync::{Arc, Mutex};
 
 use pi_chord::context::background_context;
 
 use crate::harness::types::{
-    ShellOutputLimits, ShellOutputMetadata, ShellOutputRetention, ShellOutputUpdate,
-    TruncatedBy,
+    ShellOutputLimits, ShellOutputMetadata, ShellOutputRetention, ShellOutputUpdate, TruncatedBy,
 };
 use crate::harness::utils::output_capture::{
-    apply_shell_output_update, is_invalid_shell_output_char, sanitize_shell_output, OutputCapture,
-    OutputCaptureHandlers,
+    OutputCapture, OutputCaptureHandlers, apply_shell_output_update, is_invalid_shell_output_char,
+    sanitize_shell_output,
 };
 
 struct Fixture {
@@ -85,11 +81,10 @@ fn removes_invalid_control_characters() {
     let input = "a\0b\tc\nd\re\u{7}f\u{fff9}g\u{fffb}h\u{1f600}";
     assert_eq!(sanitize_shell_output(input), "ab\tc\ndefgh\u{1f600}");
     let mut fixture = capture();
-    fixture.capture.push(crate::harness::utils::output_capture::Chunk::Text(input));
-    assert_eq!(
-        fixture.capture.snapshot().text,
-        "ab\tc\ndefgh\u{1f600}"
-    );
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text(input));
+    assert_eq!(fixture.capture.snapshot().text, "ab\tc\ndefgh\u{1f600}");
 }
 
 /// UTF-8 decodes across raw process chunks.
@@ -97,11 +92,17 @@ fn removes_invalid_control_characters() {
 fn decodes_utf8_split_across_raw_process_chunks() {
     let mut fixture = capture();
     let bytes = "😀".as_bytes();
-    fixture.capture.push(crate::harness::utils::output_capture::Chunk::Bytes(&bytes[..2]));
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Bytes(
+            &bytes[..2],
+        ));
     assert_eq!(fixture.capture.snapshot().text, "");
     fixture
         .capture
-        .push(crate::harness::utils::output_capture::Chunk::Bytes(&bytes[2..]));
+        .push(crate::harness::utils::output_capture::Chunk::Bytes(
+            &bytes[2..],
+        ));
     fixture.capture.finish();
     assert_eq!(fixture.capture.snapshot().text, "😀");
 }
@@ -113,7 +114,9 @@ fn keeps_the_exact_byte_count_for_an_oversized_single_line() {
     let mut fixture = capture_with(10, 100, ShellOutputRetention::Tail);
     fixture
         .capture
-        .push(crate::harness::utils::output_capture::Chunk::Text(&"x".repeat(100)));
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            &"x".repeat(100),
+        ));
     let snapshot = fixture.capture.snapshot();
     assert_eq!(snapshot.text, "x".repeat(10));
     assert_eq!(snapshot.metadata.last_line_bytes, Some(100));
@@ -125,10 +128,11 @@ fn keeps_the_exact_byte_count_for_an_oversized_single_line() {
 #[test]
 fn preserves_the_original_head_after_its_raw_guard_is_crossed() {
     let mut fixture = capture_with(100, 2, ShellOutputRetention::Head);
-    fixture.capture.push(crate::harness::utils::output_capture::Chunk::Text(&format!(
-        "first\nsecond\n{}",
-        "tail".repeat(100)
-    )));
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            &format!("first\nsecond\n{}", "tail".repeat(100)),
+        ));
     assert_eq!(fixture.capture.snapshot().text, "first\nsecond");
 }
 
@@ -162,6 +166,7 @@ async fn publishes_immediately_then_trickles_and_collapses_bursts() {
         let updates = fixture.updates.lock().expect("updates lock");
         assert_eq!(updates.len(), 1);
         assert!(matches!(updates[0], ShellOutputUpdate::Replace { .. }));
+        drop(updates);
     }
     tokio::time::advance(std::time::Duration::from_millis(150)).await;
     pump().await;
@@ -178,7 +183,6 @@ fn folded_text(updates: &[ShellOutputUpdate]) -> String {
     fold(updates).map(|output| output.text).unwrap_or_default()
 }
 
-
 /// Post-cap trickle publishes a small slide; a full turnover publishes a
 /// cap-bounded replacement.
 #[tokio::test(start_paused = true)]
@@ -186,7 +190,9 @@ async fn publishes_a_slide_then_a_replacement_after_turnover() {
     let mut fixture = capture_with(10, 100, ShellOutputRetention::Tail);
     fixture
         .capture
-        .push(crate::harness::utils::output_capture::Chunk::Text("abcdefghij"));
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            "abcdefghij",
+        ));
     pump().await;
     tokio::time::advance(std::time::Duration::from_millis(150)).await;
     pump().await;
@@ -201,23 +207,32 @@ async fn publishes_a_slide_then_a_replacement_after_turnover() {
             "the trickle slides: {:?}",
             updates[1]
         );
+        drop(updates);
     }
-    assert_eq!(folded_text(&fixture.updates.lock().expect("updates lock")), "bcdefghijk");
+    assert_eq!(
+        folded_text(&fixture.updates.lock().expect("updates lock")),
+        "bcdefghijk"
+    );
 
     let mut replacement = capture_with(10, 100, ShellOutputRetention::Tail);
     replacement
         .capture
-        .push(crate::harness::utils::output_capture::Chunk::Text("abcdefghij"));
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            "abcdefghij",
+        ));
     pump().await;
     replacement
         .capture
-        .push(crate::harness::utils::output_capture::Chunk::Text(&"x".repeat(100)));
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            &"x".repeat(100),
+        ));
     pump().await;
     tokio::time::advance(std::time::Duration::from_millis(100)).await;
     pump().await;
     {
         let updates = replacement.updates.lock().expect("updates lock");
         assert!(matches!(updates[1], ShellOutputUpdate::Replace { .. }));
+        drop(updates);
     }
     let view = fold(&replacement.updates.lock().expect("updates lock")).expect("folded");
     assert_eq!(view.text.chars().count(), 10);
@@ -238,7 +253,10 @@ async fn flush_publishes_and_dispose_silences_the_trailing_timer() {
         .push(crate::harness::utils::output_capture::Chunk::Text("b"));
     fixture.capture.flush();
     pump().await;
-    assert_eq!(folded_text(&fixture.updates.lock().expect("updates lock")), "ab");
+    assert_eq!(
+        folded_text(&fixture.updates.lock().expect("updates lock")),
+        "ab"
+    );
     fixture.capture.dispose();
     tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
     pump().await;
@@ -272,9 +290,8 @@ async fn the_spill_path_reaches_the_folded_metadata() {
     pump().await;
     fixture.capture.set_spill_path("/tmp/output.log");
     pump().await;
-    let updates = fixture.updates.lock().expect("updates lock");
-    let view = fold(&updates).expect("folded");
-    let metadata: ShellOutputMetadata = view.metadata.clone();
+    let view = fold(&fixture.updates.lock().expect("updates lock")).expect("folded");
+    let metadata: ShellOutputMetadata = view.metadata;
     assert_eq!(metadata.spill_path.as_deref(), Some("/tmp/output.log"));
     let _ = TruncatedBy::Bytes;
 }

@@ -14,6 +14,11 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+/// The prior-to-current update diff, upstream's
+/// `(previous: TValue | undefined, current: TValue) => TUpdate | undefined`.
+pub type UpdateFn<TValue, TUpdate> =
+    Arc<dyn Fn(Option<&TValue>, &TValue) -> Option<TUpdate> + Send + Sync>;
+
 /// The callbacks one publisher consults, upstream's
 /// `AdaptivePublisherOptions<TValue, TUpdate>`.
 pub struct AdaptivePublisherOptions<TValue, TUpdate> {
@@ -21,7 +26,7 @@ pub struct AdaptivePublisherOptions<TValue, TUpdate> {
     pub snapshot: Arc<dyn Fn() -> TValue + Send + Sync>,
     /// The update from the previously published state to `current`;
     /// `None` when the two states are equivalent.
-    pub update: Arc<dyn Fn(Option<&TValue>, &TValue) -> Option<TUpdate> + Send + Sync>,
+    pub update: UpdateFn<TValue, TUpdate>,
     /// The encoded size the rate limit buys the delay from.
     pub measure: Arc<dyn Fn(&TUpdate) -> u64 + Send + Sync>,
     /// Delivers one update. Runs after the publisher has committed its
@@ -38,7 +43,8 @@ pub struct AdaptivePublisherOptions<TValue, TUpdate> {
 
 impl<TValue, TUpdate> std::fmt::Debug for AdaptivePublisherOptions<TValue, TUpdate> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AdaptivePublisherOptions").finish_non_exhaustive()
+        f.debug_struct("AdaptivePublisherOptions")
+            .finish_non_exhaustive()
     }
 }
 
@@ -129,17 +135,27 @@ impl<TValue: Send + 'static, TUpdate: Send + 'static> AdaptivePublisher<TValue, 
 
 impl<TValue: Send + 'static, TUpdate: Send + 'static> PublisherCore<TValue, TUpdate> {
     fn lock_state(&self) -> std::sync::MutexGuard<'_, PublisherState<TValue>> {
-        self.state.lock().expect("publisher state lock")
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn clear_timer(&self) {
-        if let Some(handle) = self.timer.lock().expect("publisher timer lock").take() {
+        let handle = self
+            .timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
             handle.abort();
         }
     }
 
     fn arm_timer(self: &Arc<Self>, wait: Duration) {
-        let mut timer = self.timer.lock().expect("publisher timer lock");
+        let mut timer = self
+            .timer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if timer.is_some() {
             return;
         }
@@ -153,7 +169,7 @@ impl<TValue: Send + 'static, TUpdate: Send + 'static> PublisherCore<TValue, TUpd
         *timer = Some(handle);
     }
 
-fn flush(self: &Arc<Self>, force: bool) {
+    fn flush(self: &Arc<Self>, force: bool) {
         let update = {
             let mut state = self.lock_state();
             if state.disposed || !state.dirty {

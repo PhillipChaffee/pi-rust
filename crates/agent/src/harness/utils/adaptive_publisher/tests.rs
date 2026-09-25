@@ -10,13 +10,15 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 #![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use std::sync::{Arc, Mutex};
 
 use crate::harness::utils::adaptive_publisher::{AdaptivePublisher, AdaptivePublisherOptions};
 
-fn sink<T: Send + 'static>() -> (Arc<Mutex<Vec<T>>>, Arc<dyn Fn(T) + Send + Sync>) {
+/// The published-update collector and its push handle, shared by the
+/// fixture builders.
+type Sink<T> = (Arc<Mutex<Vec<T>>>, Arc<dyn Fn(T) + Send + Sync>);
+
+fn sink<T: Send + 'static>() -> Sink<T> {
     let sink: Arc<Mutex<Vec<T>>> = Arc::new(Mutex::new(Vec::new()));
     let handle = Arc::clone(&sink);
     (
@@ -114,7 +116,10 @@ async fn commits_its_baseline_before_a_consumer_failure() {
     pump().await;
     assert_eq!(
         updates.lock().expect("updates lock").clone(),
-        vec![(None, "a".to_owned()), (Some("a".to_owned()), "ab".to_owned())]
+        vec![
+            (None, "a".to_owned()),
+            (Some("a".to_owned()), "ab".to_owned())
+        ]
     );
 
     *value.lock().expect("value lock") = "abc".to_owned();
@@ -122,7 +127,9 @@ async fn commits_its_baseline_before_a_consumer_failure() {
     pump().await;
     tokio::time::advance(std::time::Duration::from_millis(100)).await;
     pump().await;
-    let published = updates.lock().expect("updates lock").clone();
-    assert_eq!(published.last().map(|record| record.1.clone()), Some("abc".to_owned()));
+    let delivered = updates.lock().expect("updates lock").clone();
+    assert_eq!(
+        delivered.last().map(|record| record.1.clone()),
+        Some("abc".to_owned())
+    );
 }
-

@@ -22,10 +22,10 @@ use pi_ai::types::BoxedFuture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use crate::harness::context::{AbortSignal, AbortReason, Context};
+use crate::harness::context::{AbortReason, AbortSignal, Context};
 use crate::harness::types::{
     CreateDirOptions, ExecutionEnv, ExecutionError, ExecutionErrorCode, FileContent, FileError,
-    FileErrorCode, FileKind, FileInfo, FileSystem, ReadTextLinesOptions, RemoveOptions, Shell,
+    FileErrorCode, FileInfo, FileKind, FileSystem, ReadTextLinesOptions, RemoveOptions, Shell,
     ShellExecOptions, ShellExecResult, TempFileOptions, TextLine, TextLineReader,
 };
 use crate::harness::utils::output_capture::{Chunk, OutputCapture, OutputCaptureHandlers};
@@ -61,7 +61,7 @@ fn aborted_file_error(path: Option<String>) -> FileError {
 /// The context's abort signal when it already fired, upstream's
 /// `signal?.aborted` checks.
 fn fired_abort_signal(context: &Context) -> Option<AbortSignal> {
-    context.abort_signal().filter(|signal| signal.aborted())
+    context.abort_signal().filter(AbortSignal::aborted)
 }
 
 /// Resolves the shell timeout into milliseconds, upstream's
@@ -89,6 +89,11 @@ fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<u64>, ExecutionErro
             None,
         ));
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the timeout is validated positive, finite, and under the millisecond cap above; sub-millisecond precision is not observable"
+    )]
     Ok(Some(timeout_ms as u64))
 }
 
@@ -110,16 +115,15 @@ fn file_url_to_path(url: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         match bytes[index] {
-            b'%' if index + 2 < bytes.len() => match u8::from_str_radix(&path[index + 1..index + 3], 16) {
-                Ok(byte) => {
+            b'%' if index + 2 < bytes.len() => {
+                if let Ok(byte) = u8::from_str_radix(&path[index + 1..index + 3], 16) {
                     decoded.push(byte);
                     index += 3;
-                }
-                Err(_) => {
+                } else {
                     decoded.push(bytes[index]);
                     index += 1;
                 }
-            },
+            }
             byte => {
                 decoded.push(byte);
                 index += 1;
@@ -134,7 +138,7 @@ fn file_url_to_path(url: &str) -> String {
 fn resolve_path(cwd: &str, path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let normalized = if path == "~" && !home.is_empty() {
-        home.clone()
+        home
     } else if let Some(rest) = path.strip_prefix("~/") {
         if home.is_empty() {
             path.to_owned()
@@ -174,10 +178,11 @@ fn normalize_path(path: &Path) -> PathBuf {
             std::path::Component::Normal(part) => components.push(part.to_owned()),
         }
     }
-    let mut joined = prefix.map_or_else(PathBuf::new, PathBuf::from);
-    if absolute {
-        joined.push("/");
-    }
+    let mut joined = if absolute {
+        PathBuf::from("/")
+    } else {
+        prefix.map_or_else(PathBuf::new, PathBuf::from)
+    };
     for component in components {
         joined.push(component);
     }
@@ -189,7 +194,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 
 /// Builds one [`FileInfo`] from lstat data, upstream's
 /// `fileInfoFromStats`.
-fn file_info_from_metadata(path: &str, metadata: &std::fs::Metadata) -> Result<FileInfo, FileError> {
+fn file_info_from_metadata(
+    path: &str,
+    metadata: &std::fs::Metadata,
+) -> Result<FileInfo, FileError> {
     let file_type = metadata.file_type();
     let kind = if file_type.is_file() {
         FileKind::File
@@ -206,9 +214,10 @@ fn file_info_from_metadata(path: &str, metadata: &std::fs::Metadata) -> Result<F
         ));
     };
     Ok(FileInfo {
-        name: Path::new(path)
-            .file_name()
-            .map_or_else(|| path.to_owned(), |name| name.to_string_lossy().into_owned()),
+        name: Path::new(path).file_name().map_or_else(
+            || path.to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
         path: path.to_owned(),
         kind,
         size: metadata.len(),
@@ -360,10 +369,14 @@ fn get_shell_env(
 /// group), so a negative-pid `SIGKILL` reaches the whole tree; a failed
 /// group kill falls back to the child alone. The win32 `taskkill` branch
 /// rides the map's win32 ticket.
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "the kernel's pid_t is i32; a process id beyond it cannot exist on a supported platform"
+)]
 fn kill_process_tree(pid: u32) {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{kill, Signal};
+        use nix::sys::signal::{Signal, kill};
         use nix::unistd::Pid;
         let group = Pid::from_raw(-(pid as i32));
         if kill(group, Signal::SIGKILL).is_err() {
@@ -398,15 +411,14 @@ async fn run_command(command: &str, args: &[&str], timeout_ms: u64) -> (String, 
         let status = child.wait().await.ok().and_then(|status| status.code());
         (String::from_utf8_lossy(&stdout).into_owned(), status)
     };
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), probe).await {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            if let Some(pid) = child.id() {
-                kill_process_tree(pid);
-            }
-            let _ = child.wait().await;
-            (String::new(), None)
+    if let Ok(outcome) = tokio::time::timeout(Duration::from_millis(timeout_ms), probe).await {
+        outcome
+    } else {
+        if let Some(pid) = child.id() {
+            kill_process_tree(pid);
         }
+        let _ = child.wait().await;
+        (String::new(), None)
     }
 }
 
@@ -433,7 +445,9 @@ async fn find_bash_on_path() -> Option<String> {
 fn temp_name(counter: u64) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+        });
     format!("{:x}-{:x}-{:x}", std::process::id(), nanos, counter)
 }
 
@@ -464,7 +478,7 @@ type AbortWait = Pin<Box<dyn Future<Output = AbortReason> + Send>>;
 
 impl NodeTextLineReader {
     /// The line reader over one open file, upstream's constructor.
-    fn new(file: tokio::fs::File, path: String) -> Self {
+    const fn new(file: tokio::fs::File, path: String) -> Self {
         Self {
             file,
             path,
@@ -639,7 +653,8 @@ impl FileSystem for NodeExecutionEnv {
                     if fired_abort_signal(context).is_some() {
                         return Err(aborted_file_error(Some(resolved)));
                     }
-                    let reader: Box<dyn TextLineReader> = Box::new(NodeTextLineReader::new(file, resolved));
+                    let reader: Box<dyn TextLineReader> =
+                        Box::new(NodeTextLineReader::new(file, resolved));
                     Ok(reader)
                 }
             }
@@ -659,7 +674,9 @@ impl FileSystem for NodeExecutionEnv {
             }
             let mut reader = FileSystem::open_text_line_reader(self, path, context).await?;
             let mut lines = Vec::new();
-            while max_lines.is_none_or(|max| usize::try_from(max).unwrap_or(usize::MAX) > lines.len()) {
+            while max_lines
+                .is_none_or(|max| usize::try_from(max).unwrap_or(usize::MAX) > lines.len())
+            {
                 match reader.read_line(context).await {
                     Err(error) => {
                         reader.close(context).await;
@@ -694,19 +711,19 @@ impl FileSystem for NodeExecutionEnv {
         &'a self,
         path: &'a str,
         content: FileContent,
-        context: &'a Context,
+        ctx: &'a Context,
     ) -> BoxedFuture<'a, Result<(), FileError>> {
         Box::pin(async move {
             let resolved = resolve_path(&self.cwd, path);
-            if fired_abort_signal(context).is_some() {
+            if fired_abort_signal(ctx).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
-            if let Some(parent) = Path::new(&resolved).parent() {
-                if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                    return Err(to_file_error(&error, Some(resolved)));
-                }
+            if let Some(parent) = Path::new(&resolved).parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                return Err(to_file_error(&error, Some(resolved)));
             }
-            if fired_abort_signal(context).is_some() {
+            if fired_abort_signal(ctx).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
             let write = match &content {
@@ -721,19 +738,19 @@ impl FileSystem for NodeExecutionEnv {
         &'a self,
         path: &'a str,
         content: FileContent,
-        context: &'a Context,
+        ctx: &'a Context,
     ) -> BoxedFuture<'a, Result<(), FileError>> {
         Box::pin(async move {
             let resolved = resolve_path(&self.cwd, path);
-            if fired_abort_signal(context).is_some() {
+            if fired_abort_signal(ctx).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
-            if let Some(parent) = Path::new(&resolved).parent() {
-                if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                    return Err(to_file_error(&error, Some(resolved)));
-                }
+            if let Some(parent) = Path::new(&resolved).parent()
+                && let Err(error) = tokio::fs::create_dir_all(parent).await
+            {
+                return Err(to_file_error(&error, Some(resolved)));
             }
-            if fired_abort_signal(context).is_some() {
+            if fired_abort_signal(ctx).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
             let mut file = match tokio::fs::OpenOptions::new()
@@ -752,7 +769,7 @@ impl FileSystem for NodeExecutionEnv {
             if let Err(error) = written {
                 return Err(to_file_error(&error, Some(resolved)));
             }
-            if fired_abort_signal(context).is_some() {
+            if fired_abort_signal(ctx).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
             Ok(())
@@ -868,7 +885,9 @@ impl FileSystem for NodeExecutionEnv {
             if fired_abort_signal(context).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
-            let recursive = options.and_then(|options| options.recursive).unwrap_or(true);
+            let recursive = options
+                .and_then(|options| options.recursive)
+                .unwrap_or(true);
             let created = if recursive {
                 tokio::fs::create_dir_all(&resolved).await
             } else {
@@ -889,7 +908,9 @@ impl FileSystem for NodeExecutionEnv {
             if fired_abort_signal(context).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
-            let recursive = options.and_then(|options| options.recursive).unwrap_or(false);
+            let recursive = options
+                .and_then(|options| options.recursive)
+                .unwrap_or(false);
             let force = options.and_then(|options| options.force).unwrap_or(false);
             let removed = if recursive {
                 match tokio::fs::symlink_metadata(&resolved).await {
@@ -996,7 +1017,7 @@ impl Shell for NodeExecutionEnv {
             let pids = self
                 .active_child_pids
                 .lock()
-                .expect("active child pids lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .drain()
                 .collect::<Vec<_>>();
             for pid in pids {
@@ -1024,7 +1045,7 @@ struct SpillState {
 }
 
 impl SpillState {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             file: None,
             prefixes: Vec::new(),
@@ -1040,6 +1061,10 @@ impl SpillState {
     reason = "the driver mirrors upstream's single exec closure; splitting it would \
     separate the settle ordering from the state it reads"
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parameters are the resolved exec environment (command, options, context, resolved shell, kill bookkeeping, the file seam); a bundle struct would only re-wrap them for one caller"
+)]
 async fn exec_command(
     command: String,
     options: Option<ShellExecOptions>,
@@ -1051,7 +1076,7 @@ async fn exec_command(
     files: &dyn FileSystem,
 ) -> Result<ShellExecResult, ExecutionError> {
     let signal = context.abort_signal();
-    if signal.as_ref().is_some_and(|signal| signal.aborted()) {
+    if signal.as_ref().is_some_and(AbortSignal::aborted) {
         return Err(ExecutionError::new(
             ExecutionErrorCode::Aborted,
             "aborted",
@@ -1074,7 +1099,9 @@ async fn exec_command(
         ));
     }
 
-    let on_update = options.as_ref().and_then(|options| options.on_update.clone());
+    let on_update = options
+        .as_ref()
+        .and_then(|options| options.on_update.clone());
     let spill_requested = options
         .as_ref()
         .and_then(|options| options.capture.as_ref())
@@ -1091,7 +1118,10 @@ async fn exec_command(
         let failure = Arc::clone(&failure);
         Arc::new(move |message: String| {
             {
-                let mut error = failure.callback_error.lock().expect("callback error lock");
+                let mut error = failure
+                    .callback_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if error.is_none() {
                     *error = Some(ExecutionError::new(
                         ExecutionErrorCode::CallbackError,
@@ -1100,14 +1130,21 @@ async fn exec_command(
                     ));
                 }
             }
-            if let Some(pid) = failure.pid.lock().expect("failure pid lock").take() {
+            let pid = failure
+                .pid
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some(pid) = pid {
                 kill_process_tree(pid);
             }
         })
     };
 
     let mut capture = match OutputCapture::new(
-        options.as_ref().and_then(|options| options.capture.as_ref()),
+        options
+            .as_ref()
+            .and_then(|options| options.capture.as_ref()),
         context.clone(),
         OutputCaptureHandlers {
             on_update,
@@ -1168,13 +1205,14 @@ async fn exec_command(
     if let Some(pid) = pid {
         active_child_pids
             .lock()
-            .expect("active child pids lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(pid);
-        *failure.pid.lock().expect("failure pid lock") = Some(pid);
+        *failure
+            .pid
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pid);
     }
-    if command_from_stdin
-        && let Some(mut stdin) = child.stdin.take()
-    {
+    if command_from_stdin && let Some(mut stdin) = child.stdin.take() {
         if let Err(error) = stdin.write_all(command.as_bytes()).await {
             return Err(ExecutionError::new(
                 ExecutionErrorCode::SpawnError,
@@ -1227,7 +1265,7 @@ async fn exec_command(
             status = child.wait(), if exit_status.is_none() => {
                 exit_status = Some(status);
             }
-            _ = wait_timeout(&mut timeout_sleep), if timeout_sleep.is_some() && !timed_out => {
+            () = wait_timeout(&mut timeout_sleep), if timeout_sleep.is_some() && !timed_out => {
                 timed_out = true;
                 if let Some(pid) = pid {
                     kill_process_tree(pid);
@@ -1248,7 +1286,7 @@ async fn exec_command(
     if let Some(pid) = pid {
         active_child_pids
             .lock()
-            .expect("active child pids lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&pid);
     }
     if let Some((_, mut spill_file)) = spill.file.take() {
@@ -1257,18 +1295,22 @@ async fn exec_command(
 
     capture.finish();
     capture.flush();
-    if let Some(error) = failure
+    let error = failure
         .callback_error
         .lock()
-        .expect("callback error lock")
-        .take()
-    {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(error) = error {
         return Err(error);
     }
     if timed_out {
         return Err(ExecutionError::new(
             ExecutionErrorCode::Timeout,
-            format!("timeout:{}", timeout_seconds.map_or_else(|| "undefined".to_owned(), |seconds| seconds.to_string())),
+            format!(
+                "timeout:{}",
+                timeout_seconds
+                    .map_or_else(|| "undefined".to_owned(), |seconds| seconds.to_string())
+            ),
             None,
         ));
     }
@@ -1284,7 +1326,13 @@ async fn exec_command(
     }
     let output = capture.snapshot();
     capture.dispose();
-    let status = exit_status.expect("the driver settles with an exit status");
+    let Some(status) = exit_status else {
+        return Err(ExecutionError::new(
+            ExecutionErrorCode::SpawnError,
+            "The shell driver settled without an exit status",
+            None,
+        ));
+    };
     let Ok(status) = status else {
         return Err(ExecutionError::new(
             ExecutionErrorCode::SpawnError,
@@ -1299,7 +1347,9 @@ async fn exec_command(
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt as _;
-            status.signal().map_or(1, |signal_number| 128 + signal_number)
+            status
+                .signal()
+                .map_or(1, |signal_number| 128 + signal_number)
         }
         #[cfg(not(unix))]
         {
@@ -1325,9 +1375,7 @@ async fn wait_timeout(sleep: &mut Option<TimeoutWait>) {
 }
 
 /// Awaits the abort signal, mirroring [`wait_timeout`].
-async fn wait_abort(
-    wait: &mut Option<AbortWait>,
-) -> AbortReason {
+async fn wait_abort(wait: &mut Option<AbortWait>) -> AbortReason {
     if let Some(wait) = wait.as_mut() {
         wait.await
     } else {
@@ -1387,9 +1435,12 @@ async fn write_spill(
                 context,
             )
             .await;
-        let Ok(path) = created else {
-            fail_spill(spill, created.unwrap_err().message, pid);
-            return;
+        let path = match created {
+            Ok(path) => path,
+            Err(error) => {
+                fail_spill(spill, &error.message, pid);
+                return;
+            }
         };
         match tokio::fs::OpenOptions::new()
             .create(true)
@@ -1398,7 +1449,7 @@ async fn write_spill(
             .await
         {
             Err(error) => {
-                fail_spill(spill, error.to_string(), pid);
+                fail_spill(spill, &error.to_string(), pid);
                 return;
             }
             Ok(file) => {
@@ -1411,13 +1462,13 @@ async fn write_spill(
         return;
     };
     if let Err(error) = file.write_all(chunk).await {
-        fail_spill(spill, error.to_string(), pid);
+        fail_spill(spill, &error.to_string(), pid);
     }
 }
 
 /// Fails the spill, upstream's `failSpill`: the first failure wins and the
 /// child dies, so no output is silently lost.
-fn fail_spill(spill: &mut SpillState, message: String, pid: Option<u32>) {
+fn fail_spill(spill: &mut SpillState, message: &str, pid: Option<u32>) {
     if spill.error.is_some() {
         return;
     }

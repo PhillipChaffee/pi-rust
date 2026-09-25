@@ -7,15 +7,13 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use serde_json::json;
 
-use crate::harness::session::types::{
-    operation_scope_of, Entry, MessageEntry, OperationScope, OperationState, RunSettings,
-    SettledStopReason, SessionError, StopReason,
-};
 use crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS;
+use crate::harness::session::types::{
+    Entry, MessageEntry, OperationScope, OperationState, RunSettings, SessionError,
+    SettledStopReason, StopReason, operation_scope_of,
+};
 use crate::types::{QueueMode, ToolExecutionMode};
 
 fn user_message() -> crate::types::AgentMessage {
@@ -45,7 +43,8 @@ fn scope_fixture() -> OperationScope {
 fn the_settled_stop_reason_narrows_over_pending() {
     assert!(SettledStopReason::from_stop_reason(StopReason::Pending).is_none());
     assert_eq!(
-        SettledStopReason::from_stop_reason(StopReason::ToolUse).map(SettledStopReason::stop_reason),
+        SettledStopReason::from_stop_reason(StopReason::ToolUse)
+            .map(SettledStopReason::stop_reason),
         Some(StopReason::ToolUse)
     );
 }
@@ -58,10 +57,10 @@ fn the_entry_accessors_project_the_base_fields() {
         parent_id: None,
         seq: 1,
         timestamp: 1,
-        body: MessageEntry {
+        body: Box::new(MessageEntry {
             message: user_message(),
             terminate: None,
-        },
+        }),
     };
     assert_eq!(entry.id(), "entry");
     assert_eq!(entry.parent_id(), None);
@@ -93,4 +92,5 @@ fn operation_scope_of_copies_the_uniform_scope() {
     let state = OperationState::Starting(crate::harness::session::types::StartingOperation {
         scope: scope_fixture(),
     });
-    assert_eq!(operation_scope_of(&state), scope_fixture());}
+    assert_eq!(operation_scope_of(&state), scope_fixture());
+}

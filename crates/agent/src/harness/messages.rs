@@ -9,6 +9,7 @@
 //! [`convert_to_llm`] matches on the role discriminators exactly as
 //! upstream's switch does.
 
+use std::fmt::Write as _;
 
 use pi_ai::types::{ImageContent, Message, TextContent, UserBlock, UserContent, UserMessage};
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,8 @@ pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 
 /// The text block wrapper around one branch summary, upstream's
 /// `BRANCH_SUMMARY_PREFIX`.
-pub const BRANCH_SUMMARY_PREFIX: &str = "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+pub const BRANCH_SUMMARY_PREFIX: &str =
+    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 
 /// The closing wrapper around one branch summary, upstream's
 /// `BRANCH_SUMMARY_SUFFIX`.
@@ -33,7 +35,7 @@ pub const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
 
 /// The content union a custom message carries, upstream's
 /// `string | (TextContent | ImageContent)[]`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CustomMessageContent {
     /// One text string.
@@ -44,7 +46,7 @@ pub enum CustomMessageContent {
 
 /// One content block of a custom message, upstream's
 /// `TextContent | ImageContent`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CustomMessageBlock {
     /// A text block.
@@ -54,7 +56,7 @@ pub enum CustomMessageBlock {
 }
 
 /// The `custom` role message, upstream's `CustomMessage<T>`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomMessage {
     /// The role discriminator.
@@ -73,7 +75,7 @@ pub struct CustomMessage {
 }
 
 /// The `bashExecution` role message, upstream's `BashExecutionMessage`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BashExecutionMessage {
     /// The role discriminator.
@@ -99,7 +101,7 @@ pub struct BashExecutionMessage {
 }
 
 /// The `branchSummary` role message, upstream's `BranchSummaryMessage`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchSummaryMessage {
     /// The role discriminator.
@@ -114,7 +116,7 @@ pub struct BranchSummaryMessage {
 
 /// The `compactionSummary` role message, upstream's
 /// `CompactionSummaryMessage`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSummaryMessage {
     /// The role discriminator.
@@ -132,21 +134,27 @@ pub struct CompactionSummaryMessage {
 #[must_use]
 pub fn bash_execution_to_text(msg: &BashExecutionMessage) -> String {
     let mut text = format!("Ran `{}`\n", msg.command);
-    if !msg.output.is_empty() {
-        text.push_str(&format!("```\n{}\n```", msg.output));
-    } else {
+    if msg.output.is_empty() {
         text.push_str("(no output)");
+    } else {
+        let _ = write!(text, "```\n{}\n```", msg.output);
     }
     if msg.cancelled {
         text.push_str("\n\n(command cancelled)");
     } else if msg.exit_code.is_some_and(|exit_code| exit_code != 0) {
-        text.push_str(&format!(
+        let _ = write!(
+            text,
             "\n\nCommand exited with code {}",
             msg.exit_code.unwrap_or_default()
-        ));
+        );
     }
-    if msg.truncated && let Some(full_output_path) = &msg.full_output_path {
-        text.push_str(&format!("\n\n[Output truncated. Full output: {full_output_path}]"));
+    if msg.truncated
+        && let Some(full_output_path) = &msg.full_output_path
+    {
+        let _ = write!(
+            text,
+            "\n\n[Output truncated. Full output: {full_output_path}]"
+        );
     }
     text
 }
@@ -240,22 +248,20 @@ impl Timestamp {
 #[must_use]
 pub fn parse_date_millis(date: &str) -> i64 {
     let invalid = i64::MIN;
-    let parse_int = |slice: Option<&str>| {
-        slice.and_then(|slice| i64::from_str_radix(slice, 10).ok())
-    };
+    let parse_int = |slice: Option<&str>| slice.and_then(|slice| slice.parse::<i64>().ok());
     let Some(year) = parse_int(date.get(0..4)) else {
         return invalid;
     };
     let Some(month) = date
         .get(5..7)
-        .and_then(|slice| u32::from_str_radix(slice, 10).ok())
+        .and_then(|slice| slice.parse::<u32>().ok())
         .filter(|month| (1..=12).contains(month))
     else {
         return invalid;
     };
     let Some(day) = date
         .get(8..10)
-        .and_then(|slice| u32::from_str_radix(slice, 10).ok())
+        .and_then(|slice| slice.parse::<u32>().ok())
         .filter(|day| (1..=31).contains(day))
     else {
         return invalid;
@@ -275,7 +281,7 @@ pub fn parse_date_millis(date: &str) -> i64 {
         let parse_two = |slice: Option<&str>| {
             slice
                 .and_then(|slice| slice.get(0..2))
-                .and_then(|pair| u32::from_str_radix(pair, 10).ok())
+                .and_then(|pair| pair.parse::<u32>().ok())
         };
         let Some(parsed_hour) = parse_two(Some(rest)) else {
             return invalid;
@@ -296,17 +302,15 @@ pub fn parse_date_millis(date: &str) -> i64 {
                 };
                 second = parsed_second;
                 let after_second = &after_minute[2..];
-                let (fraction, offset_part) =
-                    after_second
-                        .strip_prefix('.')
-                        .map_or((String::new(), after_second.to_owned()), |fraction| {
-                            let digits: String = fraction
-                                .chars()
-                                .take_while(|c| c.is_ascii_digit())
-                                .collect();
-                            (digits.clone(), fraction[digits.len()..].to_owned())
-                        });
-if !fraction.is_empty() {
+                let (fraction, offset_part) = after_second.strip_prefix('.').map_or_else(
+                    || (String::new(), after_second.to_owned()),
+                    |fraction| {
+                        let digits: String =
+                            fraction.chars().take_while(char::is_ascii_digit).collect();
+                        (digits.clone(), fraction[digits.len()..].to_owned())
+                    },
+                );
+                if !fraction.is_empty() {
                     let mut scaled = fraction;
                     while scaled.len() < 3 {
                         scaled.push('0');
@@ -314,7 +318,11 @@ if !fraction.is_empty() {
                     millis = scaled[..3].parse::<i64>().unwrap_or(0);
                 }
                 offset_ms = parse_offset(&offset_part).unwrap_or(i64::MIN);
-                if offset_ms == i64::MIN && !offset_part.is_empty() && offset_part != "Z" && offset_part != "z" {
+                if offset_ms == i64::MIN
+                    && !offset_part.is_empty()
+                    && offset_part != "Z"
+                    && offset_part != "z"
+                {
                     return invalid;
                 }
             } else {
@@ -331,10 +339,7 @@ if !fraction.is_empty() {
         }
     }
 
-    Ok::<i64, ()>(epoch_ms_for(
-        year, month, day, hour, minute, second, millis, offset_ms,
-    ))
-    .unwrap_or(invalid)
+    epoch_ms_for(year, month, day, hour, minute, second, millis, offset_ms)
 }
 
 /// Parses the numeric UTC offset tail (`Z`, `±HH`, `±HH:MM`), upstream's
@@ -348,22 +353,21 @@ fn parse_offset(rest: &str) -> Result<i64, ()> {
         Some(b'-') => (-1i64, &rest[1..]),
         _ => return Err(()),
     };
-    let parse_two = |slice: &str| {
-        slice
-            .get(0..2)
-            .and_then(|part| i64::from_str_radix(part, 10).ok())
-    };
+    let parse_two = |slice: &str| slice.get(0..2).and_then(|part| part.parse::<i64>().ok());
     let hours = parse_two(rest).ok_or(())?;
     let minutes = rest
         .get(3..5)
-        .and_then(|part| i64::from_str_radix(part, 10).ok())
+        .and_then(|part| part.parse::<i64>().ok())
         .unwrap_or(0);
     Ok(sign * (hours * 3_600_000 + minutes * 60_000))
 }
 
 /// Days-from-civil to epoch milliseconds, Howard Hinnant's algorithm, the
 /// proleptic-Gregorian arithmetic JavaScript's `Date` carries.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the calendar inputs are the wire's date shape; bundling them hides it"
+)]
 fn epoch_ms_for(
     year: i64,
     month: u32,
@@ -389,8 +393,9 @@ fn epoch_ms_for(
         - offset_ms
 }
 
-/// Converts harness messages into LLM messages, upstream's `convertToLlm`:
-/// bash executions render through [`bash_execution_to_text`], custom
+/// Converts harness messages into LLM messages, upstream's `convertToLlm`.
+///
+/// Bash executions render through [`bash_execution_to_text`], custom
 /// messages pass their content, branch and compaction summaries wrap their
 /// text in the summary constants, standard messages pass through, and
 /// anything else drops.

@@ -14,11 +14,13 @@ use std::sync::{Arc, Mutex};
 
 use pi_chord::context::AbortSignal;
 
-/// The cancellation promise [`GateControl::begin_abort`] carries, upstream's
-/// `Promise<void>`: the abort path awaits it while aborted effects settle.
-/// A watch receiver restates the promise's one-shot settlement — every
-/// clone resolves when the abort work sends or the sender drops — and
-/// stays cloneable and awaitable where a boxed future is single-consumer.
+/// The cancellation promise [`GateControl::begin_abort`] carries,
+/// upstream's `Promise<void>`.
+///
+/// The abort path awaits it while aborted effects settle. A watch receiver
+/// restates the promise's one-shot settlement — every clone resolves when
+/// the abort work sends or the sender drops — and stays cloneable and
+/// awaitable where a boxed future is single-consumer.
 pub type Cancellation = tokio::sync::watch::Receiver<()>;
 
 /// The expected internal control flow when cancellation wins effect
@@ -80,12 +82,8 @@ struct GateShared {
 
 enum GateState {
     Open,
-    Aborting {
-        cancellation: Cancellation,
-    },
-    Closed {
-        error: String,
-    },
+    Aborting { cancellation: Cancellation },
+    Closed { error: String },
 }
 
 /// Owner-facing lifecycle controls for one drive pass, upstream's
@@ -110,7 +108,7 @@ impl std::fmt::Debug for GateControl {
 impl Gate {
     /// The gate's cancellation signal, upstream's `Gate.signal`.
     #[must_use]
-    pub fn signal(&self) -> &AbortSignal {
+    pub const fn signal(&self) -> &AbortSignal {
         &self.signal
     }
 
@@ -120,7 +118,12 @@ impl Gate {
     /// Returns [`GateRejection::AbortRequested`] when cancellation won the
     /// admission race and [`GateRejection::Closed`] when the gate closed.
     pub fn admit<T>(&self, invoke: impl FnOnce() -> T) -> Result<T, GateRejection> {
-        let cancellation = match &*self.shared.state.lock().expect("gate state lock") {
+        let cancellation = match &*self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
             GateState::Aborting { cancellation } => Some(cancellation.clone()),
             GateState::Closed { error } => {
                 return Err(GateRejection::Closed(GateClosedError(error.clone())));
@@ -128,7 +131,9 @@ impl Gate {
             GateState::Open => None,
         };
         if let Some(cancellation) = cancellation {
-            return Err(GateRejection::AbortRequested(AbortRequested { cancellation }));
+            return Err(GateRejection::AbortRequested(AbortRequested {
+                cancellation,
+            }));
         }
         Ok(invoke())
     }
@@ -138,7 +143,11 @@ impl GateControl {
     /// Records the abort's cancellation future, ignoring later calls,
     /// upstream's `beginAbort`.
     pub fn begin_abort(&self, cancellation: Cancellation) {
-        let mut state = self.shared.state.lock().expect("gate state lock");
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !matches!(*state, GateState::Open) {
             return;
         }
@@ -148,7 +157,11 @@ impl GateControl {
     /// Fires the gate's signal once aborting, upstream's `signalAbort`.
     pub fn signal_abort(&self) {
         {
-            let state = self.shared.state.lock().expect("gate state lock");
+            let state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !matches!(*state, GateState::Aborting { .. })
                 || self.shared.controller.signal().aborted()
             {
@@ -162,7 +175,11 @@ impl GateControl {
     /// live, upstream's `close`.
     pub fn close(&self, error: String) {
         {
-            let mut state = self.shared.state.lock().expect("gate state lock");
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if matches!(*state, GateState::Closed { .. }) {
                 return;
             }

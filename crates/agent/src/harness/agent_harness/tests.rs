@@ -68,7 +68,6 @@ fn assistant_message_event() -> pi_ai::types::AssistantMessageEvent {
     .expect("assistant message event")
 }
 
-
 fn usage() -> pi_ai::types::Usage {
     serde_json::from_value(serde_json::json!({
         "input": 1, "output": 2, "cacheRead": 3, "cacheWrite": 4, "totalTokens": 10,
@@ -76,7 +75,6 @@ fn usage() -> pi_ai::types::Usage {
     }))
     .expect("usage")
 }
-
 
 /// Every payload discriminant round-trips its upstream wire name and its
 /// type discriminator matches, upstream's `HarnessEvent["type"]` table.
@@ -159,11 +157,7 @@ fn the_lane_split_matches_upstream_membership() {
         HarnessEventType::LaneCreated,
     ] {
         let payload = payload_for(kind);
-        assert!(
-            payload.is_lane_scoped(),
-            "{} is lane-scoped",
-            kind.as_str()
-        );
+        assert!(payload.is_lane_scoped(), "{} is lane-scoped", kind.as_str());
     }
     for kind in [
         HarnessEventType::Fault,
@@ -205,7 +199,12 @@ fn the_status_and_tool_snapshot_unions_keep_the_wire() {
         args: serde_json::json!({}),
         result: None,
     };
-    let LaneSnapshotTool::Running { tool_call_id, tool_name, .. } = &running_tool else {
+    let LaneSnapshotTool::Running {
+        tool_call_id,
+        tool_name,
+        ..
+    } = &running_tool
+    else {
         panic!("the running shape");
     };
     assert_eq!(tool_call_id, "call");
@@ -215,17 +214,16 @@ fn the_status_and_tool_snapshot_unions_keep_the_wire() {
     subscription.unsubscribe();
 }
 
-
-
-
-
-
 /// One fixture payload per event discriminant, upstream's
 /// `HarnessEventPayload` table.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the fixture enumerates every payload discriminant; splitting it would hide the table's completeness"
+)]
 fn payload_for(kind: HarnessEventType) -> HarnessEventPayload {
     use crate::harness::agent_harness::{
-        CompactionEndStatus, ConfigUpdateKind, HandlerErrorKind,
-        LaneConfigUpdate, NavigationEndStatus, RunEndStatus, ValueUpdateKind,
+        CompactionEndStatus, ConfigUpdateKind, HandlerErrorKind, LaneConfigUpdate,
+        NavigationEndStatus, RunEndStatus, ValueUpdateKind,
     };
     use crate::harness::session::types::{CompactionReason, MessageEntry, UsageRow};
 
@@ -234,7 +232,9 @@ fn payload_for(kind: HarnessEventType) -> HarnessEventPayload {
             run_id: "run".to_owned(),
             started_at: 1,
         },
-        HarnessEventType::RunResume => HarnessEventPayload::RunResume { run_id: "run".to_owned() },
+        HarnessEventType::RunResume => HarnessEventPayload::RunResume {
+            run_id: "run".to_owned(),
+        },
         HarnessEventType::RunSuspend => HarnessEventPayload::RunSuspend {
             run_id: "run".to_owned(),
             deferred: deferred_handle(),
@@ -300,8 +300,8 @@ fn payload_for(kind: HarnessEventType) -> HarnessEventPayload {
         },
         HarnessEventType::MessageUpdate => HarnessEventPayload::MessageUpdate {
             run_id: "run".to_owned(),
-            message: user_agent_message(),
-            event: assistant_message_event(),
+            message: Box::new(user_agent_message()),
+            event: Box::new(assistant_message_event()),
             frame: None,
         },
         HarnessEventType::MessageEnd => HarnessEventPayload::MessageEnd {
@@ -350,10 +350,10 @@ fn payload_for(kind: HarnessEventType) -> HarnessEventPayload {
                 parent_id: None,
                 seq: 1,
                 timestamp: 1,
-                body: MessageEntry {
+                body: Box::new(MessageEntry {
                     message: user_agent_message(),
                     terminate: None,
-                },
+                }),
             },
         },
         HarnessEventType::QueueUpdate => HarnessEventPayload::QueueUpdate { queues: vec![] },

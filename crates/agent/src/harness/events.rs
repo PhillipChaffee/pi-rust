@@ -96,17 +96,21 @@ struct BusCore {
 
 impl BusCore {
     /// Pushes one job and spawns one drain cycle when none is running.
-    fn push_job(core: &Arc<Mutex<BusCore>>, job: BusJob) {
+    fn push_job(core: &Arc<Mutex<Self>>, job: BusJob) {
         {
-            let mut core = core.lock().expect("bus core lock");
+            let mut core = core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             core.queue.push_back(job);
         }
-        BusCore::ensure_draining(core);
+        Self::ensure_draining(core);
     }
 
-    fn ensure_draining(core: &Arc<Mutex<BusCore>>) {
+    fn ensure_draining(core: &Arc<Mutex<Self>>) {
         let spawn = {
-            let mut core = core.lock().expect("bus core lock");
+            let mut core = core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if core.draining {
                 false
             } else {
@@ -119,13 +123,15 @@ impl BusCore {
             tokio::spawn(async move {
                 loop {
                     let job = {
-                        let mut core = core.lock().expect("bus core lock");
-                        match core.queue.pop_front() {
-                            Some(job) => job,
-                            None => {
-                                core.draining = false;
-                                return;
-                            }
+                        let mut core = core
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(job) = core.queue.pop_front() {
+                            job
+                        } else {
+                            core.draining = false;
+                            drop(core);
+                            return;
                         }
                     };
                     match job {
@@ -180,10 +186,15 @@ impl HarnessEventBus {
     }
 
     fn closed_error(&self) -> Option<String> {
-        self.core.lock().expect("bus core lock").closed_error.clone()
+        self.core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed_error
+            .clone()
     }
 
     /// Emits one event, upstream's `emit`.
+    #[must_use]
     pub fn emit(&self, event: HarnessEvent, context: &Context) -> BoxedFuture<'_, ()> {
         self.emit_batch(vec![(event, context.clone())])
     }
@@ -192,6 +203,7 @@ impl HarnessEventBus {
     /// global delivery tail, upstream's `emitBatch`.
     ///
     /// A closed bus or an empty batch resolves immediately.
+    #[must_use]
     pub fn emit_batch(&self, events: Vec<(HarnessEvent, Context)>) -> BoxedFuture<'_, ()> {
         if self.closed_error().is_some() || events.is_empty() {
             return Box::pin(async {});
@@ -212,22 +224,32 @@ impl HarnessEventBus {
     }
 
     fn snapshot_recipients_union(&self, events: &[(HarnessEvent, Context)]) -> Vec<BusListener> {
-        let core = self.core.lock().expect("bus core lock");
+        let core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut union: Vec<BusListener> = Vec::new();
         for (event, _) in events {
             if let Some(list) = core.listeners.get(&event.payload.event_type()) {
                 for listener in list {
-                    if !union.iter().any(|registered| Arc::ptr_eq(registered, listener)) {
+                    if !union
+                        .iter()
+                        .any(|registered| Arc::ptr_eq(registered, listener))
+                    {
                         union.push(Arc::clone(listener));
                     }
                 }
             }
         }
         for listener in &core.watch_listeners {
-            if !union.iter().any(|registered| Arc::ptr_eq(registered, listener)) {
+            if !union
+                .iter()
+                .any(|registered| Arc::ptr_eq(registered, listener))
+            {
                 union.push(Arc::clone(listener));
             }
         }
+        drop(core);
         union
     }
 
@@ -243,21 +265,24 @@ impl HarnessEventBus {
         if let Some(closed_error) = self.closed_error() {
             return Err(closed_error);
         }
-        let wrapped: BusListener = {
+        let wrapped: BusListener = Arc::new(move |event, context| {
             let listener = Arc::clone(&listener);
-            Arc::new(move |event, context| {
-                let listener = Arc::clone(&listener);
-                Box::pin(async move { listener(event, context).await })
-            })
-        };
-        let mut core = self.core.lock().expect("bus core lock");
+            Box::pin(async move { listener(event, context).await })
+        });
+        let mut core = self
+            .core
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         core.listeners
             .entry(event_type)
             .or_default()
             .push(Arc::clone(&wrapped));
+        drop(core);
         let unsubscribe_core = Arc::clone(&self.core);
         Ok(Subscription::new(Arc::new(move || {
-            let mut core = unsubscribe_core.lock().expect("bus core lock");
+            let mut core = unsubscribe_core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(list) = core.listeners.get_mut(&event_type) {
                 list.retain(|registered| !Arc::ptr_eq(registered, &wrapped));
             }
@@ -330,7 +355,10 @@ impl HarnessEventBus {
     /// delivery tail settles, upstream's `close`.
     pub fn close(&self, error: String) {
         let already_closed = {
-            let mut core = self.core.lock().expect("bus core lock");
+            let mut core = self
+                .core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let already_closed = core.closed_error.is_some();
             if !already_closed {
                 core.closed_error = Some(error);
@@ -346,7 +374,9 @@ impl HarnessEventBus {
                 let core = Arc::clone(&self.core);
                 move || {
                     Box::pin(async move {
-                        let mut core = core.lock().expect("bus core lock");
+                        let mut core = core
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         core.listeners.clear();
                         core.watch_listeners.clear();
                     })
@@ -363,29 +393,31 @@ impl HarnessEventBus {
     ) -> Arc<BufferedEventWatcher<T>> {
         let on_error: Arc<dyn Fn(String, HarnessEvent, Context) + Send + Sync> = {
             let bus = Arc::downgrade(&self.core);
-            Arc::new(move |error: String, event: HarnessEvent, context: Context| {
-                if event.payload.event_type() == HarnessEventType::HandlerError {
-                    return;
-                }
-                let Some(core) = bus.upgrade() else {
-                    return;
-                };
-                let payload = HarnessEventPayload::HandlerError {
-                    error,
-                    stack: None,
-                    kind: HandlerErrorKind::Event {
-                        event: event.payload.event_type().as_str().to_owned(),
-                    },
-                };
-                let emitted = HarnessEvent {
-                    lane: event.lane.clone(),
-                    recovery: false,
-                    payload,
-                };
-                // The bus holds its delivery tail synchronously; the
-                // dropped future is only a completion signal.
-                let _ = HarnessEventBus { core }.emit(emitted, &context);
-            })
+            Arc::new(
+                move |error: String, event: HarnessEvent, context: Context| {
+                    if event.payload.event_type() == HarnessEventType::HandlerError {
+                        return;
+                    }
+                    let Some(core) = bus.upgrade() else {
+                        return;
+                    };
+                    let payload = HarnessEventPayload::HandlerError {
+                        error,
+                        stack: None,
+                        kind: HandlerErrorKind::Event {
+                            event: event.payload.event_type().as_str().to_owned(),
+                        },
+                    };
+                    let emitted = HarnessEvent {
+                        lane: event.lane,
+                        recovery: false,
+                        payload,
+                    };
+                    // The bus holds its delivery tail synchronously; the dropped
+                    // future is only a completion signal.
+                    drop(Self { core }.emit(emitted, &context));
+                },
+            )
         };
         let watcher = Arc::new(BufferedEventWatcher {
             shared: Arc::new(WatcherShared {
@@ -423,13 +455,15 @@ impl HarnessEventBus {
         let unsubscribe_core = Arc::clone(&self.core);
         let unsubscribe_token = Arc::clone(&watch_listener);
         watcher.set_unsubscribe(Arc::new(move || {
-            let mut core = unsubscribe_core.lock().expect("bus core lock");
+            let mut core = unsubscribe_core
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             core.watch_listeners
                 .retain(|registered| !Arc::ptr_eq(registered, &unsubscribe_token));
         }));
         self.core
             .lock()
-            .expect("bus core lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .watch_listeners
             .push(watch_listener);
         watcher.set_self_weak(Arc::downgrade(&watcher));
@@ -471,7 +505,14 @@ async fn deliver(
                 // further, and the recursion boxes through one level so
                 // the future stays finite.
                 let handler_recipients = snapshot_recipients(core, &handler_error);
-                Box::pin(deliver(core, &handler_error, &handler_recipients, false, context)).await;
+                Box::pin(deliver(
+                    core,
+                    &handler_error,
+                    &handler_recipients,
+                    false,
+                    context,
+                ))
+                .await;
             }
         }
     }
@@ -480,7 +521,9 @@ async fn deliver(
 /// The listeners one delivered event binds, upstream's
 /// `snapshotRecipients`.
 fn snapshot_recipients(core: &Mutex<BusCore>, event: &HarnessEvent) -> Vec<BusListener> {
-    let bound = core.lock().expect("bus core lock");
+    let bound = core
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut union: Vec<BusListener> = Vec::new();
     if let Some(list) = bound.listeners.get(&event.payload.event_type()) {
         for listener in list {
@@ -490,6 +533,7 @@ fn snapshot_recipients(core: &Mutex<BusCore>, event: &HarnessEvent) -> Vec<BusLi
     for listener in &bound.watch_listeners {
         union.push(Arc::clone(listener));
     }
+    drop(bound);
     union
 }
 
@@ -539,13 +583,14 @@ pub struct BufferedEventWatcher<T> {
     shared: Arc<WatcherShared<T>>,
     filter: WatchFilter,
     bus: Weak<Mutex<BusCore>>,
-    self_weak: OnceLockWeak<BufferedEventWatcher<T>>,
+    self_weak: OnceLockWeak<Self>,
     _snapshot: PhantomData<fn(T) -> T>,
 }
 
 impl<T> std::fmt::Debug for BufferedEventWatcher<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BufferedEventWatcher").finish_non_exhaustive()
+        f.debug_struct("BufferedEventWatcher")
+            .finish_non_exhaustive()
     }
 }
 
@@ -570,26 +615,34 @@ struct OnceLockWeak<T> {
 impl<T> Clone for OnceLockWeak<T> {
     fn clone(&self) -> Self {
         Self {
-            cell: Mutex::new(self.cell.lock().expect("self weak lock").clone()),
+            cell: Mutex::new(
+                self.cell
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            ),
         }
     }
 }
 
 impl<T> OnceLockWeak<T> {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             cell: Mutex::new(None),
         }
     }
 
     fn set(&self, weak: Weak<T>) {
-        *self.cell.lock().expect("self weak lock") = Some(weak);
+        *self
+            .cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(weak);
     }
 
     fn upgrade(&self) -> Option<Arc<T>> {
         self.cell
             .lock()
-            .expect("self weak lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .and_then(Weak::upgrade)
     }
@@ -601,7 +654,7 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
         self.shared
             .state
             .lock()
-            .expect("watcher state lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot = Some(snapshot);
     }
 
@@ -612,7 +665,11 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
     /// When called twice, upstream's "may be called only once" guard.
     pub fn start(&self, listener: EventListener) {
         let buffered = {
-            let mut state = self.shared.state.lock().expect("watcher state lock");
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert!(
                 matches!(state.phase, WatcherPhase::Buffering),
                 "WatchHandle.start() may be called only once"
@@ -629,7 +686,11 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
     /// Unsubscribes the watcher, upstream's `unsubscribe`.
     pub fn unsubscribe(&self) {
         let unsubscribe = {
-            let mut state = self.shared.state.lock().expect("watcher state lock");
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.phase == WatcherPhase::Unsubscribed {
                 return;
             }
@@ -646,13 +707,20 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
     /// Pushes one event into the watcher's pipeline, upstream's `push`.
     pub fn push(&self, event: HarnessEvent, context: Context) {
         let action = {
-            let mut state = self.shared.state.lock().expect("watcher state lock");
-            match state.phase {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let action = match state.phase {
                 WatcherPhase::Unsubscribed => None,
                 _ if state
                     .resnapshot_state
                     .as_ref()
-                    .is_some_and(|hold| hold.phase == ResnapshotPhase::Dropping) => None,
+                    .is_some_and(|hold| hold.phase == ResnapshotPhase::Dropping) =>
+                {
+                    None
+                }
                 _ if state.resnapshot_state.is_some() => {
                     if let Some(hold) = &mut state.resnapshot_state {
                         hold.held.push_back((event, context));
@@ -668,7 +736,9 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
                     let epoch = state.epoch;
                     Some((event, context, epoch))
                 }
-            }
+            };
+            drop(state);
+            action
         };
         if let Some((event, context, epoch)) = action {
             self.enqueue(event, context, epoch);
@@ -677,13 +747,17 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
 
     fn enqueue(&self, event: HarnessEvent, context: Context, epoch: u64) {
         {
-            let mut queue = self.shared.queue.lock().expect("watcher queue lock");
+            let mut queue = self
+                .shared
+                .queue
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             queue.push_back((event, context, epoch));
         }
         self.ensure_draining();
     }
 
-fn ensure_draining(&self) {
+    fn ensure_draining(&self) {
         if self.shared.draining.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -691,21 +765,26 @@ fn ensure_draining(&self) {
         tokio::spawn(async move {
             loop {
                 let job = {
-                    let mut queue = shared.queue.lock().expect("watcher queue lock");
-                    match queue.pop_front() {
-                        Some(job) => job,
-                        None => {
-                            // Exit and clear the flag under the same lock:
-                            // a pusher cannot interleave between the empty
-                            // pop and the flag clear.
-                            shared.draining.store(false, Ordering::Release);
-                            return;
-                        }
+                    let mut queue = shared
+                        .queue
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(job) = queue.pop_front() {
+                        job
+                    } else {
+                        // Exit and clear the flag under the same lock:
+                        // a pusher cannot interleave between the empty
+                        // pop and the flag clear.
+                        shared.draining.store(false, Ordering::Release);
+                        return;
                     }
                 };
                 let (event, context, epoch) = job;
                 let (listener, on_error) = {
-                    let state = shared.state.lock().expect("watcher state lock");
+                    let state = shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if state.phase != WatcherPhase::Started || epoch != state.epoch {
                         continue;
                     }
@@ -724,7 +803,11 @@ fn ensure_draining(&self) {
     /// Flips the resnapshot hold from dropping to holding, upstream's
     /// `markResnapshotBoundary`.
     pub fn mark_resnapshot_boundary(&self) {
-        let mut state = self.shared.state.lock().expect("watcher state lock");
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(hold) = state.resnapshot_state.as_mut()
             && hold.phase == ResnapshotPhase::Dropping
         {
@@ -735,7 +818,7 @@ fn ensure_draining(&self) {
         }
     }
 
-fn boundary(&self) -> ResnapshotBoundary {
+    fn boundary(&self) -> ResnapshotBoundary {
         let bus = self.bus.clone();
         let self_weak = self.self_weak.clone();
         ResnapshotBoundary {
@@ -766,23 +849,27 @@ fn boundary(&self) -> ResnapshotBoundary {
         self.shared
             .state
             .lock()
-            .expect("watcher state lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .unsubscribe = Some(unsubscribe);
     }
 }
 
 impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
-/// The current snapshot, upstream's `WatchHandle.snapshot`.
+    /// The current snapshot, upstream's `WatchHandle.snapshot`.
     ///
     /// # Panics
     /// When no snapshot was installed; upstream's typed handle always
     /// carries one.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        reason = "upstream's typed handle always carries a snapshot; the absence is a wiring bug, not a runtime branch"
+    )]
     pub fn snapshot(&self) -> T {
         self.shared
             .state
             .lock()
-            .expect("watcher state lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .snapshot
             .clone()
             .expect("watcher snapshot")
@@ -806,12 +893,18 @@ impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
         let this = self.clone();
         Box::pin(async move {
             let (callback, reached) = {
-                let mut state = this.shared.state.lock().expect("watcher state lock");
+                let mut state = this
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if state.phase == WatcherPhase::Unsubscribed {
                     return Err(ListenerError::from("WatchHandle is unsubscribed"));
                 }
                 let Some(callback) = state.resnapshot_callback.clone() else {
-                    return Err(ListenerError::from("WatchHandle does not support resnapshot"));
+                    return Err(ListenerError::from(
+                        "WatchHandle does not support resnapshot",
+                    ));
                 };
                 if state.resnapshot_state.is_some() {
                     return Err(ListenerError::from(
@@ -825,7 +918,9 @@ impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
                     held: VecDeque::new(),
                     phase: ResnapshotPhase::Dropping,
                 });
-                (callback, reached)
+                let action = (callback, reached);
+                drop(state);
+                action
             };
             // The capture's mark call is synchronous; the boundary flip
             // rides the bus tail, so "did the capture mark" is its own
@@ -846,7 +941,11 @@ impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
                 // The capture never marked its boundary; release the
                 // hold and report, upstream's "did not mark" throw.
                 let held = {
-                    let mut state = this.shared.state.lock().expect("watcher state lock");
+                    let mut state = this
+                        .shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     state
                         .resnapshot_state
                         .take()
@@ -860,14 +959,14 @@ impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
                 ));
             }
             let _ = reached.await;
-            let (snapshot, held) = {
-                let mut state = this.shared.state.lock().expect("watcher state lock");
-                let held = state
-                    .resnapshot_state
-                    .take()
-                    .map_or_else(VecDeque::new, |hold| hold.held);
-                (snapshot, held)
-            };
+            let held = this
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resnapshot_state
+                .take()
+                .map_or_else(VecDeque::new, |hold| hold.held);
             match snapshot {
                 Ok(snapshot) => {
                     this.set_snapshot(snapshot.clone());
@@ -885,31 +984,27 @@ impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
             }
         })
     }
-
 }
 
 impl<T: Send + Sync + 'static + Clone> WatchHandle<T> for BufferedEventWatcher<T> {
     fn snapshot(&self) -> T {
-        BufferedEventWatcher::snapshot(self)
+        Self::snapshot(self)
     }
 
     fn set_snapshot(&self, snapshot: T) {
-        BufferedEventWatcher::set_snapshot(self, snapshot);
+        Self::set_snapshot(self, snapshot);
     }
 
     fn start(&self, listener: EventListener) {
-        BufferedEventWatcher::start(self, listener);
+        Self::start(self, listener);
     }
 
-    fn resnapshot<'a>(
-        &self,
-        context: &'a Context,
-    ) -> BoxedFuture<'a, Result<T, ListenerError>> {
-        BufferedEventWatcher::resnapshot(self, context)
+    fn resnapshot<'a>(&self, context: &'a Context) -> BoxedFuture<'a, Result<T, ListenerError>> {
+        Self::resnapshot(self, context)
     }
 
     fn unsubscribe(&self) {
-        BufferedEventWatcher::unsubscribe(self);
+        Self::unsubscribe(self);
     }
 }
 

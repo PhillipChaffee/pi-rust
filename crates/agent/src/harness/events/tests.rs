@@ -11,9 +11,6 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use std::sync::{Arc, Mutex};
 
 use pi_ai::types::BoxedFuture;
@@ -41,11 +38,10 @@ fn listener(sink: Recorded) -> crate::harness::agent_harness::EventListener {
         let sink = Arc::clone(&sink);
         let event = event.clone();
         {
-            let boxed: BoxedFuture<'static, Result<(), ListenerError>> =
-                Box::pin(async move {
-            sink.lock().expect("received lock").push(event);
-            Ok(())
-        });
+            let boxed: BoxedFuture<'static, Result<(), ListenerError>> = Box::pin(async move {
+                sink.lock().expect("received lock").push(event);
+                Ok(())
+            });
             boxed
         }
     })
@@ -112,11 +108,7 @@ async fn listener_failures_isolate_into_handler_errors() {
 async fn watchers_buffer_until_start_and_drop_after_unsubscribe() {
     let bus = HarnessEventBus::new();
     let watcher = bus
-        .watch::<usize>(
-            0,
-            Arc::new(|_event| true),
-            None,
-        )
+        .watch::<usize>(0, Arc::new(|_event| true), None)
         .expect("watch");
     bus.emit(lane_event("run"), &background_context()).await;
     let delivered: Recorded = Arc::new(Mutex::new(Vec::new()));
@@ -128,13 +120,13 @@ async fn watchers_buffer_until_start_and_drop_after_unsubscribe() {
                 let sink = Arc::clone(&sink);
                 let event = event.clone();
                 {
-            let boxed: BoxedFuture<'static, Result<(), ListenerError>> =
-                Box::pin(async move {
-                    sink.lock().expect("delivered lock").push(event);
-                    Ok(())
-                });
-            boxed
-        }
+                    let boxed: BoxedFuture<'static, Result<(), ListenerError>> =
+                        Box::pin(async move {
+                            sink.lock().expect("delivered lock").push(event);
+                            Ok(())
+                        });
+                    boxed
+                }
             }),
         );
     }
@@ -194,9 +186,10 @@ async fn an_unmarked_resnapshot_boundary_reports_the_violation() {
         .expect("watch");
     // No resnapshot callback installed: the watcher reports the
     // non-resnapshotting contract.
-    let error = crate::harness::agent_harness::WatchHandle::resnapshot(&*watcher, &background_context())
-        .await
-        .expect_err("a watcher without a capture cannot resnapshot");
+    let error =
+        crate::harness::agent_harness::WatchHandle::resnapshot(&*watcher, &background_context())
+            .await
+            .expect_err("a watcher without a capture cannot resnapshot");
     assert!(error.to_string().contains("does not support resnapshot"));
 }
 
@@ -206,7 +199,10 @@ async fn a_closed_bus_rejects_subscriptions_and_watches() {
     let bus = HarnessEventBus::new();
     bus.close("closed".to_owned());
     let error = bus
-        .on(HarnessEventType::RunStart, listener(Arc::new(Mutex::new(Vec::new()))))
+        .on(
+            HarnessEventType::RunStart,
+            listener(Arc::new(Mutex::new(Vec::new()))),
+        )
         .expect_err("closed bus rejects subscriptions");
     assert_eq!(error, "closed");
     let error = bus

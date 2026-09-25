@@ -24,7 +24,7 @@ use crate::harness::session::types::OperationKind;
 /// `toJSON` upstream builds. `is(value)` checks restate as `matches!`
 /// over the variant, and the factory's dynamic property assignment
 /// restates as the variant's fields.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all_fields = "camelCase")]
 pub enum HarnessError {
     /// The lane already has an active operation, upstream's `LaneBusy`.
@@ -144,7 +144,7 @@ pub enum HarnessError {
 impl HarnessError {
     /// The upstream `_tag` value for the variant.
     #[must_use]
-    pub fn tag(&self) -> &'static str {
+    pub const fn tag(&self) -> &'static str {
         match self {
             Self::LaneBusy { .. } => "LaneBusy",
             Self::OperationMismatch { .. } => "OperationMismatch",
@@ -180,8 +180,8 @@ impl HarnessError {
             | Self::UnknownTemplate { message, .. }
             | Self::UnknownTarget { message, .. }
             | Self::InvalidLane { message, .. }
-            | Self::Closed { message } => message,
-            Self::NoActiveOperation { message, .. } => message,
+            | Self::Closed { message }
+            | Self::NoActiveOperation { message, .. } => message,
         }
     }
 }
@@ -210,7 +210,10 @@ pub struct HarnessFault {
 impl HarnessFault {
     /// Builds a fault from its message and cause.
     #[must_use]
-    pub fn new(message: impl Into<String>, cause: Box<dyn std::error::Error + Send + Sync>) -> Self {
+    pub fn new(
+        message: impl Into<String>,
+        cause: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
         Self {
             message: message.into(),
             cause,

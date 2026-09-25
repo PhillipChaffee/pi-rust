@@ -11,19 +11,16 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use pi_ai::types::BoxedFuture;
-use pi_chord::context::{background_context, with_cancel, Context};
+use pi_chord::context::{Context, background_context, with_cancel};
 
 use crate::harness::env::nodejs::{NodeExecutionEnv, SPILL_FILE_PREFIX};
 use crate::harness::types::{
-    CreateDirOptions, ExecutionEnv, FileContent, FileErrorCode, FileKind,
-    FileSystem, ReadTextLinesOptions, RemoveOptions, Shell, ShellExecOptions, ShellExecResult,
+    CreateDirOptions, ExecutionEnv, FileContent, FileErrorCode, FileKind, FileSystem,
+    ReadTextLinesOptions, RemoveOptions, Shell, ShellExecOptions, ShellExecResult,
     ShellOutputUpdate, ShellOutputView, TempFileOptions,
 };
 use crate::harness::utils::output_capture::apply_shell_output_update;
@@ -46,14 +43,17 @@ async fn collect_shell_output(
     command: &str,
     options: Option<ShellExecOptions>,
     context: &Context,
-) -> (Result<ShellExecResult, crate::harness::types::ExecutionError>, Option<ShellOutputView>) {
+) -> (
+    Result<ShellExecResult, crate::harness::types::ExecutionError>,
+    Option<ShellOutputView>,
+) {
     let collected: Arc<Mutex<Option<ShellOutputView>>> = Arc::new(Mutex::new(None));
     let reducer = Arc::clone(&collected);
     let mut options = options.unwrap_or_default();
     options.on_update = Some(Arc::new(move |update: &ShellOutputUpdate, _context| {
         let previous = reducer.lock().expect("output lock").take();
         *reducer.lock().expect("output lock") =
-                    Some(apply_shell_output_update(previous.as_ref(), update));
+            Some(apply_shell_output_update(previous.as_ref(), update));
     }));
     let result = Shell::exec(env, command, Some(options), context).await;
     let output = collected.lock().expect("output lock").take();
@@ -103,9 +103,7 @@ async fn reads_writes_lists_and_removes_files_and_directories() {
         FileSystem::read_text_lines(
             &env,
             "nested/child/file.txt",
-            Some(ReadTextLinesOptions {
-                max_lines: Some(1)
-            }),
+            Some(ReadTextLinesOptions { max_lines: Some(1) }),
             &context
         )
         .await
@@ -128,15 +126,19 @@ async fn reads_writes_lists_and_removes_files_and_directories() {
     assert_eq!(entries[0].kind, FileKind::File);
     assert_eq!(entries[0].size, 5);
 
-    assert!(FileSystem::exists(&env, "nested/child/file.txt", &context)
-        .await
-        .expect("exists"));
+    assert!(
+        FileSystem::exists(&env, "nested/child/file.txt", &context)
+            .await
+            .expect("exists")
+    );
     FileSystem::remove(&env, "nested/child/file.txt", None, &context)
         .await
         .expect("remove");
-    assert!(!FileSystem::exists(&env, "nested/child/file.txt", &context)
-        .await
-        .expect("exists after remove"));
+    assert!(
+        !FileSystem::exists(&env, "nested/child/file.txt", &context)
+            .await
+            .expect("exists after remove")
+    );
 }
 
 fn env_at(root: &str) -> NodeExecutionEnv {
@@ -160,9 +162,13 @@ async fn expands_home_relative_paths_and_file_urls() {
     );
     let file_path = format!("{root}/file with spaces.txt");
     assert_eq!(
-        FileSystem::absolute_path(&env, &format!("file://{root}/file%20with%20spaces.txt"), &context)
-            .await
-            .expect("file url"),
+        FileSystem::absolute_path(
+            &env,
+            &format!("file://{root}/file%20with%20spaces.txt"),
+            &context
+        )
+        .await
+        .expect("file url"),
         file_path
     );
 }
@@ -192,7 +198,9 @@ async fn file_info_reports_kinds_without_following_symlinks() {
     std::os::unix::fs::symlink(format!("{root}/dir"), format!("{root}/dir-link"))
         .expect("symlink dir");
 
-    let info = FileSystem::file_info(&env, "dir", &context).await.expect("dir info");
+    let info = FileSystem::file_info(&env, "dir", &context)
+        .await
+        .expect("dir info");
     assert_eq!(info.kind, FileKind::Directory);
     let info = FileSystem::file_info(&env, "dir/file.txt", &context)
         .await
@@ -230,7 +238,9 @@ async fn lists_symlinks_as_symlinks() {
     std::os::unix::fs::symlink(format!("{root}/target.txt"), format!("{root}/link.txt"))
         .expect("symlink");
 
-    let entries = FileSystem::list_dir(&env, ".", &context).await.expect("list");
+    let entries = FileSystem::list_dir(&env, ".", &context)
+        .await
+        .expect("list");
     let mut named: Vec<(String, FileKind)> = entries
         .into_iter()
         .map(|entry| (entry.name, entry.kind))
@@ -259,9 +269,7 @@ async fn stops_reading_text_lines_at_the_requested_limit() {
         FileSystem::read_text_lines(
             &env,
             "file.txt",
-            Some(ReadTextLinesOptions {
-                max_lines: Some(1)
-            }),
+            Some(ReadTextLinesOptions { max_lines: Some(1) }),
             &context
         )
         .await
@@ -282,10 +290,15 @@ async fn missing_paths_report_not_found_and_exists_false() {
         .await
         .expect_err("missing path errors");
     assert_eq!(error.code, FileErrorCode::NotFound);
-    assert_eq!(error.path.as_deref(), Some(format!("{root}/missing.txt").as_str()));
-    assert!(!FileSystem::exists(&env, "missing.txt", &context)
-        .await
-        .expect("exists false"));
+    assert_eq!(
+        error.path.as_deref(),
+        Some(format!("{root}/missing.txt").as_str())
+    );
+    assert!(
+        !FileSystem::exists(&env, "missing.txt", &context)
+            .await
+            .expect("exists false")
+    );
 }
 
 /// Listing a non-directory reports `not_directory`.
@@ -341,7 +354,11 @@ async fn renames_atomically_and_replaces_the_destination() {
     FileSystem::rename_file(&env, "source.txt", "destination.txt", &context)
         .await
         .expect("rename");
-    assert!(!FileSystem::exists(&env, "source.txt", &context).await.expect("source gone"));
+    assert!(
+        !FileSystem::exists(&env, "source.txt", &context)
+            .await
+            .expect("source gone")
+    );
     assert_eq!(
         FileSystem::read_text_file(&env, "destination.txt", &context)
             .await
@@ -365,7 +382,10 @@ async fn rename_reports_the_source_path_when_the_source_is_missing() {
         .await
         .expect_err("missing source errors");
     assert_eq!(error.code, FileErrorCode::NotFound);
-    assert_eq!(error.path.as_deref(), Some(format!("{root}/missing-source.txt").as_str()));
+    assert_eq!(
+        error.path.as_deref(),
+        Some(format!("{root}/missing-source.txt").as_str())
+    );
     assert_eq!(
         FileSystem::read_text_file(&env, "destination.txt", &context)
             .await
@@ -378,7 +398,7 @@ async fn rename_reports_the_source_path_when_the_source_is_missing() {
 #[tokio::test]
 async fn creates_temporary_directories_and_files() {
     let root = tempfile::tempdir().expect("temp root");
-    let env = env_at(&root.path().to_string_lossy().as_ref());
+    let env = env_at(root.path().to_string_lossy().as_ref());
     let context = context();
     let temp_dir = FileSystem::create_temp_dir(&env, Some("node-env-test-"), &context)
         .await
@@ -394,7 +414,11 @@ async fn creates_temporary_directories_and_files() {
     )
     .await
     .expect("temp file");
-    assert!(temp_file.ends_with(".txt"));
+    assert!(
+        std::path::Path::new(&temp_file)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("txt"))
+    );
     assert!(std::fs::metadata(&temp_file).is_ok());
 }
 
@@ -444,7 +468,11 @@ async fn honors_create_dir_and_remove_options() {
     )
     .await
     .expect("recursive removal");
-    assert!(!FileSystem::exists(&env, "dir", &context).await.expect("dir gone"));
+    assert!(
+        !FileSystem::exists(&env, "dir", &context)
+            .await
+            .expect("dir gone")
+    );
 
     let error = FileSystem::remove(
         &env,
@@ -543,9 +571,15 @@ async fn executes_commands_in_cwd_with_env_overrides() {
 #[tokio::test]
 async fn applies_string_shell_environment_overrides() {
     let base = BTreeMap::from([
-        ("PI_SESSION_FILE".to_owned(), "/stale/parent.jsonl".to_owned()),
+        (
+            "PI_SESSION_FILE".to_owned(),
+            "/stale/parent.jsonl".to_owned(),
+        ),
         ("PI_CODING_AGENT".to_owned(), "true".to_owned()),
-        ("PI_NODE_ENV_PRESERVED_TEST".to_owned(), "preserved".to_owned()),
+        (
+            "PI_NODE_ENV_PRESERVED_TEST".to_owned(),
+            "preserved".to_owned(),
+        ),
     ]);
     for (overrides, expected_session_file) in [
         (None, "x:/stale/parent.jsonl"),
@@ -570,8 +604,7 @@ async fn applies_string_shell_environment_overrides() {
             None,
             Some(base.clone()),
         );
-        let command =
-            "printf '%s:%s|%s|%s' \"${PI_SESSION_FILE+x}\" \"${PI_SESSION_FILE-}\" \"$PI_CODING_AGENT\" \"$PI_NODE_ENV_PRESERVED_TEST\"";
+        let command = "printf '%s:%s|%s|%s' \"${PI_SESSION_FILE+x}\" \"${PI_SESSION_FILE-}\" \"$PI_CODING_AGENT\" \"$PI_NODE_ENV_PRESERVED_TEST\"";
         let (result, output) = collect_shell_output(
             &env,
             command,
@@ -603,7 +636,10 @@ async fn can_replace_rather_than_inherit_the_default_shell_environment() {
         )])),
     );
     let mut env_overrides = BTreeMap::new();
-    env_overrides.insert("PI_NODE_ENV_EXPLICIT_TEST".to_owned(), "explicit".to_owned());
+    env_overrides.insert(
+        "PI_NODE_ENV_EXPLICIT_TEST".to_owned(),
+        "explicit".to_owned(),
+    );
     let (result, output) = collect_shell_output(
         &env,
         "printf '%s:%s:%s' \"${PI_NODE_ENV_INHERITED_TEST-}\" \"${PI_NODE_ENV_CONFIGURED_TEST-}\" \"${PI_NODE_ENV_EXPLICIT_TEST-}\"",
@@ -638,7 +674,7 @@ async fn cleanup_terminates_active_shell_processes() {
     let started = loop {
         tokio::select! {
             _ = &mut execution => panic!("the long-running shell should still be running"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+            () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
                 if FileSystem::exists(&env, "started", &background).await.unwrap_or(false) {
                     break true;
                 }
@@ -672,18 +708,34 @@ async fn combines_stdout_and_stderr_into_one_bounded_view() {
                 .push(update_kind(update).to_owned());
             let previous = reducer.lock().expect("output lock").take();
             *reducer.lock().expect("output lock") =
-                    Some(apply_shell_output_update(previous.as_ref(), update));
+                Some(apply_shell_output_update(previous.as_ref(), update));
         })),
         ..ShellExecOptions::default()
     };
-    let result = Shell::exec(&env, "printf out; printf err >&2", Some(options), &context())
-        .await
-        .expect("exec");
+    let result = Shell::exec(
+        &env,
+        "printf out; printf err >&2",
+        Some(options),
+        &context(),
+    )
+    .await
+    .expect("exec");
     assert_eq!(result.exit_code, 0);
-    let output = collected.lock().expect("output lock").take().expect("output");
+    let output = collected
+        .lock()
+        .expect("output lock")
+        .take()
+        .expect("output");
     assert!(output.text.contains("out"));
     assert!(output.text.contains("err"));
-    assert_eq!(updates.lock().expect("updates lock").first().map(String::as_str), Some("replace"));
+    assert_eq!(
+        updates
+            .lock()
+            .expect("updates lock")
+            .first()
+            .map(String::as_str),
+        Some("replace")
+    );
 }
 
 /// The update kind discriminator, upstream's `update.kind`.
@@ -707,7 +759,10 @@ async fn reports_a_missing_working_directory_before_spawning() {
     let error = Shell::exec(&env, "printf ok", None, &context())
         .await
         .expect_err("missing cwd errors");
-    assert_eq!(error.code, crate::harness::types::ExecutionErrorCode::SpawnError);
+    assert_eq!(
+        error.code,
+        crate::harness::types::ExecutionErrorCode::SpawnError
+    );
     assert!(error.message.contains("Working directory does not exist"));
 }
 
@@ -751,7 +806,10 @@ async fn commands_exceeding_the_timeout_report_timeout_errors() {
     )
     .await
     .expect_err("timeout errors");
-    assert_eq!(error.code, crate::harness::types::ExecutionErrorCode::Timeout);
+    assert_eq!(
+        error.code,
+        crate::harness::types::ExecutionErrorCode::Timeout
+    );
 }
 
 /// A configured shell path that does not exist reports
@@ -760,11 +818,8 @@ async fn commands_exceeding_the_timeout_report_timeout_errors() {
 async fn shell_unavailable_and_spawn_errors() {
     let root = tempfile::tempdir().expect("temp root");
     let root = root.path().to_string_lossy().into_owned();
-    let missing_shell_env = NodeExecutionEnv::new(
-        root.clone(),
-        Some(format!("{root}/missing-shell")),
-        None,
-    );
+    let missing_shell_env =
+        NodeExecutionEnv::new(root.clone(), Some(format!("{root}/missing-shell")), None);
     let error = Shell::exec(&missing_shell_env, "printf ok", None, &context())
         .await
         .expect_err("missing shell errors");
@@ -775,9 +830,14 @@ async fn shell_unavailable_and_spawn_errors() {
 
     let shell_path = format!("{root}/not-executable-shell");
     let env = env_at(&root);
-    FileSystem::write_file(&env, "not-executable-shell", "not executable".into(), &context())
-        .await
-        .expect("write shell");
+    FileSystem::write_file(
+        &env,
+        "not-executable-shell",
+        "not executable".into(),
+        &context(),
+    )
+    .await
+    .expect("write shell");
     let spawn_error_env = NodeExecutionEnv::new(root, Some(shell_path), None);
     let error = Shell::exec(&spawn_error_env, "printf ok", None, &context())
         .await
@@ -823,7 +883,10 @@ async fn does_not_create_a_spill_before_bounded_output_crosses_its_limits() {
     assert!(result.spill_path.is_none());
 }
 
-fn spill_capture(max_bytes: u64, max_lines: u64) -> crate::harness::types::ShellOutputCaptureOptions {
+fn spill_capture(
+    max_bytes: u64,
+    max_lines: u64,
+) -> crate::harness::types::ShellOutputCaptureOptions {
     crate::harness::types::ShellOutputCaptureOptions {
         limits: crate::harness::types::ShellOutputLimits {
             max_bytes,
@@ -876,8 +939,15 @@ async fn fails_rather_than_silently_losing_a_requested_spill() {
     )
     .await
     .expect_err("the failed spill errors");
-    assert_eq!(error.code, crate::harness::types::ExecutionErrorCode::Unknown);
-    assert!(error.message.contains("Failed to preserve complete shell output"));
+    assert_eq!(
+        error.code,
+        crate::harness::types::ExecutionErrorCode::Unknown
+    );
+    assert!(
+        error
+            .message
+            .contains("Failed to preserve complete shell output")
+    );
 }
 
 /// The spill writer, upstream's `FailingSpillExecutionEnv`: the spill file
@@ -930,8 +1000,10 @@ impl FileSystem for FailingSpillExecutionEnv {
         &'a self,
         path: &'a str,
         context: &'a Context,
-    ) -> BoxedFuture<'a, Result<Box<dyn crate::harness::types::TextLineReader>, crate::harness::types::FileError>>
-    {
+    ) -> BoxedFuture<
+        'a,
+        Result<Box<dyn crate::harness::types::TextLineReader>, crate::harness::types::FileError>,
+    > {
         self.inner.open_text_line_reader(path, context)
     }
 
@@ -956,18 +1028,18 @@ impl FileSystem for FailingSpillExecutionEnv {
         &'a self,
         path: &'a str,
         content: FileContent,
-        context: &'a Context,
+        ctx: &'a Context,
     ) -> BoxedFuture<'a, Result<(), crate::harness::types::FileError>> {
-        self.inner.write_file(path, content, context)
+        self.inner.write_file(path, content, ctx)
     }
 
     fn append_file<'a>(
         &'a self,
         path: &'a str,
         content: FileContent,
-        context: &'a Context,
+        ctx: &'a Context,
     ) -> BoxedFuture<'a, Result<(), crate::harness::types::FileError>> {
-        self.inner.append_file(path, content, context)
+        self.inner.append_file(path, content, ctx)
     }
 
     fn rename_file<'a>(
@@ -976,14 +1048,16 @@ impl FileSystem for FailingSpillExecutionEnv {
         destination_path: &'a str,
         context: &'a Context,
     ) -> BoxedFuture<'a, Result<(), crate::harness::types::FileError>> {
-        self.inner.rename_file(source_path, destination_path, context)
+        self.inner
+            .rename_file(source_path, destination_path, context)
     }
 
     fn file_info<'a>(
         &'a self,
         path: &'a str,
         context: &'a Context,
-    ) -> BoxedFuture<'a, Result<crate::harness::types::FileInfo, crate::harness::types::FileError>> {
+    ) -> BoxedFuture<'a, Result<crate::harness::types::FileInfo, crate::harness::types::FileError>>
+    {
         self.inner.file_info(path, context)
     }
 
@@ -991,7 +1065,10 @@ impl FileSystem for FailingSpillExecutionEnv {
         &'a self,
         path: &'a str,
         context: &'a Context,
-    ) -> BoxedFuture<'a, Result<Vec<crate::harness::types::FileInfo>, crate::harness::types::FileError>> {
+    ) -> BoxedFuture<
+        'a,
+        Result<Vec<crate::harness::types::FileInfo>, crate::harness::types::FileError>,
+    > {
         self.inner.list_dir(path, context)
     }
 
@@ -1047,9 +1124,7 @@ impl FileSystem for FailingSpillExecutionEnv {
             .and_then(|options| options.prefix.as_deref())
             .is_some_and(|prefix| prefix == SPILL_FILE_PREFIX);
         if spill {
-            return Box::pin(async move {
-                Ok(format!("{}/missing/spill.log", self.inner.cwd()))
-            });
+            return Box::pin(async move { Ok(format!("{}/missing/spill.log", self.inner.cwd())) });
         }
         self.inner.create_temp_file(options, context)
     }
@@ -1065,8 +1140,7 @@ impl Shell for FailingSpillExecutionEnv {
         command: &'a str,
         options: Option<ShellExecOptions>,
         context: &'a Context,
-    ) -> BoxedFuture<'a, Result<ShellExecResult, crate::harness::types::ExecutionError>>
-    {
+    ) -> BoxedFuture<'a, Result<ShellExecResult, crate::harness::types::ExecutionError>> {
         Box::pin(super::exec_command(
             command.to_owned(),
             options,
@@ -1115,14 +1189,9 @@ async fn spill_preserves_complete_output_for_a_fast_exiting_process() {
 async fn captures_large_shell_output_to_a_full_output_file_through_the_execution_env() {
     let root = tempfile::tempdir().expect("temp root");
     let env = env_at(root.path().to_string_lossy().as_ref());
-    let result = execute_shell_with_capture(
-        &env,
-        "yes line | head -n 15000",
-        None,
-        &context(),
-    )
-    .await
-    .expect("capture");
+    let result = execute_shell_with_capture(&env, "yes line | head -n 15000", None, &context())
+        .await
+        .expect("capture");
     assert!(result.truncated);
     let full_output_path = result.full_output_path.expect("full output path");
     let full_output = FileSystem::read_text_file(&env, &full_output_path, &context())

@@ -53,7 +53,7 @@ pub fn validate_tool_names(tools: &[impl AsRef<str>]) -> Result<(), String> {
 /// A `RangeError`-shaped message when any value exceeds the JavaScript
 /// safe-integer ceiling.
 pub fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), String> {
-    if !within_safe_integer(policy.max_retries as u64)
+    if !within_safe_integer(u64::from(policy.max_retries))
         || !within_safe_integer(policy.base_delay_ms)
         || policy
             .max_agent_delay_ms
@@ -64,7 +64,7 @@ pub fn validate_retry_policy(policy: &RetryPolicy) -> Result<(), String> {
     Ok(())
 }
 
-fn within_safe_integer(value: u64) -> bool {
+const fn within_safe_integer(value: u64) -> bool {
     value <= MAX_SAFE_INTEGER
 }
 

@@ -11,9 +11,7 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 #![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
-use crate::harness::gate::{create_gate, GateRejection};
+use crate::harness::gate::{GateRejection, create_gate};
 
 fn settled_cancellation() -> crate::harness::gate::Cancellation {
     let (_sender, receiver) = tokio::sync::watch::channel(());
@@ -40,13 +38,11 @@ async fn an_aborting_gate_refuses_admission_with_the_cancellation() {
     let GateRejection::AbortRequested(requested) = rejection else {
         panic!("the abort path carries the cancellation future");
     };
-    let settled = *requested.cancellation.borrow();
-    let _ = settled;
+    *requested.cancellation.borrow();
+    let () = ();
     // A second abort attempt is a no-op; the gate stays aborting.
     control.begin_abort(settled_cancellation());
-    let rejection = gate
-        .admit(|| 42)
-        .expect_err("the gate stays aborting");
+    let rejection = gate.admit(|| 42).expect_err("the gate stays aborting");
     assert!(matches!(rejection, GateRejection::AbortRequested(_)));
 }
 
@@ -71,8 +67,6 @@ fn begin_abort_ignores_a_closed_gate() {
     let (gate, control) = create_gate();
     control.close("gate closed".to_owned());
     control.begin_abort(settled_cancellation());
-    let rejection = gate
-        .admit(|| 42)
-        .expect_err("the gate stays closed");
+    let rejection = gate.admit(|| 42).expect_err("the gate stays closed");
     assert!(matches!(rejection, GateRejection::Closed(_)));
 }

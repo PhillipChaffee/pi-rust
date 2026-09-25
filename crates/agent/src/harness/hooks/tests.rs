@@ -11,18 +11,18 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 #![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use pi_chord::context::{background_context, Context};
+use pi_chord::context::{Context, background_context};
 
 use crate::harness::agent_harness::{
     HookEvent, HookInvocation, HookName, HookOptions, HookResult, StepKind,
 };
-use crate::harness::gate::{create_gate, GateRejection};
-use crate::harness::hooks::{apply_stream_options_patch, create_stream_options_patch, HookRegistry};
+use crate::harness::gate::{GateRejection, create_gate};
+use crate::harness::hooks::{
+    HookRegistry, apply_stream_options_patch, create_stream_options_patch,
+};
 use crate::harness::types::{AgentHarnessStreamOptions, AgentHarnessStreamOptionsPatch};
 
 fn invocation(event: HookEvent) -> HookInvocation {
@@ -33,7 +33,9 @@ fn invocation(event: HookEvent) -> HookInvocation {
     }
 }
 
-fn reporting_handler_errors(errors: Arc<Mutex<Vec<String>>>) -> crate::harness::hooks::HookErrorReporter {
+fn reporting_handler_errors(
+    errors: Arc<Mutex<Vec<String>>>,
+) -> crate::harness::hooks::HookErrorReporter {
     Arc::new(move |error, _name, _lane, _context| {
         let errors = Arc::clone(&errors);
         Box::pin(async move {
@@ -66,8 +68,9 @@ fn handler(
 async fn before_run_aggregates_fail_open() {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    let mut options = HookOptions::default();
-    options.id = Some("second".to_owned());
+    let options = HookOptions {
+        id: Some("second".to_owned()),
+    };
     registry
         .on(
             HookName::BeforeRun,
@@ -86,12 +89,7 @@ async fn before_run_aggregates_fail_open() {
     let current = invocation(event.clone());
     let (gate, _gate_control) = create_gate();
     let result = registry
-        .run_with_gate(
-            HookName::BeforeRun,
-            current,
-            &gate,
-            &background_context(),
-        )
+        .run_with_gate(HookName::BeforeRun, current, &gate, &background_context())
         .await;
     let result = match result {
         Ok(result) => result,
@@ -153,7 +151,10 @@ async fn a_closed_registry_refuses_every_run() {
         )
         .await
         .expect_err("a closed registry errors");
-    assert!(matches!(error, crate::harness::hooks::HookRunError::Closed(_)));
+    assert!(matches!(
+        error,
+        crate::harness::hooks::HookRunError::Closed(_)
+    ));
 }
 
 /// The stream-options patch applies per key over the base, and the
@@ -228,7 +229,9 @@ async fn run(
     context: &Context,
 ) -> Result<HookResult, crate::harness::hooks::HookRunError> {
     let (gate, _control) = create_gate();
-    registry.run_with_gate(name, invocation(event), &gate, context).await
+    registry
+        .run_with_gate(name, invocation(event), &gate, context)
+        .await
 }
 
 /// `transform_context` folds replacements across handlers fail-open.
@@ -239,10 +242,12 @@ async fn transform_context_folds_replacements() {
         .on(
             HookName::TransformContext,
             handler(|_event| {
-                HookResult::TransformContext(Some(crate::harness::agent_harness::TransformContextResult {
-                    messages: Some(vec![user_message()]),
-                    system_prompt: Some("replacement".to_owned()),
-                }))
+                HookResult::TransformContext(Some(
+                    crate::harness::agent_harness::TransformContextResult {
+                        messages: Some(vec![user_message()]),
+                        system_prompt: Some("replacement".to_owned()),
+                    },
+                ))
             }),
             HookOptions::default(),
         )
@@ -310,12 +315,14 @@ async fn before_request_folds_stream_option_patches() {
         .on(
             HookName::BeforeRequest,
             handler(|_event| {
-                HookResult::BeforeRequest(Some(crate::harness::agent_harness::BeforeRequestResult {
-                    stream_options: AgentHarnessStreamOptionsPatch {
-                        timeout_ms: Some(Some(2_000)),
-                        ..AgentHarnessStreamOptionsPatch::default()
+                HookResult::BeforeRequest(Some(
+                    crate::harness::agent_harness::BeforeRequestResult {
+                        stream_options: AgentHarnessStreamOptionsPatch {
+                            timeout_ms: Some(Some(2_000)),
+                            ..AgentHarnessStreamOptionsPatch::default()
+                        },
                     },
-                }))
+                ))
             }),
             HookOptions::default(),
         )
@@ -383,9 +390,11 @@ async fn after_response_carries_the_replacement() {
         .on(
             HookName::AfterResponse,
             handler(move |_event| {
-                HookResult::AfterResponse(Some(crate::harness::agent_harness::AfterResponseResult {
-                    message: Some(settled_message()),
-                }))
+                HookResult::AfterResponse(Some(Box::new(
+                    crate::harness::agent_harness::AfterResponseResult {
+                        message: Some(settled_message()),
+                    },
+                )))
             }),
             HookOptions::default(),
         )
@@ -497,16 +506,18 @@ async fn before_compaction_takes_the_first_decisive_result() {
         .on(
             HookName::BeforeCompaction,
             handler(|_event| {
-                HookResult::BeforeCompaction(Some(crate::harness::agent_harness::CompactionHookResult {
-                    decline: Some(true),
-                    compaction: Some(crate::harness::compaction::types::CompactResult {
-                        summary: "summary".to_owned(),
-                        tokens_before: 1,
-                        usage: None,
-                        retained_tail: vec![],
-                        details: None,
-                    }),
-                }))
+                HookResult::BeforeCompaction(Some(
+                    crate::harness::agent_harness::CompactionHookResult {
+                        decline: Some(true),
+                        compaction: Some(crate::harness::compaction::types::CompactResult {
+                            summary: "summary".to_owned(),
+                            tokens_before: 1,
+                            usage: None,
+                            retained_tail: vec![],
+                            details: None,
+                        }),
+                    },
+                ))
             }),
             HookOptions::default(),
         )
@@ -515,10 +526,12 @@ async fn before_compaction_takes_the_first_decisive_result() {
         .on(
             HookName::BeforeCompaction,
             handler(|_event| {
-                HookResult::BeforeCompaction(Some(crate::harness::agent_harness::CompactionHookResult {
-                    decline: Some(true),
-                    compaction: None,
-                }))
+                HookResult::BeforeCompaction(Some(
+                    crate::harness::agent_harness::CompactionHookResult {
+                        decline: Some(true),
+                        compaction: None,
+                    },
+                ))
             }),
             HookOptions::default(),
         )
@@ -548,9 +561,13 @@ async fn before_compaction_takes_the_first_decisive_result() {
         panic!("the decline reaches the aggregate");
     };
     assert_eq!(result.decline, Some(true));
-    assert!(errors.lock().expect("report lock").iter().any(|error| {
-        error.contains("cannot return both decline and compaction")
-    }));
+    assert!(
+        errors
+            .lock()
+            .expect("report lock")
+            .iter()
+            .any(|error| { error.contains("cannot return both decline and compaction") })
+    );
 }
 
 /// `before_drive` runs fail-closed: a failing handler errors the drive.
@@ -563,7 +580,9 @@ async fn before_drive_runs_fail_closed() {
             HookName::BeforeDrive,
             Arc::new(|_event: &HookInvocation, _context| {
                 Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from("drive handler failed"))
+                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                        "drive handler failed",
+                    ))
                 })
             }),
             HookOptions::default(),

@@ -1,12 +1,6 @@
 //! The error taxonomy's display and tag surface, upstream's
 //! `matchError`/`is`/`message` table exercised through the one enum.
 
-#![expect(
-    clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use crate::harness::result::{HarnessClosed, HarnessError, HarnessFault};
 use crate::harness::session::types::OperationKind;
 
@@ -48,5 +42,8 @@ fn faults_chain_their_source() {
     let source = std::error::Error::source(&fault);
     assert!(source.is_some());
     let closed = HarnessClosed;
-    assert_eq!(closed.to_string(), "AgentHarness was closed while the operation was active");
+    assert_eq!(
+        closed.to_string(),
+        "AgentHarness was closed while the operation was active"
+    );
 }

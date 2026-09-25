@@ -8,10 +8,8 @@
 use std::sync::{Arc, Mutex};
 
 use crate::harness::context::Context;
-use crate::harness::types::{
-    ExecutionEnv, ExecutionError, ShellExecOptions, ShellOutputView,
-};
-use crate::harness::utils::output_capture::apply_shell_output_update;
+use crate::harness::types::{ExecutionEnv, ExecutionError, ShellExecOptions, ShellOutputView};
+use crate::harness::utils::output_capture::{ShellUpdateListener, apply_shell_output_update};
 use crate::harness::utils::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncationResult, truncate_tail,
 };
@@ -107,8 +105,60 @@ fn progress_from(output: &ShellOutputView) -> ShellCaptureProgress {
     }
 }
 
+/// Folds each published update into the shared compatibility view and
+/// forwards incremental chunks to `on_chunk`; the view slot's guard
+/// releases before the callback runs so its progress getter may re-lock.
+fn shell_capture_update_sink(
+    capture_output: Arc<Mutex<Option<ShellOutputView>>>,
+    on_chunk: Option<Arc<OnShellChunk>>,
+) -> ShellUpdateListener {
+    Arc::new(move |update, update_context| {
+        let mut slot = capture_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = slot.clone();
+        let next = apply_shell_output_update(previous.as_ref(), update);
+        // A metadata-only update and a post-cap replacement contain no
+        // new incremental chunk. Reporting their complete view would
+        // duplicate bytes for callers that accumulate this
+        // compatibility callback.
+        let chunk = match update {
+            crate::harness::types::ShellOutputUpdate::Append { text, .. }
+            | crate::harness::types::ShellOutputUpdate::Slide { text, .. } => Some(text.clone()),
+            crate::harness::types::ShellOutputUpdate::Replace { .. } if previous.is_none() => {
+                Some(next.text.clone())
+            }
+            _ => None,
+        };
+        *slot = Some(next);
+        // The progress getter re-locks the shared view, so the update
+        // slot's guard must release before the callback runs.
+        drop(slot);
+        if let (Some(chunk), Some(on_chunk)) = (chunk, on_chunk.as_ref()) {
+            let getter_output = Arc::clone(&capture_output);
+            on_chunk(
+                &chunk,
+                &move || {
+                    let guard = getter_output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard
+                        .as_ref()
+                        .map_or_else(ShellCaptureProgress::default, progress_from)
+                },
+                update_context,
+            );
+        }
+    })
+}
+
 /// Executes `command` on the environment with default capture limits and
 /// spilling, folding the published view into one final result.
+///
+/// # Errors
+/// The environment's execution error when the command fails, unless the
+/// run aborted (a cancelled result returns instead) or
+/// `return_execution_errors` carries the failure as captured output.
 pub async fn execute_shell_with_capture(
     env: &dyn ExecutionEnv,
     command: &str,
@@ -117,8 +167,7 @@ pub async fn execute_shell_with_capture(
 ) -> Result<ShellCaptureResult, ExecutionError> {
     let options = options.unwrap_or_default();
     let on_chunk = options.on_chunk.clone();
-    let shared_output: Arc<Mutex<Option<ShellOutputView>>> =
-        Arc::new(Mutex::new(None));
+    let shared_output: Arc<Mutex<Option<ShellOutputView>>> = Arc::new(Mutex::new(None));
     let capture_output = Arc::clone(&shared_output);
     let exec_options = ShellExecOptions {
         cwd: options.cwd.clone(),
@@ -133,49 +182,19 @@ pub async fn execute_shell_with_capture(
             },
             spill: true,
         }),
-        on_update: Some(Arc::new(move |update, update_context| {
-            let mut slot = capture_output.lock().expect("shell capture output lock");
-            let previous = slot.clone();
-            let next = apply_shell_output_update(previous.as_ref(), update);
-            // A metadata-only update and a post-cap replacement contain no
-            // new incremental chunk. Reporting their complete view would
-            // duplicate bytes for callers that accumulate this
-            // compatibility callback.
-            let chunk = match update {
-                crate::harness::types::ShellOutputUpdate::Append { text, .. }
-                | crate::harness::types::ShellOutputUpdate::Slide { text, .. } => Some(text.clone()),
-                crate::harness::types::ShellOutputUpdate::Replace { .. } if previous.is_none() => {
-                    Some(next.text.clone())
-                }
-                _ => None,
-            };
-            *slot = Some(next);
-            // The progress getter re-locks the shared view, so the update
-            // slot's guard must release before the callback runs.
-            drop(slot);
-            if let (Some(chunk), Some(on_chunk)) = (chunk, on_chunk.as_ref()) {
-                let getter_output = Arc::clone(&capture_output);
-                on_chunk(
-                    &chunk,
-                    &move || {
-                        let guard = getter_output.lock().expect("shell capture output lock");
-                        guard.as_ref().map_or_else(
-                            ShellCaptureProgress::default,
-                            |view| progress_from(view),
-                        )
-                    },
-                    update_context,
-                );
-            }
-        })),
+        on_update: Some(shell_capture_update_sink(capture_output, on_chunk)),
     };
     let result = env.exec(command, Some(exec_options), context).await;
 
     let output = {
-        let mut slot = shared_output.lock().expect("shell capture output lock");
+        let mut slot = shared_output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         slot.take().unwrap_or_else(|| {
-            let empty =
-                truncate_tail("", crate::harness::utils::truncate::TruncationOptions::default());
+            let empty = truncate_tail(
+                "",
+                crate::harness::utils::truncate::TruncationOptions::default(),
+            );
             ShellOutputView {
                 text: empty.content,
                 metadata: crate::harness::types::ShellOutputMetadata {
@@ -190,7 +209,9 @@ pub async fn execute_shell_with_capture(
     match result {
         Err(error) => {
             if error.code == crate::harness::types::ExecutionErrorCode::Aborted
-                || context.abort_signal().is_some_and(|signal| signal.aborted())
+                || context
+                    .abort_signal()
+                    .is_some_and(|signal| signal.aborted())
             {
                 return Ok(ShellCaptureResult {
                     exit_code: None,
@@ -213,7 +234,6 @@ pub async fn execute_shell_with_capture(
                     truncation: progress.truncation,
                     full_output_path: progress.full_output_path,
                     last_line_bytes: progress.last_line_bytes,
-                    ..ShellCaptureResult::default()
                 });
             }
             Err(error)

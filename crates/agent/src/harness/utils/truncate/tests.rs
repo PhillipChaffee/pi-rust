@@ -6,16 +6,9 @@
 //! which cannot exist in a Rust `str` — those cases collapse, and the
 //! exhaustive fuzz walks the same alphabet minus the lone surrogates.
 
-#![expect(
-    clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use crate::harness::types::TruncatedBy;
 use crate::harness::utils::truncate::{
-    format_size, truncate_head, truncate_line, truncate_tail, utf8_byte_length, TruncationOptions,
+    TruncationOptions, format_size, truncate_head, truncate_line, truncate_tail, utf8_byte_length,
 };
 
 fn options(max_bytes: u64, max_lines: u64) -> TruncationOptions {
@@ -111,7 +104,6 @@ fn drops_an_oversized_trailing_character() {
 /// equivalence harness; the lone-surrogate cases cannot exist in Rust).
 #[test]
 fn matches_the_reference_tail_semantics_over_multi_byte_inputs() {
-    let alphabet = ["a", "\u{7f}", "\u{80}", "é", "\u{7ff}", "\u{800}", "中", "🙂", "\u{e000}", "\u{ffff}"];
     fn reference_tail(content: &str, max_bytes: u64) -> String {
         let bytes = content.as_bytes();
         if bytes.len() as u64 <= max_bytes {
@@ -123,12 +115,15 @@ fn matches_the_reference_tail_semantics_over_multi_byte_inputs() {
         }
         String::from_utf8_lossy(&bytes[start..]).into_owned()
     }
-    fn check(alphabet: &[&str], prefix: String, depth: usize) {
-        let total = utf8_byte_length(&prefix);
+    fn check(alphabet: &[&str], prefix: &str, depth: usize) {
+        let total = utf8_byte_length(prefix);
         for limit in 0..=total + 5 {
-            let result = truncate_tail(&prefix, options(limit, 10));
-            let expected = reference_tail(&prefix, limit);
-            assert_eq!(result.content, expected, "input={prefix:?} maxBytes={limit}");
+            let result = truncate_tail(prefix, options(limit, 10));
+            let expected = reference_tail(prefix, limit);
+            assert_eq!(
+                result.content, expected,
+                "input={prefix:?} maxBytes={limit}"
+            );
             assert!(
                 utf8_byte_length(&result.content) <= limit,
                 "tail exceeded the limit: input={prefix:?} maxBytes={limit}"
@@ -138,10 +133,13 @@ fn matches_the_reference_tail_semantics_over_multi_byte_inputs() {
             return;
         }
         for character in alphabet {
-            check(alphabet, format!("{prefix}{character}"), depth - 1);
+            check(alphabet, &format!("{prefix}{character}"), depth - 1);
         }
     }
-    check(&alphabet, String::new(), 2);
+    let alphabet = [
+        "a", "\u{7f}", "\u{80}", "é", "\u{7ff}", "\u{800}", "中", "🙂", "\u{e000}", "\u{ffff}",
+    ];
+    check(&alphabet, "", 2);
 }
 
 /// The line-limited head truncation keeps complete lines and reports the

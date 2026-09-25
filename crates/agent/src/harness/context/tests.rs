@@ -5,8 +5,6 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
-
 use std::io;
 
 use pi_telemetry::{InMemoryTelemetryContext, NOOP_TELEMETRY_CONTEXT, SpanOptions};

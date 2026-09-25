@@ -47,7 +47,7 @@ pub struct ValueList<T> {
 
 /// The stored view of one value, upstream's `StoredValue<T>` with the
 /// erased payload the durable layer persists.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredValue {
     /// The addressed namespace.
@@ -61,7 +61,7 @@ pub struct StoredValue {
 }
 
 /// One element of a stored list, upstream's `ListElement<T>`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListElement {
     /// The element's sequence.
@@ -105,7 +105,7 @@ pub struct ResolvedListReadOptions {
 }
 
 /// A value set write, upstream's `ValueSetWrite`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueSetWrite {
     /// The write family.
@@ -121,7 +121,7 @@ pub struct ValueSetWrite {
 }
 
 /// A value delete write, upstream's `ValueDeleteWrite`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ValueDeleteWrite {
     /// The write family.
@@ -135,7 +135,7 @@ pub struct ValueDeleteWrite {
 }
 
 /// A list append write, upstream's `ListAppendWrite`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListAppendWrite {
     /// The write family.
@@ -151,7 +151,7 @@ pub struct ListAppendWrite {
 }
 
 /// A list delete write, upstream's `ListDeleteWrite`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListDeleteWrite {
     /// The write family.
@@ -170,7 +170,7 @@ pub struct ListDeleteWrite {
 #[serde(untagged)]
 pub enum Write {
     /// An entry insert.
-    Entry(EntryWrite),
+    Entry(Box<EntryWrite>),
     /// A usage insert.
     Usage(UsageWrite),
     /// A value set.
@@ -213,10 +213,14 @@ pub fn validate_address(namespace: &str, key: &str) -> Result<(), SessionError> 
         return Err(SessionError("Value namespace must not be empty".to_owned()));
     }
     if namespace.contains('\u{0}') {
-        return Err(SessionError("Value namespace must not contain \\u0000".to_owned()));
+        return Err(SessionError(
+            "Value namespace must not contain \\u0000".to_owned(),
+        ));
     }
     if key.contains('\u{0}') {
-        return Err(SessionError("Value key must not contain \\u0000".to_owned()));
+        return Err(SessionError(
+            "Value key must not contain \\u0000".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -256,10 +260,7 @@ pub fn list<T>(namespace: &str, key: &str) -> Result<ValueList<T>, SessionError>
 ///
 /// # Errors
 /// Payload serialization failures.
-pub fn set_value<T: Serialize>(
-    address: &Value<T>,
-    next: T,
-) -> Result<ValueSetWrite, SessionError> {
+pub fn set_value<T: Serialize>(address: &Value<T>, next: T) -> Result<ValueSetWrite, SessionError> {
     Ok(ValueSetWrite {
         kind: "value".to_owned(),
         op: "set".to_owned(),
@@ -296,9 +297,8 @@ pub fn append_list<T: Serialize>(
         op: "append".to_owned(),
         namespace: address.address.namespace.clone(),
         key: address.address.key.clone(),
-        value: serde_json::to_value(element).map_err(|error| {
-            SessionError(format!("List element serialization failed: {error}"))
-        })?,
+        value: serde_json::to_value(element)
+            .map_err(|error| SessionError(format!("List element serialization failed: {error}")))?,
     })
 }
 
@@ -338,43 +338,56 @@ pub fn resolve_list_read_options(
 }
 
 /// The branch tip address, upstream's `branchTip(branch)`.
+#[must_use]
 pub fn branch_tip(branch: &str) -> Value<Option<String>> {
     value::<Option<String>>("pi.branch.tip", branch).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The branch-tip inventory prefix, upstream's `branchTipInventoryPrefix()`.
+#[must_use]
 pub fn branch_tip_inventory_prefix() -> Value<Option<String>> {
     value::<Option<String>>("pi.branch.tip", "").unwrap_or_else(|_| unreachable_value())
 }
 
 /// The lane configuration address, upstream's `laneConfig(lane)`.
+#[must_use]
 pub fn lane_config(lane: &str) -> Value<LaneConfiguration> {
     value::<LaneConfiguration>("pi.lane.config", lane).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The lane state address, upstream's `laneState(lane)`.
+#[must_use]
 pub fn lane_state(lane: &str) -> Value<LaneState> {
     value::<LaneState>("pi.lane.state", lane).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The operation result address, upstream's `operationResult(operationId)`.
+#[must_use]
 pub fn operation_result(operation_id: &str) -> Value<OperationResultRecord> {
-    value::<OperationResultRecord>("pi.result", operation_id).unwrap_or_else(|_| unreachable_value())
+    value::<OperationResultRecord>("pi.result", operation_id)
+        .unwrap_or_else(|_| unreachable_value())
 }
 
 /// The operation meta address, upstream's `operationMeta(operationId)`.
+#[must_use]
 pub fn operation_meta(operation_id: &str) -> Value<OperationMeta> {
     value::<OperationMeta>("pi.op.meta", operation_id).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The operation state address, upstream's `operationState(operationId)`.
+#[must_use]
 pub fn operation_state(operation_id: &str) -> Value<OperationState> {
     value::<OperationState>("pi.op.state", operation_id).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The tool-arguments address, upstream's
 /// `operationToolArgs(operationId, stepId, sourceIndex)`.
-pub fn operation_tool_args(operation_id: &str, step_id: &str, source_index: u64) -> Value<ToolArgs> {
+#[must_use]
+pub fn operation_tool_args(
+    operation_id: &str,
+    step_id: &str,
+    source_index: u64,
+) -> Value<ToolArgs> {
     value::<ToolArgs>(
         "pi.op.tool_args",
         &format!("{operation_id}:{step_id}:{source_index}"),
@@ -387,7 +400,12 @@ pub type ToolArgs = serde_json::Map<String, JsonValue>;
 
 /// The tool memo address, upstream's
 /// `operationToolMemo(operationId, invocationId, name)`.
-pub fn operation_tool_memo(operation_id: &str, invocation_id: &str, name: &str) -> Value<JsonValue> {
+#[must_use]
+pub fn operation_tool_memo(
+    operation_id: &str,
+    invocation_id: &str,
+    name: &str,
+) -> Value<JsonValue> {
     value::<JsonValue>(
         "pi.op.tool_memo",
         &format!("{operation_id}:{invocation_id}:{name}"),
@@ -397,45 +415,57 @@ pub fn operation_tool_memo(operation_id: &str, invocation_id: &str, name: &str) 
 
 /// The operation preparation address, upstream's
 /// `operationPreparation(operationId, taskId)`.
-pub fn operation_preparation(operation_id: &str, task_id: &str) -> Value<DurableStructuralPreparation> {
+#[must_use]
+pub fn operation_preparation(
+    operation_id: &str,
+    task_id: &str,
+) -> Value<DurableStructuralPreparation> {
     value::<DurableStructuralPreparation>("pi.op.preparation", &format!("{operation_id}:{task_id}"))
         .unwrap_or_else(|_| unreachable_value())
 }
 
 /// The tool-arguments prefix address, upstream's
 /// `operationToolArgsPrefix(operationId, stepId?)`.
+#[must_use]
 pub fn operation_tool_args_prefix(operation_id: &str, step_id: Option<&str>) -> Value<ToolArgs> {
-    let key = match step_id {
-        Some(step_id) => format!("{operation_id}:{step_id}:"),
-        None => format!("{operation_id}:"),
-    };
+    let key = step_id.map_or_else(
+        || format!("{operation_id}:"),
+        |step_id| format!("{operation_id}:{step_id}:"),
+    );
     value::<ToolArgs>("pi.op.tool_args", &key).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The tool-memo prefix address, upstream's
 /// `operationToolMemoPrefix(operationId, invocationId?)`.
-pub fn operation_tool_memo_prefix(operation_id: &str, invocation_id: Option<&str>) -> Value<JsonValue> {
-    let key = match invocation_id {
-        Some(invocation_id) => format!("{operation_id}:{invocation_id}:"),
-        None => format!("{operation_id}:"),
-    };
+#[must_use]
+pub fn operation_tool_memo_prefix(
+    operation_id: &str,
+    invocation_id: Option<&str>,
+) -> Value<JsonValue> {
+    let key = invocation_id.map_or_else(
+        || format!("{operation_id}:"),
+        |invocation_id| format!("{operation_id}:{invocation_id}:"),
+    );
     value::<JsonValue>("pi.op.tool_memo", &key).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The preparation prefix address, upstream's
 /// `operationPreparationPrefix(operationId)`.
+#[must_use]
 pub fn operation_preparation_prefix(operation_id: &str) -> Value<DurableStructuralPreparation> {
     value::<DurableStructuralPreparation>("pi.op.preparation", &format!("{operation_id}:"))
         .unwrap_or_else(|_| unreachable_value())
 }
 
 /// The pending-entry address, upstream's `pendingEntry(entryId)`.
+#[must_use]
 pub fn pending_entry(entry_id: &str) -> Value<PendingEntry> {
     value::<PendingEntry>("pi.pending.entry", entry_id).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The pending tool output address, upstream's
 /// `pendingToolOutput(operationId, invocationId)`.
+#[must_use]
 pub fn pending_tool_output(operation_id: &str, invocation_id: &str) -> Value<ToolOutputPayload> {
     value::<ToolOutputPayload>(
         "pi.pending.tool_output",
@@ -466,6 +496,7 @@ pub struct ToolOutputPayload {
 
 /// The pending assistant frames list address, upstream's
 /// `pendingAssistantFrames(operationId, responseEntryId)`.
+#[must_use]
 pub fn pending_assistant_frames(
     operation_id: &str,
     response_entry_id: &str,
@@ -479,23 +510,27 @@ pub fn pending_assistant_frames(
 
 /// The pending tool output prefix, upstream's
 /// `pendingToolOutputPrefix(operationId)`.
+#[must_use]
 pub fn pending_tool_output_prefix(operation_id: &str) -> Value<ToolOutputPayload> {
     value::<ToolOutputPayload>("pi.pending.tool_output", &format!("{operation_id}:"))
         .unwrap_or_else(|_| unreachable_value())
 }
 
 /// The session name address, upstream's `sessionName`.
+#[must_use]
 pub fn session_name() -> Value<String> {
     value::<String>("pi.session.name", "").unwrap_or_else(|_| unreachable_value())
 }
 
 /// The entry label address, upstream's `entryLabel(entryId)`.
+#[must_use]
 pub fn entry_label(entry_id: &str) -> Value<String> {
     value::<String>("pi.entry.label", entry_id).unwrap_or_else(|_| unreachable_value())
 }
 
 /// A generic value address, upstream's `value<unknown>("test.value", ...)`
 /// call sites.
+#[must_use]
 pub fn generic_value(namespace: &str, key: &str) -> Value<JsonValue> {
     value::<JsonValue>(namespace, key).unwrap_or_else(|_| unreachable_value())
 }
@@ -506,7 +541,7 @@ pub type StreamOptionsPayload = AgentHarnessStreamOptions;
 
 /// The value-write union the session contract references, upstream's
 /// `ValueWrite = ValueSetWrite | ValueDeleteWrite`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ValueWrite {
     /// A set.
@@ -516,7 +551,7 @@ pub enum ValueWrite {
 }
 
 /// The list-write union, upstream's `ListWrite`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ListWrite {
     /// An append.
@@ -548,6 +583,10 @@ pub struct ListAddress {
 /// The internal marker the `unreachable_value` helpers feed; the fixed
 /// harness namespaces never fail validation, so the fallback never
 /// constructs.
+#[expect(
+    clippy::panic,
+    reason = "the fixed harness namespaces never fail address validation; the fallback is unreachable by construction"
+)]
 fn unreachable_value<T>() -> T {
     panic!("fixed harness value addresses are always valid")
 }

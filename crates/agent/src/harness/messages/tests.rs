@@ -7,17 +7,15 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 #![expect(clippy::panic, reason = "tests assert by panicking")]
-#![expect(clippy::unwrap_used, reason = "tests unwrap the pinned outcomes")]
-
 use serde_json::json;
 
 use crate::harness::messages::{
-    bash_execution_to_text, convert_to_llm, create_branch_summary_message,
-    create_compaction_summary_message, create_custom_message, parse_date_millis, Timestamp,
-    BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX,
+    BRANCH_SUMMARY_PREFIX, COMPACTION_SUMMARY_PREFIX, Timestamp, bash_execution_to_text,
+    convert_to_llm, create_branch_summary_message, create_compaction_summary_message,
+    create_custom_message, parse_date_millis,
 };
-use pi_ai::types::{Message, UserContent};
 use crate::types::AgentMessage;
+use pi_ai::types::{Message, UserContent};
 
 fn bash_execution_wire() -> serde_json::Value {
     json!({
@@ -77,11 +75,11 @@ fn bash_execution_text_renders_the_suffixes() {
 /// the summary prefixes ride `convert_to_llm`.
 #[test]
 fn the_message_constructors_and_conversion_keep_the_wire() {
-    let branch = create_branch_summary_message("summary", Some("from".to_owned()), Timestamp::Millis(1));
+    let branch =
+        create_branch_summary_message("summary", Some("from".to_owned()), Timestamp::Millis(1));
     assert_eq!(branch.summary, "summary");
     assert_eq!(branch.from_id.as_deref(), Some("from"));
-    let compaction =
-        create_compaction_summary_message("summary", 100, Timestamp::Millis(2));
+    let compaction = create_compaction_summary_message("summary", 100, Timestamp::Millis(2));
     assert_eq!(compaction.tokens_before, 100);
     let custom = create_custom_message(
         "note",

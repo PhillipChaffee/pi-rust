@@ -17,22 +17,28 @@ use pi_ai::types::BoxedFuture;
 use pi_telemetry::schema::IntoSpanAttributes;
 use serde_json::Value as JsonValue;
 
-use crate::harness::agent_harness::{
-    HookEvent, HookHandler, HookInvocation, HookName, HookResult,
-};
-use crate::harness::context::{with_abort_signal, Context};
+use crate::harness::agent_harness::{HookEvent, HookHandler, HookInvocation, HookName, HookResult};
+use crate::harness::context::{Context, with_abort_signal};
 use crate::harness::gate::Gate;
 use crate::harness::result::HarnessError;
 use crate::harness::types::AgentHarnessStreamOptions;
 use crate::types::AgentMessage;
 
+/// The registration token source: process-unique, upstream's `Set`-keyed
+/// identity.
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
 /// The error reporter the registry forwards handler failures to, upstream's
 /// `HookErrorReporter`.
 pub type HookErrorReporter = Arc<
-    dyn for<'a> Fn(Box<dyn std::error::Error + Send + Sync>, HookName, &'a str, &'a Context)
-        -> BoxedFuture<'a, ()>
-    + Send
-    + Sync,
+    dyn for<'a> Fn(
+            Box<dyn std::error::Error + Send + Sync>,
+            HookName,
+            &'a str,
+            &'a Context,
+        ) -> BoxedFuture<'a, ()>
+        + Send
+        + Sync,
 >;
 
 #[derive(Clone)]
@@ -78,19 +84,23 @@ impl HookRegistry {
         handler: HookHandler,
         options: crate::harness::agent_harness::HookOptions,
     ) -> Result<crate::harness::agent_harness::Subscription, String> {
-        if let Some(closed_error) = self.closed_error.lock().expect("hook closed lock").clone() {
+        let closed_error = self
+            .closed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(closed_error) = closed_error {
             return Err(closed_error);
         }
-        static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
         let registration = HookRegistration {
-            id: options.id.clone(),
+            id: options.id,
             handler,
             token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         };
         let token = registration.token;
         self.registrations
             .lock()
-            .expect("hook registrations lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(name)
             .or_default()
             .push(registration);
@@ -99,7 +109,7 @@ impl HookRegistry {
             move || {
                 if let Some(list) = registrations
                     .lock()
-                    .expect("hook registrations lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get_mut(&name)
                 {
                     list.retain(|registration| registration.token != token);
@@ -113,7 +123,7 @@ impl HookRegistry {
     pub fn has(&self, name: HookName) -> bool {
         self.registrations
             .lock()
-            .expect("hook registrations lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&name)
             .is_some_and(|list| !list.is_empty())
     }
@@ -121,7 +131,10 @@ impl HookRegistry {
     /// Closes the registry with its error; the first error wins, upstream's
     /// `close`.
     pub fn close(&self, error: String) {
-        let mut closed = self.closed_error.lock().expect("hook closed lock");
+        let mut closed = self
+            .closed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if closed.is_none() {
             *closed = Some(error);
         }
@@ -140,8 +153,7 @@ impl HookRegistry {
         gate: &Gate,
         context: &Context,
     ) -> Result<HookResult, HookRunError> {
-        let admitted_context =
-            gate.admit(|| with_abort_signal(gate.signal().clone(), context))?;
+        let admitted_context = gate.admit(|| with_abort_signal(gate.signal().clone(), context))?;
         if let Some(signal) = admitted_context.abort_signal()
             && let Some(reason) = signal.reason()
         {
@@ -162,15 +174,16 @@ impl HookRegistry {
         gate: &Gate,
         context: &Context,
     ) -> Result<HookResult, HookRunError> {
-        let admitted_context =
-            gate.admit(|| with_abort_signal(gate.signal().clone(), context))?;
+        let admitted_context = gate.admit(|| with_abort_signal(gate.signal().clone(), context))?;
         if let Some(signal) = admitted_context.abort_signal()
             && let Some(reason) = signal.reason()
         {
             return Err(HookRunError::Aborted(reason));
         }
         match name {
-            HookName::BeforeTool | HookName::AfterTool => self.run_admitted(name, event, &admitted_context).await,
+            HookName::BeforeTool | HookName::AfterTool => {
+                self.run_admitted(name, event, &admitted_context).await
+            }
             _ => Err(HookRunError::Closed(HarnessError::Closed {
                 message: format!("{} is not a tool hook", name.as_str()),
             })),
@@ -183,7 +196,12 @@ impl HookRegistry {
         event: HookInvocation,
         context: &Context,
     ) -> Result<HookResult, HookRunError> {
-        if let Some(closed_error) = self.closed_error.lock().expect("hook closed lock").clone() {
+        let closed_error = self
+            .closed_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(closed_error) = closed_error {
             return Err(HookRunError::Closed(HarnessError::Closed {
                 message: closed_error,
             }));
@@ -208,9 +226,9 @@ impl HookRegistry {
             HookName::BeforePayload => Ok(HookResult::BeforePayload(Some(
                 self.before_payload(&event, context).await,
             ))),
-            HookName::AfterResponse => Ok(HookResult::AfterResponse(Some(
+            HookName::AfterResponse => Ok(HookResult::AfterResponse(Some(Box::new(
                 self.after_response(&event, context).await,
-            ))),
+            )))),
             HookName::BeforeTool => Ok(HookResult::BeforeTool(
                 self.before_tool(&event, context).await,
             )),
@@ -260,9 +278,8 @@ impl HookRegistry {
                 }
             }
         }
-        (!injected.is_empty()).then_some(crate::harness::agent_harness::BeforeRunResult {
-            messages: injected,
-        })
+        (!injected.is_empty())
+            .then_some(crate::harness::agent_harness::BeforeRunResult { messages: injected })
     }
 
     async fn before_run_end(
@@ -270,7 +287,11 @@ impl HookRegistry {
         event: &HookInvocation,
         context: &Context,
     ) -> Option<crate::harness::agent_harness::FollowUpResult> {
-        let HookEvent::BeforeRunEnd { run_id: _, messages: _ } = &event.event else {
+        let HookEvent::BeforeRunEnd {
+            run_id: _,
+            messages: _,
+        } = &event.event
+        else {
             return None;
         };
         let mut follow_up: Option<String> = None;
@@ -286,8 +307,7 @@ impl HookRegistry {
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    (self.report_error)(error, HookName::BeforeRunEnd, &event.lane, context)
-                        .await;
+                    (self.report_error)(error, HookName::BeforeRunEnd, &event.lane, context).await;
                 }
             }
         }
@@ -334,8 +354,13 @@ impl HookRegistry {
                 Ok(_) => {}
                 Err(error) => {
                     let reason = error.to_string();
-                    (self.report_error)(Box::new(error), HookName::BeforeTool, &event.lane, context)
-                        .await;
+                    (self.report_error)(
+                        Box::new(error),
+                        HookName::BeforeTool,
+                        &event.lane,
+                        context,
+                    )
+                    .await;
                     block = Some(crate::harness::agent_harness::ToolBlock {
                         reason,
                         terminate: None,
@@ -447,7 +472,11 @@ impl HookRegistry {
         event: &HookInvocation,
         context: &Context,
     ) -> crate::harness::agent_harness::PayloadResult {
-        let HookEvent::BeforePayload { model, payload: original_payload } = &event.event else {
+        let HookEvent::BeforePayload {
+            model,
+            payload: original_payload,
+        } = &event.event
+        else {
             return crate::harness::agent_harness::PayloadResult {
                 payload: JsonValue::Null,
             };
@@ -536,7 +565,7 @@ impl HookRegistry {
         let mut current_content = original_content.clone();
         let mut current_details = original_details.clone();
         let mut current_is_error = *original_is_error;
-        let mut current_usage = original_usage.clone();
+        let mut current_usage = *original_usage;
         let mut aggregate = crate::harness::agent_harness::AfterToolResult::default();
         for registration in self.registrations_for(HookName::AfterTool) {
             let current = HookInvocation {
@@ -549,7 +578,7 @@ impl HookRegistry {
                     content: current_content.clone(),
                     details: current_details.clone(),
                     is_error: current_is_error,
-                    usage: current_usage.clone(),
+                    usage: current_usage,
                 },
             };
             match invoke_tool_registration(HookName::AfterTool, &registration, &current, context)
@@ -569,7 +598,7 @@ impl HookRegistry {
                         current_is_error = is_error;
                     }
                     if let Some(usage) = result.usage {
-                        aggregate.usage = Some(usage.clone());
+                        aggregate.usage = Some(usage);
                         current_usage = Some(usage);
                     }
                     if let Some(terminate) = result.terminate {
@@ -604,7 +633,9 @@ impl HookRegistry {
         };
         for registration in self.registrations_for(name) {
             match (registration.handler)(event, context).await {
-                Ok(HookResult::BeforeCompaction(Some(result))) if field == StructuralField::Compaction => {
+                Ok(HookResult::BeforeCompaction(Some(result)))
+                    if field == StructuralField::Compaction =>
+                {
                     if result.decline == Some(true) && result.compaction.is_some() {
                         (self.report_error)(
                             Box::new(std::io::Error::other(format!(
@@ -653,13 +684,19 @@ impl HookRegistry {
         None
     }
 
-    async fn before_drive(&self, event: &HookInvocation, context: &Context) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn before_drive(
+        &self,
+        event: &HookInvocation,
+        context: &Context,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for registration in self.registrations_for(HookName::BeforeDrive) {
             match (registration.handler)(event, context).await {
                 Ok(_) => {}
                 Err(error) => {
                     (self.report_error)(error, HookName::BeforeDrive, &event.lane, context).await;
-                    return Err(Box::new(std::io::Error::other("before_drive handler failed")));
+                    return Err(Box::new(std::io::Error::other(
+                        "before_drive handler failed",
+                    )));
                 }
             }
         }
@@ -669,7 +706,7 @@ impl HookRegistry {
     fn registrations_for(&self, name: HookName) -> Vec<HookRegistration> {
         self.registrations
             .lock()
-            .expect("hook registrations lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&name)
             .cloned()
             .unwrap_or_default()
@@ -705,9 +742,9 @@ impl From<crate::harness::gate::GateRejection> for HookRunError {
             crate::harness::gate::GateRejection::AbortRequested(_) => {
                 Self::Aborted(pi_chord::context::AbortReason::Aborted)
             }
-            crate::harness::gate::GateRejection::Closed(error) => Self::Closed(HarnessError::Closed {
-                message: error.0,
-            }),
+            crate::harness::gate::GateRejection::Closed(error) => {
+                Self::Closed(HarnessError::Closed { message: error.0 })
+            }
         }
     }
 }
@@ -738,7 +775,9 @@ impl StructuralField {
 }
 
 /// Narrows a first-match result to `before_compaction`'s payload.
-fn first_structural_compaction(result: HookResult) -> Option<crate::harness::agent_harness::CompactionHookResult> {
+fn first_structural_compaction(
+    result: HookResult,
+) -> Option<crate::harness::agent_harness::CompactionHookResult> {
     match result {
         HookResult::BeforeCompaction(result) => result,
         _ => None,
@@ -746,7 +785,9 @@ fn first_structural_compaction(result: HookResult) -> Option<crate::harness::age
 }
 
 /// Narrows a first-match result to `before_navigation`'s payload.
-fn first_structural_navigation(result: HookResult) -> Option<crate::harness::agent_harness::NavigationHookResult> {
+fn first_structural_navigation(
+    result: HookResult,
+) -> Option<crate::harness::agent_harness::NavigationHookResult> {
     match result {
         HookResult::BeforeNavigation(result) => result,
         _ => None,
@@ -803,7 +844,7 @@ async fn invoke_tool_registration(
     .await
 }
 
-fn hook_name_span(
+const fn hook_name_span(
     name: HookName,
 ) -> crate::harness::telemetry::harness_schema::hook::HookNameSpan {
     use crate::harness::telemetry::harness_schema::hook::HookNameSpan as Span;
@@ -830,7 +871,7 @@ pub fn apply_stream_options_patch(
     patch: &crate::harness::types::AgentHarnessStreamOptionsPatch,
 ) -> AgentHarnessStreamOptions {
     let mut next = base.clone();
-    apply_scalar(&mut next.transport, patch.transport.clone());
+    apply_scalar(&mut next.transport, patch.transport);
     apply_scalar(&mut next.timeout_ms, patch.timeout_ms);
     apply_scalar(&mut next.max_retries, patch.max_retries);
     apply_scalar(&mut next.max_retry_delay_ms, patch.max_retry_delay_ms);
@@ -877,6 +918,13 @@ pub fn apply_stream_options_patch(
     next
 }
 
+/// Applies one scalar patch leg, upstream's `value?: T | null`: the
+/// outer `Option` separates an absent patch key (keep) from a present
+/// key whose `null` clears the value.
+#[expect(
+    clippy::option_option,
+    reason = "the patch wire distinguishes absent, null, and set; the tri-state is the wire shape"
+)]
 fn apply_scalar<T>(target: &mut Option<T>, patch: Option<Option<T>>) {
     match patch {
         Some(None) => *target = None,
@@ -894,7 +942,7 @@ pub fn create_stream_options_patch(
 ) -> crate::harness::types::AgentHarnessStreamOptionsPatch {
     let mut patch = crate::harness::types::AgentHarnessStreamOptionsPatch::default();
     if base.transport != value.transport {
-        patch.transport = Some(value.transport.clone());
+        patch.transport = Some(value.transport);
     }
     if base.timeout_ms != value.timeout_ms {
         patch.timeout_ms = Some(value.timeout_ms);
@@ -912,16 +960,10 @@ pub fn create_stream_options_patch(
         patch.deferred = Some(value.deferred.clone());
     }
     if base.headers != value.headers {
-        patch.headers = Some(map_patch(
-            base.headers.as_ref(),
-            value.headers.as_ref(),
-        ));
+        patch.headers = Some(map_patch(base.headers.as_ref(), value.headers.as_ref()));
     }
     if base.metadata != value.metadata {
-        patch.metadata = Some(map_patch(
-            base.metadata.as_ref(),
-            value.metadata.as_ref(),
-        ));
+        patch.metadata = Some(map_patch(base.metadata.as_ref(), value.metadata.as_ref()));
     }
     patch
 }
@@ -934,9 +976,7 @@ fn map_patch<V: PartialEq + Clone>(
     base: Option<&BTreeMap<String, V>>,
     value: Option<&BTreeMap<String, V>>,
 ) -> Option<BTreeMap<String, Option<V>>> {
-    let Some(value_map) = value else {
-        return None;
-    };
+    let value_map = value?;
     let empty = BTreeMap::new();
     let base_map = base.unwrap_or(&empty);
     let mut patch = BTreeMap::new();

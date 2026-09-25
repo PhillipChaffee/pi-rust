@@ -17,8 +17,8 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pi_ai::types::{AssistantMessage, StopReason, Usage};
 use pi_ai::types::BoxedFuture;
+use pi_ai::types::{AssistantMessage, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -71,7 +71,7 @@ pub enum SettledStopReason {
 impl SettledStopReason {
     /// Narrows a stop reason, dropping `pending`.
     #[must_use]
-    pub fn from_stop_reason(stop_reason: StopReason) -> Option<Self> {
+    pub const fn from_stop_reason(stop_reason: StopReason) -> Option<Self> {
         match stop_reason {
             StopReason::Pending => None,
             StopReason::Stop => Some(Self::Stop),
@@ -179,7 +179,7 @@ pub struct BranchSummaryEntryBody {
 }
 
 /// The custom entry body, upstream's `CustomEntry`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomEntryBody {
     /// The application's custom type discriminator.
@@ -195,7 +195,11 @@ pub struct CustomEntryBody {
 /// flat object with the `"type"` discriminator, exactly upstream's entry
 /// shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Entry {
     /// A transcript message, wire `"type": "message"`.
     #[serde(rename = "message")]
@@ -210,7 +214,7 @@ pub enum Entry {
         timestamp: i64,
         /// The message and termination flag.
         #[serde(flatten)]
-        body: MessageEntry,
+        body: Box<MessageEntry>,
     },
     /// A compaction summary, wire `"type": "compaction"`.
     #[serde(rename = "compaction")]
@@ -330,7 +334,11 @@ impl Entry {
 /// timestamp, upstream's `NewEntry` — the same wire shape as [`Entry`]
 /// minus `seq`/`timestamp`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum NewEntry {
     /// A transcript message, wire `"type": "message"`.
     #[serde(rename = "message")]
@@ -341,7 +349,7 @@ pub enum NewEntry {
         parent_id: Option<String>,
         /// The message and termination flag.
         #[serde(flatten)]
-        body: MessageEntry,
+        body: Box<MessageEntry>,
     },
     /// A compaction summary, wire `"type": "compaction"`.
     #[serde(rename = "compaction")]
@@ -459,13 +467,12 @@ impl NewEntry {
 ///
 /// Returns `None` when the entry contributes nothing to the context.
 #[derive(Clone)]
-pub struct EntryProjector(
-    pub Arc<
-        dyn for<'a> Fn(&Entry, &'a Context) -> BoxedFuture<'a, Option<Vec<AgentMessage>>>
-            + Send
-            + Sync,
-    >,
-);
+pub struct EntryProjector(pub EntryProjectorFn);
+
+/// The projector callback over one entry and the call's context.
+pub type EntryProjectorFn = Arc<
+    dyn for<'a> Fn(&Entry, &'a Context) -> BoxedFuture<'a, Option<Vec<AgentMessage>>> + Send + Sync,
+>;
 
 impl std::fmt::Debug for EntryProjector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -497,7 +504,7 @@ pub struct ModelIdentity {
 }
 
 /// The durable intent one operation serves, upstream's `OperationMeta`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationMeta {
     /// The durable operation id.
@@ -513,8 +520,12 @@ pub struct OperationMeta {
 }
 
 /// The intent union, upstream's `OperationMeta["intent"]`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum OperationIntent {
     /// A run over prompt entries.
     #[serde(rename = "run")]
@@ -547,7 +558,11 @@ pub enum OperationIntent {
 
 /// The cancellation control state of an operation, upstream's `Control`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "status",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum Control {
     /// The operation runs.
     #[serde(rename = "running")]
@@ -561,7 +576,7 @@ pub enum Control {
 }
 
 /// A durable operation error, upstream's `OperationError`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationError {
     /// The stable error code.
@@ -589,7 +604,7 @@ pub enum TerminalStatus {
 
 /// The immutable lane-lived observation record one terminal transaction
 /// writes, upstream's `OperationResultRecord`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationResultRecord {
     /// The durable operation id.
@@ -645,7 +660,7 @@ pub enum Continuation {
 }
 
 /// The checkpoint payload, upstream's `CheckpointData`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointData {
     /// The recorded continuation.
@@ -697,13 +712,17 @@ pub struct LaneState {
 /// A pending entry the session writes before its first commit, upstream's
 /// `PendingEntry`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum PendingEntry {
     /// A transcript message, wire `"type": "message"`.
     #[serde(rename = "message")]
     Message {
         /// The message payload.
-        payload: AgentMessage,
+        payload: Box<AgentMessage>,
     },
     /// An application-defined entry, wire `"type": "custom"`.
     #[serde(rename = "custom")]
@@ -731,7 +750,7 @@ pub struct NormalizedRetryPolicy {
 
 /// The generation inputs one assistant step carries, upstream's
 /// `GenerationContext`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerationContext {
     /// The durable step id.
@@ -749,7 +768,7 @@ pub struct GenerationContext {
 }
 
 /// One planned or executed tool call in a batch, upstream's `ToolCall`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
     /// Zero-based index in the assistant message's complete content array,
@@ -763,7 +782,7 @@ pub struct ToolCall {
 }
 
 /// The tool-call phase, upstream's `ToolCall["status"]` union.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ToolCallStatus {
     /// Planned but not yet admitted.
@@ -790,7 +809,7 @@ pub enum ToolCallStatus {
 }
 
 /// One durable tool batch, upstream's `ToolBatch`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolBatch {
     /// The assistant entry the batch runs from.
@@ -804,7 +823,7 @@ pub struct ToolBatch {
 }
 
 /// The inputs one summary generation carries, upstream's `SummaryContext`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryContext {
     /// The reserved summary entry id.
@@ -818,7 +837,7 @@ pub struct SummaryContext {
 }
 
 /// The lane settings one operation snapshots, upstream's `RunSettings`.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSettings {
     /// The compaction settings snapshot.
@@ -833,7 +852,7 @@ pub struct RunSettings {
 
 /// The uniform scope every operation leaf carries, upstream's
 /// `OperationScope`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationScope {
     /// The cancellation control.
@@ -846,7 +865,7 @@ pub struct OperationScope {
 
 /// The shared backoff data every retry-wait leaf carries, upstream's
 /// `RetryWait`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RetryWait {
     /// The next attempt number.
@@ -858,8 +877,12 @@ pub struct RetryWait {
 }
 
 /// The boundary a summary task settles into, upstream's `ResultBoundary`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum ResultBoundary {
     /// Resume from the recorded checkpoint.
     #[serde(rename = "resume_checkpoint")]
@@ -882,7 +905,7 @@ pub enum ResultBoundary {
 }
 
 /// A structural summary task, upstream's `SummaryTask`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryTask {
     /// The durable task id.
@@ -916,7 +939,11 @@ pub type DurableFileOperations = crate::harness::compaction::types::FileOperatio
 /// The durable structural preparation one summary task persists, upstream's
 /// `DurableStructuralPreparation`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum DurableStructuralPreparation {
     /// A compaction preparation, wire `"kind": "compaction"`.
     #[serde(rename = "compaction")]
@@ -953,7 +980,7 @@ pub enum DurableStructuralPreparation {
 }
 
 /// The summary generation context, upstream's `SummaryGenerationScope`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryGenerationScope {
     /// The summary task.
@@ -963,7 +990,7 @@ pub struct SummaryGenerationScope {
 }
 
 /// The deferred-step scope, upstream's `DeferredScope`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeferredScope {
     /// The cancellation control and settings snapshot.
@@ -982,7 +1009,7 @@ pub struct DeferredScope {
 }
 
 /// The starting leaf, upstream's `StartingOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartingOperation {
     /// The uniform scope.
@@ -990,7 +1017,7 @@ pub struct StartingOperation {
 }
 
 /// The checkpoint leaf, upstream's `CheckpointOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckpointOperation {
     /// The uniform scope.
@@ -1001,7 +1028,7 @@ pub struct CheckpointOperation {
 }
 
 /// The assistant-ready leaf, upstream's `AssistantReadyOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantReadyOperation {
     /// The uniform scope.
@@ -1014,7 +1041,7 @@ pub struct AssistantReadyOperation {
 
 /// The assistant-effect-pending leaf, upstream's
 /// `AssistantEffectPendingOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantEffectPendingOperation {
     /// The uniform scope.
@@ -1034,7 +1061,7 @@ pub struct AssistantEffectPendingOperation {
 }
 
 /// The assistant-retry-wait leaf, upstream's `AssistantRetryWaitOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantRetryWaitOperation {
     /// The uniform scope.
@@ -1047,7 +1074,7 @@ pub struct AssistantRetryWaitOperation {
 }
 
 /// The tools leaf, upstream's `ToolsOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolsOperation {
     /// The uniform scope.
@@ -1057,7 +1084,7 @@ pub struct ToolsOperation {
 }
 
 /// The deferred-suspended leaf, upstream's `DeferredSuspendedOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeferredSuspendedOperation {
     /// The deferred-step scope.
@@ -1067,7 +1094,7 @@ pub struct DeferredSuspendedOperation {
 
 /// The deferred-effect-pending leaf, upstream's
 /// `DeferredEffectPendingOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeferredEffectPendingOperation {
     /// The deferred-step scope.
@@ -1080,7 +1107,7 @@ pub struct DeferredEffectPendingOperation {
 }
 
 /// The summary-deciding leaf, upstream's `SummaryDecidingOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryDecidingOperation {
     /// The uniform scope.
@@ -1090,7 +1117,7 @@ pub struct SummaryDecidingOperation {
 }
 
 /// The summary-ready leaf, upstream's `SummaryReadyOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryReadyOperation {
     /// The uniform scope.
@@ -1104,7 +1131,7 @@ pub struct SummaryReadyOperation {
 
 /// The summary-effect-pending leaf, upstream's
 /// `SummaryEffectPendingOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryEffectPendingOperation {
     /// The uniform scope.
@@ -1133,7 +1160,7 @@ pub struct SummaryEffectRequest {
 }
 
 /// The summary-retry-wait leaf, upstream's `SummaryRetryWaitOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryRetryWaitOperation {
     /// The uniform scope.
@@ -1148,7 +1175,7 @@ pub struct SummaryRetryWaitOperation {
 
 /// The navigation-ready-to-commit leaf, upstream's
 /// `NavigationReadyToCommitOperation`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NavigationReadyToCommitOperation {
     /// The uniform scope.
@@ -1161,9 +1188,11 @@ pub struct NavigationReadyToCommitOperation {
 }
 
 /// The flat durable operation state machine, upstream's `OperationState`:
-/// exactly 13 family-neutral dispatcher leaves. Tool batches stay the
-/// nested child collection, and cancellation rides [`OperationScope`].
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// exactly 13 family-neutral dispatcher leaves.
+///
+/// Tool batches stay the nested child collection, and cancellation rides
+/// [`OperationScope`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "at", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum OperationState {
     /// A just-admitted operation.
@@ -1206,7 +1235,6 @@ pub enum OperationState {
     #[serde(rename = "navigation.ready_to_commit")]
     NavigationReadyToCommit(NavigationReadyToCommitOperation),
 }
-
 
 /// Copies only the uniform operation scope when constructing a successor
 /// leaf, upstream's `operationScopeOf`.
@@ -1387,7 +1415,7 @@ pub struct StorageBranchScan {
 
 /// The structural view of one committed entry, upstream's
 /// `EntryStructure`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EntryStructure {
     /// Stable entry id.
@@ -1533,11 +1561,12 @@ pub trait SessionMutation: SessionMutator {
     fn end(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>>;
 }
 
-/// The callback `Session::mutate` runs, upstream's
-/// `SessionMutationCallback<T>` with `T` erased to `Box<dyn Any + Send>`,
-/// per the contract-erasure decision recorded on the harness-foundations
-/// child: callers downcast the boxed result. Upstream's one-shot contract
-/// restates as a shared reference because the returned future borrows the
+/// The callback `Session::mutate` runs, upstream's `SessionMutationCallback`.
+///
+/// Upstream's type parameter `T` erases to `Box<dyn Any + Send>`, per the
+/// contract-erasure decision recorded on the harness-foundations child:
+/// callers downcast the boxed result. Upstream's one-shot contract restates
+/// as a shared reference because the returned future borrows the
 /// capability; the session runtime enforces the single call.
 pub type SessionMutationCallback = Box<
     dyn for<'a> Fn(&'a dyn SessionMutator, &'a Context) -> BoxedFuture<'a, Box<dyn Any + Send>>
@@ -1585,8 +1614,9 @@ pub trait Branch: Send + Sync {
     ) -> BoxedFuture<'_, Result<String, SessionError>>;
 }
 
-/// The read-only session surface, upstream's `SessionReader`. Typed
-/// payloads restate as JSON and erased addresses, per the contract-
+/// The read-only session surface, upstream's `SessionReader`.
+///
+/// Typed payloads restate as JSON and erased addresses, per the contract-
 /// erasure decision recorded on the harness-foundations child; typed
 /// sugar lives in [`crate::harness::session::values`].
 pub trait SessionReader: Send + Sync {
@@ -1598,10 +1628,7 @@ pub trait SessionReader: Send + Sync {
     ) -> BoxedFuture<'_, Result<BTreeMap<String, Entry>, SessionError>>;
 
     /// The session totals, upstream's `getStats`.
-    fn get_stats(
-        &self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<SessionStats, SessionError>>;
+    fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>>;
 
     /// One stored value by erased address, upstream's `getValue<T>`.
     fn get_value(
@@ -1636,8 +1663,10 @@ pub trait SessionReader: Send + Sync {
 
 /// The session contract, upstream's `Session<TMetadata extends
 /// SessionMetadata>`, with the metadata erased to [`SessionMetadata`]
-/// for object safety. Every method carries the chord `Context`
-/// explicitly, the harness context seam the foundations child settled.
+/// for object safety.
+///
+/// Every method carries the chord `Context` explicitly, the harness
+/// context seam the foundations child settled.
 pub trait Session: SessionReader {
     /// The session metadata, upstream's `metadata: TMetadata`.
     fn metadata(&self) -> &SessionMetadata;
@@ -1653,10 +1682,7 @@ pub trait Session: SessionReader {
     ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>>;
 
     /// The session name, upstream's `getName`.
-    fn get_name(
-        &self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<String>, SessionError>>;
+    fn get_name(&self, context: &Context) -> BoxedFuture<'_, Result<Option<String>, SessionError>>;
 
     /// One entry's label, upstream's `getLabel`.
     fn get_label(
@@ -1827,10 +1853,7 @@ pub trait Storage: Send + Sync {
     ) -> BoxedFuture<'_, Result<Vec<UsageRow>, SessionError>>;
 
     /// The session totals, upstream's `getStats`.
-    fn get_stats(
-        &self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<SessionStats, SessionError>>;
+    fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>>;
 
     /// Close the storage, upstream's `close`.
     fn close(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>>;
