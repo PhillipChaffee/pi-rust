@@ -6,7 +6,6 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(clippy::panic, reason = "tests assert by panicking")]
 
 use super::{ForkDestinationSnapshot, ForkSourceSnapshot, create_fork_snapshot};
 use crate::harness::session::types::{CustomEntryBody, Entry, ForkPosition};

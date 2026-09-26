@@ -13,8 +13,8 @@
 )]
 
 mod session_common;
+use session_common::storage_backed_session;
 use session_common::*;
-use session_common::{queued_mutate_probe, storage_backed_session};
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -25,7 +25,7 @@ use pi_agent_core::harness::session::commit::{
 };
 use pi_agent_core::harness::session::in_memory_storage_state::InMemoryStorageState;
 use pi_agent_core::harness::session::memory::{
-    MemorySessionRepo, MemorySessionRepoOptions, MemoryStorage, MemoryStorageOptions,
+    MemorySessionRepoOptions, MemoryStorage, MemoryStorageOptions,
 };
 use pi_agent_core::harness::session::mutation_line::MutationLine;
 use pi_agent_core::harness::session::session::{StorageBackedSession, StorageBackedSessionOptions};
@@ -33,8 +33,8 @@ use pi_agent_core::harness::session::testing::StorageFixture;
 use pi_agent_core::harness::session::testing::create_storage_conformance;
 use pi_agent_core::harness::session::types::{
     BranchScanOrder, CustomEntryBody, Entry, EntryQuery, EntryScanOrder, EntryType, NewEntry,
-    Session, SessionCreateOptions, SessionError, SessionReader, SessionRepo, SessionStats, Storage,
-    StorageBranchScan, UsageWriteRow,
+    Session, SessionCreateOptions, SessionError, SessionRepo, Storage, StorageBranchScan,
+    UsageWriteRow,
 };
 use pi_agent_core::harness::session::values::Write;
 use pi_agent_core::harness::session::values::{self as stored_values};
@@ -598,8 +598,7 @@ async fn the_facade_rejects_a_queued_callback_body_and_deletes_only_closed_sessi
     let queued = queued.await;
     assert!(
         queued
-            .err()
-            .expect("queued callback")
+            .expect_err("queued callback")
             .to_string()
             .contains("Session is closed"),
     );
@@ -615,7 +614,7 @@ async fn the_facade_rejects_a_queued_callback_body_and_deletes_only_closed_sessi
         .delete(reopened.metadata(), &background_context())
         .await;
     assert_eq!(
-        rejected.err().expect("open session"),
+        rejected.expect_err("open session"),
         SessionError::Message("Session is open: session".to_owned()),
     );
     reopened.close(&background_context()).await.expect("close");
@@ -645,8 +644,7 @@ async fn unknown_branch_tips_report_the_invariant() {
     let error = session
         .get_branch_tip("other", &background_context())
         .await
-        .err()
-        .expect("unknown branch");
+        .expect_err("unknown branch");
     assert_eq!(
         error,
         SessionError::Invariant("Unknown branch: other".to_owned()),
@@ -740,8 +738,7 @@ async fn the_mutation_scans_error_outside_the_callback() {
     let stats = mutation.get_stats(&background_context()).await;
     assert!(
         stats
-            .err()
-            .expect("invalidated mutator")
+            .expect_err("invalidated mutator")
             .to_string()
             .contains("outside its mutation callback"),
     );
@@ -753,8 +750,7 @@ async fn the_mutation_scans_error_outside_the_callback() {
         .await;
     assert!(
         values
-            .err()
-            .expect("invalidated mutator")
+            .expect_err("invalidated mutator")
             .to_string()
             .contains("outside its mutation callback"),
     );
@@ -766,8 +762,7 @@ async fn the_mutation_scans_error_outside_the_callback() {
         )
         .await;
     assert!(
-        list.err()
-            .expect("invalidated mutator")
+        list.expect_err("invalidated mutator")
             .to_string()
             .contains("outside its mutation callback"),
     );
@@ -781,8 +776,7 @@ async fn the_mutation_scans_error_outside_the_callback() {
         )
         .await;
     assert!(
-        scan.err()
-            .expect("invalidated mutator")
+        scan.expect_err("invalidated mutator")
             .to_string()
             .contains("outside its mutation callback"),
     );
@@ -794,19 +788,19 @@ async fn the_gate_rejects_bad_counts_and_double_discards() {
     let gate = pi_agent_core::harness::session::testing::GatingStorage::new(memory_storage());
     let rejected = gate.wait_pending(0).await;
     assert_eq!(
-        rejected.err().expect("zero count"),
+        rejected.expect_err("zero count"),
         SessionError::Message("Pending commit count must be a positive safe integer".to_owned()),
     );
     let rejected = gate.next(0).await;
     assert_eq!(
-        rejected.err().expect("zero count"),
+        rejected.expect_err("zero count"),
         SessionError::Message("Released commit count must be a positive safe integer".to_owned()),
     );
     gate.discard();
     gate.discard();
     let rejected = gate.wait_pending(1).await;
     assert!(
-        matches!(rejected.err().expect("discarded"), SessionError::CommitDiscarded(message) if message == "storage discarded"),
+        matches!(rejected.expect_err("discarded"), SessionError::CommitDiscarded(message) if message == "storage discarded"),
     );
     gate.close(&background_context()).await.expect("close");
 }
@@ -827,7 +821,7 @@ async fn the_gate_rejects_a_discarded_parked_commit_through_its_future() {
     tokio::pin!(commit);
     let rejected = std::future::poll_fn(|cx| commit.as_mut().poll(cx)).await;
     assert!(
-        matches!(rejected.err().expect("discarded commit"), SessionError::CommitDiscarded(message) if message.contains("commit rejected")),
+        matches!(rejected.expect_err("discarded commit"), SessionError::CommitDiscarded(message) if message.contains("commit rejected")),
     );
     gate.close(&background_context()).await.expect("close");
 }
@@ -842,7 +836,7 @@ fn the_debug_impls_render_the_session_surface() {
     );
     let session = storage_backed_session(memory_storage());
     assert!(format!("{session:?}").contains("StorageBackedSession"));
-    let options = pi_agent_core::harness::session::session::StorageBackedSessionOptions::default();
+    let options = StorageBackedSessionOptions::default();
     assert!(format!("{options:?}").contains("StorageBackedSessionOptions"));
     let _ = pi_agent_core::harness::session::types::SessionStats::default();
     let _ = EntryQuery::default();
@@ -852,9 +846,9 @@ fn the_debug_impls_render_the_session_surface() {
 #[test]
 fn the_downcast_helper_panics_on_a_broken_fixture() {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        pi_agent_core::harness::session::testing::conformance::downcast_commit_result(Box::new(
-            42_u32,
-        ));
+        let _ = pi_agent_core::harness::session::testing::conformance::downcast_commit_result(
+            Box::new(42_u32),
+        );
     }));
     assert!(result.is_err(), "a non-commit-result payload panics");
 }

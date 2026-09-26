@@ -355,8 +355,7 @@ pub async fn assert_second_attempt_rejected(
     let rejected = mutator.commit(Vec::new(), context).await;
     assert!(
         rejected
-            .err()
-            .expect("second attempt")
+            .expect_err("second attempt")
             .to_string()
             .contains("commit already attempted"),
     );
