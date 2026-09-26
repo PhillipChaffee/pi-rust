@@ -166,3 +166,11 @@ fn truncate_line_appends_the_truncated_suffix() {
     assert_eq!(cut.text, "hello... [truncated]");
     assert!(cut.was_truncated);
 }
+
+/// `into_content` consumes the result down to the retained text, upstream's
+/// content accessor.
+#[test]
+fn into_content_yields_the_retained_text() {
+    let result = truncate_head("kept\ndropped", options(100, 1));
+    assert_eq!(result.into_content(), "kept");
+}

@@ -15,7 +15,7 @@ use crate::harness::messages::{
     create_custom_message, parse_date_millis,
 };
 use crate::types::AgentMessage;
-use pi_ai::types::{Message, UserContent};
+use pi_ai::types::{Message, UserBlock, UserContent, UserMessage};
 
 fn bash_execution_wire() -> serde_json::Value {
     json!({
@@ -150,4 +150,187 @@ fn the_date_parser_covers_the_round_tripped_formats() {
         1_704_067_200_000
     );
     assert_eq!(parse_date_millis("not a date"), i64::MIN);
+}
+
+/// The cancelled bash-execution rendering takes the cancel suffix and
+/// suppresses the exit-code suffix, upstream's cancelled branch.
+#[test]
+fn bash_execution_text_renders_the_cancelled_suffix() {
+    let cancelled = custom_message(json!({
+        "role": "bashExecution",
+        "command": "cargo test",
+        "output": "",
+        "exitCode": 1,
+        "cancelled": true,
+        "truncated": false,
+        "timestamp": 1,
+    }));
+    let AgentMessage::Custom(custom) = &cancelled else {
+        panic!("custom variant");
+    };
+    let parsed: crate::harness::messages::BashExecutionMessage =
+        crate::harness::messages::BashExecutionMessage::try_from(custom)
+            .expect("the bash execution shape");
+    assert_eq!(
+        bash_execution_to_text(&parsed),
+        "Ran `cargo test`\n(no output)\n\n(command cancelled)"
+    );
+}
+
+/// The timestamp constructors accept epoch millis and date strings,
+/// upstream's `string | number` union.
+#[test]
+fn timestamps_accept_millis_and_date_strings() {
+    let from_millis: Timestamp = 5i64.into();
+    assert_eq!(from_millis.millis(), 5);
+    assert_eq!(
+        Timestamp::Date("2024-01-01".to_owned()).millis(),
+        1_704_067_200_000
+    );
+}
+
+/// The date parser rejects malformed months, days, separators, time
+/// pieces, and offsets, restating JavaScript's NaN as `i64::MIN`.
+#[test]
+fn the_date_parser_rejects_malformed_pieces() {
+    assert_eq!(parse_date_millis("2024-13-01"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-00-15"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-00"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-32"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01X"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T:00"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T00Zx"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T00:00:0x"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T00:00:00.5+zz"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T00:00:00X"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T00:00+zz"), i64::MIN);
+    assert_eq!(parse_date_millis("2024-01-01T00:Q"), i64::MIN);
+}
+
+/// The date parser applies numeric UTC offsets with and without minutes
+/// and accepts minuteless and secondless forms.
+#[test]
+fn the_date_parser_applies_utc_offsets() {
+    assert_eq!(
+        parse_date_millis("2024-01-01T00:00:00+05:30"),
+        1_704_067_200_000 - 5 * 3_600_000 - 30 * 60_000
+    );
+    assert_eq!(
+        parse_date_millis("2024-01-01T00:00:00-05:00"),
+        1_704_067_200_000 + 5 * 3_600_000
+    );
+    assert_eq!(
+        parse_date_millis("2024-01-01T00:00:00.5-01:00"),
+        1_704_067_200_500 + 3_600_000
+    );
+    assert_eq!(
+        parse_date_millis("2024-01-01T00:00+01:00"),
+        1_704_063_600_000
+    );
+    assert_eq!(parse_date_millis("2024-01-01T00:00-05"), 1_704_085_200_000);
+    assert_eq!(parse_date_millis("2024-01-01T00Z"), 1_704_067_200_000);
+    assert_eq!(parse_date_millis("2024-01-01T00"), 1_704_067_200_000);
+}
+
+/// The LLM conversion carries bash executions, custom text and block
+/// content, and standard messages; excluded, malformed, and unknown
+/// entries drop, upstream's filter.
+#[test]
+fn convert_to_llm_maps_and_drops_by_role() {
+    let excluded = custom_message(json!({
+        "role": "bashExecution",
+        "command": "cargo test",
+        "output": "x",
+        "cancelled": false,
+        "truncated": false,
+        "excludeFromContext": true,
+        "timestamp": 2,
+    }));
+    let malformed_bash: AgentMessage = serde_json::from_value(json!({
+        "role": "bashExecution",
+        "timestamp": 3,
+    }))
+    .expect("bash wire");
+    let text_custom = custom_message(json!({
+        "role": "custom",
+        "customType": "note",
+        "content": "hello",
+        "display": true,
+        "timestamp": 4,
+    }));
+    let blocks_custom = custom_message(json!({
+        "role": "custom",
+        "customType": "note",
+        "content": [
+            {"type": "text", "text": "a"},
+            {"type": "image", "data": "Zm9v", "mimeType": "image/png"},
+        ],
+        "display": false,
+        "timestamp": 4,
+    }));
+    let malformed_branch: AgentMessage = serde_json::from_value(json!({
+        "role": "branchSummary",
+        "timestamp": 5,
+    }))
+    .expect("branch summary wire");
+    let malformed_compaction: AgentMessage = serde_json::from_value(json!({
+        "role": "compactionSummary",
+        "timestamp": 6,
+    }))
+    .expect("compaction summary wire");
+    let malformed_custom: AgentMessage = serde_json::from_value(json!({
+        "role": "custom",
+        "timestamp": 9,
+    }))
+    .expect("custom wire");
+    let standard = AgentMessage::Standard(Message::User(UserMessage {
+        content: UserContent::Text("hi".to_owned()),
+        timestamp: 7,
+    }));
+    let bash = custom_message(bash_execution_wire());
+    let converted = convert_to_llm(&[
+        bash,
+        excluded,
+        malformed_bash,
+        text_custom,
+        blocks_custom,
+        malformed_branch,
+        malformed_compaction,
+        malformed_custom,
+        standard,
+    ]);
+    assert_eq!(converted.len(), 4);
+    let Message::User(bash_user) = &converted[0] else {
+        panic!("a bash execution converts to a user message");
+    };
+    assert!(matches!(
+        &bash_user.content,
+        UserContent::Text(text) if text.contains("Ran `cargo test`")
+    ));
+    let Message::User(text_user) = &converted[1] else {
+        panic!("a custom message converts to a user message");
+    };
+    assert!(matches!(
+        &text_user.content,
+        UserContent::Text(text) if text == "hello"
+    ));
+    let Message::User(blocks_user) = &converted[2] else {
+        panic!("a block custom message converts to a user message");
+    };
+    let UserContent::Blocks(blocks) = &blocks_user.content else {
+        panic!("block content stays typed");
+    };
+    assert_eq!(blocks.len(), 2);
+    assert!(matches!(
+        &blocks[0],
+        UserBlock::Text(text) if text.text == "a"
+    ));
+    assert!(matches!(&blocks[1], UserBlock::Image(_)));
+    let Message::User(standard_user) = &converted[3] else {
+        panic!("a standard message passes through");
+    };
+    assert!(matches!(
+        &standard_user.content,
+        UserContent::Text(text) if text == "hi"
+    ));
 }

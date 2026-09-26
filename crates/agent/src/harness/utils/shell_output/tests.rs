@@ -78,3 +78,108 @@ async fn read_text_file(env: &NodeExecutionEnv, path: &str) -> String {
         .await
         .expect("read spill")
 }
+
+/// The option bundle's debug view restates the callback presence without
+/// exposing closure internals.
+#[test]
+fn the_capture_options_debug_view_reports_the_callback_presence() {
+    let plain = ShellCaptureOptions::default();
+    assert!(format!("{plain:?}").contains("on_chunk: false"));
+    let with_callback = ShellCaptureOptions {
+        on_chunk: Some(Arc::new(
+            |_chunk: &str, _progress: &dyn Fn() -> ShellCaptureProgress, _context| (),
+        )),
+        ..ShellCaptureOptions::default()
+    };
+    assert!(format!("{with_callback:?}").contains("on_chunk: true"));
+}
+
+/// A run with no output folds the empty view, upstream's empty-view
+/// fallback when nothing was published.
+#[tokio::test]
+async fn an_output_free_run_folds_the_empty_view() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path());
+    let result = execute_shell_with_capture(&env, "true", None, &background_context())
+        .await
+        .expect("capture");
+    assert!(result.output.is_empty());
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!result.truncated);
+    assert!(!result.cancelled);
+    assert_eq!(result.full_output_path, None);
+    assert_eq!(result.last_line_bytes, 0);
+    assert!(result.execution_error.is_none());
+}
+
+/// A spawn failure surfaces inline when `return_execution_errors` carries
+/// it, upstream's inline-error mode.
+#[tokio::test]
+async fn a_failed_run_returns_the_error_inline_when_requested() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path());
+    let result = execute_shell_with_capture(
+        &env,
+        "true",
+        Some(ShellCaptureOptions {
+            cwd: Some("/nonexistent-dir-for-shell-capture-test".to_owned()),
+            return_execution_errors: true,
+            ..ShellCaptureOptions::default()
+        }),
+        &background_context(),
+    )
+    .await
+    .expect("inline error result");
+    let error = result.execution_error.expect("inline execution error");
+    assert_eq!(
+        error.code,
+        crate::harness::types::ExecutionErrorCode::SpawnError
+    );
+    assert_eq!(result.exit_code, None);
+    assert!(!result.cancelled);
+    assert!(result.output.is_empty());
+}
+
+/// A spawn failure surfaces as the failed result without the inline flag,
+/// upstream's default error propagation.
+#[tokio::test]
+async fn a_failed_run_surfaces_the_error_without_the_flag() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path());
+    let error = execute_shell_with_capture(
+        &env,
+        "true",
+        Some(ShellCaptureOptions {
+            cwd: Some("/nonexistent-dir-for-shell-capture-test".to_owned()),
+            ..ShellCaptureOptions::default()
+        }),
+        &background_context(),
+    )
+    .await
+    .expect_err("spawn failure");
+    assert_eq!(
+        error.code,
+        crate::harness::types::ExecutionErrorCode::SpawnError
+    );
+}
+
+/// An aborted run folds a cancelled result instead of the error, upstream's
+/// cancelled fold.
+#[tokio::test]
+async fn an_aborted_run_folds_a_cancelled_result() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path());
+    let (context, controller) = pi_chord::context::with_cancel(&background_context());
+    let aborter = controller.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        aborter.abort("cancelled by the test");
+    });
+    let result = execute_shell_with_capture(&env, "sleep 30", None, &context)
+        .await
+        .expect("cancelled capture");
+    assert!(result.cancelled);
+    assert_eq!(result.exit_code, None);
+    assert!(!result.truncated);
+    assert!(result.execution_error.is_none());
+}

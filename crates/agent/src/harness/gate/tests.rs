@@ -70,3 +70,79 @@ fn begin_abort_ignores_a_closed_gate() {
     let rejection = gate.admit(|| 42).expect_err("the gate stays closed");
     assert!(matches!(rejection, GateRejection::Closed(_)));
 }
+
+/// `signal_abort` fires only once the gate is aborting: an open gate stays
+/// live, the aborting gate's signal carries the fixed reason, and repeat
+/// calls never override the first abort.
+#[test]
+fn signal_abort_ignores_a_gate_that_is_not_aborting() {
+    let (gate, control) = create_gate();
+    control.signal_abort();
+    assert!(!gate.signal().aborted());
+
+    control.begin_abort(settled_cancellation());
+    control.signal_abort();
+    assert!(gate.signal().aborted());
+    assert_eq!(
+        gate.signal().reason(),
+        Some(pi_chord::context::AbortReason::Caller(
+            "Abort requested".to_owned()
+        ))
+    );
+
+    control.signal_abort();
+    assert_eq!(
+        gate.signal().reason(),
+        Some(pi_chord::context::AbortReason::Caller(
+            "Abort requested".to_owned()
+        ))
+    );
+
+    let (closed, closed_control) = create_gate();
+    closed_control.close("gate closed".to_owned());
+    closed_control.signal_abort();
+    assert!(closed.signal().aborted());
+    assert_eq!(
+        closed.signal().reason(),
+        Some(pi_chord::context::AbortReason::Caller("gate closed".to_owned()))
+    );
+}
+
+/// The gate surfaces render their debug shapes and the abort/closed errors
+/// render their fixed messages.
+#[test]
+fn the_gate_surfaces_render_their_shapes() {
+    let (gate, control) = create_gate();
+    assert!(format!("{gate:?}").contains("Gate"));
+    assert!(format!("{control:?}").contains("GateControl"));
+    let requested = crate::harness::gate::AbortRequested {
+        cancellation: settled_cancellation(),
+    };
+    assert!(format!("{requested:?}").contains("AbortRequested"));
+    assert_eq!(requested.to_string(), "Abort requested");
+    let closed = crate::harness::gate::GateClosedError("gate closed".to_owned());
+    assert_eq!(closed.to_string(), "gate closed");
+}
+
+/// A gate that closed while already aborting records the close error but
+/// never re-fires the aborted signal.
+#[test]
+fn a_close_after_abort_records_the_error_without_refiring() {
+    let (gate, control) = create_gate();
+    control.begin_abort(settled_cancellation());
+    control.signal_abort();
+    control.close("closed late".to_owned());
+    assert_eq!(
+        gate.signal().reason(),
+        Some(pi_chord::context::AbortReason::Caller(
+            "Abort requested".to_owned()
+        ))
+    );
+    let rejection = gate
+        .admit(|| 42)
+        .expect_err("a closed gate refuses admission");
+    let GateRejection::Closed(error) = rejection else {
+        panic!("the closed path carries the gate error");
+    };
+    assert_eq!(error.0, "closed late");
+}

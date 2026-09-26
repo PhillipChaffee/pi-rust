@@ -643,7 +643,11 @@ pub enum OperationKind {
 
 /// The continuation a checkpoint recorded, upstream's `Continuation`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub enum Continuation {
     /// The run continues with an assistant request.
     #[serde(rename = "need_assistant")]

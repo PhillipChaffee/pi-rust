@@ -295,3 +295,235 @@ async fn the_spill_path_reaches_the_folded_metadata() {
     assert_eq!(metadata.spill_path.as_deref(), Some("/tmp/output.log"));
     let _ = TruncatedBy::Bytes;
 }
+
+/// The constructor rejects zero limits, upstream's `TypeError` throw.
+#[test]
+fn the_constructor_rejects_zero_limits() {
+    let options = |max_bytes: u64, max_lines: u64| crate::harness::types::ShellOutputCaptureOptions {
+        limits: ShellOutputLimits {
+            max_bytes,
+            max_lines,
+            retain: None,
+        },
+        spill: false,
+    };
+    let zero_bytes = OutputCapture::new(
+        Some(&options(0, 10)),
+        background_context(),
+        OutputCaptureHandlers {
+            on_update: None,
+            on_error: Arc::new(|_| {}),
+        },
+    )
+    .expect_err("zero maxBytes");
+    assert_eq!(
+        zero_bytes,
+        "Output maxBytes must be a positive finite number"
+    );
+    let zero_lines = OutputCapture::new(
+        Some(&options(10, 0)),
+        background_context(),
+        OutputCaptureHandlers {
+            on_update: None,
+            on_error: Arc::new(|_| {}),
+        },
+    )
+    .expect_err("zero maxLines");
+    assert_eq!(zero_lines, "Output maxLines must be a positive integer");
+}
+
+/// The capture and handler handles render debug views without leaking
+/// closure internals.
+#[test]
+fn the_capture_handles_render_debug_views() {
+    let handlers = OutputCaptureHandlers {
+        on_update: None,
+        on_error: Arc::new(|_: String| {}),
+    };
+    assert!(format!("{handlers:?}").contains("on_update: false"));
+    let mut fixture = capture();
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text("a"));
+    assert!(format!("{:?}", fixture.capture).contains("OutputCapture"));
+}
+
+/// An incomplete trailing sequence flushes as the replacement character
+/// when the stream ends, Node's non-fatal decoding.
+#[test]
+fn finishes_an_incomplete_sequence_as_a_replacement() {
+    let mut fixture = capture();
+    let bytes = "😀".as_bytes();
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Bytes(
+            &bytes[..2],
+        ));
+    fixture.capture.finish();
+    assert_eq!(fixture.capture.snapshot().text, "\u{fffd}");
+}
+
+/// A text chunk flushes the decoder's pending raw-byte tail before
+/// appending, upstream's string push.
+#[tokio::test]
+async fn a_text_push_flushes_the_pending_byte_tail() {
+    let mut fixture = capture();
+    let bytes = "a😀".as_bytes();
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Bytes(
+            &bytes[..2],
+        ));
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text("b"));
+    assert_eq!(fixture.capture.snapshot().text, "a\u{fffd}b");
+}
+
+/// Pushes and finishes after `dispose` stay silent.
+#[tokio::test(start_paused = true)]
+async fn pushes_and_finishes_after_dispose_stay_silent() {
+    let mut fixture = capture();
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text("a"));
+    pump().await;
+    let published = fixture.updates.lock().expect("updates lock").len();
+    fixture.capture.dispose();
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text("b"));
+    fixture.capture.finish();
+    tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
+    pump().await;
+    assert_eq!(fixture.updates.lock().expect("updates lock").len(), published);
+    assert_eq!(fixture.capture.snapshot().text, "a");
+}
+
+/// A repeated spill path and a disposed capture republish nothing,
+/// upstream's `setSpillPath` guard.
+#[tokio::test(start_paused = true)]
+async fn a_repeated_or_disposed_spill_path_republishes_nothing() {
+    let mut fixture = capture();
+    fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text("a"));
+    pump().await;
+    fixture.capture.set_spill_path("/tmp/one.log");
+    pump().await;
+    let published = fixture.updates.lock().expect("updates lock").len();
+    fixture.capture.set_spill_path("/tmp/one.log");
+    pump().await;
+    assert_eq!(fixture.updates.lock().expect("updates lock").len(), published);
+    fixture.capture.dispose();
+    fixture.capture.set_spill_path("/tmp/two.log");
+    pump().await;
+    assert_eq!(fixture.updates.lock().expect("updates lock").len(), published);
+}
+
+fn view(text: &str, max_bytes: u64) -> crate::harness::types::ShellOutputView {
+    let bytes = crate::harness::utils::truncate::utf8_byte_length(text);
+    crate::harness::types::ShellOutputView {
+        text: text.to_owned(),
+        metadata: ShellOutputMetadata {
+            truncation: crate::harness::types::ShellOutputTruncation {
+                truncated: false,
+                truncated_by: None,
+                total_lines: 1,
+                total_bytes: bytes,
+                output_lines: 1,
+                output_bytes: bytes,
+                last_line_partial: false,
+                first_line_exceeds_limit: false,
+                max_lines: 100,
+                max_bytes,
+            },
+            spill_path: None,
+            last_line_bytes: None,
+        },
+    }
+}
+
+/// `update_from` derives appends and metadata-only updates from the two
+/// views, upstream's `updateFrom`.
+#[test]
+fn update_from_derives_appends_and_metadata_only_updates() {
+    let previous = view("abc", 50);
+    let grown = view("abcd", 50);
+    assert!(matches!(
+        crate::harness::utils::output_capture::update_from(Some(&previous), &grown),
+        Some(ShellOutputUpdate::Append { ref text, .. }) if text == "d"
+    ));
+    let same = view("abc", 60);
+    assert!(matches!(
+        crate::harness::utils::output_capture::update_from(Some(&previous), &same),
+        Some(ShellOutputUpdate::Metadata { .. })
+    ));
+    assert!(matches!(
+        crate::harness::utils::output_capture::update_from(None, &grown),
+        Some(ShellOutputUpdate::Replace { .. })
+    ));
+}
+
+/// A probe match that fails the byte-overlap check falls back to the
+/// whole-view replacement, and the candidate scan caps at nine probes;
+/// a zero scan or an empty side short-circuits, upstream's
+/// `suffixPrefixOverlap` guards.
+#[test]
+fn update_from_replaces_when_the_slide_overlap_fails() {
+    // "ab" matches the "aQ" tail's first byte but the tails diverge.
+    let diverged = crate::harness::utils::output_capture::update_from(
+        Some(&view("baQ", 50)),
+        &view("ab", 50),
+    );
+    assert!(matches!(diverged, Some(ShellOutputUpdate::Replace { .. })));
+    // Repeated probe hits exhaust the candidate cap without an overlap.
+    let capped = crate::harness::utils::output_capture::update_from(
+        Some(&view(&"a".repeat(12), 50)),
+        &view(&format!("a{}", "b".repeat(11)), 50),
+    );
+    assert!(matches!(capped, Some(ShellOutputUpdate::Replace { .. })));
+    // A zero byte budget zeroes the scan window.
+    let zeroed = crate::harness::utils::output_capture::update_from(
+        Some(&view("abc", 0)),
+        &view("xbcd", 0),
+    );
+    assert!(matches!(zeroed, Some(ShellOutputUpdate::Replace { .. })));
+}
+
+/// A scan window capped below the previous view still finds the slide
+/// overlap from the trimmed tail.
+#[test]
+fn a_capped_scan_window_still_finds_the_slide() {
+    let previous = view("zzzzabcd", 2);
+    let current = view("abcde", 2);
+    assert!(matches!(
+        crate::harness::utils::output_capture::update_from(Some(&previous), &current),
+        Some(ShellOutputUpdate::Slide { drop: 4, ref text, .. }) if text == "e"
+    ));
+}
+
+/// The raw buffer guard trims on UTF-8 boundaries for both retentions.
+#[test]
+fn the_raw_buffer_guard_trims_on_utf8_boundaries() {
+    let mut tail_fixture = capture_with(10, 100, ShellOutputRetention::Tail);
+    tail_fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            &"中".repeat(14),
+        ));
+    assert_eq!(tail_fixture.capture.snapshot().text, "中".repeat(3));
+
+    let mut head_fixture = capture_with(10, 100, ShellOutputRetention::Head);
+    head_fixture
+        .capture
+        .push(crate::harness::utils::output_capture::Chunk::Text(
+            &"中".repeat(14),
+        ));
+    let snapshot = head_fixture.capture.snapshot();
+    assert_eq!(
+        snapshot.metadata.truncation.total_bytes,
+        crate::harness::utils::truncate::utf8_byte_length(&"中".repeat(14))
+    );
+    assert!(snapshot.metadata.truncation.first_line_exceeds_limit);
+}

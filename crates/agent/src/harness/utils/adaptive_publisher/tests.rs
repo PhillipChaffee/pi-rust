@@ -133,3 +133,134 @@ async fn commits_its_baseline_before_a_consumer_failure() {
         Some("abc".to_owned())
     );
 }
+
+/// The option bundle and the publisher handle render debug views without
+/// leaking closure internals.
+#[test]
+fn the_publisher_handles_render_debug_views() {
+    let (sink_records, publish) = sink::<String>();
+    let options = AdaptivePublisherOptions {
+        snapshot: Arc::new(|| "a".to_owned()),
+        update: Arc::new(|_previous: Option<&String>, current: &String| Some(current.clone())),
+        measure: Arc::new(|update: &String| u64::try_from(update.len()).unwrap_or(u64::MAX)),
+        publish,
+        on_error: Arc::new(|_: String| {}),
+        min_interval_ms: Some(100),
+        target_bytes_per_second: Some(100),
+    };
+    assert!(format!("{options:?}").contains("AdaptivePublisherOptions"));
+    let publisher = AdaptivePublisher::new(options);
+    assert!(format!("{publisher:?}").contains("AdaptivePublisher"));
+    drop(sink_records);
+}
+
+/// A disposed publisher ignores dirty marks and forced flushes.
+#[tokio::test(start_paused = true)]
+async fn a_disposed_publisher_ignores_dirty_marks() {
+    let value: Arc<Mutex<String>> = Arc::new(Mutex::new("a".to_owned()));
+    let (updates, publish) = sink::<String>();
+    let publisher = AdaptivePublisher::new(AdaptivePublisherOptions {
+        snapshot: {
+            let value = Arc::clone(&value);
+            Arc::new(move || value.lock().expect("value lock").clone())
+        },
+        update: Arc::new(|_previous, current| Some(current.clone())),
+        measure: Arc::new(|update: &String| u64::try_from(update.len()).unwrap_or(u64::MAX)),
+        publish,
+        on_error: Arc::new(|error| panic!("the publisher errored: {error}")),
+        min_interval_ms: Some(100),
+        target_bytes_per_second: Some(100),
+    });
+    publisher.dispose();
+    *value.lock().expect("value lock") = "b".to_owned();
+    publisher.mark_dirty();
+    publisher.flush(true);
+    pump().await;
+    assert!(updates.lock().expect("updates lock").is_empty());
+}
+
+/// A rate-limited non-forceful flush re-arms the trailing timer instead of
+/// publishing, upstream's re-arm branch.
+#[tokio::test(start_paused = true)]
+async fn a_rate_limited_flush_re_arms_the_trailing_timer() {
+    let value: Arc<Mutex<String>> = Arc::new(Mutex::new("a".to_owned()));
+    let (updates, publish) = sink::<String>();
+    let publisher = AdaptivePublisher::new(AdaptivePublisherOptions {
+        snapshot: {
+            let value = Arc::clone(&value);
+            Arc::new(move || value.lock().expect("value lock").clone())
+        },
+        update: Arc::new(|_previous, current| Some(current.clone())),
+        measure: Arc::new(|update: &String| u64::try_from(update.len()).unwrap_or(u64::MAX)),
+        publish,
+        on_error: Arc::new(|error| panic!("the publisher errored: {error}")),
+        min_interval_ms: Some(100),
+        target_bytes_per_second: Some(100),
+    });
+
+    publisher.mark_dirty();
+    pump().await;
+    *value.lock().expect("value lock") = "b".to_owned();
+    publisher.mark_dirty();
+    pump().await;
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    pump().await;
+    *value.lock().expect("value lock") = "c".to_owned();
+    publisher.mark_dirty();
+    pump().await;
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    pump().await;
+    publisher.flush(false);
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    pump().await;
+    assert_eq!(
+        updates.lock().expect("updates lock").clone(),
+        vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+    );
+}
+
+/// A flush whose update is `None` re-baselines without delivering, and the
+/// next dirty mark publishes without waiting on a pushed-forward interval,
+/// upstream's no-change branch.
+#[tokio::test(start_paused = true)]
+async fn an_unchanged_state_rebaselines_without_publishing() {
+    let value: Arc<Mutex<String>> = Arc::new(Mutex::new("a".to_owned()));
+    let (updates, publish) = sink::<String>();
+    let publisher = AdaptivePublisher::new(AdaptivePublisherOptions {
+        snapshot: {
+            let value = Arc::clone(&value);
+            Arc::new(move || value.lock().expect("value lock").clone())
+        },
+        update: Arc::new(|previous: Option<&String>, current: &String| {
+            (previous != Some(current)).then(|| current.clone())
+        }),
+        measure: Arc::new(|update: &String| u64::try_from(update.len()).unwrap_or(u64::MAX)),
+        publish,
+        on_error: Arc::new(|error| panic!("the publisher errored: {error}")),
+        min_interval_ms: Some(100),
+        target_bytes_per_second: Some(100),
+    });
+
+    publisher.mark_dirty();
+    pump().await;
+    assert_eq!(
+        updates.lock().expect("updates lock").clone(),
+        vec!["a".to_owned()]
+    );
+    publisher.mark_dirty();
+    pump().await;
+    tokio::time::advance(std::time::Duration::from_millis(100)).await;
+    pump().await;
+    assert_eq!(
+        updates.lock().expect("updates lock").clone(),
+        vec!["a".to_owned()]
+    );
+
+    *value.lock().expect("value lock") = "b".to_owned();
+    publisher.mark_dirty();
+    pump().await;
+    assert_eq!(
+        updates.lock().expect("updates lock").clone(),
+        vec!["a".to_owned(), "b".to_owned()]
+    );
+}
