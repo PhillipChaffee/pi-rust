@@ -19,12 +19,12 @@ use pi_chord::context::{Context, background_context, with_cancel};
 
 use crate::harness::env::nodejs::{NodeExecutionEnv, SPILL_FILE_PREFIX};
 use crate::harness::types::{
-    ExecutionErrorCode, ShellOutputCaptureOptions, ShellOutputLimits, TextLineReader,
-};
-use crate::harness::types::{
     CreateDirOptions, ExecutionEnv, FileContent, FileErrorCode, FileKind, FileSystem,
     ReadTextLinesOptions, RemoveOptions, Shell, ShellExecOptions, ShellExecResult,
     ShellOutputUpdate, ShellOutputView, TempFileOptions,
+};
+use crate::harness::types::{
+    ExecutionErrorCode, ShellOutputCaptureOptions, ShellOutputLimits, TextLineReader,
 };
 use crate::harness::utils::output_capture::apply_shell_output_update;
 use crate::harness::utils::shell_output::execute_shell_with_capture;
@@ -762,10 +762,7 @@ async fn reports_a_missing_working_directory_before_spawning() {
     let error = Shell::exec(&env, "printf ok", None, &context())
         .await
         .expect_err("missing cwd errors");
-    assert_eq!(
-        error.code,
-        ExecutionErrorCode::SpawnError
-    );
+    assert_eq!(error.code, ExecutionErrorCode::SpawnError);
     assert!(error.message.contains("Working directory does not exist"));
 }
 
@@ -809,10 +806,7 @@ async fn commands_exceeding_the_timeout_report_timeout_errors() {
     )
     .await
     .expect_err("timeout errors");
-    assert_eq!(
-        error.code,
-        ExecutionErrorCode::Timeout
-    );
+    assert_eq!(error.code, ExecutionErrorCode::Timeout);
 }
 
 /// A configured shell path that does not exist reports
@@ -826,10 +820,7 @@ async fn shell_unavailable_and_spawn_errors() {
     let error = Shell::exec(&missing_shell_env, "printf ok", None, &context())
         .await
         .expect_err("missing shell errors");
-    assert_eq!(
-        error.code,
-        ExecutionErrorCode::ShellUnavailable
-    );
+    assert_eq!(error.code, ExecutionErrorCode::ShellUnavailable);
 
     let shell_path = format!("{root}/not-executable-shell");
     let env = env_at(&root);
@@ -845,10 +836,7 @@ async fn shell_unavailable_and_spawn_errors() {
     let error = Shell::exec(&spawn_error_env, "printf ok", None, &context())
         .await
         .expect_err("non-executable shell errors");
-    assert_eq!(
-        error.code,
-        ExecutionErrorCode::SpawnError
-    );
+    assert_eq!(error.code, ExecutionErrorCode::SpawnError);
 }
 
 /// Aborted commands report the aborted error.
@@ -860,10 +848,7 @@ async fn aborted_commands_report_the_aborted_error() {
     let execution = Shell::exec(&env, "sleep 5", None, &context);
     controller.abort("aborted");
     let error = execution.await.expect_err("aborted exec errors");
-    assert_eq!(
-        error.code,
-        ExecutionErrorCode::Aborted
-    );
+    assert_eq!(error.code, ExecutionErrorCode::Aborted);
 }
 
 /// No spill file is created while the bounded output stays within its
@@ -886,10 +871,7 @@ async fn does_not_create_a_spill_before_bounded_output_crosses_its_limits() {
     assert!(result.spill_path.is_none());
 }
 
-fn spill_capture(
-    max_bytes: u64,
-    max_lines: u64,
-) -> ShellOutputCaptureOptions {
+fn spill_capture(max_bytes: u64, max_lines: u64) -> ShellOutputCaptureOptions {
     ShellOutputCaptureOptions {
         limits: ShellOutputLimits {
             max_bytes,
@@ -942,10 +924,7 @@ async fn fails_rather_than_silently_losing_a_requested_spill() {
     )
     .await
     .expect_err("the failed spill errors");
-    assert_eq!(
-        error.code,
-        ExecutionErrorCode::Unknown
-    );
+    assert_eq!(error.code, ExecutionErrorCode::Unknown);
     assert!(
         error
             .message
@@ -1003,10 +982,7 @@ impl FileSystem for FailingSpillExecutionEnv {
         &'a self,
         path: &'a str,
         context: &'a Context,
-    ) -> BoxedFuture<
-        'a,
-        Result<Box<dyn TextLineReader>, crate::harness::types::FileError>,
-    > {
+    ) -> BoxedFuture<'a, Result<Box<dyn TextLineReader>, crate::harness::types::FileError>> {
         self.inner.open_text_line_reader(path, context)
     }
 
@@ -1218,23 +1194,19 @@ async fn cleanup_on_an_idle_environment_resolves() {
 // directly instead of through contrived filesystem states.
 
 use super::{
-    CommandTransport, file_url_to_path, find_bash_on_path, get_bash_shell_config,
-    get_shell_config, get_shell_env, resolve_path, resolve_timeout_ms, run_command, temp_name,
+    CommandTransport, file_url_to_path, find_bash_on_path, get_bash_shell_config, get_shell_config,
+    get_shell_env, resolve_path, resolve_timeout_ms, run_command, temp_name,
 };
 
 #[test]
 fn the_timeout_resolution_rejects_non_finite_negative_and_oversized_values() {
-    assert_eq!(
-        resolve_timeout_ms(None).expect("absent timeout"),
-        None
-    );
+    assert_eq!(resolve_timeout_ms(None).expect("absent timeout"), None);
     assert_eq!(
         resolve_timeout_ms(Some(1.5)).expect("a positive timeout"),
         Some(1_500)
     );
     for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        let error = resolve_timeout_ms(Some(invalid))
-            .expect_err("an invalid timeout errors");
+        let error = resolve_timeout_ms(Some(invalid)).expect_err("an invalid timeout errors");
         assert_eq!(error.code, ExecutionErrorCode::Timeout);
     }
     let error = resolve_timeout_ms(Some(2_147_483.648))
@@ -1263,7 +1235,10 @@ fn resolve_path_expands_home_and_normalizes_segments() {
     assert_eq!(resolve_path("/work", "./x"), "/work/x");
     assert_eq!(resolve_path("/work", "a//b"), "/work/a/b");
     if std::env::var("HOME").is_ok_and(|home| !home.is_empty()) {
-        assert_eq!(resolve_path("/work", "~"), std::env::var("HOME").expect("home"));
+        assert_eq!(
+            resolve_path("/work", "~"),
+            std::env::var("HOME").expect("home")
+        );
         assert_eq!(
             resolve_path("/work", "~/child"),
             format!("{}/child", std::env::var("HOME").expect("home"))
@@ -1274,16 +1249,10 @@ fn resolve_path_expands_home_and_normalizes_segments() {
 #[test]
 fn the_legacy_wsl_bash_maps_to_stdin_transport() {
     let config = get_bash_shell_config("C:\\Windows\\System32\\bash.exe".to_owned());
-    assert!(matches!(
-        config.command_transport,
-        CommandTransport::Stdin
-    ));
+    assert!(matches!(config.command_transport, CommandTransport::Stdin));
     assert_eq!(config.args, vec!["-s".to_owned()]);
     let config = get_bash_shell_config("/bin/bash".to_owned());
-    assert!(matches!(
-        config.command_transport,
-        CommandTransport::Argv
-    ));
+    assert!(matches!(config.command_transport, CommandTransport::Argv));
     assert_eq!(config.args, vec!["-c".to_owned()]);
 }
 
@@ -1546,11 +1515,23 @@ async fn writes_through_a_file_parent_report_the_io_error() {
     let error = FileSystem::write_file(&env, "file.txt/child", "x".into(), &context)
         .await
         .expect_err("a file parent errors");
-    assert!(error.path.as_deref().is_some_and(|path| path.contains("file.txt/child")), "{error:?}");
+    assert!(
+        error
+            .path
+            .as_deref()
+            .is_some_and(|path| path.contains("file.txt/child")),
+        "{error:?}"
+    );
     let error = FileSystem::append_file(&env, "file.txt/child", "x".into(), &context)
         .await
         .expect_err("a file parent errors on append too");
-    assert!(error.path.as_deref().is_some_and(|path| path.contains("file.txt/child")), "{error:?}");
+    assert!(
+        error
+            .path
+            .as_deref()
+            .is_some_and(|path| path.contains("file.txt/child")),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1584,8 +1565,15 @@ async fn canonical_and_create_dir_error_surfaces() {
         .await
         .expect_err("a missing canonical path errors");
     assert_eq!(error.code, FileErrorCode::NotFound);
-    let error = FileSystem::create_dir(&env, "file.txt", Some(CreateDirOptions { recursive: Some(false) }), &context)
-        .await
-        .expect_err("a non-recursive create over a file errors");
+    let error = FileSystem::create_dir(
+        &env,
+        "file.txt",
+        Some(CreateDirOptions {
+            recursive: Some(false),
+        }),
+        &context,
+    )
+    .await
+    .expect_err("a non-recursive create over a file errors");
     assert!(error.code != FileErrorCode::Aborted, "{error:?}");
 }

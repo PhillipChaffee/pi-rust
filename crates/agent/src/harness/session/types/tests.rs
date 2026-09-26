@@ -17,20 +17,21 @@ use serde_json::json;
 use crate::harness::compaction::types::{DEFAULT_COMPACTION_SETTINGS, FileOperations};
 use crate::harness::context::{Context, background_context};
 use crate::harness::session::types::{
-    operation_scope_of, AssistantEffectPendingOperation, AssistantReadyOperation,
-    AssistantRetryWaitOperation, BranchScan, BranchScanOrder, BranchSummaryEntryBody,
-    CheckpointData, CheckpointOperation, CompactionEntryBody, CompactionReason, CommitResult,
-    Continuation, Control, CustomEntryBody, DeferredEffectPendingOperation, DeferredScope,
-    DeferredSuspendedOperation, DurableStructuralPreparation, Entry, EntryCursor, EntryProjector,
-    EntryQuery, EntryScan, EntryScanOrder, EntryStructure, EntryType, GenerationContext,
-    InboxItem, InboxItemKind, LaneConfiguration, LaneState, MessageEntry,
-    NavigationReadyToCommitOperation, NewEntry, NormalizedRetryPolicy, OperationError,
-    OperationIntent, OperationKind, OperationMeta, OperationResultRecord, OperationScope,
-    OperationState, PendingEntry, ResultBoundary, RetryWait, RunSettings, SessionError,
-    SessionMetadata, SessionStats, SettledAssistantMessage, SettledStopReason, StartingOperation,
-    StorageBranchScan, SummaryContext, SummaryDecidingOperation, SummaryEffectPendingOperation,
-    SummaryEffectRequest, SummaryGenerationScope, SummaryReadyOperation, SummaryRetryWaitOperation,
-    SummaryTask, TerminalStatus, ToolBatch, ToolsOperation, UsageRow, UsageScan, UsageWriteRow,
+    AssistantEffectPendingOperation, AssistantReadyOperation, AssistantRetryWaitOperation,
+    BranchScan, BranchScanOrder, BranchSummaryEntryBody, CheckpointData, CheckpointOperation,
+    CommitResult, CompactionEntryBody, CompactionReason, Continuation, Control, CustomEntryBody,
+    DeferredEffectPendingOperation, DeferredScope, DeferredSuspendedOperation,
+    DurableStructuralPreparation, Entry, EntryCursor, EntryProjector, EntryQuery, EntryScan,
+    EntryScanOrder, EntryStructure, EntryType, GenerationContext, InboxItem, InboxItemKind,
+    LaneConfiguration, LaneState, MessageEntry, NavigationReadyToCommitOperation, NewEntry,
+    NormalizedRetryPolicy, OperationError, OperationIntent, OperationKind, OperationMeta,
+    OperationResultRecord, OperationScope, OperationState, PendingEntry, ResultBoundary, RetryWait,
+    RunSettings, SessionError, SessionMetadata, SessionStats, SettledAssistantMessage,
+    SettledStopReason, StartingOperation, StorageBranchScan, SummaryContext,
+    SummaryDecidingOperation, SummaryEffectPendingOperation, SummaryEffectRequest,
+    SummaryGenerationScope, SummaryReadyOperation, SummaryRetryWaitOperation, SummaryTask,
+    TerminalStatus, ToolBatch, ToolsOperation, UsageRow, UsageScan, UsageWriteRow,
+    operation_scope_of,
 };
 use crate::harness::types::AgentHarnessStreamOptions;
 use crate::types::{AgentMessage, QueueMode, ToolExecutionMode};
@@ -260,12 +261,19 @@ fn the_settled_stop_reason_covers_every_reason() {
         (StopReason::ToolUse, SettledStopReason::ToolUse, "toolUse"),
         (StopReason::Error, SettledStopReason::Error, "error"),
         (StopReason::Aborted, SettledStopReason::Aborted, "aborted"),
-        (StopReason::Deferred, SettledStopReason::Deferred, "deferred"),
+        (
+            StopReason::Deferred,
+            SettledStopReason::Deferred,
+            "deferred",
+        ),
     ];
     for (reason, settled, wire) in reasons {
         assert_eq!(SettledStopReason::from_stop_reason(reason), Some(settled));
         assert_eq!(settled.stop_reason(), reason);
-        assert_eq!(serde_json::to_value(settled).expect("serialize"), json!(wire));
+        assert_eq!(
+            serde_json::to_value(settled).expect("serialize"),
+            json!(wire)
+        );
     }
     let settled = SettledAssistantMessage {
         message: assistant_message(),
@@ -795,15 +803,14 @@ fn the_tools_and_deferred_leaves_round_trip_their_wire_shape() {
     );
     assert_eq!(operation_scope_of(&suspended), scope);
 
-    let effect_pending =
-        OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
-            scope: DeferredScope {
-                poll: 1,
-                ..deferred
-            },
-            response_entry_id: "response".to_owned(),
-            usage_id: "usage".to_owned(),
-        });
+    let effect_pending = OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
+        scope: DeferredScope {
+            poll: 1,
+            ..deferred
+        },
+        response_entry_id: "response".to_owned(),
+        usage_id: "usage".to_owned(),
+    });
     assert_wire_round_trip(
         &effect_pending,
         json!({
@@ -882,27 +889,26 @@ fn the_summary_deciding_and_ready_leaves_round_trip_their_wire_shape() {
 #[test]
 fn the_summary_pending_and_retry_leaves_round_trip_their_wire_shape() {
     let scope = scope_fixture();
-    let effect_pending =
-        OperationState::SummaryEffectPending(SummaryEffectPendingOperation {
-            scope: scope.clone(),
-            generation: SummaryGenerationScope {
-                task: summary_task(
-                    ResultBoundary::CommitNavigation {
-                        target_id: "target".to_owned(),
-                        label: Some("target".to_owned()),
-                    },
-                    None,
-                    None,
-                ),
-                summary_context: summary_context(),
-            },
-            attempt: 1,
-            request: Some(SummaryEffectRequest {
-                index: 0,
-                usage_id: "usage".to_owned(),
-            }),
-            usage_ids: Vec::new(),
-        });
+    let effect_pending = OperationState::SummaryEffectPending(SummaryEffectPendingOperation {
+        scope: scope.clone(),
+        generation: SummaryGenerationScope {
+            task: summary_task(
+                ResultBoundary::CommitNavigation {
+                    target_id: "target".to_owned(),
+                    label: Some("target".to_owned()),
+                },
+                None,
+                None,
+            ),
+            summary_context: summary_context(),
+        },
+        attempt: 1,
+        request: Some(SummaryEffectRequest {
+            index: 0,
+            usage_id: "usage".to_owned(),
+        }),
+        usage_ids: Vec::new(),
+    });
     assert_wire_round_trip(
         &effect_pending,
         json!({
@@ -959,24 +965,22 @@ fn the_summary_pending_and_retry_leaves_round_trip_their_wire_shape() {
 #[test]
 fn the_navigation_leaf_round_trips_its_wire_shape() {
     let scope = scope_fixture();
-    let root_target =
-        OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
-            scope: scope.clone(),
-            target_id: None,
-            label: None,
-        });
+    let root_target = OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
+        scope: scope.clone(),
+        target_id: None,
+        label: None,
+    });
     assert_wire_round_trip(
         &root_target,
         json!({"at": "navigation.ready_to_commit", "scope": scope_json(), "targetId": null}),
     );
     assert_eq!(operation_scope_of(&root_target), scope);
 
-    let labeled =
-        OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
-            scope: scope.clone(),
-            target_id: Some("target".to_owned()),
-            label: Some("label".to_owned()),
-        });
+    let labeled = OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
+        scope: scope.clone(),
+        target_id: Some("target".to_owned()),
+        label: Some("label".to_owned()),
+    });
     assert_wire_round_trip(
         &labeled,
         json!({
@@ -1136,7 +1140,10 @@ fn the_result_payloads_round_trip_their_wire_shape() {
         (TerminalStatus::Failed, "failed"),
     ];
     for (status, wire) in statuses {
-        assert_eq!(serde_json::to_value(status).expect("serialize"), json!(wire));
+        assert_eq!(
+            serde_json::to_value(status).expect("serialize"),
+            json!(wire)
+        );
     }
     let kinds = [
         (OperationKind::Run, "run"),
@@ -1340,7 +1347,10 @@ fn the_generation_and_boundary_payloads_round_trip_their_wire_shape() {
         (CompactionReason::Overflow, "overflow"),
     ];
     for (reason, wire) in reasons {
-        assert_eq!(serde_json::to_value(reason).expect("serialize"), json!(wire));
+        assert_eq!(
+            serde_json::to_value(reason).expect("serialize"),
+            json!(wire)
+        );
     }
     let task = summary_task(resume, Some(CompactionReason::Threshold), Some("compact"));
     assert_wire_round_trip(

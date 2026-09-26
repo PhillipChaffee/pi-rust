@@ -365,7 +365,7 @@ impl std::error::Error for FileError {
 }
 
 /// Stable, backend-independent execution error codes returned by
-/// [`ExecutionEnv::exec`], upstream's `ExecutionErrorCode`.
+/// [`Shell::exec`], upstream's `ExecutionErrorCode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionErrorCode {
@@ -383,7 +383,7 @@ pub enum ExecutionErrorCode {
     Unknown,
 }
 
-/// Error returned by [`ExecutionEnv::exec`], upstream's `ExecutionError`.
+/// Error returned by [`Shell::exec`], upstream's `ExecutionError`.
 #[derive(Debug)]
 pub struct ExecutionError {
     /// Backend-independent error code.

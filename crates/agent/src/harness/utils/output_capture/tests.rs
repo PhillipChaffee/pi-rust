@@ -299,14 +299,15 @@ async fn the_spill_path_reaches_the_folded_metadata() {
 /// The constructor rejects zero limits, upstream's `TypeError` throw.
 #[test]
 fn the_constructor_rejects_zero_limits() {
-    let options = |max_bytes: u64, max_lines: u64| crate::harness::types::ShellOutputCaptureOptions {
-        limits: ShellOutputLimits {
-            max_bytes,
-            max_lines,
-            retain: None,
-        },
-        spill: false,
-    };
+    let options =
+        |max_bytes: u64, max_lines: u64| crate::harness::types::ShellOutputCaptureOptions {
+            limits: ShellOutputLimits {
+                max_bytes,
+                max_lines,
+                retain: None,
+            },
+            spill: false,
+        };
     let zero_bytes = OutputCapture::new(
         Some(&options(0, 10)),
         background_context(),
@@ -396,7 +397,10 @@ async fn pushes_and_finishes_after_dispose_stay_silent() {
     fixture.capture.finish();
     tokio::time::advance(std::time::Duration::from_millis(1_000)).await;
     pump().await;
-    assert_eq!(fixture.updates.lock().expect("updates lock").len(), published);
+    assert_eq!(
+        fixture.updates.lock().expect("updates lock").len(),
+        published
+    );
     assert_eq!(fixture.capture.snapshot().text, "a");
 }
 
@@ -414,11 +418,17 @@ async fn a_repeated_or_disposed_spill_path_republishes_nothing() {
     let published = fixture.updates.lock().expect("updates lock").len();
     fixture.capture.set_spill_path("/tmp/one.log");
     pump().await;
-    assert_eq!(fixture.updates.lock().expect("updates lock").len(), published);
+    assert_eq!(
+        fixture.updates.lock().expect("updates lock").len(),
+        published
+    );
     fixture.capture.dispose();
     fixture.capture.set_spill_path("/tmp/two.log");
     pump().await;
-    assert_eq!(fixture.updates.lock().expect("updates lock").len(), published);
+    assert_eq!(
+        fixture.updates.lock().expect("updates lock").len(),
+        published
+    );
 }
 
 fn view(text: &str, max_bytes: u64) -> crate::harness::types::ShellOutputView {
@@ -472,10 +482,8 @@ fn update_from_derives_appends_and_metadata_only_updates() {
 #[test]
 fn update_from_replaces_when_the_slide_overlap_fails() {
     // "ab" matches the "aQ" tail's first byte but the tails diverge.
-    let diverged = crate::harness::utils::output_capture::update_from(
-        Some(&view("baQ", 50)),
-        &view("ab", 50),
-    );
+    let diverged =
+        crate::harness::utils::output_capture::update_from(Some(&view("baQ", 50)), &view("ab", 50));
     assert!(matches!(diverged, Some(ShellOutputUpdate::Replace { .. })));
     // Repeated probe hits exhaust the candidate cap without an overlap.
     let capped = crate::harness::utils::output_capture::update_from(
@@ -484,10 +492,8 @@ fn update_from_replaces_when_the_slide_overlap_fails() {
     );
     assert!(matches!(capped, Some(ShellOutputUpdate::Replace { .. })));
     // A zero byte budget zeroes the scan window.
-    let zeroed = crate::harness::utils::output_capture::update_from(
-        Some(&view("abc", 0)),
-        &view("xbcd", 0),
-    );
+    let zeroed =
+        crate::harness::utils::output_capture::update_from(Some(&view("abc", 0)), &view("xbcd", 0));
     assert!(matches!(zeroed, Some(ShellOutputUpdate::Replace { .. })));
 }
 

@@ -530,10 +530,7 @@ impl SessionReader for StubSession {
         stub_error()
     }
 
-    fn get_stats(
-        &self,
-        _context: &Context,
-    ) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
+    fn get_stats(&self, _context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
         stub_error()
     }
 
@@ -588,7 +585,10 @@ impl crate::harness::session::types::Session for StubSession {
         stub_error()
     }
 
-    fn get_name(&self, _context: &Context) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
+    fn get_name(
+        &self,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
         stub_error()
     }
 

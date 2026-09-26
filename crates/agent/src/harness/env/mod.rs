@@ -1,7 +1,8 @@
 //! The nodejs execution environment, ported from upstream
 //! `src/harness/env/nodejs.ts`.
 //!
-//! The module carries the real-process real-filesystem [`NodeExecutionEnv`]:
+//! The module carries the real-process real-filesystem
+//! [`nodejs::NodeExecutionEnv`]:
 //! tokio process + fs for upstream's `node:child_process` and
 //! `node:fs/promises`, process-group `SIGKILL` for upstream's
 //! `killProcessTree`, and the same non-throwing contract — every operation

@@ -104,7 +104,9 @@ fn signal_abort_ignores_a_gate_that_is_not_aborting() {
     assert!(closed.signal().aborted());
     assert_eq!(
         closed.signal().reason(),
-        Some(pi_chord::context::AbortReason::Caller("gate closed".to_owned()))
+        Some(pi_chord::context::AbortReason::Caller(
+            "gate closed".to_owned()
+        ))
     );
 }
 

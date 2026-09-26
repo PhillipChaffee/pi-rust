@@ -522,8 +522,12 @@ macro_rules! __telemetry_events {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __telemetry_span_name {
-    (as $wire:tt $($rest:tt)*) => { $wire };
-    ($fallback:expr) => { $fallback };
+    (as $wire:tt $($rest:tt)*) => {
+        $wire
+    };
+    ($fallback:expr) => {
+        $fallback
+    };
 }
 
 /// Emits one span module: the span marker, typed start/end attribute

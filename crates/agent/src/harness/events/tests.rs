@@ -190,10 +190,9 @@ async fn an_unmarked_resnapshot_boundary_reports_the_violation() {
         .expect("watch");
     // No resnapshot callback installed: the watcher reports the
     // non-resnapshotting contract.
-    let error =
-        WatchHandle::resnapshot(&*watcher, &background_context())
-            .await
-            .expect_err("a watcher without a capture cannot resnapshot");
+    let error = WatchHandle::resnapshot(&*watcher, &background_context())
+        .await
+        .expect_err("a watcher without a capture cannot resnapshot");
     assert!(error.to_string().contains("does not support resnapshot"));
 }
 
@@ -287,11 +286,8 @@ fn the_bus_builds_through_default_and_renders_its_debug_shape() {
 async fn emit_batch_skips_delivery_on_a_closed_bus_or_an_empty_batch() {
     let bus = HarnessEventBus::new();
     let received: Recorded = Arc::new(Mutex::new(Vec::new()));
-    bus.on(
-        HarnessEventType::RunStart,
-        listener(Arc::clone(&received)),
-    )
-    .expect("subscribe");
+    bus.on(HarnessEventType::RunStart, listener(Arc::clone(&received)))
+        .expect("subscribe");
     bus.emit_batch(vec![]).await;
     bus.close("closed".to_owned());
     bus.emit_batch(vec![(lane_event("run"), background_context())])

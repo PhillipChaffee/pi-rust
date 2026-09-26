@@ -758,9 +758,9 @@ fn the_registry_and_run_error_render_their_surfaces() {
         crate::harness::hooks::HookRunError::Closed(_)
     ));
     assert_eq!(closed.to_string(), "gate closed");
-    let handler_failure = crate::harness::hooks::HookRunError::from(
-        Box::<dyn std::error::Error + Send + Sync>::from("handler failed"),
-    );
+    let handler_failure = crate::harness::hooks::HookRunError::from(Box::<
+        dyn std::error::Error + Send + Sync,
+    >::from("handler failed"));
     assert!(matches!(
         handler_failure,
         crate::harness::hooks::HookRunError::Handler(_)
@@ -853,7 +853,10 @@ async fn a_cancelled_caller_context_aborts_the_tool_admission() {
 #[tokio::test]
 async fn run_tool_with_gate_runs_the_before_tool_aggregate() {
     let recorder = InMemoryTelemetryContext::default();
-    let context = with_telemetry_context(TelemetryHandle::new(recorder.clone()), &background_context());
+    let context = with_telemetry_context(
+        TelemetryHandle::new(recorder.clone()),
+        &background_context(),
+    );
     let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
     let replaced_args = BTreeMap::from([("path".to_owned(), serde_json::json!("/tmp/replaced"))]);
     let expected_args = replaced_args.clone();
@@ -903,9 +906,7 @@ async fn run_tool_with_gate_runs_the_before_tool_aggregate() {
     );
     assert_eq!(
         attribute("pi.hook.name"),
-        Some(&Some(AttributeValue::Str(
-            "before_tool".to_owned()
-        )))
+        Some(&Some(AttributeValue::Str("before_tool".to_owned())))
     );
     assert_eq!(
         attribute("pi.hook.registration_id"),
@@ -913,9 +914,7 @@ async fn run_tool_with_gate_runs_the_before_tool_aggregate() {
     );
     assert_eq!(
         attribute("pi.hook.outcome"),
-        Some(&Some(AttributeValue::Str(
-            "completed".to_owned()
-        )))
+        Some(&Some(AttributeValue::Str("completed".to_owned())))
     );
 }
 
@@ -1020,7 +1019,10 @@ async fn before_tool_folds_argument_replacements() {
 async fn a_failing_before_tool_handler_blocks_the_call() {
     let errors = Arc::new(Mutex::new(Vec::new()));
     let recorder = InMemoryTelemetryContext::default();
-    let context = with_telemetry_context(TelemetryHandle::new(recorder.clone()), &background_context());
+    let context = with_telemetry_context(
+        TelemetryHandle::new(recorder.clone()),
+        &background_context(),
+    );
     let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
     registry
         .on(
@@ -1091,7 +1093,10 @@ async fn before_run_threads_injections_and_survives_failures() {
                 let HookEvent::BeforeRun { prompt, .. } = &event.event else {
                     panic!("the run handler receives the run event");
                 };
-                observed_for_handler.lock().expect("observed lock").push(prompt.clone());
+                observed_for_handler
+                    .lock()
+                    .expect("observed lock")
+                    .push(prompt.clone());
                 HookResult::BeforeRun(None)
             }),
             HookOptions::default(),
@@ -1445,9 +1450,7 @@ async fn after_tool_folds_every_field_and_threads_the_state() {
     registry
         .on(
             HookName::AfterTool,
-            handler(|_event| {
-                HookResult::AfterTool(Some(patched_tool_result()))
-            }),
+            handler(|_event| HookResult::AfterTool(Some(patched_tool_result()))),
             HookOptions::default(),
         )
         .expect("register the patching handler");
@@ -1467,10 +1470,12 @@ async fn after_tool_folds_every_field_and_threads_the_state() {
                 else {
                     panic!("the tool handler receives the tool event");
                 };
-                seen_for_handler
-                    .lock()
-                    .expect("seen lock")
-                    .push((content.clone(), details.clone(), *is_error, *usage));
+                seen_for_handler.lock().expect("seen lock").push((
+                    content.clone(),
+                    details.clone(),
+                    *is_error,
+                    *usage,
+                ));
                 HookResult::AfterTool(None)
             }),
             HookOptions::default(),
@@ -1497,10 +1502,12 @@ async fn after_tool_folds_every_field_and_threads_the_state() {
     let (content, details, is_error, usage) = observed.first().cloned().expect("observed");
     assert_eq!(
         content,
-        vec![crate::types::AgentToolContent::Text(pi_ai::types::TextContent {
-            text: "patched".to_owned(),
-            text_signature: None,
-        })]
+        vec![crate::types::AgentToolContent::Text(
+            pi_ai::types::TextContent {
+                text: "patched".to_owned(),
+                text_signature: None,
+            }
+        )]
     );
     assert_eq!(
         details.as_ref().and_then(|details| details.get("patched")),
@@ -1702,7 +1709,13 @@ async fn before_navigation_accepts_a_summary_replacement() {
     let HookResult::BeforeNavigation(Some(result)) = result else {
         panic!("the summary reaches the aggregate");
     };
-    assert_eq!(result.summary.as_ref().map(|summary| summary.summary.as_str()), Some("branch summary"));
+    assert_eq!(
+        result
+            .summary
+            .as_ref()
+            .map(|summary| summary.summary.as_str()),
+        Some("branch summary")
+    );
     assert!(!errors.lock().expect("report lock").is_empty());
 }
 
@@ -2000,7 +2013,10 @@ fn stream_options_patch_round_trips_every_field() {
     let derived = create_stream_options_patch(&added, &cleared);
     assert_eq!(
         derived.headers,
-        Some(Some(BTreeMap::from([("h".to_owned(), None), ("add".to_owned(), None)])))
+        Some(Some(BTreeMap::from([
+            ("h".to_owned(), None),
+            ("add".to_owned(), None)
+        ])))
     );
     assert_eq!(derived.metadata, Some(None));
     let applied = apply_stream_options_patch(&added, &derived);
@@ -2068,10 +2084,13 @@ fn stream_options_patch_headers_and_metadata_legs_apply_per_key() {
     assert_eq!(applied.headers, None);
     assert_eq!(applied.metadata, None);
 
-    let derived = create_stream_options_patch(&base, &AgentHarnessStreamOptions {
-        headers: Some(BTreeMap::new()),
-        ..AgentHarnessStreamOptions::default()
-    });
+    let derived = create_stream_options_patch(
+        &base,
+        &AgentHarnessStreamOptions {
+            headers: Some(BTreeMap::new()),
+            ..AgentHarnessStreamOptions::default()
+        },
+    );
     assert_eq!(derived.headers, Some(Some(BTreeMap::new())));
     assert_eq!(derived.metadata, None);
 }

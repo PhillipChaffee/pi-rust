@@ -75,17 +75,19 @@ fn the_tool_surface_renders_and_names_itself() {
         },
         label: "Test tool".to_owned(),
         prepare_arguments: None,
-        execute: Arc::new(|_name, _args, _update, _tool_context, _invocation, _context| {
-            Box::pin(async {
-                Ok(crate::types::AgentToolResult {
-                    content: vec![],
-                    details: serde_json::json!({}),
-                    usage: None,
-                    added_tool_names: None,
-                    terminate: None,
+        execute: Arc::new(
+            |_name, _args, _update, _tool_context, _invocation, _context| {
+                Box::pin(async {
+                    Ok(crate::types::AgentToolResult {
+                        content: vec![],
+                        details: serde_json::json!({}),
+                        usage: None,
+                        added_tool_names: None,
+                        terminate: None,
+                    })
                 })
-            })
-        }),
+            },
+        ),
         replay: None,
         execution_mode: Some(crate::types::ToolExecutionMode::Parallel),
     };
@@ -123,10 +125,7 @@ fn the_compaction_and_branch_summary_errors_render_and_chain() {
         CompactionErrorCode::SummarizationFailed
     );
     let source = std::error::Error::source(&compaction_error);
-    assert_eq!(
-        source.map(ToString::to_string),
-        Some("cause".to_owned())
-    );
+    assert_eq!(source.map(ToString::to_string), Some("cause".to_owned()));
 
     let branch_error = BranchSummaryError::new(
         BranchSummaryErrorCode::Aborted,

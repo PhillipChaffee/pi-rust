@@ -6,7 +6,8 @@
 //! signatures and hook payloads reference (`CompactionSettings`,
 //! `CompactionPreparation`, `CompactResult`, the branch-summary pair, and
 //! `FileOperations`); the compaction child owns the module's logic and the
-//! rest of `utils.ts` (recorded on that ticket).
+//! rest of `utils.ts` (recorded on that ticket). The types ride the ported
+//! suites elsewhere; this module has no upstream unit file of its own.
 
 use std::collections::BTreeSet;
 
@@ -136,6 +137,3 @@ pub struct BranchPreparation {
     /// Estimated token count for selected messages.
     pub total_tokens: i64,
 }
-
-#[cfg(test)]
-mod tests;

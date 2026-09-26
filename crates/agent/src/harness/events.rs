@@ -882,7 +882,7 @@ impl<T: Send + Sync + 'static + Clone> BufferedEventWatcher<T> {
     /// in-progress resnapshot, a capture that never marked its boundary,
     /// or the capture's own failure.
     ///
-    /// The snapshot reads need [`T`]'s `Clone`; the mutation surface keeps
+    /// The snapshot reads need the value type's `Clone`; the mutation surface keeps
     /// the un-`Clone`d bound.
     pub fn resnapshot<'a>(
         &self,

@@ -539,12 +539,16 @@ mod wire_named {
 
     #[test]
     fn the_wire_name_replaces_the_ident_in_names_and_data() {
-        assert_eq!(<wire_named::Schema as pi_telemetry::schema::TelemetrySchema>::SPAN_NAMES, &["pi.test.operation"]);
+        assert_eq!(
+            <wire_named::Schema as pi_telemetry::schema::TelemetrySchema>::SPAN_NAMES,
+            &["pi.test.operation"]
+        );
         assert_eq!(
             <wire_named::operation::Span as pi_telemetry::schema::SpanDefinition>::NAME,
             "pi.test.operation"
         );
-        let spans = <wire_named::Schema as pi_telemetry::schema::TelemetrySchema>::definition().spans;
+        let spans =
+            <wire_named::Schema as pi_telemetry::schema::TelemetrySchema>::definition().spans;
         assert!(spans.contains_key("pi.test.operation"));
         assert!(!spans.contains_key("operation"));
     }

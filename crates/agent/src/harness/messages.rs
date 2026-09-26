@@ -243,8 +243,8 @@ impl Timestamp {
 ///
 /// The supported subset covers the formats the harness round-trips:
 /// ISO-8601 dates and date-times with optional fractional seconds and a
-/// `Z` or numeric UTC offset. Unparseable input restates JavaScript's
-/// `NaN` as `i64::MIN`.
+/// `Z` or numeric UTC offset. Input the parser cannot read restates
+/// JavaScript's `NaN` as `i64::MIN`.
 #[must_use]
 pub fn parse_date_millis(date: &str) -> i64 {
     let invalid = i64::MIN;

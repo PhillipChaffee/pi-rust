@@ -10,12 +10,12 @@
 use serde_json::json;
 
 use crate::harness::session::types::{EntryScanOrder, MessageEntry, NewEntry, UsageWriteRow};
+use crate::harness::session::values as stored_values;
 use crate::harness::session::values::{
     EntryWrite, ListAddress, ListAppendWrite, ListCursor, ListDeleteWrite, ListElement,
     ListReadOptions, ListWrite, StoredValue, UsageWrite, ValueAddress, ValueDeleteWrite,
     ValueSetWrite, ValueWrite, Write,
 };
-use crate::harness::session::values as stored_values;
 use crate::types::AgentMessage;
 
 fn user_message_json() -> serde_json::Value {
@@ -188,7 +188,10 @@ fn the_scan_prefix_constructors_match_upstream_keys() {
     assert_eq!(preparation_prefix.address.namespace, "pi.op.preparation");
     assert_eq!(preparation_prefix.address.key, "operation:");
     let tool_output_prefix = stored_values::pending_tool_output_prefix("operation");
-    assert_eq!(tool_output_prefix.address.namespace, "pi.pending.tool_output");
+    assert_eq!(
+        tool_output_prefix.address.namespace,
+        "pi.pending.tool_output"
+    );
     assert_eq!(tool_output_prefix.address.key, "operation:");
     let memo = stored_values::operation_tool_memo("operation", "invocation", "name");
     assert_eq!(memo.address.namespace, "pi.op.tool_memo");
@@ -204,17 +207,11 @@ fn the_write_constructors_surface_serialization_failures() {
     let address = stored_values::value::<Unserializable>("pi.test", "key").expect("address");
     let error = stored_values::set_value(&address, Unserializable)
         .expect_err("a failing payload errors the set write");
-    assert_eq!(
-        error.0,
-        "Value payload serialization failed: no wire"
-    );
+    assert_eq!(error.0, "Value payload serialization failed: no wire");
     let list = stored_values::list::<Unserializable>("pi.test.list", "key").expect("list");
     let error = stored_values::append_list(&list, Unserializable)
         .expect_err("a failing payload errors the append write");
-    assert_eq!(
-        error.0,
-        "List element serialization failed: no wire"
-    );
+    assert_eq!(error.0, "List element serialization failed: no wire");
 }
 
 fn entry_write_json() -> serde_json::Value {
@@ -314,20 +311,32 @@ fn the_transaction_write_union_serializes_each_family() {
     let writes = [
         (Write::Entry(Box::new(entry_write())), entry_write_json()),
         (Write::Usage(usage_write()), usage_write_json()),
-        (Write::ValueSet(value_set_write()), json!({
-            "kind": "value", "op": "set",
-            "namespace": "pi.branch.tip", "key": "main", "value": "leaf"
-        })),
-        (Write::ValueDelete(value_delete_write()), json!({
-            "kind": "value", "op": "delete", "namespace": "pi.entry.label", "key": "entry"
-        })),
-        (Write::ListAppend(list_append_write()), json!({
-            "kind": "list", "op": "append",
-            "namespace": "pi.test", "key": "list", "value": {"name": "created"}
-        })),
-        (Write::ListDelete(list_delete_write()), json!({
-            "kind": "list", "op": "delete", "namespace": "pi.test", "key": "list"
-        })),
+        (
+            Write::ValueSet(value_set_write()),
+            json!({
+                "kind": "value", "op": "set",
+                "namespace": "pi.branch.tip", "key": "main", "value": "leaf"
+            }),
+        ),
+        (
+            Write::ValueDelete(value_delete_write()),
+            json!({
+                "kind": "value", "op": "delete", "namespace": "pi.entry.label", "key": "entry"
+            }),
+        ),
+        (
+            Write::ListAppend(list_append_write()),
+            json!({
+                "kind": "list", "op": "append",
+                "namespace": "pi.test", "key": "list", "value": {"name": "created"}
+            }),
+        ),
+        (
+            Write::ListDelete(list_delete_write()),
+            json!({
+                "kind": "list", "op": "delete", "namespace": "pi.test", "key": "list"
+            }),
+        ),
     ];
     for (write, wire) in writes {
         assert_eq!(serde_json::to_value(&write).expect("serialize"), wire);
@@ -345,13 +354,19 @@ fn the_transaction_write_union_resolves_each_family_on_read() {
     let resolved = [
         (Write::Entry(Box::new(entry_write())), entry_write_json()),
         (Write::Usage(usage_write()), usage_write_json()),
-        (Write::ValueSet(value_set_write()), json!({
-            "kind": "value", "op": "set",
-            "namespace": "pi.branch.tip", "key": "main", "value": "leaf"
-        })),
-        (Write::ValueDelete(value_delete_write()), json!({
-            "kind": "value", "op": "delete", "namespace": "pi.entry.label", "key": "entry"
-        })),
+        (
+            Write::ValueSet(value_set_write()),
+            json!({
+                "kind": "value", "op": "set",
+                "namespace": "pi.branch.tip", "key": "main", "value": "leaf"
+            }),
+        ),
+        (
+            Write::ValueDelete(value_delete_write()),
+            json!({
+                "kind": "value", "op": "delete", "namespace": "pi.entry.label", "key": "entry"
+            }),
+        ),
     ];
     for (write, wire) in resolved {
         let back: Write = serde_json::from_value(wire).expect("deserialize");
@@ -506,31 +521,135 @@ type PanicCase = (&'static str, Box<dyn Fn()>);
 /// `unwrap_or_else` fallback deliberately panics, the port's analog of
 /// upstream's thrown `TypeError` for these infallible helpers. The
 /// catch keeps the suite green while exercising each reachable fallback.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one case row per fixed constructor keeps the panic surface table complete"
+)]
 #[test]
 fn the_fixed_address_constructors_panic_on_invalid_components() {
     const FALLBACK_MESSAGE: &str = "fixed harness value addresses are always valid";
     let bad = "\0bad";
     let cases: Vec<PanicCase> = vec![
-        ("branch_tip", Box::new(|| { let _ = stored_values::branch_tip(bad); })),
-        ("lane_config", Box::new(|| { let _ = stored_values::lane_config(bad); })),
-        ("lane_state", Box::new(|| { let _ = stored_values::lane_state(bad); })),
-        ("operation_result", Box::new(|| { let _ = stored_values::operation_result(bad); })),
-        ("operation_meta", Box::new(|| { let _ = stored_values::operation_meta(bad); })),
-        ("operation_state", Box::new(|| { let _ = stored_values::operation_state(bad); })),
-        ("operation_tool_args", Box::new(|| { let _ = stored_values::operation_tool_args(bad, "step", 0); })),
-        ("operation_tool_memo", Box::new(|| { let _ = stored_values::operation_tool_memo(bad, "invocation", "name"); })),
-        ("operation_preparation", Box::new(|| { let _ = stored_values::operation_preparation(bad, "task"); })),
-        ("operation_tool_args_prefix", Box::new(|| { let _ = stored_values::operation_tool_args_prefix(bad, None); })),
-        ("operation_tool_args_prefix_step", Box::new(|| { let _ = stored_values::operation_tool_args_prefix(bad, Some("step")); })),
-        ("operation_tool_memo_prefix", Box::new(|| { let _ = stored_values::operation_tool_memo_prefix(bad, None); })),
-        ("operation_tool_memo_prefix_invocation", Box::new(|| { let _ = stored_values::operation_tool_memo_prefix(bad, Some("invocation")); })),
-        ("operation_preparation_prefix", Box::new(|| { let _ = stored_values::operation_preparation_prefix(bad); })),
-        ("pending_entry", Box::new(|| { let _ = stored_values::pending_entry(bad); })),
-        ("pending_tool_output", Box::new(|| { let _ = stored_values::pending_tool_output(bad, "invocation"); })),
-        ("pending_tool_output_prefix", Box::new(|| { let _ = stored_values::pending_tool_output_prefix(bad); })),
-        ("pending_assistant_frames", Box::new(|| { let _ = stored_values::pending_assistant_frames(bad, "response"); })),
-        ("entry_label", Box::new(|| { let _ = stored_values::entry_label(bad); })),
-        ("generic_value", Box::new(|| { let _ = stored_values::generic_value("", "key"); })),
+        (
+            "branch_tip",
+            Box::new(|| {
+                let _ = stored_values::branch_tip(bad);
+            }),
+        ),
+        (
+            "lane_config",
+            Box::new(|| {
+                let _ = stored_values::lane_config(bad);
+            }),
+        ),
+        (
+            "lane_state",
+            Box::new(|| {
+                let _ = stored_values::lane_state(bad);
+            }),
+        ),
+        (
+            "operation_result",
+            Box::new(|| {
+                let _ = stored_values::operation_result(bad);
+            }),
+        ),
+        (
+            "operation_meta",
+            Box::new(|| {
+                let _ = stored_values::operation_meta(bad);
+            }),
+        ),
+        (
+            "operation_state",
+            Box::new(|| {
+                let _ = stored_values::operation_state(bad);
+            }),
+        ),
+        (
+            "operation_tool_args",
+            Box::new(|| {
+                let _ = stored_values::operation_tool_args(bad, "step", 0);
+            }),
+        ),
+        (
+            "operation_tool_memo",
+            Box::new(|| {
+                let _ = stored_values::operation_tool_memo(bad, "invocation", "name");
+            }),
+        ),
+        (
+            "operation_preparation",
+            Box::new(|| {
+                let _ = stored_values::operation_preparation(bad, "task");
+            }),
+        ),
+        (
+            "operation_tool_args_prefix",
+            Box::new(|| {
+                let _ = stored_values::operation_tool_args_prefix(bad, None);
+            }),
+        ),
+        (
+            "operation_tool_args_prefix_step",
+            Box::new(|| {
+                let _ = stored_values::operation_tool_args_prefix(bad, Some("step"));
+            }),
+        ),
+        (
+            "operation_tool_memo_prefix",
+            Box::new(|| {
+                let _ = stored_values::operation_tool_memo_prefix(bad, None);
+            }),
+        ),
+        (
+            "operation_tool_memo_prefix_invocation",
+            Box::new(|| {
+                let _ = stored_values::operation_tool_memo_prefix(bad, Some("invocation"));
+            }),
+        ),
+        (
+            "operation_preparation_prefix",
+            Box::new(|| {
+                let _ = stored_values::operation_preparation_prefix(bad);
+            }),
+        ),
+        (
+            "pending_entry",
+            Box::new(|| {
+                let _ = stored_values::pending_entry(bad);
+            }),
+        ),
+        (
+            "pending_tool_output",
+            Box::new(|| {
+                let _ = stored_values::pending_tool_output(bad, "invocation");
+            }),
+        ),
+        (
+            "pending_tool_output_prefix",
+            Box::new(|| {
+                let _ = stored_values::pending_tool_output_prefix(bad);
+            }),
+        ),
+        (
+            "pending_assistant_frames",
+            Box::new(|| {
+                let _ = stored_values::pending_assistant_frames(bad, "response");
+            }),
+        ),
+        (
+            "entry_label",
+            Box::new(|| {
+                let _ = stored_values::entry_label(bad);
+            }),
+        ),
+        (
+            "generic_value",
+            Box::new(|| {
+                let _ = stored_values::generic_value("", "key");
+            }),
+        ),
     ];
     for (name, call) in cases {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call));
