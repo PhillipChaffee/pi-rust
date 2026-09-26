@@ -17,7 +17,6 @@ use crate::auth::oauth::callback::{
     CallbackHandler, CallbackRequest, CallbackResponse, OAuthCallbackServer, WaitCell,
 };
 use crate::auth::oauth::device_code::{PollOptions, PollOutcome, poll_oauth_device_code_flow};
-use crate::auth::oauth::github_copilot::status_reason;
 use crate::auth::oauth::oauth_page::{oauth_error_html, oauth_success_html};
 use crate::auth::oauth::pkce::{Pkce, decode_json_segment, generate_pkce};
 use crate::auth::oauth::{
@@ -28,6 +27,7 @@ use crate::auth::types::ModelAuth;
 use crate::auth::types::{
     AuthError, AuthEvent, AuthPrompt, AuthPromptKind, AuthPromptOption, OAuthCredentials,
 };
+use crate::http::client::status_reason;
 use crate::http::{HttpClient, HttpResponse};
 use crate::types::BoxedFuture;
 use crate::utils::provider_env::get_provider_env_value;

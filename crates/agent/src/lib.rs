@@ -21,6 +21,7 @@
 pub mod agent;
 pub mod agent_loop;
 pub mod harness;
+pub mod proxy;
 pub mod search;
 pub mod stream_fn;
 pub mod types;
@@ -30,6 +31,7 @@ pub use agent_loop::{
     AgentEventSink, AgentEventStream, AgentLoopError, agent_loop, agent_loop_continue,
     run_agent_loop, run_agent_loop_continue,
 };
+pub use proxy::{ProxyAssistantMessageEvent, ProxyStreamOptions, stream_proxy};
 pub use search::{
     EntrySearchHit, SearchQuery, SessionSearchError, SessionSearchHit, SessionSearchService,
     SessionSearchTopHit,
