@@ -1742,6 +1742,7 @@ pub type PromptProvider = Arc<
 
 /// The system-prompt source, upstream's
 /// `string | ((toolContext, context) => string | Promise<string>)`.
+#[derive(Clone)]
 pub enum SystemPromptSource {
     /// One static prompt.
     Static(String),

@@ -313,6 +313,32 @@ pub fn delete_list<T>(address: &ValueList<T>) -> ListDeleteWrite {
     }
 }
 
+/// Builds the value-set write one transaction carries from a typed address,
+/// upstream's `setValue<T>(address, next)` return inside `Write`.
+///
+/// # Errors
+/// Payload serialization failures.
+pub fn set_value_write<T: Serialize>(address: &Value<T>, next: T) -> Result<Write, SessionError> {
+    set_value(address, next).map(Write::ValueSet)
+}
+
+/// Builds the value-delete write one transaction carries, upstream's
+/// `deleteValue<T>(address)` return inside `Write`.
+#[must_use]
+pub fn delete_value_write<T>(address: &Value<T>) -> Write {
+    Write::ValueDelete(delete_value(address))
+}
+
+/// Builds the list-append write one transaction carries from a typed
+/// address, upstream's `appendList<T>(address, element)` return inside
+/// `Write`.
+///
+/// # Errors
+/// Payload serialization failures.
+pub fn append_list_write<T: Serialize>(address: &ValueList<T>, element: T) -> Result<Write, SessionError> {
+    append_list(address, element).map(Write::ListAppend)
+}
+
 /// Resolves list-read defaults, upstream's `resolveListReadOptions`.
 ///
 /// # Errors

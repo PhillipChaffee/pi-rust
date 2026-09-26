@@ -110,6 +110,46 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+impl From<SessionInvariantError> for SessionError {
+    fn from(error: SessionInvariantError) -> Self {
+        Self(error.0)
+    }
+}
+
+impl From<SessionPendingAssistantMessageError> for SessionError {
+    fn from(_: SessionPendingAssistantMessageError) -> Self {
+        Self("Cannot persist a pending assistant message".to_owned())
+    }
+}
+
+/// The session's durable state is internally inconsistent and cannot be
+/// safely advanced, upstream's `SessionInvariantError` in `session.ts`
+/// (carried for the session-layer child, which owns that module).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionInvariantError(pub String);
+
+impl std::fmt::Display for SessionInvariantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SessionInvariantError {}
+
+/// A pending assistant message cannot be persisted as a session entry,
+/// upstream's `SessionPendingAssistantMessageError` in `session.ts` (carried
+/// for the session-layer child, which owns that module).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionPendingAssistantMessageError;
+
+impl std::fmt::Display for SessionPendingAssistantMessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Cannot persist a pending assistant message")
+    }
+}
+
+impl std::error::Error for SessionPendingAssistantMessageError {}
+
 /// The entry types a session transcript holds, upstream's `EntryType`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -785,6 +825,24 @@ pub struct ToolCall {
     status: ToolCallStatus,
 }
 
+impl ToolCall {
+    /// The call's phase, upstream's `ToolCall.status`.
+    #[must_use]
+    pub const fn status(&self) -> &ToolCallStatus {
+        &self.status
+    }
+
+    /// Whether the phase carries the terminate hint, upstream's
+    /// `call.terminate` reads on the completed/outcome-ready phases.
+    #[must_use]
+    pub const fn terminate(&self) -> Option<bool> {
+        match &self.status {
+            ToolCallStatus::Planned | ToolCallStatus::EffectPending { .. } => None,
+            ToolCallStatus::OutcomeReady { terminate } | ToolCallStatus::Completed { terminate } => Some(*terminate),
+        }
+    }
+}
+
 /// The tool-call phase, upstream's `ToolCall["status"]` union.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -1240,6 +1298,28 @@ pub enum OperationState {
     NavigationReadyToCommit(NavigationReadyToCommitOperation),
 }
 
+impl OperationState {
+    /// The wire `at` discriminator, upstream's `OperationState["at"]`.
+    #[must_use]
+    pub const fn at(&self) -> &'static str {
+        match self {
+            Self::Starting(_) => "starting",
+            Self::Checkpoint(_) => "checkpoint",
+            Self::AssistantReady(_) => "assistant.ready",
+            Self::AssistantEffectPending(_) => "assistant.effect_pending",
+            Self::AssistantRetryWait(_) => "assistant.retry_wait",
+            Self::Tools(_) => "tools",
+            Self::DeferredSuspended(_) => "deferred.suspended",
+            Self::DeferredEffectPending(_) => "deferred.effect_pending",
+            Self::SummaryDeciding(_) => "summary.deciding",
+            Self::SummaryReady(_) => "summary.ready",
+            Self::SummaryEffectPending(_) => "summary.effect_pending",
+            Self::SummaryRetryWait(_) => "summary.retry_wait",
+            Self::NavigationReadyToCommit(_) => "navigation.ready_to_commit",
+        }
+    }
+}
+
 /// Copies only the uniform operation scope when constructing a successor
 /// leaf, upstream's `operationScopeOf`.
 #[must_use]
@@ -1389,7 +1469,7 @@ pub enum BranchScanOrder {
 
 /// A branch-path scan with a required start, upstream's
 /// `StorageBranchScan = BranchScan & { start: string }`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageBranchScan {
     /// The entry the scan starts from, exclusive.
