@@ -1477,7 +1477,7 @@ fn the_pending_entry_round_trips_its_wire_shape() {
 /// The session error renders its message and chains as an error.
 #[test]
 fn the_session_error_renders_its_message() {
-    let error = SessionError("failure".to_owned());
+    let error = SessionError::Message("failure".to_owned());
     assert_eq!(error.to_string(), "failure");
     let _: &dyn std::error::Error = &error;
 }
@@ -1496,12 +1496,14 @@ fn operation_scope_of_copies_the_uniform_scope() {
 #[tokio::test]
 async fn the_entry_projector_renders_debug_and_projects() {
     let projector = EntryProjector(Arc::new(
-        |_entry: &Entry, _context: &Context| -> BoxedFuture<'_, Option<Vec<AgentMessage>>> {
-            Box::pin(std::future::ready(None))
+        |_entry: &Entry,
+         _context: &Context|
+         -> BoxedFuture<'_, Result<Option<Vec<AgentMessage>>, SessionError>> {
+            Box::pin(std::future::ready(Ok(None)))
         },
     ));
     assert_eq!(format!("{projector:?}"), "EntryProjector(..)");
     let entry = message_entry_fixture();
     let projected = (projector.0)(&entry, &background_context()).await;
-    assert_eq!(projected, None);
+    assert_eq!(projected, Ok(None));
 }

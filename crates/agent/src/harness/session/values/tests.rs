@@ -63,13 +63,16 @@ where
 #[test]
 fn address_validation_rejects_the_bad_components() {
     let error = stored_values::validate_address("", "key").expect_err("an empty namespace errors");
-    assert_eq!(error.0, "Value namespace must not be empty");
+    assert_eq!(error.to_string(), "Value namespace must not be empty");
     let error =
         stored_values::validate_address("ns\0", "key").expect_err("a NUL in the namespace errors");
-    assert_eq!(error.0, "Value namespace must not contain \\u0000");
+    assert_eq!(
+        error.to_string(),
+        "Value namespace must not contain \\u0000"
+    );
     let error =
         stored_values::validate_address("ns", "ke\0y").expect_err("a NUL in the key errors");
-    assert_eq!(error.0, "Value key must not contain \\u0000");
+    assert_eq!(error.to_string(), "Value key must not contain \\u0000");
     assert!(stored_values::validate_address("ns", "key").is_ok());
 }
 
@@ -86,7 +89,10 @@ fn the_list_read_resolver_defaults_and_clamps() {
         ..ListReadOptions::default()
     }))
     .expect_err("a zero limit errors");
-    assert_eq!(error.0, "List read limit must be a positive safe integer");
+    assert_eq!(
+        error.to_string(),
+        "List read limit must be a positive safe integer"
+    );
     let clamped = stored_values::resolve_list_read_options(Some(ListReadOptions {
         limit: Some(50_000),
         ..ListReadOptions::default()
@@ -207,11 +213,17 @@ fn the_write_constructors_surface_serialization_failures() {
     let address = stored_values::value::<Unserializable>("pi.test", "key").expect("address");
     let error = stored_values::set_value(&address, Unserializable)
         .expect_err("a failing payload errors the set write");
-    assert_eq!(error.0, "Value payload serialization failed: no wire");
+    assert_eq!(
+        error.to_string(),
+        "Value payload serialization failed: no wire"
+    );
     let list = stored_values::list::<Unserializable>("pi.test.list", "key").expect("list");
     let error = stored_values::append_list(&list, Unserializable)
         .expect_err("a failing payload errors the append write");
-    assert_eq!(error.0, "List element serialization failed: no wire");
+    assert_eq!(
+        error.to_string(),
+        "List element serialization failed: no wire"
+    );
 }
 
 fn entry_write_json() -> serde_json::Value {
