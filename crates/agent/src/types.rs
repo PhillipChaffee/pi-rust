@@ -13,8 +13,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use pi_ai::types::{
-    AssistantMessage, AssistantMessageEvent, Context, Message, Model, SimpleStreamOptions, Tool,
-    ToolCall, ToolResultMessage, Usage,
+    AssistantMessage, AssistantMessageEvent, Context, ImageContent, Message, Model,
+    SimpleStreamOptions, Tool, ToolCall, ToolResultMessage, Usage,
 };
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use tokio_util::sync::CancellationToken;
@@ -284,6 +284,43 @@ pub type PrepareNextTurn = Arc<
         + Sync,
 >;
 
+/// The `should_stop_after_turn` hook shape the [`Agent`](crate::agent::Agent)
+/// options carry, upstream's `AgentOptions.shouldStopAfterTurn`.
+///
+/// The loop-shaped hook plus the run's cancellation token, which the `Agent`
+/// injects at call time from its active run.
+pub type AgentShouldStopAfterTurn = Arc<
+    dyn Fn(ShouldStopAfterTurnContext, Option<CancellationToken>) -> BoxedFuture<'static, bool>
+        + Send
+        + Sync,
+>;
+
+/// The `Agent` options' signal-only turn-preparation hook, upstream's
+/// `AgentOptions.prepareNextTurn`.
+///
+/// Same contract as [`PrepareNextTurn`], plus the run's cancellation token
+/// in place of the context the loop passes.
+pub type AgentPrepareNextTurn = Arc<
+    dyn Fn(Option<CancellationToken>) -> BoxedFuture<'static, Option<AgentLoopTurnUpdate>>
+        + Send
+        + Sync,
+>;
+
+/// The `Agent` options' context-aware turn-preparation hook, upstream's
+/// `AgentOptions.prepareNextTurnWithContext`.
+///
+/// Same contract as [`AgentPrepareNextTurn`] with the completed-turn context
+/// restored. When both hooks are configured, this one wins per call,
+/// upstream-verbatim.
+pub type AgentPrepareNextTurnWithContext = Arc<
+    dyn Fn(
+            PrepareNextTurnContext,
+            Option<CancellationToken>,
+        ) -> BoxedFuture<'static, Option<AgentLoopTurnUpdate>>
+        + Send
+        + Sync,
+>;
+
 /// Returns steering messages to inject into the conversation mid-run,
 /// upstream's `AgentLoopConfig.getSteeringMessages`.
 ///
@@ -482,6 +519,70 @@ pub enum AgentMessage {
     /// An app-defined custom message.
     Custom(CustomAgentMessage),
 }
+
+/// The prompt input the `Agent` accepts, upstream's overloaded
+/// `prompt(input: string | AgentMessage | AgentMessage[], images?)`.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the input model mirrors upstream's overload union: a single assistant message carries the full usage accounting beside one-line prompts"
+)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PromptInput {
+    /// Plain text with optional image blocks. The `Agent` normalizes it to a
+    /// single user message whose content is a text block followed by the
+    /// images; with no images the content is the text block alone.
+    Text {
+        /// The prompt text.
+        text: String,
+        /// Optional image blocks appended after the text block.
+        images: Vec<ImageContent>,
+    },
+    /// A single message.
+    One(AgentMessage),
+    /// A batch of messages.
+    Many(Vec<AgentMessage>),
+}
+
+impl From<&str> for PromptInput {
+    fn from(text: &str) -> Self {
+        Self::Text {
+            text: text.to_owned(),
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<String> for PromptInput {
+    fn from(text: String) -> Self {
+        Self::Text {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<AgentMessage> for PromptInput {
+    fn from(message: AgentMessage) -> Self {
+        Self::One(message)
+    }
+}
+
+impl From<Vec<AgentMessage>> for PromptInput {
+    fn from(messages: Vec<AgentMessage>) -> Self {
+        Self::Many(messages)
+    }
+}
+
+/// A lifecycle listener the `Agent` dispatches events to, upstream's
+/// `Agent.subscribe` callback `(event, signal) => void | Promise<void>`.
+///
+/// Listeners are awaited in registration order and included in the run's
+/// settlement: the agent does not become idle until every awaited listener
+/// for the final `agent_end` event has settled. The token is the active
+/// run's cancellation token. The contract mirrors the loop hooks: must not
+/// panic — a panicking listener fails the run.
+pub type AgentListener =
+    Arc<dyn Fn(AgentEvent, CancellationToken) -> BoxedFuture<'static, ()> + Send + Sync>;
 
 /// Public agent state, upstream's `AgentState`.
 ///

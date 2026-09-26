@@ -34,6 +34,7 @@ use pi_ai::types::SimpleStreamOptions;
 use pi_ai::types::StopReason;
 use pi_ai::types::TextContent;
 use pi_ai::types::ToolCall;
+use pi_ai::types::ToolResultBlock;
 use pi_ai::types::Usage;
 use pi_ai::types::UserContent;
 use pi_ai::utils::event_stream::assistant_message_event_stream;
@@ -309,3 +310,57 @@ pub fn suite_tool(
 
 /// A record of what ran, for executed-value assertions.
 pub type ExecutedRecord = Arc<Mutex<Vec<String>>>;
+
+/// A no-op tool, upstream's noop fixture: returns one text block.
+pub fn noop_tool(result_text: &str) -> pi_agent_core::AgentTool {
+    let result_text = result_text.to_owned();
+    suite_tool(
+        "noop",
+        json!({ "type": "object", "properties": {} }),
+        None,
+        Arc::new(move |_tool_call_id, _args: &Value, _signal, _on_update| {
+            let result = text_tool_result(&result_text, json!({}));
+            Box::pin(async move { Ok(result) })
+        }),
+    )
+}
+
+/// A tool result carrying one text block.
+pub fn text_tool_result(text: &str, details: Value) -> pi_agent_core::AgentToolResult {
+    pi_agent_core::AgentToolResult {
+        content: vec![ToolResultBlock::Text(TextContent {
+            text: text.to_owned(),
+            text_signature: None,
+        })],
+        details,
+        usage: None,
+        added_tool_names: None,
+        terminate: None,
+    }
+}
+
+/// The request-counting stream fn of the tool-call round trips: the first
+/// call returns the tool-use message, later calls return the final text.
+pub fn tool_then_final_stream_fn(request_count: &Arc<AtomicUsize>, final_text: &str) -> StreamFn {
+    let request_count = Arc::clone(request_count);
+    let final_text = final_text.to_owned();
+    Arc::new(move |_model, _context, _options| {
+        let index = request_count.fetch_add(1, Ordering::Relaxed);
+        let mock = mock_stream();
+        let push = mock.clone();
+        let final_message =
+            create_assistant_message(vec![text_block(&final_text)], StopReason::Stop);
+        tokio::spawn(async move {
+            let message = if index == 0 {
+                create_assistant_message(
+                    vec![create_tool_call("tool-1", "noop", json!({}))],
+                    StopReason::ToolUse,
+                )
+            } else {
+                final_message
+            };
+            push.push(done_event(message));
+        });
+        mock
+    })
+}
