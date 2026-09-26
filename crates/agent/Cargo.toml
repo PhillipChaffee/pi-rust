@@ -28,12 +28,16 @@ serde_json = { version = "1.0.145", features = ["preserve_order"] }
 # The abort plumbing the stack decision pins: hook and tool signatures carry
 # the same cancellation token pi-ai's transport options do.
 tokio-util = { version = "0.7", default-features = false }
-# tokio: the async substrate the stack decision pins. sync: the channels and
-# watch/oneshot primitives the ordered delivery tails collapse into; time: the
+# tokio: the async substrate the stack decision pins. rt: `agent_loop` fires
+# its run on a spawned task (upstream's `void runAgentLoop(...)`) and parallel
+# tool execution spawns one task per prepared call. sync: the channels and
+# watch/oneshot primitives the ordered delivery tails collapse into, and the
+# Agent's idle waiters (upstream's per-run `waitForIdle` promise); time: the
 # output publisher's trailing timer and the shell exec timeout; process: the
 # nodejs execution environment's child processes; fs: the environment's file
 # operations; io-util: the child stdout/stderr readers.
 tokio = { version = "1.47", default-features = false, features = [
+  "rt",
   "sync",
   "time",
   "process",
@@ -44,8 +48,10 @@ tokio = { version = "1.47", default-features = false, features = [
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the
 # single-threaded substrate expects; time: the paused clock for ordered
-# settlement tests; process: the nodejs execution environment's shell probes.
-tokio = { version = "1.47", features = ["macros", "rt", "time", "process", "test-util"] }
+# settlement tests; process: the nodejs execution environment's shell probes;
+# sync: the oneshot/Notify release gates the tool execution-order tests drive;
+# test-util: the clock pause itself.
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "time", "process", "test-util"] }
 # tempfile: the execution-environment suites' scratch roots.
 tempfile = "3"
 
