@@ -24,10 +24,12 @@ use pi_agent_core::AgentMessage;
 use pi_agent_core::ConvertToLlm;
 use pi_agent_core::StreamFn;
 use pi_ai::auth::resolve::now_ms;
+use pi_ai::http::mock::{MockHttpClient, MockResponse};
 use pi_ai::types::Api;
 use pi_ai::types::AssistantBlock;
 use pi_ai::types::AssistantMessage;
 use pi_ai::types::AssistantMessageEvent;
+use pi_ai::types::Context;
 use pi_ai::types::Message;
 use pi_ai::types::Model;
 use pi_ai::types::SimpleStreamOptions;
@@ -363,4 +365,115 @@ pub fn tool_then_final_stream_fn(request_count: &Arc<AtomicUsize>, final_text: &
         });
         mock
     })
+}
+
+// --- proxy-suite fixtures, upstream `test/proxy.test.ts` shapes ---
+
+/// The proxy suite's model literal, upstream's `gpt-5.4` fixture.
+pub fn proxy_model() -> Model {
+    serde_json::from_value(json!({
+        "id": "gpt-5.4",
+        "name": "GPT-5.4",
+        "api": "openai-responses",
+        "provider": "openai",
+        "baseUrl": "https://api.openai.com/v1",
+        "reasoning": true,
+        "input": ["text"],
+        "cost": { "input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0 },
+        "contextWindow": 400_000,
+        "maxTokens": 128_000,
+    }))
+    .expect("a well-formed model literal")
+}
+
+/// The all-zero usage the proxy fixtures script, upstream's `usage`.
+pub fn empty_proxy_usage() -> Usage {
+    Usage::default()
+}
+
+/// The empty context the proxy fixtures stream against, upstream's
+/// `{ systemPrompt: "", messages: [] }`.
+pub const fn empty_proxy_context() -> Context {
+    Context {
+        system_prompt: Some(String::new()),
+        messages: Vec::new(),
+        tools: None,
+    }
+}
+
+/// The wire body a scripted proxy event list produces, upstream's
+/// `proxyEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`)`.
+pub fn proxy_data_lines(events: &[pi_agent_core::ProxyAssistantMessageEvent]) -> String {
+    let mut body = String::new();
+    for event in events {
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(event).expect("a serializable proxy event"));
+        body.push_str("\n\n");
+    }
+    body
+}
+
+/// The wire tag an assistant-message event carries, upstream's
+/// `event.type` — read from the event's own serialization so the tag is the
+/// wire's verbatim.
+pub fn proxy_event_type(event: &AssistantMessageEvent) -> String {
+    serde_json::to_value(event)
+        .expect("an event serializes")
+        .get("type")
+        .and_then(Value::as_str)
+        .expect("a tagged event")
+        .to_owned()
+}
+
+/// The `done` proxy event the fixtures script, empty usage and an optional
+/// provider thinking level, upstream's inline done objects.
+pub fn proxy_done(
+    reason: StopReason,
+    provider_thinking_level: Option<&str>,
+) -> pi_agent_core::ProxyAssistantMessageEvent {
+    pi_agent_core::ProxyAssistantMessageEvent::Done {
+        reason,
+        usage: empty_proxy_usage(),
+        provider_thinking_level: provider_thinking_level.map(ToOwned::to_owned),
+    }
+}
+
+/// The `toolcall_end` proxy event from a wire JSON literal, upstream's
+/// toolCall objects (`"type": "toolCall"`-discriminated on the wire).
+pub fn proxy_toolcall_end(
+    content_index: u64,
+    wire: Value,
+) -> pi_agent_core::ProxyAssistantMessageEvent {
+    pi_agent_core::ProxyAssistantMessageEvent::ToolcallEnd {
+        content_index,
+        tool_call: serde_json::from_value(wire).expect("a well-formed tool call"),
+    }
+}
+
+/// Run the proxy against `options` and drain, the proxy suites' shared
+/// tail: the scripted body streams through, then the settled result.
+/// Returns the events plus the settled message, upstream's `for await` +
+/// `result()` pair.
+pub async fn run_proxy(
+    options: pi_agent_core::ProxyStreamOptions,
+) -> (Vec<AssistantMessageEvent>, AssistantMessage) {
+    let stream = pi_agent_core::stream_proxy(&proxy_model(), &empty_proxy_context(), &options);
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event);
+    }
+    let result = stream.result().await;
+    (events, result)
+}
+
+/// Mount a mock client answering `body` on the proxy URL and return the
+/// options that send through it, upstream's `vi.stubGlobal("fetch", ...)`.
+pub fn proxy_options_with_body(body: String) -> pi_agent_core::ProxyStreamOptions {
+    let mock = MockHttpClient::new();
+    mock.on(|request| request.url == "https://proxy.example.com/api/stream")
+        .respond(MockResponse::status(200).with_body(body));
+    pi_agent_core::ProxyStreamOptions {
+        http_client: Some(Arc::new(mock)),
+        ..pi_agent_core::ProxyStreamOptions::new("test-token", "https://proxy.example.com")
+    }
 }

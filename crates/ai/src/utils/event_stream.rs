@@ -119,14 +119,15 @@ impl<T, R: Clone> EventStream<T, R> {
     }
 
     /// End the stream. An explicit result settles the final result for every
-    /// waiter; without one the final result stays unset, exactly like the
-    /// upstream promise left pending.
+    /// waiter; without one the final result keeps whatever a completing
+    /// event settled — upstream's `if (result !== undefined)` guard — or
+    /// stays unset when nothing did.
     pub fn end(&self, result: Option<&R>) {
         let mut state = self.lock();
         state.done = true;
-        state.result = result.cloned();
-        for waiter in std::mem::take(&mut state.result_waiters) {
-            if let Some(result) = result {
+        if let Some(result) = result {
+            state.result = Some(result.clone());
+            for waiter in std::mem::take(&mut state.result_waiters) {
                 let _ = waiter.send(result.clone());
             }
         }
