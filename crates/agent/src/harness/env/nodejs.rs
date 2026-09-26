@@ -104,12 +104,19 @@ fn file_url_to_path(url: &str) -> String {
     let Some(rest) = url.strip_prefix("file://") else {
         return url.to_owned();
     };
-    // The authority half is empty for local files; the loopback markers are
-    // the only hosts a local path carries.
-    let path = rest
-        .strip_prefix("localhost/")
-        .or_else(|| rest.strip_prefix("127.0.0.1/"))
-        .unwrap_or(rest);
+    // `file:///path` carries an empty authority and the path begins at the
+    // slash; `file://localhost/path` and `file://127.0.0.1/path` name the
+    // local hosts, whose path keeps its leading slash (Node's
+    // `fileURLToPath`). A remote authority, or a bare authority without a
+    // path half, is not a local URL: the original text stands, upstream's
+    // catch keeps malformed input as an ordinary path.
+    let path = match rest.split_once('/') {
+        Some((authority, _)) => match authority {
+            "" | "localhost" | "127.0.0.1" => &rest[authority.len()..],
+            _ => return url.to_owned(),
+        },
+        None => return url.to_owned(),
+    };
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;

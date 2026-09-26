@@ -19,6 +19,9 @@ use pi_chord::context::{Context, background_context, with_cancel};
 
 use crate::harness::env::nodejs::{NodeExecutionEnv, SPILL_FILE_PREFIX};
 use crate::harness::types::{
+    ExecutionErrorCode, ShellOutputCaptureOptions, ShellOutputLimits, TextLineReader,
+};
+use crate::harness::types::{
     CreateDirOptions, ExecutionEnv, FileContent, FileErrorCode, FileKind, FileSystem,
     ReadTextLinesOptions, RemoveOptions, Shell, ShellExecOptions, ShellExecResult,
     ShellOutputUpdate, ShellOutputView, TempFileOptions,
@@ -761,7 +764,7 @@ async fn reports_a_missing_working_directory_before_spawning() {
         .expect_err("missing cwd errors");
     assert_eq!(
         error.code,
-        crate::harness::types::ExecutionErrorCode::SpawnError
+        ExecutionErrorCode::SpawnError
     );
     assert!(error.message.contains("Working directory does not exist"));
 }
@@ -808,7 +811,7 @@ async fn commands_exceeding_the_timeout_report_timeout_errors() {
     .expect_err("timeout errors");
     assert_eq!(
         error.code,
-        crate::harness::types::ExecutionErrorCode::Timeout
+        ExecutionErrorCode::Timeout
     );
 }
 
@@ -825,7 +828,7 @@ async fn shell_unavailable_and_spawn_errors() {
         .expect_err("missing shell errors");
     assert_eq!(
         error.code,
-        crate::harness::types::ExecutionErrorCode::ShellUnavailable
+        ExecutionErrorCode::ShellUnavailable
     );
 
     let shell_path = format!("{root}/not-executable-shell");
@@ -844,7 +847,7 @@ async fn shell_unavailable_and_spawn_errors() {
         .expect_err("non-executable shell errors");
     assert_eq!(
         error.code,
-        crate::harness::types::ExecutionErrorCode::SpawnError
+        ExecutionErrorCode::SpawnError
     );
 }
 
@@ -859,7 +862,7 @@ async fn aborted_commands_report_the_aborted_error() {
     let error = execution.await.expect_err("aborted exec errors");
     assert_eq!(
         error.code,
-        crate::harness::types::ExecutionErrorCode::Aborted
+        ExecutionErrorCode::Aborted
     );
 }
 
@@ -886,9 +889,9 @@ async fn does_not_create_a_spill_before_bounded_output_crosses_its_limits() {
 fn spill_capture(
     max_bytes: u64,
     max_lines: u64,
-) -> crate::harness::types::ShellOutputCaptureOptions {
-    crate::harness::types::ShellOutputCaptureOptions {
-        limits: crate::harness::types::ShellOutputLimits {
+) -> ShellOutputCaptureOptions {
+    ShellOutputCaptureOptions {
+        limits: ShellOutputLimits {
             max_bytes,
             max_lines,
             retain: Some(crate::harness::types::ShellOutputRetention::Tail),
@@ -941,7 +944,7 @@ async fn fails_rather_than_silently_losing_a_requested_spill() {
     .expect_err("the failed spill errors");
     assert_eq!(
         error.code,
-        crate::harness::types::ExecutionErrorCode::Unknown
+        ExecutionErrorCode::Unknown
     );
     assert!(
         error
@@ -1002,7 +1005,7 @@ impl FileSystem for FailingSpillExecutionEnv {
         context: &'a Context,
     ) -> BoxedFuture<
         'a,
-        Result<Box<dyn crate::harness::types::TextLineReader>, crate::harness::types::FileError>,
+        Result<Box<dyn TextLineReader>, crate::harness::types::FileError>,
     > {
         self.inner.open_text_line_reader(path, context)
     }
@@ -1208,4 +1211,381 @@ async fn cleanup_on_an_idle_environment_resolves() {
     let root = tempfile::tempdir().expect("temp root");
     let env = env_at(root.path().to_string_lossy().as_ref());
     Shell::cleanup(&env, &context()).await;
+}
+
+// --- Private helper surface: the tests module is a sibling of the
+// environment module, so the resolution and probe helpers are reachable
+// directly instead of through contrived filesystem states.
+
+use super::{
+    CommandTransport, file_url_to_path, find_bash_on_path, get_bash_shell_config,
+    get_shell_config, get_shell_env, resolve_path, resolve_timeout_ms, run_command, temp_name,
+};
+
+#[test]
+fn the_timeout_resolution_rejects_non_finite_negative_and_oversized_values() {
+    assert_eq!(
+        resolve_timeout_ms(None).expect("absent timeout"),
+        None
+    );
+    assert_eq!(
+        resolve_timeout_ms(Some(1.5)).expect("a positive timeout"),
+        Some(1_500)
+    );
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let error = resolve_timeout_ms(Some(invalid))
+            .expect_err("an invalid timeout errors");
+        assert_eq!(error.code, ExecutionErrorCode::Timeout);
+    }
+    let error = resolve_timeout_ms(Some(2_147_483.648))
+        .expect_err("a timeout past the millisecond cap errors");
+    assert_eq!(error.code, ExecutionErrorCode::Timeout);
+}
+
+#[test]
+fn file_urls_decode_local_paths_and_keep_malformed_input() {
+    assert_eq!(
+        file_url_to_path("file:///home/a%20user/x.txt"),
+        "/home/a user/x.txt"
+    );
+    assert_eq!(file_url_to_path("file://localhost/x.txt"), "/x.txt");
+    assert_eq!(file_url_to_path("file://127.0.0.1/x.txt"), "/x.txt");
+    assert_eq!(file_url_to_path("file://localhost"), "file://localhost");
+    assert_eq!(file_url_to_path("file:///bad%2zx"), "/bad%2zx");
+    assert_eq!(file_url_to_path("file:///short%2"), "/short%2");
+    assert_eq!(file_url_to_path("plain.txt"), "plain.txt");
+}
+
+#[test]
+fn resolve_path_expands_home_and_normalizes_segments() {
+    assert_eq!(resolve_path("/work", "a/./b/../c"), "/work/a/c");
+    assert_eq!(resolve_path("/work", "/abs/x"), "/abs/x");
+    assert_eq!(resolve_path("/work", "./x"), "/work/x");
+    assert_eq!(resolve_path("/work", "a//b"), "/work/a/b");
+    if std::env::var("HOME").is_ok_and(|home| !home.is_empty()) {
+        assert_eq!(resolve_path("/work", "~"), std::env::var("HOME").expect("home"));
+        assert_eq!(
+            resolve_path("/work", "~/child"),
+            format!("{}/child", std::env::var("HOME").expect("home"))
+        );
+    }
+}
+
+#[test]
+fn the_legacy_wsl_bash_maps_to_stdin_transport() {
+    let config = get_bash_shell_config("C:\\Windows\\System32\\bash.exe".to_owned());
+    assert!(matches!(
+        config.command_transport,
+        CommandTransport::Stdin
+    ));
+    assert_eq!(config.args, vec!["-s".to_owned()]);
+    let config = get_bash_shell_config("/bin/bash".to_owned());
+    assert!(matches!(
+        config.command_transport,
+        CommandTransport::Argv
+    ));
+    assert_eq!(config.args, vec!["-c".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_missing_custom_shell_reports_shell_unavailable() {
+    let error = get_shell_config(Some("/definitely/missing/bash"))
+        .await
+        .expect_err("a missing custom shell errors");
+    assert_eq!(error.code, ExecutionErrorCode::ShellUnavailable);
+}
+
+#[tokio::test]
+async fn a_present_custom_shell_skips_discovery() {
+    let config = get_shell_config(Some("/bin/bash"))
+        .await
+        .expect("the custom shell exists");
+    assert_eq!(config.shell, "/bin/bash");
+}
+
+#[test]
+fn the_shell_environment_composes_inheritance_and_overrides() {
+    let mut base = BTreeMap::new();
+    base.insert("BASE".to_owned(), "1".to_owned());
+    let mut extra = BTreeMap::new();
+    extra.insert("BASE".to_owned(), "2".to_owned());
+    extra.insert("EXTRA".to_owned(), "3".to_owned());
+    let composed = get_shell_env(Some(&base), Some(&extra), false);
+    assert_eq!(composed["BASE"], "2");
+    assert_eq!(composed["EXTRA"], "3");
+    assert!(get_shell_env(Some(&base), None, false).is_empty());
+    assert!(get_shell_env(None, None, true).contains_key("PATH"));
+}
+
+#[tokio::test]
+async fn the_probe_runner_reports_spawn_failures_and_timeouts() {
+    let (stdout, status) = run_command("/bin/echo", &["-n", "probe-ok"], 5_000).await;
+    assert_eq!(stdout, "probe-ok");
+    assert_eq!(status, Some(0));
+    let (stdout, status) = run_command("/definitely/missing/probe", &[], 5_000).await;
+    assert!(stdout.is_empty());
+    assert_eq!(status, None);
+    let (stdout, status) = run_command("/bin/sleep", &["30"], 20).await;
+    assert!(stdout.is_empty());
+    assert_eq!(status, None);
+}
+
+#[tokio::test]
+async fn find_bash_on_path_resolves_on_this_machine() {
+    let found = find_bash_on_path()
+        .await
+        .expect("bash exists on mac/linux CI machines");
+    assert!(found.contains("bash"));
+}
+
+#[test]
+fn temp_names_stay_unique_per_counter() {
+    let first = temp_name(1);
+    let second = temp_name(2);
+    assert_ne!(first, second);
+    assert!(first.split('-').count() >= 3);
+}
+
+// --- Abort guards and error mapping the operation suites do not reach.
+
+#[tokio::test]
+async fn pre_aborted_auxiliary_operations_report_aborted() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let context = context();
+    FileSystem::write_file(&env, "file.txt", "hello".into(), &context)
+        .await
+        .expect("write");
+    let aborted = aborted_context();
+    let results = (
+        FileSystem::append_file(&env, "file.txt", "x".into(), &aborted).await,
+        FileSystem::file_info(&env, "file.txt", &aborted).await,
+        FileSystem::create_temp_dir(&env, None, &aborted).await,
+        FileSystem::create_temp_file(&env, None, &aborted).await,
+        FileSystem::create_dir(&env, "dir", None, &aborted).await,
+        FileSystem::remove(&env, "file.txt", None, &aborted).await,
+    );
+    for error in [
+        results.0.expect_err("append aborted"),
+        results.1.expect_err("file info aborted"),
+        results.2.expect_err("temp dir aborted"),
+        results.3.expect_err("temp file aborted"),
+        results.4.expect_err("create dir aborted"),
+        results.5.expect_err("remove aborted"),
+    ] {
+        assert_eq!(error.code, FileErrorCode::Aborted);
+    }
+}
+
+#[tokio::test]
+async fn file_errors_map_the_io_error_kinds() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let context = context();
+    FileSystem::write_file(&env, "file.txt", "hello".into(), &context)
+        .await
+        .expect("write");
+
+    // Reading through a file path names a non-directory parent.
+    let error = FileSystem::read_text_file(&env, "file.txt/child", &context)
+        .await
+        .expect_err("a file used as a directory errors");
+    assert_eq!(error.code, FileErrorCode::NotDirectory);
+
+    // Reading a directory is an is-a-directory failure.
+    let error = FileSystem::read_text_file(&env, ".", &context)
+        .await
+        .expect_err("a directory read errors");
+    assert_eq!(error.code, FileErrorCode::IsDirectory);
+
+    // A NUL byte in the path is an invalid input.
+    let error = FileSystem::write_file(&env, "bad\0path", "x".into(), &context)
+        .await
+        .expect_err("a NUL path errors");
+    assert_eq!(error.code, FileErrorCode::Invalid);
+
+    // Removing a missing path is a not-found failure.
+    let error = FileSystem::remove(&env, "missing.txt", None, &context)
+        .await
+        .expect_err("a missing removal errors");
+    assert_eq!(error.code, FileErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn file_info_rejects_unsupported_types() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let socket = std::path::Path::new(&root).join("sock");
+    std::os::unix::net::UnixListener::bind(&socket).expect("socket");
+    let error = FileSystem::file_info(&env, "sock", &context())
+        .await
+        .expect_err("a socket is an unsupported file type");
+    assert_eq!(error.code, FileErrorCode::Invalid);
+    assert_eq!(error.message, "Unsupported file type");
+}
+
+#[tokio::test]
+async fn a_closed_text_line_reader_reports_invalid() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let context = context();
+    FileSystem::write_file(&env, "file.txt", "one\ntwo".into(), &context)
+        .await
+        .expect("write");
+    let mut reader = FileSystem::open_text_line_reader(&env, "file.txt", &context)
+        .await
+        .expect("open");
+    reader.close(&context).await;
+    let error = reader.read_line(&context).await.expect_err("closed");
+    assert_eq!(error.code, FileErrorCode::Invalid);
+    assert_eq!(error.message, "Text line reader is closed");
+}
+
+#[tokio::test]
+async fn an_abort_during_a_streaming_read_reports_aborted() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let context = context();
+    let body = "x".repeat(8 * 1024 * 1024);
+    FileSystem::write_file(&env, "big.txt", body.into(), &context)
+        .await
+        .expect("write");
+    let (abort_context, controller) = with_cancel(&background_context());
+    let mut reader = FileSystem::open_text_line_reader(&env, "big.txt", &context)
+        .await
+        .expect("open");
+    let (outcome, ()) = tokio::join!(
+        TextLineReader::read_line(reader.as_mut(), &abort_context),
+        async {
+            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+            controller.abort("aborted");
+        }
+    );
+    let error = outcome.expect_err("the mid-read abort surfaces");
+    assert_eq!(error.code, FileErrorCode::Aborted);
+}
+
+#[tokio::test]
+async fn the_environment_renders_its_debug_view() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path().to_string_lossy().as_ref());
+    let debug = format!("{env:?}");
+    assert!(debug.contains("NodeExecutionEnv"), "{debug}");
+    assert!(debug.contains(&root.path().to_string_lossy().to_string()));
+}
+
+#[tokio::test]
+async fn an_exec_with_a_zero_capture_limit_fails_before_spawning() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path().to_string_lossy().as_ref());
+    let options = ShellExecOptions {
+        capture: Some(ShellOutputCaptureOptions {
+            limits: ShellOutputLimits {
+                max_bytes: 0,
+                max_lines: 0,
+                retain: None,
+            },
+            spill: false,
+        }),
+        ..ShellExecOptions::default()
+    };
+    let error = Shell::exec(&env, "echo hi", Some(options), &context())
+        .await
+        .expect_err("a zero capture limit refuses to start");
+    assert_eq!(error.code, ExecutionErrorCode::Unknown);
+}
+
+#[tokio::test]
+async fn exec_completes_before_its_timeout() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path().to_string_lossy().as_ref());
+    let options = ShellExecOptions {
+        timeout: Some(30.0),
+        ..ShellExecOptions::default()
+    };
+    let (result, _) = collect_shell_output(&env, "echo ok", Some(options), &context()).await;
+    let result = result.expect("the run settles inside its timeout");
+    assert_eq!(result.exit_code, 0);
+}
+
+// --- The remaining error surfaces the suites above do not reach.
+
+#[test]
+fn remote_authority_file_urls_keep_their_original_text() {
+    assert_eq!(
+        file_url_to_path("file://evil.example/x.txt"),
+        "file://evil.example/x.txt"
+    );
+}
+
+#[tokio::test]
+async fn a_directory_read_during_line_streaming_closes_the_reader() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path().to_string_lossy().as_ref());
+    let context = context();
+    let error = FileSystem::read_text_lines(&env, ".", None, &context)
+        .await
+        .expect_err("a directory line stream errors");
+    assert_eq!(error.code, FileErrorCode::IsDirectory);
+}
+
+#[tokio::test]
+async fn writes_through_a_file_parent_report_the_io_error() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let context = context();
+    FileSystem::write_file(&env, "file.txt", "hello".into(), &context)
+        .await
+        .expect("write");
+    let error = FileSystem::write_file(&env, "file.txt/child", "x".into(), &context)
+        .await
+        .expect_err("a file parent errors");
+    assert!(error.path.as_deref().is_some_and(|path| path.contains("file.txt/child")), "{error:?}");
+    let error = FileSystem::append_file(&env, "file.txt/child", "x".into(), &context)
+        .await
+        .expect_err("a file parent errors on append too");
+    assert!(error.path.as_deref().is_some_and(|path| path.contains("file.txt/child")), "{error:?}");
+}
+
+#[tokio::test]
+async fn a_temp_file_with_an_unwritable_prefix_reports_the_io_error() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_at(root.path().to_string_lossy().as_ref());
+    let context = context();
+    let error = FileSystem::create_temp_file(
+        &env,
+        Some(TempFileOptions {
+            prefix: Some("/definitely-missing-dir/".to_owned()),
+            suffix: None,
+        }),
+        &context,
+    )
+    .await
+    .expect_err("an unwritable prefix errors");
+    assert_eq!(error.code, FileErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn canonical_and_create_dir_error_surfaces() {
+    let root = tempfile::tempdir().expect("temp root");
+    let root = root.path().to_string_lossy().into_owned();
+    let env = env_at(&root);
+    let context = context();
+    FileSystem::write_file(&env, "file.txt", "hello".into(), &context)
+        .await
+        .expect("write");
+    let error = FileSystem::canonical_path(&env, "missing.txt", &context)
+        .await
+        .expect_err("a missing canonical path errors");
+    assert_eq!(error.code, FileErrorCode::NotFound);
+    let error = FileSystem::create_dir(&env, "file.txt", Some(CreateDirOptions { recursive: Some(false) }), &context)
+        .await
+        .expect_err("a non-recursive create over a file errors");
+    assert!(error.code != FileErrorCode::Aborted, "{error:?}");
 }
