@@ -518,7 +518,7 @@ impl IdGenerator for StubIds {
 }
 
 fn stub_error<T>() -> BoxedFuture<'static, Result<T, SessionError>> {
-    Box::pin(async { Err(SessionError("stub".to_owned())) })
+    Box::pin(async { Err(SessionError::Message("stub".to_owned())) })
 }
 
 impl SessionReader for StubSession {
