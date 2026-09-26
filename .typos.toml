@@ -8,6 +8,10 @@ calender = "calender"
 ratatui = "ratatui"
 # evn is the macro variable binding an event's name.
 evn = "evn"
+# The output belt's slide-overlap fixture sentinel: the ported
+# update_from test pairs "baQ" against "ab" so the first-byte probe hits
+# but the tails diverge; typos camel-splits the token and flags "ba".
+baQ = "baQ"
 # JSON fragments the utils suites pin verbatim from the upstream tests.
 # Relace is the vendor name of the relace/relace-search model in the
 # generated OpenRouter catalog shard (models.dev/OpenRouter data).

@@ -20,6 +20,7 @@
 
 pub mod agent;
 pub mod agent_loop;
+pub mod harness;
 pub mod search;
 pub mod stream_fn;
 pub mod types;

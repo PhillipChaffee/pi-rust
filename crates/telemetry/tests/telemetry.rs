@@ -516,3 +516,40 @@ fn find_span<'a>(
         None => unreachable!("no recorded span named {name}"),
     }
 }
+
+/// A span's optional wire-name literal sets the span name the schema data
+/// and `SPAN_NAMES` carry, so dotted wire names a Rust identifier cannot
+/// spell ride the declaration.
+mod wire_named {
+    pi_telemetry::define_telemetry_schema! {
+        /// The vocabulary of one named span.
+        pub schema wire_named {
+            version: 1,
+            spans: {
+                /// The named span.
+                operation as "pi.test.operation" => "Named operation" {
+                    parents: [any],
+                    start_attributes: {},
+                    end_attributes: {},
+                    status: { default ok, error_when "The operation fails" },
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn the_wire_name_replaces_the_ident_in_names_and_data() {
+        assert_eq!(
+            <wire_named::Schema as pi_telemetry::schema::TelemetrySchema>::SPAN_NAMES,
+            &["pi.test.operation"]
+        );
+        assert_eq!(
+            <wire_named::operation::Span as pi_telemetry::schema::SpanDefinition>::NAME,
+            "pi.test.operation"
+        );
+        let spans =
+            <wire_named::Schema as pi_telemetry::schema::TelemetrySchema>::definition().spans;
+        assert!(spans.contains_key("pi.test.operation"));
+        assert!(!spans.contains_key("operation"));
+    }
+}

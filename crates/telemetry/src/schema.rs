@@ -517,12 +517,25 @@ macro_rules! __telemetry_events {
     };
 }
 
+/// Emits one span's wire name: the declared wire literal when present,
+/// otherwise the span identifier.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __telemetry_span_name {
+    (as $wire:tt $($rest:tt)*) => {
+        $wire
+    };
+    ($fallback:expr) => {
+        $fallback
+    };
+}
+
 /// Emits one span module: the span marker, typed start/end attribute
 /// structs, and the event modules.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __telemetry_span {
-    ($vis:vis $span_name:ident $span_desc:literal {
+    ($vis:vis $span_name:ident $(as $span_wire:tt)? $span_desc:literal {
         parents: $p:tt,
         start_attributes: { $( $san:literal $sf:ident $(as $satype:ident)? : $skind:ident $smode:ident $(values $svg:tt)? description: $sd:literal ),* $(,)? },
         end_attributes: { $( $ean:literal $ef:ident $(as $eatype:ident)? : $ekind:ident $emode:ident $(values $evg:tt)? description: $ed:literal ),* $(,)? },
@@ -535,7 +548,8 @@ macro_rules! __telemetry_span {
             pub struct Span;
 
             impl $crate::schema::SpanDefinition for Span {
-                const NAME: &'static str = stringify!($span_name);
+                const NAME: &'static str =
+                    $crate::__telemetry_span_name!($(as $span_wire)? stringify!($span_name));
                 type Start = Start;
                 type End = End;
             }
@@ -557,7 +571,7 @@ macro_rules! __telemetry_span {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __telemetry_span_data {
-    ($span_name:ident $span_desc:literal {
+    ($span_name:ident $(as $span_wire:tt)? $span_desc:literal {
         parents: $p:tt,
         start_attributes: { $( $san:literal $sf:ident $(as $satype:ident)? : $skind:ident $smode:ident $(values $svg:tt)? description: $sd:literal ),* $(,)? },
         end_attributes: { $( $ean:literal $ef:ident $(as $eatype:ident)? : $ekind:ident $emode:ident $(values $evg:tt)? description: $ed:literal ),* $(,)? },
@@ -565,7 +579,7 @@ macro_rules! __telemetry_span_data {
         status: { default ok, error_when $ew:literal } $(,)?
     }) => {
         (
-            stringify!($span_name).to_owned(),
+            $crate::__telemetry_span_name!($(as $span_wire)? stringify!($span_name)).to_owned(),
             $crate::schema::TelemetrySpanDefinition {
                 description: $span_desc.to_owned(),
                 parents: $crate::__telemetry_parents!($p),
@@ -646,6 +660,12 @@ macro_rules! __telemetry_parents {
 /// [values [Variant: "value", ...]] description: "doc"`, where kind is one
 /// of `string`, `number`, `boolean`, `string_array`, `number_array`,
 /// `boolean_array`. Closed sets are string-only.
+///
+/// Grammar per span: `ident [as "wire-name"] => "description" { ... }`.
+/// The Rust identifier names the generated module; the optional wire name
+/// literal sets the span name the schema data and `SPAN_NAMES` carry, for
+/// dotted wire names a Rust identifier cannot spell. Without it the span
+/// name is the identifier.
 ///
 /// # Examples
 ///
@@ -743,7 +763,7 @@ macro_rules! define_telemetry_schema {
             spans: {
                 $(
                     $(#[$span_meta:meta])*
-                    $span_name:ident => $span_desc:literal {
+                    $span_name:ident $(as $span_wire:tt)? => $span_desc:literal {
                         parents: $p:tt,
                         start_attributes: { $( $san:literal $sf:ident $(as $satype:ident)? : $skind:ident $smode:ident $(values $svg:tt)? description: $sd:literal ),* $(,)? },
                         end_attributes: { $( $ean:literal $ef:ident $(as $eatype:ident)? : $ekind:ident $emode:ident $(values $evg:tt)? description: $ed:literal ),* $(,)? },
@@ -761,7 +781,8 @@ macro_rules! define_telemetry_schema {
             $schema_vis struct Schema;
 
             impl $crate::schema::TelemetrySchema for Schema {
-                const SPAN_NAMES: &'static [&'static str] = &[ $( stringify!($span_name) ),* ];
+                const SPAN_NAMES: &'static [&'static str] =
+                    &[ $( $crate::__telemetry_span_name!($(as $span_wire)? stringify!($span_name)) ),* ];
 
                 fn definition() -> $crate::schema::TelemetrySchemaDefinition {
                     $crate::schema::TelemetrySchemaDefinition {
@@ -770,7 +791,7 @@ macro_rules! define_telemetry_schema {
                             ::std::iter::empty::<(String, $crate::schema::TelemetrySpanDefinition)>()
                             $(
                                 .chain( ::std::iter::once( $crate::__telemetry_span_data!(
-                                    $span_name $span_desc {
+                                    $span_name $(as $span_wire)? $span_desc {
                                         parents: $p,
                                         start_attributes: { $( $san $sf $(as $satype)? : $skind $smode $(values $svg)? description: $sd ),* },
                                         end_attributes: { $( $ean $ef $(as $eatype)? : $ekind $emode $(values $evg)? description: $ed ),* },
@@ -786,7 +807,7 @@ macro_rules! define_telemetry_schema {
             $(
                 $(#[$span_meta])*
                 $crate::__telemetry_span!(
-                    $schema_vis $span_name $span_desc {
+                    $schema_vis $span_name $(as $span_wire)? $span_desc {
                         parents: $p,
                         start_attributes: { $( $san $sf $(as $satype)? : $skind $smode $(values $svg)? description: $sd ),* },
                         end_attributes: { $( $ean $ef $(as $eatype)? : $ekind $emode $(values $evg)? description: $ed ),* },

@@ -2081,9 +2081,13 @@ dependencies = [
 name = "pi-agent-core"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "pi-ai",
+ "pi-chord",
+ "pi-telemetry",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]
