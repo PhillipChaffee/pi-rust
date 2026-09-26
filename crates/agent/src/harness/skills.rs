@@ -9,9 +9,9 @@
 //!
 //! The ignore matcher restates upstream's npm `ignore` dependency on the
 //! Rust `ignore` crate: the builder runs case-insensitively, the way npm
-//! `ignore` defaults, and [`IgnoreMatcher::ignores`] re-expresses npm's
-//! parent-first walk (an ignored parent directory ignores everything below
-//! it; whitelists cannot re-include under an ignored parent) over
+//! `ignore` defaults, and the private `IgnoreMatcher::ignores` re-expresses
+//! npm's parent-first walk (an ignored parent directory ignores everything
+//! below it; whitelists cannot re-include under an ignored parent) over
 //! `Gitignore::matched`, which checks one path at a time.
 
 use ignore::Match;
