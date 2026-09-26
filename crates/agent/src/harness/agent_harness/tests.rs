@@ -8,11 +8,22 @@
 )]
 #![expect(clippy::panic, reason = "tests assert by panicking")]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use pi_ai::types::BoxedFuture;
+
 use crate::harness::agent_harness::{
-    HarnessEvent, HarnessEventPayload, HarnessEventType, LaneSnapshotTool, OperationStatus,
-    Subscription,
+    AgentHarnessOptions, HarnessEvent, HarnessEventPayload, HarnessEventType, HookName,
+    LaneSnapshotTool, OperationStatus, Subscription, SystemPromptSource,
+};
+use crate::harness::context::Context;
+use crate::harness::session::types::{
+    Branch, Entry, EntryQuery, IdGenerator, SessionError, SessionMetadata, SessionMutation,
+    SessionMutationCallback, SessionReader, SessionStats, StorageBranchScan,
+};
+use crate::harness::session::values::{
+    ListAddress, ListElement, ListReadOptions, StoredValue, ValueAddress,
 };
 
 fn deferred_handle() -> pi_ai::types::DeferredHandle {
@@ -345,7 +356,7 @@ fn payload_for(kind: HarnessEventType) -> HarnessEventPayload {
             terminate: false,
         },
         HarnessEventType::EntryAdded => HarnessEventPayload::EntryAdded {
-            entry: crate::harness::session::types::Entry::Message {
+            entry: Entry::Message {
                 id: "entry".to_owned(),
                 parent_id: None,
                 seq: 1,
@@ -407,4 +418,342 @@ fn payload_for(kind: HarnessEventType) -> HarnessEventPayload {
             totals: usage(),
         },
     }
+}
+
+/// The boundary constructors reject cross-scope payloads with the payload's
+/// wire name, and build harness-global events lane-less.
+#[test]
+fn the_boundary_constructors_reject_cross_scope_payloads() {
+    let error = HarnessEvent::lane_scoped("main", false, payload_for(HarnessEventType::Fault))
+        .expect_err("fault is harness-global");
+    assert!(error.contains("fault"), "{error}");
+    assert!(error.contains("harness-global"), "{error}");
+
+    let error = HarnessEvent::global(payload_for(HarnessEventType::RunStart))
+        .expect_err("run_start is lane-scoped");
+    assert!(error.contains("run_start"), "{error}");
+    assert!(error.contains("lane-scoped"), "{error}");
+
+    let event = HarnessEvent::global(payload_for(HarnessEventType::Fault)).expect("fault global");
+    assert!(event.lane.is_none());
+    assert!(!event.recovery);
+    assert_eq!(event.event_type().as_str(), "fault");
+}
+
+/// The subscription renders an opaque debug shape.
+#[test]
+fn the_subscription_renders_an_opaque_debug_shape() {
+    let subscription = Subscription::new(Arc::new(|| {}));
+    assert_eq!(format!("{subscription:?}"), "Subscription(..)");
+}
+
+/// Every hook name carries its wire discriminator.
+#[test]
+fn every_hook_name_carries_its_wire_discriminator() {
+    let names = [
+        (HookName::BeforeRun, "before_run"),
+        (HookName::BeforeDrive, "before_drive"),
+        (HookName::BeforeRunEnd, "before_run_end"),
+        (HookName::TransformContext, "transform_context"),
+        (HookName::BeforeRequest, "before_request"),
+        (HookName::BeforePayload, "before_payload"),
+        (HookName::AfterResponse, "after_response"),
+        (HookName::BeforeTool, "before_tool"),
+        (HookName::AfterTool, "after_tool"),
+        (HookName::BeforeCompaction, "before_compaction"),
+        (HookName::BeforeNavigation, "before_navigation"),
+    ];
+    for (name, wire) in names {
+        assert_eq!(name.as_str(), wire);
+    }
+}
+
+/// The system-prompt source renders its static prompt inline and its
+/// provider opaquely.
+#[test]
+fn the_system_prompt_source_renders_both_variants() {
+    let static_source = SystemPromptSource::Static("be terse".to_owned());
+    let debug = format!("{static_source:?}");
+    assert!(debug.contains("be terse"), "{debug}");
+    let provided_source = SystemPromptSource::Provided(Arc::new(
+        |_tool_context: crate::harness::types::ToolContext, _context: &Context| {
+            Box::pin(async { "generated".to_owned() })
+        },
+    ));
+    assert_eq!(
+        format!("{provided_source:?}"),
+        "SystemPromptSource::Provided(..)"
+    );
+}
+
+/// A session stub that reports nothing and fails every operation; the
+/// options' debug shape is the only surface under test.
+struct StubSession {
+    metadata: SessionMetadata,
+    ids: StubIds,
+}
+
+impl Default for StubSession {
+    fn default() -> Self {
+        Self {
+            metadata: SessionMetadata {
+                id: "session".to_owned(),
+                created_at: 1,
+                storage_version: 1,
+                cwd: None,
+                parent_session_id: None,
+                legacy_parent_session_path: None,
+            },
+            ids: StubIds,
+        }
+    }
+}
+
+struct StubIds;
+
+impl IdGenerator for StubIds {
+    fn next(&self, _timestamp_ms: Option<i64>) -> String {
+        "id".to_owned()
+    }
+}
+
+fn stub_error<T>() -> BoxedFuture<'static, Result<T, SessionError>> {
+    Box::pin(async { Err(SessionError("stub".to_owned())) })
+}
+
+impl SessionReader for StubSession {
+    fn get_entries(
+        &self,
+        _ids: Vec<String>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<BTreeMap<String, Entry>, SessionError>> {
+        stub_error()
+    }
+
+    fn get_stats(
+        &self,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
+        stub_error()
+    }
+
+    fn get_value(
+        &self,
+        _address: &ValueAddress,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<StoredValue>, SessionError>> {
+        stub_error()
+    }
+
+    fn scan_values(
+        &self,
+        _prefix: &ValueAddress,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<StoredValue>, SessionError>> {
+        stub_error()
+    }
+
+    fn read_list(
+        &self,
+        _address: &ListAddress,
+        _options: Option<ListReadOptions>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
+        stub_error()
+    }
+
+    fn scan_branch(
+        &self,
+        _query: &StorageBranchScan,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
+        stub_error()
+    }
+}
+
+impl crate::harness::session::types::Session for StubSession {
+    fn metadata(&self) -> &SessionMetadata {
+        &self.metadata
+    }
+
+    fn id_generator(&self) -> &dyn IdGenerator {
+        &self.ids
+    }
+
+    fn get_entry(
+        &self,
+        _id: &str,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
+        stub_error()
+    }
+
+    fn get_name(&self, _context: &Context) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
+        stub_error()
+    }
+
+    fn get_label(
+        &self,
+        _target_id: &str,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
+        stub_error()
+    }
+
+    fn find_entries(
+        &self,
+        _query: Option<&EntryQuery>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
+        stub_error()
+    }
+
+    fn find_entry(
+        &self,
+        _query: Option<&EntryQuery>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
+        stub_error()
+    }
+
+    fn branch(
+        &self,
+        _name: &str,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<Box<dyn Branch>>, SessionError>> {
+        stub_error()
+    }
+
+    fn create_branch(
+        &self,
+        _name: &str,
+        _at: Option<String>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn Branch>, SessionError>> {
+        stub_error()
+    }
+
+    fn begin_mutation(
+        &self,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn SessionMutation>, SessionError>> {
+        stub_error()
+    }
+
+    fn mutate(
+        &self,
+        _mutation: SessionMutationCallback,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn std::any::Any + Send>, SessionError>> {
+        stub_error()
+    }
+
+    fn set_value(
+        &self,
+        _address: &ValueAddress,
+        _next: serde_json::Value,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+
+    fn delete_value(
+        &self,
+        _address: &ValueAddress,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+
+    fn append_list(
+        &self,
+        _address: &ListAddress,
+        _element: serde_json::Value,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+
+    fn delete_list(
+        &self,
+        _address: &ListAddress,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+
+    fn set_name(
+        &self,
+        _name: Option<String>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+
+    fn set_label(
+        &self,
+        _target_id: &str,
+        _label: Option<String>,
+        _context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+
+    fn close(&self, _context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
+        stub_error()
+    }
+}
+
+/// A fixture model the options carry.
+fn fixture_model() -> pi_ai::types::Model {
+    pi_ai::types::Model {
+        id: "test-model".to_owned(),
+        name: "Test model".to_owned(),
+        api: pi_ai::types::Api("anthropic-messages".to_owned()),
+        provider: pi_ai::types::ProviderId("anthropic".to_owned()),
+        base_url: "https://example.test".to_owned(),
+        reasoning: false,
+        thinking_level_map: None,
+        input: vec![pi_ai::types::Modality::Text],
+        cost: pi_ai::types::ModelCost {
+            rates: pi_ai::types::ModelCostRates {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            tiers: None,
+        },
+        context_window: 1000,
+        max_tokens: 100,
+        sampling_params: None,
+        headers: None,
+        compat: None,
+    }
+}
+
+/// The harness options render their debug shape over a stub session.
+#[test]
+fn the_harness_options_render_their_debug_shape() {
+    let options = AgentHarnessOptions {
+        session: Arc::new(StubSession::default()),
+        models: Arc::new(pi_ai::models::create_models(None)),
+        model: fixture_model(),
+        thinking_level: None,
+        active_tool_names: None,
+        tools: None,
+        tool_context: None,
+        system_prompt: None,
+        resources: None,
+        stream_options: None,
+        retry: None,
+        compaction: None,
+        steering_mode: None,
+        follow_up_mode: None,
+        tool_execution: None,
+        to_provider_messages: None,
+        entry_projectors: None,
+    };
+    let debug = format!("{options:?}");
+    assert!(debug.contains("AgentHarnessOptions"), "{debug}");
 }
