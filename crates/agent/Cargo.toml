@@ -24,7 +24,9 @@ tokio-util = { version = "0.7", default-features = false }
 # rt: `agent_loop` fires its run on a spawned task (upstream's `void
 # runAgentLoop(...)`) and parallel tool execution spawns one task per
 # prepared call — the runtime the workspace stack pins.
-tokio = { version = "1.47", default-features = false, features = ["rt"] }
+# sync: the Agent's idle waiters (upstream's per-run `waitForIdle` promise)
+# settle through a watch channel the finishing run bumps.
+tokio = { version = "1.47", default-features = false, features = ["rt", "sync"] }
 
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the

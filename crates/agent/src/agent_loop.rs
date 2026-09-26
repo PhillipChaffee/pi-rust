@@ -562,10 +562,10 @@ async fn poll_steering(config: &AgentLoopConfig) -> Vec<AgentMessage> {
     }
 }
 
-/// The simple-request `reasoning` value a turn update's thinking level maps
-/// to: the agent level adds `off`, which the request options carry as an
-/// absent field.
-const fn stream_reasoning(level: ThinkingLevel) -> Option<pi_ai::types::ThinkingLevel> {
+/// The simple-request `reasoning` value a thinking level maps to: the agent
+/// level adds `off`, which the request options carry as an absent field.
+/// Shared by the loop's turn updates and the `Agent`'s loop-config builder.
+pub(crate) const fn stream_reasoning(level: ThinkingLevel) -> Option<pi_ai::types::ThinkingLevel> {
     match level {
         ThinkingLevel::Off => None,
         ThinkingLevel::Minimal => Some(pi_ai::types::ThinkingLevel::Minimal),
