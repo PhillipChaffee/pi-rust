@@ -796,3 +796,17 @@ pub async fn assert_session_list_values(
     let got: Vec<serde_json::Value> = elements.into_iter().map(|element| element.value).collect();
     assert_eq!(got, expected);
 }
+
+/// The six-entry branch path the branch-query cases seed, upstream's
+/// root/marker/middle/compact/note/leaf chain.
+#[must_use]
+pub fn branch_query_seed_writes() -> Vec<Write> {
+    vec![
+        user_entry_write("root", None, "root"),
+        custom_entry_write("marker", Some("root"), "marker"),
+        user_entry_write("middle", Some("marker"), "middle"),
+        compaction_entry_write("compact", Some("middle")),
+        custom_entry_write("note", Some("compact"), "note"),
+        user_entry_write("leaf", Some("note"), "leaf"),
+    ]
+}

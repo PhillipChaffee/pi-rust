@@ -31,10 +31,11 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::harness::context::background_context;
 use crate::harness::session::testing::conformance::{
-    asc_query, assert_lane_config, assert_lane_state, assert_session_value_absent, branch_fork,
-    close_session, create_repo_session, downcast_commit_result, find_entry_ids,
-    fork_branch_session, fork_tree_session, insert_entry_write, insert_usage_write, label_write,
-    lane_config_write, lane_state_write, seed_custom_entry, stored_values, tip_write, tree_fork,
+    asc_query, assert_lane_config, assert_lane_state, assert_session_list_values,
+    assert_session_value_absent, branch_fork, close_session, create_repo_session,
+    downcast_commit_result, find_entry_ids, fork_branch_session, fork_tree_session,
+    insert_entry_write, insert_usage_write, label_write, lane_config_write, lane_state_write,
+    seed_custom_entry, stored_values, tip_write, tree_fork,
 };
 use crate::harness::session::testing::types::{ConformanceCase, RepoFixture};
 use crate::harness::session::types::{
@@ -1480,33 +1481,20 @@ fn fork_application_list_conformance(factory: &RepoFixtureFactory) -> Vec<Confor
                         fork_tree_session(repo, source.as_ref(), "fork", source_state == "closed")
                             .await;
 
-                    assert_eq!(
-                        fork.read_list(&events.address, None, &background_context())
-                            .await
-                            .expect("list")
-                            .into_iter()
-                            .map(|element| element.value)
-                            .collect::<Vec<_>>(),
-                        [json!("event")],
-                    );
-                    assert_eq!(
-                        fork.read_list(&sibling.address, None, &background_context())
-                            .await
-                            .expect("list")
-                            .into_iter()
-                            .map(|element| element.value)
-                            .collect::<Vec<_>>(),
-                        [json!("sibling")],
-                    );
-                    assert_eq!(
-                        fork.read_list(&other_namespace.address, None, &background_context())
-                            .await
-                            .expect("list")
-                            .into_iter()
-                            .map(|element| element.value)
-                            .collect::<Vec<_>>(),
-                        [json!("other namespace")],
-                    );
+                    assert_session_list_values(fork.as_ref(), &events.address, &[json!("event")])
+                        .await;
+                    assert_session_list_values(
+                        fork.as_ref(),
+                        &sibling.address,
+                        &[json!("sibling")],
+                    )
+                    .await;
+                    assert_session_list_values(
+                        fork.as_ref(),
+                        &other_namespace.address,
+                        &[json!("other namespace")],
+                    )
+                    .await;
                     assert!(
                         fork.read_list(&absent.address, None, &background_context())
                             .await
@@ -1569,15 +1557,12 @@ fn fork_application_list_conformance(factory: &RepoFixtureFactory) -> Vec<Confor
                         fork_tree_session(repo, source.as_ref(), "fork", source_state == "closed")
                             .await;
 
-                    assert_eq!(
-                        fork.read_list(&events.address, None, &background_context())
-                            .await
-                            .expect("list")
-                            .into_iter()
-                            .map(|element| element.value)
-                            .collect::<Vec<_>>(),
-                        [json!("first survivor"), json!("second survivor")],
-                    );
+                    assert_session_list_values(
+                        fork.as_ref(),
+                        &events.address,
+                        &[json!("first survivor"), json!("second survivor")],
+                    )
+                    .await;
                     assert!(
                         fork.read_list(&deleted.address, None, &background_context())
                             .await

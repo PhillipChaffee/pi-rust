@@ -21,11 +21,12 @@ use serde_json::json;
 use crate::harness::context::background_context;
 use crate::harness::session::testing::conformance::{
     asc_scan, asc_usage_scan, assert_historical_unchanged, assert_list_values,
-    assert_strictly_increasing, assert_value_absent, commit_ok, compaction_entry_write,
-    custom_entry, custom_entry_write, ids, insert_entry_write, insert_usage_write, list_element,
-    scan_branch_ids, scan_entry_ids, scan_structure_ids, snapshot_historical_state, stored_map,
-    stored_value, stored_values, test_list, test_name, test_value, test_value_prefix, usage,
-    user_entry, user_entry_write, user_message, zero_usage,
+    assert_strictly_increasing, assert_value_absent, branch_query_seed_writes, commit_ok,
+    compaction_entry_write, custom_entry, custom_entry_write, ids, insert_entry_write,
+    insert_usage_write, list_element, scan_branch_ids, scan_entry_ids, scan_structure_ids,
+    snapshot_historical_state, stored_map, stored_value, stored_values, test_list, test_name,
+    test_value, test_value_prefix, usage, usage_ledger_writes, user_entry, user_entry_write,
+    user_message, zero_usage,
 };
 use crate::harness::session::testing::types::{ConformanceCase, StorageFixture};
 use crate::harness::session::types::{
@@ -1306,18 +1307,7 @@ pub fn create_storage_conformance(factory: &StorageFixtureFactory) -> Vec<Confor
             "applies stops before filters and cursors before limits",
             Arc::new(|storage: &dyn Storage| -> BoxedFuture<'_, ()> {
                 Box::pin(async move {
-                    let result = commit_ok(
-                        &*storage,
-                        vec![
-                            user_entry_write("root", None, "root"),
-                            custom_entry_write("marker", Some("root"), "marker"),
-                            user_entry_write("middle", Some("marker"), "middle"),
-                            compaction_entry_write("compact", Some("middle")),
-                            custom_entry_write("note", Some("compact"), "note"),
-                            user_entry_write("leaf", Some("note"), "leaf"),
-                        ],
-                    )
-                    .await;
+                    let result = commit_ok(&*storage, branch_query_seed_writes()).await;
 
                     assert_eq!(
                         scan_branch_ids(
@@ -1479,18 +1469,7 @@ pub fn create_storage_conformance(factory: &StorageFixtureFactory) -> Vec<Confor
             "applies branch query semantics to structure scans",
             Arc::new(|storage: &dyn Storage| -> BoxedFuture<'_, ()> {
                 Box::pin(async move {
-                    let result = commit_ok(
-                        &*storage,
-                        vec![
-                            user_entry_write("root", None, "root"),
-                            custom_entry_write("marker", Some("root"), "marker"),
-                            user_entry_write("middle", Some("marker"), "middle"),
-                            compaction_entry_write("compact", Some("middle")),
-                            custom_entry_write("note", Some("compact"), "note"),
-                            user_entry_write("leaf", Some("note"), "leaf"),
-                        ],
-                    )
-                    .await;
+                    let result = commit_ok(&*storage, branch_query_seed_writes()).await;
 
                     assert_eq!(
                         scan_structure_ids(
@@ -1544,19 +1523,7 @@ pub fn create_storage_conformance(factory: &StorageFixtureFactory) -> Vec<Confor
             "scans the usage ledger with explicit ranges, orders, and limits",
             Arc::new(|storage: &dyn Storage| -> BoxedFuture<'_, ()> {
                 Box::pin(async move {
-                    let result = commit_ok(
-                        &*storage,
-                        vec![
-                            insert_usage_write("usage-1", usage(1, 1), false, None),
-                            Write::ValueSet(
-                                stored_values::set_value(&test_name(), json!("sequence gap"))
-                                    .expect("write"),
-                            ),
-                            insert_usage_write("usage-2", usage(2, 2), false, None),
-                            insert_usage_write("usage-3", usage(3, 3), true, None),
-                        ],
-                    )
-                    .await;
+                    let result = commit_ok(&*storage, usage_ledger_writes()).await;
 
                     assert_eq!(
                         storage

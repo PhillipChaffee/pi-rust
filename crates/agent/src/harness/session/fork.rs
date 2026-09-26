@@ -212,3 +212,6 @@ fn validate_fork_source_snapshot(
 fn unreachable_selected_entry(id: &str) -> ! {
     panic!("selected fork entry {id} missing from the source snapshot")
 }
+
+#[cfg(test)]
+mod tests;

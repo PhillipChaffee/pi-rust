@@ -9,6 +9,7 @@
 #![expect(clippy::panic, reason = "tests assert by panicking")]
 
 mod session_common;
+use session_common::assert_second_attempt_rejected;
 use session_common::storage_backed_session;
 use session_common::*;
 
@@ -774,13 +775,7 @@ async fn serializes_mutations_permits_one_commit_attempt_and_invalidates_the_mut
                             )
                             .await
                             .expect("commit");
-                        let rejected = mutator.commit(Vec::new(), context).await;
-                        assert!(
-                            rejected
-                                .expect_err("second attempt")
-                                .to_string()
-                                .contains("commit already attempted"),
-                        );
+                        assert_second_attempt_rejected(mutator, context).await;
                         let done: Box<dyn std::any::Any + Send> = Box::new(());
                         Ok(done)
                     })
@@ -832,13 +827,7 @@ async fn consumes_the_commit_guard_when_the_first_commit_fails() {
                                 .to_string()
                                 .contains("Missing parent entry"),
                         );
-                        let rejected = mutator.commit(Vec::new(), context).await;
-                        assert!(
-                            rejected
-                                .expect_err("second attempt")
-                                .to_string()
-                                .contains("commit already attempted"),
-                        );
+                        assert_second_attempt_rejected(mutator, context).await;
                         let done: Box<dyn std::any::Any + Send> = Box::new(());
                         Ok(done)
                     })

@@ -342,3 +342,22 @@ pub fn storage_backed_session(storage: Arc<dyn Storage>) -> StorageBackedSession
         pi_agent_core::harness::session::session::StorageBackedSessionOptions::default(),
     )
 }
+
+/// The second-commit-attempt assert, upstream's
+/// `rejects.toThrow("commit already attempted")`.
+///
+/// # Panics
+/// When the second attempt does not reject with the consumed-guard error.
+pub async fn assert_second_attempt_rejected(
+    mutator: &dyn pi_agent_core::harness::session::types::SessionMutator,
+    context: &pi_agent_core::harness::context::Context,
+) {
+    let rejected = mutator.commit(Vec::new(), context).await;
+    assert!(
+        rejected
+            .err()
+            .expect("second attempt")
+            .to_string()
+            .contains("commit already attempted"),
+    );
+}
