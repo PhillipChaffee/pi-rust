@@ -103,6 +103,24 @@ async fn wakes_all_waiting_consumers_when_ended_without_a_result() {
 }
 
 #[tokio::test]
+async fn ending_without_a_result_keeps_what_a_completing_event_settled() {
+    // Upstream guards `end(result?)` with `if (result !== undefined)`
+    // (event-stream.ts:62), so a stream that pushes its terminal event and
+    // then ends — the proxy's and every forwarder's shape — keeps the
+    // settled result instead of leaving late `result()` callers waiting on
+    // a promise that never resolves.
+    let stream = assistant_message_event_stream();
+    let mut done = bare_assistant_message();
+    done.stop_reason = StopReason::Stop;
+    stream.push(AssistantMessageEvent::Done {
+        reason: StopReason::Stop,
+        message: done.clone(),
+    });
+    stream.end(None);
+    assert_eq!(stream.result().await, done);
+}
+
+#[tokio::test]
 async fn the_assistant_stream_resolves_to_done_and_error_messages() {
     let stream = assistant_message_event_stream();
 

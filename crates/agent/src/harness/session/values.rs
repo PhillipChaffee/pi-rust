@@ -203,6 +203,20 @@ pub struct UsageWrite {
     pub row: crate::harness::session::types::UsageWriteRow,
 }
 
+/// The reserved lane-configuration namespace, upstream's
+/// `laneConfig("").namespace` (`"pi.lane.config"`).
+#[must_use]
+pub const fn lane_config_namespace() -> &'static str {
+    "pi.lane.config"
+}
+
+/// The reserved lane-state namespace, upstream's
+/// `laneState("").namespace` (`"pi.lane.state"`).
+#[must_use]
+pub const fn lane_state_namespace() -> &'static str {
+    "pi.lane.state"
+}
+
 /// Validates one address component pair, upstream's `validateAddress`.
 ///
 /// # Errors
@@ -210,15 +224,17 @@ pub struct UsageWrite {
 /// component contains a NUL byte.
 pub fn validate_address(namespace: &str, key: &str) -> Result<(), SessionError> {
     if namespace.is_empty() {
-        return Err(SessionError("Value namespace must not be empty".to_owned()));
+        return Err(SessionError::Message(
+            "Value namespace must not be empty".to_owned(),
+        ));
     }
     if namespace.contains('\u{0}') {
-        return Err(SessionError(
+        return Err(SessionError::Message(
             "Value namespace must not contain \\u0000".to_owned(),
         ));
     }
     if key.contains('\u{0}') {
-        return Err(SessionError(
+        return Err(SessionError::Message(
             "Value key must not contain \\u0000".to_owned(),
         ));
     }
@@ -267,7 +283,7 @@ pub fn set_value<T: Serialize>(address: &Value<T>, next: T) -> Result<ValueSetWr
         namespace: address.address.namespace.clone(),
         key: address.address.key.clone(),
         value: serde_json::to_value(next).map_err(|error| {
-            SessionError(format!("Value payload serialization failed: {error}"))
+            SessionError::Message(format!("Value payload serialization failed: {error}"))
         })?,
     })
 }
@@ -297,8 +313,9 @@ pub fn append_list<T: Serialize>(
         op: "append".to_owned(),
         namespace: address.address.namespace.clone(),
         key: address.address.key.clone(),
-        value: serde_json::to_value(element)
-            .map_err(|error| SessionError(format!("List element serialization failed: {error}")))?,
+        value: serde_json::to_value(element).map_err(|error| {
+            SessionError::Message(format!("List element serialization failed: {error}"))
+        })?,
     })
 }
 
@@ -324,7 +341,7 @@ pub fn resolve_list_read_options(
     let options = options.unwrap_or_default();
     let requested_limit = options.limit.unwrap_or(1_000);
     if requested_limit == 0 || requested_limit > 9_007_199_254_740_991 {
-        return Err(SessionError(
+        return Err(SessionError::Message(
             "List read limit must be a positive safe integer".to_owned(),
         ));
     }
@@ -533,6 +550,12 @@ pub fn entry_label(entry_id: &str) -> Value<String> {
 #[must_use]
 pub fn generic_value(namespace: &str, key: &str) -> Value<JsonValue> {
     value::<JsonValue>(namespace, key).unwrap_or_else(|_| unreachable_value())
+}
+
+/// A generic list address, upstream's `list<unknown>(...)` call sites.
+#[must_use]
+pub fn generic_list(namespace: &str, key: &str) -> ValueList<JsonValue> {
+    list::<JsonValue>(namespace, key).unwrap_or_else(|_| unreachable_value())
 }
 
 /// The erased stream options payload the durable preparation carries,

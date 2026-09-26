@@ -2184,6 +2184,8 @@ dependencies = [
 name = "pi-agent-core"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-core",
  "ignore",
  "nix",
  "pi-ai",

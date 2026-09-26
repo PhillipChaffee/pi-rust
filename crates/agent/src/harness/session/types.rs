@@ -97,14 +97,78 @@ impl SettledStopReason {
     }
 }
 
-/// Error raised by session and storage operations, the typed restatement
-/// of upstream's thrown `Error`s in the session layer.
+/// Error raised by session and storage operations, the session layer's
+/// thrown errors restated as one taxonomy.
+///
+/// The named upstream classes carry their payloads as variant fields;
+/// plain `new Error(message)` throws carry [`SessionError::Message`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionError(pub String);
+pub enum SessionError {
+    /// A plain error message, upstream's `new Error(message)` throws.
+    Message(String),
+    /// Durable session state is internally inconsistent and cannot be
+    /// safely advanced, upstream's `SessionInvariantError`.
+    Invariant(String),
+    /// A requested Branch name is invalid, upstream's
+    /// `SessionInvalidBranchError` (carries `branch` and `reason`).
+    InvalidBranch {
+        /// The rejected branch name.
+        branch: String,
+        /// Why the name was rejected.
+        reason: String,
+    },
+    /// A requested branch already exists, upstream's
+    /// `SessionBranchExistsError` (carries `branch`).
+    BranchExists {
+        /// The rejected branch name.
+        branch: String,
+    },
+    /// A pending assistant message cannot be persisted as a session
+    /// entry, upstream's `SessionPendingAssistantMessageError`.
+    PendingAssistantMessage,
+    /// A requested session entry target does not exist, upstream's
+    /// `SessionUnknownTargetError` (carries `targetId`).
+    UnknownTarget {
+        /// The unknown entry id.
+        target_id: String,
+    },
+    /// A commit was rejected after simulated storage loss, upstream's
+    /// testing-surface `CommitDiscarded`.
+    CommitDiscarded(String),
+}
+
+impl SessionError {
+    /// The upstream class name this error restates, the `{name}` slot of
+    /// the JS `Error` subclasses; plain messages read as `Error`.
+    #[must_use]
+    pub const fn class_name(&self) -> &'static str {
+        match self {
+            Self::Message(_) => "Error",
+            Self::Invariant(_) => "SessionInvariantError",
+            Self::InvalidBranch { .. } => "SessionInvalidBranchError",
+            Self::BranchExists { .. } => "SessionBranchExistsError",
+            Self::PendingAssistantMessage => "SessionPendingAssistantMessageError",
+            Self::UnknownTarget { .. } => "SessionUnknownTargetError",
+            Self::CommitDiscarded(_) => "CommitDiscarded",
+        }
+    }
+}
 
 impl std::fmt::Display for SessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        match self {
+            Self::Message(message) | Self::Invariant(message) | Self::CommitDiscarded(message) => {
+                f.write_str(message)
+            }
+            Self::InvalidBranch { branch, reason } => {
+                write!(f, "Invalid branch {branch:?}: {reason}")
+            }
+            Self::BranchExists { branch } => write!(f, "Branch already exists: {branch}"),
+            Self::PendingAssistantMessage => {
+                f.write_str("Cannot persist a pending assistant message")
+            }
+            Self::UnknownTarget { target_id } => write!(f, "Unknown target: {target_id}"),
+        }
     }
 }
 
@@ -465,13 +529,20 @@ impl NewEntry {
 /// Converts an application-defined custom entry into model context,
 /// upstream's `EntryProjector`.
 ///
-/// Returns `None` when the entry contributes nothing to the context.
+/// Returns `Ok(None)` when the entry contributes nothing to the context;
+/// an error propagates to the context build, upstream's thrown projector
+/// failure.
 #[derive(Clone)]
 pub struct EntryProjector(pub EntryProjectorFn);
 
 /// The projector callback over one entry and the call's context.
 pub type EntryProjectorFn = Arc<
-    dyn for<'a> Fn(&Entry, &'a Context) -> BoxedFuture<'a, Option<Vec<AgentMessage>>> + Send + Sync,
+    dyn for<'a> Fn(
+            &Entry,
+            &'a Context,
+        ) -> BoxedFuture<'a, Result<Option<Vec<AgentMessage>>, SessionError>>
+        + Send
+        + Sync,
 >;
 
 impl std::fmt::Debug for EntryProjector {
@@ -1389,7 +1460,7 @@ pub enum BranchScanOrder {
 
 /// A branch-path scan with a required start, upstream's
 /// `StorageBranchScan = BranchScan & { start: string }`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageBranchScan {
     /// The entry the scan starts from, exclusive.
@@ -1538,9 +1609,9 @@ pub trait IdGenerator: Send + Sync {
 }
 
 /// The callback-scoped mutation capability, upstream's
-/// `SessionMutator = Omit<SessionMutation, "end">`: exactly one commit
-/// attempt, no authority to release the session barrier.
-pub trait SessionMutator: Send + Sync {
+/// `SessionMutator = Omit<SessionMutation, "end">`: the reader surface plus
+/// exactly one commit attempt, no authority to release the session barrier.
+pub trait SessionMutator: SessionReader {
     /// The single commit attempt; a second attempt errors, upstream's
     /// `commit`.
     ///
@@ -1554,8 +1625,8 @@ pub trait SessionMutator: Send + Sync {
     ) -> BoxedFuture<'_, Result<CommitResult, SessionError>>;
 }
 
-/// The exclusive mutation capability, upstream's `SessionMutation`: adds
-/// releasing the barrier.
+/// The exclusive mutation capability, upstream's `SessionMutation`: the
+/// reader surface plus the commit attempt and releasing the barrier.
 pub trait SessionMutation: SessionMutator {
     /// Waits for any commit attempt, invalidates the capability, and
     /// releases the barrier, upstream's `end`.
@@ -1571,9 +1642,13 @@ pub trait SessionMutation: SessionMutator {
 /// contract-erasure decision recorded on the harness-foundations child:
 /// callers downcast the boxed result. Upstream's one-shot contract restates
 /// as a shared reference because the returned future borrows the
-/// capability; the session runtime enforces the single call.
+/// capability; the session runtime enforces the single call. An error
+/// result propagates out of `mutate`, upstream's thrown callback failure.
 pub type SessionMutationCallback = Box<
-    dyn for<'a> Fn(&'a dyn SessionMutator, &'a Context) -> BoxedFuture<'a, Box<dyn Any + Send>>
+    dyn for<'a> Fn(
+            &'a dyn SessionMutator,
+            &'a Context,
+        ) -> BoxedFuture<'a, Result<Box<dyn Any + Send>, SessionError>>
         + Send,
 >;
 
@@ -1861,6 +1936,143 @@ pub trait Storage: Send + Sync {
 
     /// Close the storage, upstream's `close`.
     fn close(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>>;
+}
+
+/// The options a session's creation accepts, upstream's
+/// `SessionCreateOptions`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCreateOptions {
+    /// The requested session id; the repo generates one when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The parent session id, when the session descends from a fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_session_id: Option<String>,
+}
+
+/// The position a branch-scope fork copies up to, upstream's
+/// `"before" | "at"`; the default includes the selected entry (`at`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkPosition {
+    /// Copy up to the selected entry's parent, excluding it.
+    Before,
+    /// Copy through the selected entry; the default.
+    #[default]
+    At,
+}
+
+/// What a fork copies, upstream's `ForkOptions`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "scope",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ForkOptions {
+    /// Copy one path from a complete configured source `AgentLane` under the
+    /// same Branch name, with copied configuration and fresh idle lane
+    /// state, wire `"scope": "branch"`.
+    #[serde(rename = "branch")]
+    Branch {
+        /// The source Branch to copy.
+        branch: String,
+        /// The entry on the source Branch's current tip ancestry; the
+        /// current tip when omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        entry_id: Option<String>,
+        /// Whether the fork includes the selected entry (`at`, the
+        /// default) or stops at its parent (`before`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<ForkPosition>,
+        /// The destination session id; the repo generates one when
+        /// omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    /// Copy the whole conversation tree and every Branch tip; each
+    /// configured `AgentLane` copies configuration plus fresh idle state,
+    /// data-only Branches stay data-only, and operation, pending, result,
+    /// and usage state is excluded, wire `"scope": "tree"`.
+    #[serde(rename = "tree")]
+    Tree {
+        /// The destination session id; the repo generates one when
+        /// omitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+}
+
+impl ForkOptions {
+    /// The destination session id either scope may request, upstream's
+    /// `options.id`.
+    #[must_use]
+    pub const fn id(&self) -> Option<&String> {
+        match self {
+            Self::Branch { id, .. } | Self::Tree { id } => id.as_ref(),
+        }
+    }
+}
+
+/// The session repository contract, upstream's `SessionRepo`.
+///
+/// The metadata, create-option, and list-option type parameters erase to
+/// their defaults for object safety; backends with richer options extend
+/// the trait surface at their own seam.
+pub trait SessionRepo: Send + Sync {
+    /// Create a session, upstream's `create`.
+    ///
+    /// # Errors
+    /// A `SessionError` when the repo is closed or the requested id is
+    /// taken.
+    fn create(
+        &self,
+        options: SessionCreateOptions,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn Session>, SessionError>>;
+
+    /// Open a previously created session, upstream's `open`.
+    ///
+    /// # Errors
+    /// A `SessionError` when the session is unknown or already open.
+    fn open(
+        &self,
+        metadata: &SessionMetadata,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn Session>, SessionError>>;
+
+    /// List every session's metadata, upstream's `list` with the erased
+    /// void list options.
+    ///
+    /// # Errors
+    /// A `SessionError` when the repo is closed.
+    fn list(
+        &self,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<SessionMetadata>, SessionError>>;
+
+    /// Delete a closed session, upstream's `delete`.
+    ///
+    /// # Errors
+    /// A `SessionError` when the session is unknown or still open.
+    fn delete(
+        &self,
+        metadata: &SessionMetadata,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>>;
+
+    /// Fork a source session into a new one, upstream's `fork`.
+    ///
+    /// # Errors
+    /// A `SessionError` when the source is unknown, the fork scope is
+    /// invalid, or the destination id is taken.
+    fn fork(
+        &self,
+        source: &SessionMetadata,
+        options: &ForkOptions,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn Session>, SessionError>>;
 }
 
 #[cfg(test)]
