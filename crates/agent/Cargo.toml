@@ -53,6 +53,12 @@ ignore = "0.4"
 # dependency: yaml-rust2 rejects the same malformed inputs (unterminated flow
 # sequences, duplicate keys) the `yaml` parse throws on.
 yaml-rust2 = "0.13"
+# The path resolution variants and the fuzzy-match normalizer's NFKC pass,
+# upstream's `String.prototype.normalize`.
+unicode-normalization = "0.1"
+# The read tool's base64 image attachments, upstream's hand-rolled
+# `encodeBase64` (Buffer.prototype.toString("base64")).
+base64 = "0.22"
 
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the

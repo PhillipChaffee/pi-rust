@@ -110,11 +110,18 @@ async fn the_mutation_line_seals_queued_jobs_and_drains_the_granted_one() {
         granted_started.load(Ordering::Acquire),
         "the first job grants immediately",
     );
-    line.seal(SessionError::Message("sealed".to_owned()));
+    // Seal's future marks the latch when first polled, so it starts in the
+    // background before the granted job releases.
+    let sealed = tokio::spawn({
+        let line = line.clone();
+        async move { line.seal(SessionError::Message("sealed".to_owned())).await }
+    });
+    tokio::task::yield_now().await;
     // Release the granted job first: the queued job then takes the line and
     // rejects on the seal it now sees, upstream's queued-job check.
     granted_done.notify_waiters();
     granted.await.expect("granted task");
+    sealed.await.expect("seal task");
     let queued = queued.await.expect("queued task");
     assert!(
         matches!(queued.expect_err("sealed job"), SessionError::Message(message) if message == "sealed"),

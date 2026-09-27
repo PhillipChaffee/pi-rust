@@ -11,8 +11,8 @@
 //! (skills, prompt templates, system prompt; map child "pi-agent-core:
 //! skills, prompt templates, and system prompt"); the execution layer (the
 //! tool-call pipeline and the assistant stream runner) rides the execution
-//! child. The nodejs execution environment, the session and compaction
-//! implementations, and the runtime constructor ride their own tickets.
+//! child, the compaction domain the compaction child. The nodejs execution
+//! environment and the runtime constructor ride their own tickets.
 pub mod agent_harness;
 pub mod compaction;
 pub mod config;
@@ -31,6 +31,7 @@ pub mod session;
 pub mod skills;
 pub mod system_prompt;
 pub mod telemetry;
+pub mod tools;
 pub mod types;
 pub mod utils;
 
