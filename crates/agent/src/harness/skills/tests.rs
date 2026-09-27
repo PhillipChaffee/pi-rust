@@ -741,3 +741,477 @@ fn the_invocation_directory_covers_the_path_shapes() {
         format_skill_invocation(&skill("SKILL.md"), None).contains("References are relative to /.")
     );
 }
+
+// --- boundary: the loader's error-diagnostic branches, bound through the
+// --- fault-injecting environment.
+
+use crate::harness::skills::{IGNORE_FILE_NAMES, IgnoreMatcher, load_skills_from_dir_internal};
+use crate::harness::test_support::{Fault, FaultEnv};
+use crate::harness::types::FileErrorCode;
+
+const BOOM: Fault = Fault {
+    path_contains: "",
+    code: FileErrorCode::Unknown,
+    message: "boom",
+};
+
+/// A root file-info failure outside `not_found` reports the diagnostic;
+/// `not_found` stays silent (the missing-directory skip).
+#[tokio::test]
+async fn a_root_file_info_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let context = background_context();
+
+    let mut env = FaultEnv::new(root.path());
+    env.file_info_fault = Some(BOOM);
+    let loaded = load_skills(&env, &["skills".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::FileInfoFailed,
+            "boom",
+            "skills",
+        )]
+    );
+
+    env.file_info_fault = Some(Fault {
+        code: FileErrorCode::NotFound,
+        ..BOOM
+    });
+    let loaded = load_skills(&env, &["skills".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert!(loaded.diagnostics.is_empty());
+}
+
+/// A directory-info failure inside the walk reports the same diagnostic,
+/// bound by driving the walker directly (the root probe faults first
+/// through `load_skills`).
+#[tokio::test]
+async fn a_directory_info_failure_inside_the_walk_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "skills/example", &context).await;
+    write(
+        &env,
+        "skills/example/SKILL.md",
+        "---\nname: example\ndescription: Example\n---\nBody",
+        &context,
+    )
+    .await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.file_info_fault = Some(BOOM);
+    let mut matcher = IgnoreMatcher::new();
+    let (skills, diagnostics) =
+        load_skills_from_dir_internal(&faulted, "skills", true, &mut matcher, "skills", &context)
+            .await;
+    assert!(skills.is_empty());
+    assert_eq!(
+        diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::FileInfoFailed,
+            "boom",
+            "skills",
+        )]
+    );
+}
+
+/// A listing failure reports the `list_failed` diagnostic.
+#[tokio::test]
+async fn a_listing_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "skills", &context).await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.list_dir_fault = Some(BOOM);
+    let loaded = load_skills(&faulted, &["skills".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::ListFailed,
+            "boom",
+            root.path().join("skills").to_string_lossy().as_ref(),
+        )]
+    );
+}
+
+/// An ignore-file read failure reports `read_failed` at the ignore file;
+/// a skill-file read failure reports `read_failed` at the skill file.
+#[tokio::test]
+async fn read_failures_report_the_read_failed_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let context = background_context();
+    let env = env_for(root.path());
+    mkdir(&env, "skills/example", &context).await;
+    write(&env, "skills/.gitignore", "nothing", &context).await;
+    write(
+        &env,
+        "skills/example/SKILL.md",
+        "---\nname: example\ndescription: Example\n---\nBody",
+        &context,
+    )
+    .await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.read_text_file_fault = Some(Fault {
+        path_contains: ".gitignore",
+        ..BOOM
+    });
+    let loaded = load_skills(&faulted, &["skills".to_owned()], &context).await;
+    assert_eq!(loaded.skills.len(), 1);
+    assert_eq!(
+        loaded.diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::ReadFailed,
+            "boom",
+            root.path()
+                .join("skills/.gitignore")
+                .to_string_lossy()
+                .as_ref(),
+        )]
+    );
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.read_text_file_fault = Some(Fault {
+        path_contains: "SKILL.md",
+        ..BOOM
+    });
+    let loaded = load_skills(&faulted, &["skills".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::ReadFailed,
+            "boom",
+            root.path()
+                .join("skills/example/SKILL.md")
+                .to_string_lossy()
+                .as_ref(),
+        )]
+    );
+}
+
+/// An ignore-path join failure reports the diagnostic at the directory;
+/// the probe repeats for each ignore-file name.
+#[tokio::test]
+async fn an_ignore_path_join_failure_reports_the_diagnostic_per_name() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "skills/example", &context).await;
+    write(
+        &env,
+        "skills/example/SKILL.md",
+        "---\nname: example\ndescription: Example\n---\nBody",
+        &context,
+    )
+    .await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.join_path_fault = Some(BOOM);
+    let loaded = load_skills(&faulted, &["skills".to_owned()], &context).await;
+    assert_eq!(loaded.skills.len(), 1);
+    // The join repeats per ignore-file name per traversed depth: three at
+    // the root, three inside the skill directory.
+    assert_eq!(loaded.diagnostics.len(), 2 * IGNORE_FILE_NAMES.len());
+    for diagnostic in &loaded.diagnostics[..IGNORE_FILE_NAMES.len()] {
+        assert_eq!(diagnostic.code, SkillDiagnosticCode::FileInfoFailed);
+        assert_eq!(
+            diagnostic.path,
+            root.path().join("skills").to_string_lossy().as_ref()
+        );
+    }
+    for diagnostic in &loaded.diagnostics[IGNORE_FILE_NAMES.len()..] {
+        assert_eq!(
+            diagnostic.path,
+            root.path()
+                .join("skills/example")
+                .to_string_lossy()
+                .as_ref()
+        );
+    }
+}
+
+/// An ignore-file info failure outside `not_found` reports the diagnostic
+/// at the ignore file; `not_found` stays silent.
+#[tokio::test]
+async fn an_ignore_file_info_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "skills/example", &context).await;
+    write(&env, "skills/.gitignore", "nothing", &context).await;
+    write(
+        &env,
+        "skills/example/SKILL.md",
+        "---\nname: example\ndescription: Example\n---\nBody",
+        &context,
+    )
+    .await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.file_info_fault = Some(Fault {
+        path_contains: ".gitignore",
+        ..BOOM
+    });
+    let loaded = load_skills(&faulted, &["skills".to_owned()], &context).await;
+    assert_eq!(loaded.skills.len(), 1);
+    // The probe follows the ignore-file name at every traversed depth: the
+    // root's and the skill directory's.
+    assert_eq!(
+        loaded.diagnostics,
+        vec![
+            SkillDiagnostic::warning(
+                SkillDiagnosticCode::FileInfoFailed,
+                "boom",
+                root.path()
+                    .join("skills/.gitignore")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+            SkillDiagnostic::warning(
+                SkillDiagnosticCode::FileInfoFailed,
+                "boom",
+                root.path()
+                    .join("skills/example/.gitignore")
+                    .to_string_lossy()
+                    .as_ref(),
+            ),
+        ]
+    );
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.file_info_fault = Some(Fault {
+        path_contains: ".gitignore",
+        code: FileErrorCode::NotFound,
+        ..BOOM
+    });
+    let loaded = load_skills(&faulted, &["skills".to_owned()], &context).await;
+    assert_eq!(loaded.skills.len(), 1);
+    assert!(loaded.diagnostics.is_empty());
+}
+
+/// A canonical-path probe failure on a symlinked root reports the
+/// diagnostic at the addressed path and skips the input.
+#[tokio::test]
+async fn a_canonical_probe_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "actual/example", &context).await;
+    std::os::unix::fs::symlink(
+        file_path(root.path(), "actual"),
+        file_path(root.path(), "skills-link"),
+    )
+    .expect("symlink");
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.canonical_path_fault = Some(BOOM);
+    let loaded = load_skills(&faulted, &["skills-link".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::FileInfoFailed,
+            "boom",
+            root.path().join("skills-link").to_string_lossy().as_ref(),
+        )]
+    );
+}
+
+/// A failure probing the canonical target reports the diagnostic at the
+/// addressed (link) path, upstream's `info.path` choice.
+#[tokio::test]
+async fn a_canonical_target_failure_reports_the_diagnostic_at_the_link() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "actual-dir/example", &context).await;
+    std::os::unix::fs::symlink(
+        file_path(root.path(), "actual-dir"),
+        file_path(root.path(), "skills-link"),
+    )
+    .expect("symlink");
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.file_info_fault = Some(Fault {
+        path_contains: "actual-dir",
+        ..BOOM
+    });
+    let loaded = load_skills(&faulted, &["skills-link".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![SkillDiagnostic::warning(
+            SkillDiagnosticCode::FileInfoFailed,
+            "boom",
+            root.path().join("skills-link").to_string_lossy().as_ref(),
+        )]
+    );
+}
+
+/// A declared skill file with malformed frontmatter reports `parse_failed`.
+#[tokio::test]
+async fn a_declared_skill_with_malformed_frontmatter_reports_parse_failed() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "skills/example", &context).await;
+    write(
+        &env,
+        "skills/example/SKILL.md",
+        "---\nname: [invalid\n---\nBody",
+        &context,
+    )
+    .await;
+
+    let loaded = load_skills(&env, &["skills".to_owned()], &context).await;
+    assert!(loaded.skills.is_empty());
+    assert_eq!(loaded.diagnostics.len(), 1);
+    assert_eq!(loaded.diagnostics[0].code, SkillDiagnosticCode::ParseFailed);
+    assert_eq!(
+        loaded.diagnostics[0].path,
+        file_path(root.path(), "skills/example/SKILL.md")
+    );
+}
+
+/// The name validator's rules in order, upstream's `validateName`.
+#[test]
+fn the_name_validator_covers_the_declared_rules() {
+    use super::validate_name;
+
+    assert_eq!(validate_name("skills", "skills"), Vec::<String>::new());
+    assert_eq!(
+        validate_name("custom", "skills"),
+        ["name \"custom\" does not match parent directory \"skills\""]
+    );
+    assert_eq!(
+        validate_name(&"a".repeat(65), "skills"),
+        [
+            format!(
+                "name \"{}\" does not match parent directory \"skills\"",
+                "a".repeat(65)
+            ),
+            "name exceeds 64 characters (65)".to_owned(),
+        ]
+    );
+    assert_eq!(validate_name(&"a".repeat(64), "skills").len(), 1);
+    assert_eq!(
+        validate_name("Bad", "Bad"),
+        ["name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)"]
+    );
+    assert_eq!(
+        validate_name("", "x"),
+        [
+            "name \"\" does not match parent directory \"x\"",
+            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)",
+        ]
+    );
+    assert_eq!(
+        validate_name("-lead", "-lead"),
+        ["name must not start or end with a hyphen"]
+    );
+    assert_eq!(
+        validate_name("trail-", "trail-"),
+        ["name must not start or end with a hyphen"]
+    );
+    assert_eq!(
+        validate_name("a--b", "a--b"),
+        ["name must not contain consecutive hyphens"]
+    );
+}
+
+/// The description validator's rules, upstream's `validateDescription`.
+#[test]
+fn the_description_validator_covers_the_declared_rules() {
+    use super::validate_description;
+
+    assert_eq!(validate_description(None), ["description is required"]);
+    assert_eq!(validate_description(Some("")), ["description is required"]);
+    assert_eq!(
+        validate_description(Some("   ")),
+        ["description is required"]
+    );
+    assert_eq!(
+        validate_description(Some(&"x".repeat(1025))),
+        ["description exceeds 1024 characters (1025)"]
+    );
+    assert_eq!(
+        validate_description(Some(&"x".repeat(1024))),
+        Vec::<String>::new()
+    );
+}
+
+/// The ignore-line prefixer's rules, upstream's `prefixIgnorePattern`.
+#[test]
+fn the_ignore_line_prefixer_covers_the_declared_rules() {
+    use super::prefix_ignore_pattern;
+
+    assert_eq!(prefix_ignore_pattern("", ""), None);
+    assert_eq!(prefix_ignore_pattern("   ", ""), None);
+    assert_eq!(prefix_ignore_pattern("# note", ""), None);
+    assert_eq!(
+        prefix_ignore_pattern("\\#tag", ""),
+        Some("\\#tag".to_owned())
+    );
+    assert_eq!(
+        prefix_ignore_pattern("!build", "a/"),
+        Some("!a/build".to_owned())
+    );
+    assert_eq!(
+        prefix_ignore_pattern("\\!bang", "a/"),
+        Some("a/!bang".to_owned())
+    );
+    assert_eq!(
+        prefix_ignore_pattern("/foo", "a/"),
+        Some("a/foo".to_owned())
+    );
+    assert_eq!(prefix_ignore_pattern("/foo", ""), Some("foo".to_owned()));
+    assert_eq!(
+        prefix_ignore_pattern("plain", "a/"),
+        Some("a/plain".to_owned())
+    );
+}
+
+/// The matcher's semantics the suites exercise, npm `ignore` parity: empty
+/// adds are no-ops, patterns accumulate across adds with last-match-wins,
+/// directories test with the trailing slash, and matching is
+/// case-insensitive.
+#[test]
+fn the_ignore_matcher_binds_npm_ignore_semantics() {
+    use super::IgnoreMatcher;
+
+    let mut matcher = IgnoreMatcher::new();
+    assert!(!matcher.ignores("anything"));
+    assert!(!matcher.ignores("a/anything"));
+
+    matcher.add(&["temp".to_owned()]);
+    assert!(matcher.ignores("temp"));
+    assert!(matcher.ignores("a/temp"));
+    assert!(matcher.ignores("a/deeper/temp"));
+    assert!(!matcher.ignores("xtemp"));
+    assert!(!matcher.ignores("a/xtemp"));
+
+    matcher.add(&["example/".to_owned()]);
+    assert!(matcher.ignores("example/"));
+    assert!(!matcher.ignores("example"));
+    assert!(matcher.ignores("example/x"));
+
+    matcher.add(&["*.log".to_owned()]);
+    matcher.add(&["!keep.log".to_owned()]);
+    assert!(!matcher.ignores("keep.log"));
+    assert!(matcher.ignores("other.log"));
+
+    matcher.add(&[]);
+    assert!(matcher.ignores("other.log"));
+
+    let mut matcher = IgnoreMatcher::new();
+    matcher.add(&["BUILD".to_owned()]);
+    assert!(matcher.ignores("build"));
+    assert!(matcher.ignores("a/Build"));
+}
