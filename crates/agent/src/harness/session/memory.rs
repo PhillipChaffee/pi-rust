@@ -71,7 +71,7 @@ impl std::fmt::Debug for MemorySessionRepoOptions {
     }
 }
 
-fn default_now() -> NowFn {
+pub(crate) fn default_now() -> NowFn {
     Arc::new(pi_ai::auth::resolve::now_ms)
 }
 
