@@ -44,6 +44,15 @@ tokio = { version = "1.47", default-features = false, features = [
   "fs",
   "io-util",
 ] }
+# The skills loader's ignore-file engine (.gitignore/.ignore/.fdignore),
+# upstream's npm `ignore` dependency: the crate's gitignore machinery with
+# npm's default case-insensitivity and its parent-first walk re-expressed
+# over `Gitignore::matched` (see the skills module's IgnoreMatcher).
+ignore = "0.4"
+# SKILL.md and prompt-template frontmatter parsing, upstream's npm `yaml`
+# dependency: yaml-rust2 rejects the same malformed inputs (unterminated flow
+# sequences, duplicate keys) the `yaml` parse throws on.
+yaml-rust2 = "0.13"
 
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the
@@ -54,6 +63,12 @@ tokio = { version = "1.47", default-features = false, features = [
 tokio = { version = "1.47", features = ["macros", "rt", "sync", "time", "process", "test-util"] }
 # tempfile: the execution-environment suites' scratch roots.
 tempfile = "3"
+# The chunk type of the seam's byte streams; the proxy boundary suite's
+# signal-ignoring client builds canned chunk bodies with it.
+bytes = "1.12"
+# The Stream trait of the seam's byte streams; the proxy boundary suite's
+# gated body (chunk, suspension, end) implements it by hand.
+futures-core = "0.3"
 
 [lints]
 workspace = true

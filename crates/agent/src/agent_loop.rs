@@ -735,7 +735,7 @@ async fn settle_final_message(
 }
 
 /// The live partial message a mid-stream protocol event carries.
-const fn event_partial(event: &AssistantMessageEvent) -> Option<&AssistantMessage> {
+pub(crate) const fn event_partial(event: &AssistantMessageEvent) -> Option<&AssistantMessage> {
     match event {
         AssistantMessageEvent::Start { partial }
         | AssistantMessageEvent::TextStart { partial, .. }

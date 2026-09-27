@@ -7,21 +7,36 @@
 //! capability and option types, the session contract surface, the
 //! compaction type shells, the telemetry schemas and typed starters, the
 //! message helpers, the effect gate, the hook registry, the event bus, and
-//! the agent-harness type surface. The nodejs execution environment, the
-//! session and compaction implementations, and the runtime constructor
-//! ride their own tickets.
+//! the agent-harness type surface, plus the prompt-surface loaders
+//! (skills, prompt templates, system prompt; map child "pi-agent-core:
+//! skills, prompt templates, and system prompt"); the execution layer (the
+//! tool-call pipeline and the assistant stream runner) rides the execution
+//! child. The nodejs execution environment, the session and compaction
+//! implementations, and the runtime constructor ride their own tickets.
 pub mod agent_harness;
 pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod env;
 pub mod events;
+pub mod execution;
+pub mod fs_scan;
 pub mod gate;
 pub mod hooks;
 pub mod messages;
+pub mod prompt_templates;
 pub mod result;
 pub mod runtime;
 pub mod session;
+pub mod skills;
+pub mod system_prompt;
 pub mod telemetry;
 pub mod types;
 pub mod utils;
+
+#[cfg(test)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "the helpers are crate-visible in test builds; the lint reads the cfg(test) module as private"
+)]
+pub(crate) mod test_support;
