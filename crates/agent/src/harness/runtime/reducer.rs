@@ -24,7 +24,10 @@ pub enum LaneSnapshotReduction {
     Rebase,
 }
 
-fn matching_operation<'a>(snapshot: &'a mut LaneSnapshot, operation_id: &str) -> Option<&'a mut LiveOperationView> {
+fn matching_operation<'a>(
+    snapshot: &'a mut LaneSnapshot,
+    operation_id: &str,
+) -> Option<&'a mut LiveOperationView> {
     let matches = snapshot
         .operation
         .as_ref()
@@ -37,9 +40,27 @@ fn matching_operation<'a>(snapshot: &'a mut LaneSnapshot, operation_id: &str) ->
 
 /// Applies one harness event to a lane snapshot, upstream's
 /// `reduceLaneSnapshot`. Navigation completion requires a fresh snapshot.
-pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -> LaneSnapshotReduction {
+#[expect(
+    clippy::too_many_lines,
+    reason = "the port mirrors upstream's single reduceLaneSnapshot switch"
+)]
+#[expect(
+    clippy::match_same_arms,
+    reason = "the arms mirror upstream's separate switch cases over distinct payloads"
+)]
+#[expect(
+    clippy::branches_sharing_code,
+    reason = "upstream keeps the transcript push in both branches; its compaction splice restates as clear-then-append"
+)]
+pub fn reduce_lane_snapshot(
+    snapshot: &mut LaneSnapshot,
+    event: &HarnessEvent,
+) -> LaneSnapshotReduction {
     let lane_mismatch = match &event.lane {
-        Some(event_lane) => event_lane != &snapshot.lane && event.event_type() != crate::harness::agent_harness::HarnessEventType::Usage,
+        Some(event_lane) => {
+            event_lane != &snapshot.lane
+                && event.event_type() != crate::harness::agent_harness::HarnessEventType::Usage
+        }
         None => false,
     };
     if lane_mismatch {
@@ -59,7 +80,9 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                 running_tools: Vec::new(),
             });
         }
-        HarnessEventPayload::CompactionStart { run_id, started_at, .. } => {
+        HarnessEventPayload::CompactionStart {
+            run_id, started_at, ..
+        } => {
             if snapshot.operation.is_some() {
                 return LaneSnapshotReduction::Applied;
             }
@@ -75,7 +98,9 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                 running_tools: Vec::new(),
             });
         }
-        HarnessEventPayload::NavigationStart { run_id, started_at, .. } => {
+        HarnessEventPayload::NavigationStart {
+            run_id, started_at, ..
+        } => {
             snapshot.operation = Some(LiveOperationView {
                 id: run_id.clone(),
                 kind: crate::harness::session::types::OperationKind::Navigation,
@@ -98,7 +123,11 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                 operation.deferred = None;
             }
         }
-        HarnessEventPayload::RunSuspend { run_id, deferred, poll } => {
+        HarnessEventPayload::RunSuspend {
+            run_id,
+            deferred,
+            poll,
+        } => {
             let Some(operation) = matching_operation(snapshot, run_id) else {
                 return LaneSnapshotReduction::Applied;
             };
@@ -108,7 +137,13 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                 poll: *poll,
             });
         }
-        HarnessEventPayload::RetryScheduled { run_id, attempt, max_attempts, not_before, .. } => {
+        HarnessEventPayload::RetryScheduled {
+            run_id,
+            attempt,
+            max_attempts,
+            not_before,
+            ..
+        } => {
             if let Some(operation) = matching_operation(snapshot, run_id) {
                 operation.retry = Some(crate::harness::agent_harness::RetryView {
                     attempt: *attempt,
@@ -117,16 +152,20 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                 });
             }
         }
-        HarnessEventPayload::RetryStart { run_id, .. } | HarnessEventPayload::RetryEnd { run_id, .. } => {
+        HarnessEventPayload::RetryStart { run_id, .. }
+        | HarnessEventPayload::RetryEnd { run_id, .. } => {
             if let Some(operation) = matching_operation(snapshot, run_id) {
                 operation.retry = None;
             }
         }
-        HarnessEventPayload::MessageStart { run_id: Some(run_id), message } => {
+        HarnessEventPayload::MessageStart {
+            run_id: Some(run_id),
+            message,
+        } => {
             let streaming = match message {
-                crate::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(assistant))
-                    if assistant.stop_reason == pi_ai::types::StopReason::Pending =>
-                {
+                crate::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(
+                    assistant,
+                )) if assistant.stop_reason == pi_ai::types::StopReason::Pending => {
                     assistant.clone()
                 }
                 _ => return LaneSnapshotReduction::Applied,
@@ -136,24 +175,35 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
             }
         }
         HarnessEventPayload::MessageStart { run_id: None, .. } => {}
-        HarnessEventPayload::MessageUpdate { run_id, message, .. } => {
+        HarnessEventPayload::MessageUpdate {
+            run_id, message, ..
+        } => {
             let streaming = match message.as_ref() {
-                crate::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(assistant)) => {
-                    assistant.clone()
-                }
+                crate::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(
+                    assistant,
+                )) => assistant.clone(),
                 _ => return LaneSnapshotReduction::Applied,
             };
             if let Some(operation) = matching_operation(snapshot, run_id) {
                 operation.streaming_message = Some(streaming);
             }
         }
-        HarnessEventPayload::MessageEnd { run_id: Some(run_id), .. } => {
+        HarnessEventPayload::MessageEnd {
+            run_id: Some(run_id),
+            ..
+        } => {
             if let Some(operation) = matching_operation(snapshot, run_id) {
                 operation.streaming_message = None;
             }
         }
         HarnessEventPayload::MessageEnd { run_id: None, .. } => {}
-        HarnessEventPayload::ToolStart { run_id, tool_call_id, tool_name, args, .. } => {
+        HarnessEventPayload::ToolStart {
+            run_id,
+            tool_call_id,
+            tool_name,
+            args,
+            ..
+        } => {
             let Some(operation) = matching_operation(snapshot, run_id) else {
                 return LaneSnapshotReduction::Applied;
             };
@@ -167,28 +217,39 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                 },
             );
         }
-        HarnessEventPayload::ToolUpdate { run_id, tool_call_id, partial_result, .. } => {
+        HarnessEventPayload::ToolUpdate {
+            run_id,
+            tool_call_id,
+            partial_result,
+            ..
+        } => {
             let Some(operation) = matching_operation(snapshot, run_id) else {
                 return LaneSnapshotReduction::Applied;
             };
             if let Some(tool) = operation
                 .running_tools
                 .iter_mut()
-                .find(|candidate| tool_call_id_of(candidate) == Some(tool_call_id.as_str()))
+                .find(|candidate| tool_call_id_of(candidate) == tool_call_id.as_str())
+                && let LaneSnapshotTool::Running { result, .. } = tool
             {
-                if let LaneSnapshotTool::Running { result, .. } = tool {
-                    *result = Some(partial_result.clone());
-                }
+                *result = Some(partial_result.clone());
             }
         }
-        HarnessEventPayload::ToolEnd { run_id, tool_call_id, tool_name, result, is_error, .. } => {
+        HarnessEventPayload::ToolEnd {
+            run_id,
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+            ..
+        } => {
             let Some(operation) = matching_operation(snapshot, run_id) else {
                 return LaneSnapshotReduction::Applied;
             };
             let Some(index) = operation
                 .running_tools
                 .iter()
-                .position(|candidate| tool_call_id_of(candidate) == Some(tool_call_id.as_str()))
+                .position(|candidate| tool_call_id_of(candidate) == tool_call_id.as_str())
             else {
                 return LaneSnapshotReduction::Applied;
             };
@@ -203,20 +264,19 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
             };
         }
         HarnessEventPayload::EntryAdded { entry } => {
-            if let crate::harness::session::types::Entry::Message { body, .. } = &entry {
-                if let crate::types::AgentMessage::Standard(pi_ai::types::Message::ToolResult(tool_result)) =
-                    &body.message
+            if let crate::harness::session::types::Entry::Message { body, .. } = &entry
+                && let crate::types::AgentMessage::Standard(pi_ai::types::Message::ToolResult(
+                    tool_result,
+                )) = &body.message
+                && let Some(operation) = &mut snapshot.operation
+            {
+                let tool_call_id = &tool_result.tool_call_id;
+                if let Some(index) = operation
+                    .running_tools
+                    .iter()
+                    .position(|candidate| tool_call_id_of(candidate) == tool_call_id.as_str())
                 {
-                    if let Some(operation) = &mut snapshot.operation {
-                        let tool_call_id = &tool_result.tool_call_id;
-                        if let Some(index) = operation
-                            .running_tools
-                            .iter()
-                            .position(|candidate| tool_call_id_of(candidate) == Some(tool_call_id.as_str()))
-                        {
-                            operation.running_tools.remove(index);
-                        }
-                    }
+                    operation.running_tools.remove(index);
                 }
             }
             if entry.entry_type() == crate::harness::session::types::EntryType::Compaction {
@@ -231,10 +291,10 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
             }
         }
         HarnessEventPayload::QueueUpdate { queues } => {
-            snapshot.queues = queues.clone();
+            snapshot.queues.clone_from(queues);
         }
         HarnessEventPayload::Usage { totals, .. } => {
-            snapshot.stats.usage = totals.clone();
+            snapshot.stats.usage = *totals;
         }
         HarnessEventPayload::ConfigUpdate { property } => {
             let event_lane = event.lane.as_deref();
@@ -244,33 +304,59 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
                         return LaneSnapshotReduction::Applied;
                     }
                     match lane_update {
-                        crate::harness::agent_harness::LaneConfigUpdate::Model { value, .. } => {
+                        crate::harness::agent_harness::LaneConfigUpdate::Model {
+                            value, ..
+                        } => {
                             snapshot.configuration.model = value.clone();
                         }
-                        crate::harness::agent_harness::LaneConfigUpdate::ThinkingLevel { value, .. } => {
+                        crate::harness::agent_harness::LaneConfigUpdate::ThinkingLevel {
+                            value,
+                            ..
+                        } => {
                             snapshot.configuration.thinking_level = *value;
                         }
-                        crate::harness::agent_harness::LaneConfigUpdate::ActiveTools { value, .. } => {
-                            snapshot.configuration.active_tool_names = value.clone();
+                        crate::harness::agent_harness::LaneConfigUpdate::ActiveTools {
+                            value,
+                            ..
+                        } => {
+                            snapshot.configuration.active_tool_names.clone_from(value);
                         }
                     }
                 }
                 crate::harness::agent_harness::ConfigUpdateKind::Global(_) => {}
             }
         }
-        HarnessEventPayload::RunEnd { run_id, status, tip_id, ended_at, from_tip_id, .. } => {
+        HarnessEventPayload::RunEnd {
+            run_id,
+            status,
+            tip_id,
+            ended_at,
+            from_tip_id,
+            ..
+        } => {
             let Some(operation) = matching_operation(snapshot, run_id) else {
                 return LaneSnapshotReduction::Applied;
             };
             if operation.kind != crate::harness::session::types::OperationKind::Run {
                 return LaneSnapshotReduction::Applied;
             }
-            let record = run_end_record(status, from_tip_id, tip_id, operation, *ended_at);
+            let record = run_end_record(
+                status,
+                from_tip_id.as_ref(),
+                tip_id.as_ref(),
+                operation,
+                *ended_at,
+            );
             snapshot.last_result = Some(record);
             snapshot.operation = None;
-            snapshot.tip_id = tip_id.clone();
+            snapshot.tip_id.clone_from(tip_id);
         }
-        HarnessEventPayload::CompactionEnd { run_id, status, ended_at, .. } => {
+        HarnessEventPayload::CompactionEnd {
+            run_id,
+            status,
+            ended_at,
+            ..
+        } => {
             let tip_id = snapshot.tip_id.clone();
             let Some(operation) = matching_operation(snapshot, run_id) else {
                 return LaneSnapshotReduction::Applied;
@@ -278,7 +364,7 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
             if operation.kind != crate::harness::session::types::OperationKind::Compaction {
                 return LaneSnapshotReduction::Applied;
             }
-            let record = compaction_end_record(operation, status, *ended_at, &tip_id);
+            let record = compaction_end_record(operation, status, *ended_at, tip_id.as_ref());
             snapshot.last_result = Some(record);
             snapshot.operation = None;
         }
@@ -296,26 +382,25 @@ pub fn reduce_lane_snapshot(snapshot: &mut LaneSnapshot, event: &HarnessEvent) -
 }
 
 fn upsert_tool(operation: &mut LiveOperationView, tool: LaneSnapshotTool) {
-    let tool_call_id = tool_call_id_of(&tool).map(str::to_owned);
+    let tool_call_id = tool_call_id_of(&tool).to_owned();
     match operation
         .running_tools
         .iter()
-        .position(|candidate| tool_call_id_of(candidate) == tool_call_id.as_deref())
+        .position(|candidate| tool_call_id_of(candidate) == tool_call_id.as_str())
     {
         Some(index) => operation.running_tools[index] = tool,
         None => operation.running_tools.push(tool),
     }
 }
 
-fn tool_call_id_of(tool: &LaneSnapshotTool) -> Option<&str> {
+fn tool_call_id_of(tool: &LaneSnapshotTool) -> &str {
     match tool {
-        LaneSnapshotTool::Running { tool_call_id, .. } | LaneSnapshotTool::Settled { tool_call_id, .. } => {
-            Some(tool_call_id)
-        }
+        LaneSnapshotTool::Running { tool_call_id, .. }
+        | LaneSnapshotTool::Settled { tool_call_id, .. } => tool_call_id,
     }
 }
 
-fn args_of(tool: &LaneSnapshotTool) -> &serde_json::Value {
+const fn args_of(tool: &LaneSnapshotTool) -> &serde_json::Value {
     match tool {
         LaneSnapshotTool::Running { args, .. } | LaneSnapshotTool::Settled { args, .. } => args,
     }
@@ -323,15 +408,21 @@ fn args_of(tool: &LaneSnapshotTool) -> &serde_json::Value {
 
 fn run_end_record(
     status: &crate::harness::agent_harness::RunEndStatus,
-    from_tip_id: &Option<String>,
-    tip_id: &Option<String>,
+    from_tip_id: Option<&String>,
+    tip_id: Option<&String>,
     operation: &LiveOperationView,
     ended_at: i64,
 ) -> crate::harness::session::types::OperationResultRecord {
     use crate::harness::agent_harness::RunEndStatus;
     let (terminal_status, error) = match status {
-        RunEndStatus::Completed => (crate::harness::session::types::TerminalStatus::Completed, None),
-        RunEndStatus::Aborted => (crate::harness::session::types::TerminalStatus::Aborted, None),
+        RunEndStatus::Completed => (
+            crate::harness::session::types::TerminalStatus::Completed,
+            None,
+        ),
+        RunEndStatus::Aborted => (
+            crate::harness::session::types::TerminalStatus::Aborted,
+            None,
+        ),
         RunEndStatus::Failed { error } => (
             crate::harness::session::types::TerminalStatus::Failed,
             Some(error.clone()),
@@ -342,8 +433,8 @@ fn run_end_record(
         kind: crate::harness::session::types::OperationKind::Run,
         status: terminal_status,
         error,
-        from_tip_id: from_tip_id.clone(),
-        tip_id: tip_id.clone(),
+        from_tip_id: from_tip_id.cloned(),
+        tip_id: tip_id.cloned(),
         started_at: operation.started_at,
         ended_at,
     }
@@ -353,13 +444,22 @@ fn compaction_end_record(
     operation: &LiveOperationView,
     status: &crate::harness::agent_harness::CompactionEndStatus,
     ended_at: i64,
-    tip_id: &Option<String>,
+    tip_id: Option<&String>,
 ) -> crate::harness::session::types::OperationResultRecord {
     use crate::harness::agent_harness::CompactionEndStatus;
     let (terminal_status, error) = match status {
-        CompactionEndStatus::Completed { .. } => (crate::harness::session::types::TerminalStatus::Completed, None),
-        CompactionEndStatus::Declined => (crate::harness::session::types::TerminalStatus::Declined, None),
-        CompactionEndStatus::Aborted => (crate::harness::session::types::TerminalStatus::Aborted, None),
+        CompactionEndStatus::Completed { .. } => (
+            crate::harness::session::types::TerminalStatus::Completed,
+            None,
+        ),
+        CompactionEndStatus::Declined => (
+            crate::harness::session::types::TerminalStatus::Declined,
+            None,
+        ),
+        CompactionEndStatus::Aborted => (
+            crate::harness::session::types::TerminalStatus::Aborted,
+            None,
+        ),
         CompactionEndStatus::Failed { error } => (
             crate::harness::session::types::TerminalStatus::Failed,
             Some(error.clone()),
@@ -371,7 +471,7 @@ fn compaction_end_record(
         status: terminal_status,
         error,
         from_tip_id: operation.from_tip_id.clone(),
-        tip_id: tip_id.clone(),
+        tip_id: tip_id.cloned(),
         started_at: operation.started_at,
         ended_at,
     }

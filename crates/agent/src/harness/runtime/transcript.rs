@@ -5,8 +5,6 @@
 //! child carries in [`crate::harness::session::context`]; the session-child
 //! reservation stands.
 
-
-
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::HarnessEventPayload;
 use crate::harness::agent_harness::LaneQueuedItem;
@@ -14,9 +12,9 @@ use crate::harness::context::Context;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::types::ContinueOperationResult;
 use crate::harness::runtime::types::Drive;
-use crate::harness::runtime::types::lane_error;
 use crate::harness::runtime::types::LaneError;
 use crate::harness::runtime::types::OperationCommand;
+use crate::harness::runtime::types::lane_error;
 use crate::harness::session::context::SessionContextBuildOptions;
 use crate::harness::session::context::build_session_context;
 use crate::harness::session::types::BranchScanOrder;
@@ -30,8 +28,8 @@ use crate::harness::session::types::PendingEntry;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::types::SessionReader;
 use crate::harness::session::types::StorageBranchScan;
-use crate::harness::session::values::pending_entry;
 use crate::harness::session::values::StoredValue;
+use crate::harness::session::values::pending_entry;
 use crate::types::AgentMessage;
 
 /// Links a list of new entries into one parent chain, upstream's
@@ -90,8 +88,9 @@ pub fn entry_lifecycle_events(entry: Entry, lane: &str, run_id: Option<&str>) ->
         }
         Entry::Compaction { .. } | Entry::BranchSummary { .. } | Entry::Custom { .. } => Vec::new(),
     };
-    let entry_added = HarnessEvent::lane_scoped(lane, false, HarnessEventPayload::EntryAdded { entry })
-        .unwrap_or_else(|error| unreachable!("entry_added is lane-scoped: {error}"));
+    let entry_added =
+        HarnessEvent::lane_scoped(lane, false, HarnessEventPayload::EntryAdded { entry })
+            .unwrap_or_else(|error| unreachable!("entry_added is lane-scoped: {error}"));
     let mut events = message_events;
     events.push(entry_added);
     events
@@ -110,10 +109,10 @@ pub fn committed_entry_events(
 ) -> Vec<HarnessEvent> {
     let mut events = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        let seq = match commit.seqs.get(first_write_index + index) {
-            Some(seq) => *seq,
-            None => unreachable!("commit carries one sequence per write"),
-        };
+        let seq = commit.seqs.get(first_write_index + index).map_or_else(
+            || unreachable!("commit carries one sequence per write"),
+            |seq| *seq,
+        );
         let materialized = entry.clone().materialize(seq, commit.timestamp);
         events.extend(entry_lifecycle_events(materialized, lane, run_id));
     }
@@ -123,6 +122,10 @@ pub fn committed_entry_events(
 /// Reads the entries one run's operation covers, upstream's
 /// `readBoundedEntries`: the branch path from the tip to the last compaction
 /// entry, oldest first.
+///
+/// # Errors
+/// The no-tip invariant when the operation has no branch tip; the branch
+/// scan's storage error.
 pub async fn read_bounded_entries(
     lane: &Lane,
     drive: &Drive,
@@ -159,6 +162,9 @@ pub async fn read_bounded_entries(
 
 /// Reads the model context one run's operation covers, upstream's
 /// `readBoundedContext`.
+///
+/// # Errors
+/// [`read_bounded_entries`]'s errors; the context build's storage error.
 pub async fn read_bounded_context(
     lane: &Lane,
     drive: &Drive,
@@ -180,6 +186,10 @@ pub async fn read_bounded_context(
 
 /// Reads the queued items one lane's inbox holds, upstream's
 /// `readLaneQueues`: each pending payload becomes its queue view.
+///
+/// # Errors
+/// The value read's storage error; the missing-payload, malformed-payload,
+/// and non-message-pending invariants.
 pub async fn read_lane_queues(
     reader: &dyn SessionReader,
     inbox: &[InboxItem],
@@ -193,13 +203,13 @@ pub async fn read_lane_queues(
         let Some(stored) = stored else {
             return Err(SessionError::Invariant(format!(
                 "Pending {} entry {} is missing its payload",
-                inbox_item_kind(&item.kind),
+                inbox_item_kind(item.kind),
                 item.entry_id
-            ))
-            .into());
+            )));
         };
-        let pending: PendingEntry = serde_json::from_value(stored.value)
-            .map_err(|error| SessionError::Invariant(format!("Pending entry payload is malformed: {error}")))?;
+        let pending: PendingEntry = serde_json::from_value(stored.value).map_err(|error| {
+            SessionError::Invariant(format!("Pending entry payload is malformed: {error}"))
+        })?;
         match pending {
             PendingEntry::Message { payload } => {
                 queues.push(LaneQueuedItem::Message {
@@ -208,14 +218,16 @@ pub async fn read_lane_queues(
                     message: Box::new(*payload),
                 });
             }
-            PendingEntry::Custom { custom_type, payload } => {
+            PendingEntry::Custom {
+                custom_type,
+                payload,
+            } => {
                 if item.kind != InboxItemKind::Write {
                     return Err(SessionError::Invariant(format!(
                         "Pending {} entry {} is not a message",
-                        inbox_item_kind(&item.kind),
+                        inbox_item_kind(item.kind),
                         item.entry_id
-                    ))
-                    .into());
+                    )));
                 }
                 queues.push(LaneQueuedItem::Custom {
                     entry_id: item.entry_id.clone(),
@@ -229,7 +241,7 @@ pub async fn read_lane_queues(
     Ok(queues)
 }
 
-fn inbox_item_kind(kind: &InboxItemKind) -> &'static str {
+const fn inbox_item_kind(kind: InboxItemKind) -> &'static str {
     match kind {
         InboxItemKind::Steer => "steer",
         InboxItemKind::FollowUp => "followUp",
@@ -240,6 +252,10 @@ fn inbox_item_kind(kind: &InboxItemKind) -> &'static str {
 
 /// Reads the pending message payloads named ids carry, upstream's
 /// `readPendingMessages`.
+///
+/// # Errors
+/// The value read's storage error; the missing and malformed message
+/// payload invariants.
 pub async fn read_pending_messages(
     reader: &dyn SessionReader,
     ids: &[String],
@@ -253,11 +269,14 @@ pub async fn read_pending_messages(
     };
     let mut messages = Vec::with_capacity(ids.len());
     for entry_id in ids {
-        let value = reader.get_value(&pending_entry(entry_id).address, context).await?;
+        let value = reader
+            .get_value(&pending_entry(entry_id).address, context)
+            .await?;
         let stored: StoredValue = value.ok_or_else(|| missing(entry_id))?;
-        let pending: PendingEntry = serde_json::from_value(stored.value).map_err(|_| missing(entry_id))?;
+        let pending: PendingEntry =
+            serde_json::from_value(stored.value).map_err(|_| missing(entry_id))?;
         let PendingEntry::Message { payload } = pending else {
-            return Err(missing(entry_id).into());
+            return Err(missing(entry_id));
         };
         messages.push((entry_id.clone(), *payload));
     }

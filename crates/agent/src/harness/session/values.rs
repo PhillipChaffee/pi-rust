@@ -352,7 +352,10 @@ pub fn delete_value_write<T>(address: &Value<T>) -> Write {
 ///
 /// # Errors
 /// Payload serialization failures.
-pub fn append_list_write<T: Serialize>(address: &ValueList<T>, element: T) -> Result<Write, SessionError> {
+pub fn append_list_write<T: Serialize>(
+    address: &ValueList<T>,
+    element: T,
+) -> Result<Write, SessionError> {
     append_list(address, element).map(Write::ListAppend)
 }
 

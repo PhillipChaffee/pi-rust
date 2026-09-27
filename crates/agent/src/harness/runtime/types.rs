@@ -120,7 +120,8 @@ pub struct Config {
     pub to_provider_messages: crate::harness::agent_harness::ToProviderMessages,
     /// The custom-entry projectors, by custom type, upstream's
     /// `entryProjectors`.
-    pub entry_projectors: std::collections::BTreeMap<String, crate::harness::session::types::EntryProjector>,
+    pub entry_projectors:
+        std::collections::BTreeMap<String, crate::harness::session::types::EntryProjector>,
 }
 
 impl std::fmt::Debug for Config {
@@ -141,7 +142,7 @@ impl std::fmt::Debug for Config {
 /// The current durable state owned by one lane, upstream's `LaneState` in
 /// `runtime/types.ts` (the session contract's durable lane record restates
 /// as [`crate::harness::session::types::LaneState`]).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneState {
     /// The branch tip id, when any entries committed.
     pub tip_id: Option<String>,
@@ -157,7 +158,7 @@ pub struct LaneState {
 
 /// One admitted operation's meta plus durable state, upstream's
 /// `LaneState["operation"]`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveOperation {
     /// The durable meta.
     pub meta: OperationMeta,
@@ -181,15 +182,28 @@ pub struct LanePatch {
 }
 
 /// Materializes the caller's result from storage-assigned commit metadata,
-/// upstream's `materialize(commit)` — synchronous by construction, the
-/// port's type system replacing upstream's runtime thenable guard.
-pub type MaterializeFn<T> = Arc<dyn Fn(&crate::harness::session::types::CommitResult) -> T + Send + Sync>;
+/// upstream's `materialize(commit)`.
+///
+/// Synchronous by construction: the port's type system replaces upstream's
+/// runtime thenable guard.
+pub type MaterializeFn<T> =
+    Arc<dyn Fn(&crate::harness::session::types::CommitResult) -> T + Send + Sync>;
 
 /// Builds the events a commit publishes, upstream's `events?(commit)`.
-pub type EventsFn = Arc<dyn Fn(&crate::harness::session::types::CommitResult) -> Vec<crate::harness::agent_harness::HarnessEvent> + Send + Sync>;
+pub type EventsFn = Arc<
+    dyn Fn(
+            &crate::harness::session::types::CommitResult,
+        ) -> Vec<crate::harness::agent_harness::HarnessEvent>
+        + Send
+        + Sync,
+>;
 
 /// One effect-free decision made on a lane's serialized mutation line,
 /// upstream's `LaneCommand<TResult>`.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "mirrors upstream's discriminated union carrying the write list and next state whole"
+)]
 pub enum LaneCommand<T> {
     /// Commit once and materialize the result, upstream's `commit`.
     Commit {
@@ -251,6 +265,10 @@ impl<T> std::fmt::Debug for ContinueOperationResult<T> {
 }
 
 /// One durable operation transition, upstream's `OperationCommand<TResult>`.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "mirrors upstream's discriminated union carrying the write list and result record whole"
+)]
 pub enum OperationCommand<T> {
     /// Commit once with the operation-state write, upstream's `commit`.
     Commit {
@@ -336,6 +354,10 @@ pub enum ProcedureResult {
 /// The completion state one drive pass settles into, upstream's
 /// `Promise<DriveOutcome>` — pending until [`Drive::settle`] or
 /// [`Drive::fail`] fires, each no-op after the first.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "mirrors upstream's settled-or-rejected promise state carrying the outcome whole"
+)]
 pub enum DriveCompletion {
     /// No outcome yet.
     Pending,
@@ -405,7 +427,8 @@ impl Drive {
     pub fn new(options: &DriveOptions, context: &Context) -> Self {
         let (completion_tx, completion) = tokio::sync::watch::channel(DriveCompletion::Pending);
         let (gate, control) = crate::harness::gate::create_gate();
-        let (_, close_controller) = pi_chord::context::with_cancel(&pi_chord::context::background_context());
+        let (_, close_controller) =
+            pi_chord::context::with_cancel(&pi_chord::context::background_context());
         Self {
             operation_id: options.operation_id.clone(),
             context: without_abort_signal(context),
@@ -441,13 +464,19 @@ impl Drive {
 
     /// Resolves when the pass settles or fails, upstream's awaiting
     /// `completion`.
-    pub async fn completion(&self) -> Result<DriveOutcome, Arc<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// # Errors
+    /// The pass's failure, upstream's rejected completion promise.
+    pub async fn completion(
+        &self,
+    ) -> Result<DriveOutcome, Arc<dyn std::error::Error + Send + Sync>> {
         let mut receiver = self.completion.clone();
         loop {
-            if let DriveCompletion::Settled(outcome) = receiver.borrow_and_update().clone() {
+            let settled = receiver.borrow_and_update().clone();
+            if let DriveCompletion::Settled(outcome) = settled {
                 return Ok(outcome);
             }
-            if let DriveCompletion::Failed(error) = receiver.borrow_and_update().clone() {
+            if let DriveCompletion::Failed(error) = settled {
                 return Err(error);
             }
             if receiver.changed().await.is_err() {

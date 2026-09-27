@@ -13,6 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::harness::context::Context;
+use crate::harness::runtime::types::LaneState;
+use crate::harness::runtime::types::LiveOperation;
+use crate::harness::runtime::types::any_payload;
 use crate::harness::session::types::LaneConfiguration;
 use crate::harness::session::types::OperationIntent;
 use crate::harness::session::types::OperationMeta;
@@ -22,21 +25,18 @@ use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::types::SessionMutationCallback;
 use crate::harness::session::types::SessionReader;
+use crate::harness::session::values::StoredValue;
 use crate::harness::session::values::branch_tip;
 use crate::harness::session::values::branch_tip_inventory_prefix;
 use crate::harness::session::values::lane_config;
 use crate::harness::session::values::lane_state;
 use crate::harness::session::values::operation_meta;
 use crate::harness::session::values::operation_state;
-use crate::harness::session::values::StoredValue;
-use crate::harness::runtime::types::any_payload;
-use crate::harness::runtime::types::LaneState;
-use crate::harness::runtime::types::LiveOperation;
 
 /// Whether a durable leaf belongs to a summary family, upstream's
 /// `isSummaryState`.
 #[must_use]
-fn is_summary_state(state: &OperationState) -> bool {
+const fn is_summary_state(state: &OperationState) -> bool {
     matches!(
         state,
         OperationState::SummaryDeciding(_)
@@ -49,7 +49,9 @@ fn is_summary_state(state: &OperationState) -> bool {
 /// The state leaf's summary task, when the leaf is a summary family member,
 /// upstream's `state.task` reads under the summary-state narrow.
 #[must_use]
-fn summary_task(state: &OperationState) -> Option<&crate::harness::session::types::SummaryTask> {
+const fn summary_task(
+    state: &OperationState,
+) -> Option<&crate::harness::session::types::SummaryTask> {
     match state {
         OperationState::SummaryDeciding(leaf) => Some(&leaf.task),
         OperationState::SummaryReady(leaf) => Some(&leaf.generation.task),
@@ -69,7 +71,8 @@ fn summary_boundary(state: &OperationState) -> Option<&ResultBoundary> {
 pub fn state_matches_intent(meta: &OperationMeta, state: &OperationState) -> bool {
     match &meta.intent {
         OperationIntent::Compaction { .. } => {
-            is_summary_state(state) && matches!(summary_boundary(state), Some(ResultBoundary::Finish))
+            is_summary_state(state)
+                && matches!(summary_boundary(state), Some(ResultBoundary::Finish))
         }
         OperationIntent::Navigation {
             summarize,
@@ -100,7 +103,10 @@ pub fn state_matches_intent(meta: &OperationMeta, state: &OperationState) -> boo
         OperationIntent::Run { .. } => {
             !matches!(state, OperationState::NavigationReadyToCommit(_))
                 && (!is_summary_state(state)
-                    || matches!(summary_boundary(state), Some(ResultBoundary::ResumeCheckpoint { .. })))
+                    || matches!(
+                        summary_boundary(state),
+                        Some(ResultBoundary::ResumeCheckpoint { .. })
+                    ))
         }
     }
 }
@@ -108,6 +114,10 @@ pub fn state_matches_intent(meta: &OperationMeta, state: &OperationState) -> boo
 /// The storage classification one lane resolves to, upstream's
 /// `ClassifiedLaneStorage`.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "mirrors upstream's discriminated union holding the stored values whole"
+)]
 pub enum ClassifiedLaneStorage {
     /// No lane values persisted.
     Absent,
@@ -168,6 +178,10 @@ fn classify_lane_storage(
 
 /// Reads and classifies one lane's storage values, upstream's
 /// `readLaneStorage`.
+///
+/// # Errors
+/// The value reads' storage errors; the misclassified-lane invariant,
+/// carried as the classification's message.
 pub async fn read_lane_storage(
     reader: &dyn SessionReader,
     lane: &str,
@@ -195,6 +209,10 @@ enum RestoreOutcome {
 
 /// Restores every complete configured lane in one coherent session read,
 /// upstream's `restoreSession`.
+///
+/// # Errors
+/// The session mutation's storage errors; the misclassified-lane and
+/// per-lane state restore invariants.
 pub async fn restore_session(
     session: Arc<dyn Session>,
     context: &Context,
@@ -265,9 +283,9 @@ pub async fn restore_session(
         })
     });
     let restored = session.mutate(mutation, context).await?;
-    let restored = restored
-        .downcast::<RestoreOutcome>()
-        .map_err(|_| SessionError::Message("restore_session's callback returns a restore outcome".to_owned()))?;
+    let restored = restored.downcast::<RestoreOutcome>().map_err(|_| {
+        SessionError::Message("restore_session's callback returns a restore outcome".to_owned())
+    })?;
     match *restored {
         RestoreOutcome::Lanes(restored) => Ok(restored),
         RestoreOutcome::Threw(error) => Err(error),
@@ -279,6 +297,10 @@ pub async fn restore_session(
 
 /// Restores one configured lane without starting work or interpreting its
 /// state, upstream's `restoreLane`.
+///
+/// # Errors
+/// The session mutation's storage errors; the misclassified-lane and
+/// per-lane state restore invariants.
 pub async fn restore_lane(
     session: Arc<dyn Session>,
     lane: &str,
@@ -299,16 +321,16 @@ pub async fn restore_lane(
                 } = stored
                 else {
                     return Err(match stored {
-                        ClassifiedLaneStorage::Absent => SessionError::Invariant(format!(
-                            "Lane {lane:?} is missing branch.tip"
-                        )),
-                        ClassifiedLaneStorage::Branch { .. } => SessionError::Invariant(format!(
-                            "Lane {lane:?} is missing lane.config"
-                        )),
+                        ClassifiedLaneStorage::Absent => {
+                            SessionError::Invariant(format!("Lane {lane:?} is missing branch.tip"))
+                        }
+                        ClassifiedLaneStorage::Branch { .. } => {
+                            SessionError::Invariant(format!("Lane {lane:?} is missing lane.config"))
+                        }
                         ClassifiedLaneStorage::Lane { .. } => unreachable!("matched above"),
                     });
                 };
-                Ok(restore_lane_state(
+                restore_lane_state(
                     session.as_ref(),
                     &lane,
                     &tip,
@@ -316,19 +338,19 @@ pub async fn restore_lane(
                     &lane_state,
                     callback_context,
                 )
-                .await?)
+                .await
             }
             .await;
             match outcome {
                 Ok(state) => Ok(any_payload(RestoreOutcome::Lane(Box::new(state)))),
-                Err(error) => Ok(any_payload(RestoreOutcome::Threw(error.into()))),
+                Err(error) => Ok(any_payload(RestoreOutcome::Threw(error))),
             }
         })
     });
     let restored = session.mutate(mutation, context).await?;
-    let restored = restored
-        .downcast::<RestoreOutcome>()
-        .map_err(|_| SessionError::Message("restore_lane's callback returns a restore outcome".to_owned()))?;
+    let restored = restored.downcast::<RestoreOutcome>().map_err(|_| {
+        SessionError::Message("restore_lane's callback returns a restore outcome".to_owned())
+    })?;
     match *restored {
         RestoreOutcome::Lane(state) => Ok(*state),
         RestoreOutcome::Threw(error) => Err(error),
@@ -340,6 +362,11 @@ pub async fn restore_lane(
 
 /// Restores the lane state from classified storage, upstream's
 /// `restoreLaneState`.
+///
+/// # Errors
+/// The value reads' storage errors; the malformed configuration, state,
+/// and tip invariants; the missing op.meta/op.state and intent/state
+/// mismatch invariants.
 pub async fn restore_lane_state(
     reader: &dyn SessionReader,
     lane: &str,
@@ -349,11 +376,16 @@ pub async fn restore_lane_state(
     context: &Context,
 ) -> Result<LaneState, SessionError> {
     let configuration: LaneConfiguration = serde_json::from_value(configuration.value.clone())
-        .map_err(|error| SessionError::Invariant(format!("Lane {lane:?} config is malformed: {error}")))?;
-    let durable: crate::harness::session::types::LaneState = serde_json::from_value(lane_state.value.clone())
-        .map_err(|error| SessionError::Invariant(format!("Lane {lane:?} state is malformed: {error}")))?;
-    let tip_id: Option<String> = serde_json::from_value(tip.value.clone())
-        .map_err(|error| SessionError::Invariant(format!("Lane {lane:?} tip is malformed: {error}")))?;
+        .map_err(|error| {
+            SessionError::Invariant(format!("Lane {lane:?} config is malformed: {error}"))
+        })?;
+    let durable: crate::harness::session::types::LaneState =
+        serde_json::from_value(lane_state.value.clone()).map_err(|error| {
+            SessionError::Invariant(format!("Lane {lane:?} state is malformed: {error}"))
+        })?;
+    let tip_id: Option<String> = serde_json::from_value(tip.value.clone()).map_err(|error| {
+        SessionError::Invariant(format!("Lane {lane:?} tip is malformed: {error}"))
+    })?;
 
     let operation = match durable.current_operation_id {
         None => None,
@@ -369,32 +401,33 @@ pub async fn restore_lane_state(
                 SessionError::Invariant(format!("Operation {operation_id} is missing op.state"))
             })?;
             let meta: OperationMeta = serde_json::from_value(meta.value).map_err(|error| {
-                SessionError::Invariant(format!("Operation {operation_id} meta is malformed: {error}"))
+                SessionError::Invariant(format!(
+                    "Operation {operation_id} meta is malformed: {error}"
+                ))
             })?;
             let state: OperationState = serde_json::from_value(state.value).map_err(|error| {
-                SessionError::Invariant(format!("Operation {operation_id} state is malformed: {error}"))
+                SessionError::Invariant(format!(
+                    "Operation {operation_id} state is malformed: {error}"
+                ))
             })?;
             if meta.operation_id != operation_id {
                 return Err(SessionError::Invariant(format!(
                     "Operation {operation_id} metadata names operation {:?}",
                     meta.operation_id
-                ))
-                .into());
+                )));
             }
             if meta.lane != lane {
                 return Err(SessionError::Invariant(format!(
                     "Operation {operation_id} belongs to lane {:?}, not {lane:?}",
                     meta.lane
-                ))
-                .into());
+                )));
             }
             if !state_matches_intent(&meta, &state) {
                 return Err(SessionError::Invariant(format!(
                     "Operation {operation_id} intent {} does not match state {}",
                     intent_kind(&meta),
                     state.at()
-                ))
-                .into());
+                )));
             }
             Some(LiveOperation { meta, state })
         }
@@ -409,7 +442,7 @@ pub async fn restore_lane_state(
     })
 }
 
-fn intent_kind(meta: &OperationMeta) -> &'static str {
+const fn intent_kind(meta: &OperationMeta) -> &'static str {
     match meta.intent {
         OperationIntent::Run { .. } => "run",
         OperationIntent::Compaction { .. } => "compaction",

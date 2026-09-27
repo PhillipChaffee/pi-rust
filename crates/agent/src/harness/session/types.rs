@@ -869,7 +869,8 @@ impl ToolCall {
     pub const fn terminate(&self) -> Option<bool> {
         match &self.status {
             ToolCallStatus::Planned | ToolCallStatus::EffectPending { .. } => None,
-            ToolCallStatus::OutcomeReady { terminate } | ToolCallStatus::Completed { terminate } => Some(*terminate),
+            ToolCallStatus::OutcomeReady { terminate }
+            | ToolCallStatus::Completed { terminate } => Some(*terminate),
         }
     }
 }

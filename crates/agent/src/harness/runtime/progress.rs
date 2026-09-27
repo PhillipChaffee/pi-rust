@@ -85,6 +85,9 @@ impl<T> ProgressChannel<T> {
 
 /// Reads every frame one response entry holds, upstream's
 /// `readAssistantFrames`: paged ascends of up to 1,000 elements.
+///
+/// # Errors
+/// The list read's storage error; a malformed stored frame.
 pub async fn read_assistant_frames(
     reader: &dyn SessionReader,
     operation_id: &str,
@@ -109,10 +112,9 @@ pub async fn read_assistant_frames(
         let page_len = u64::try_from(page.len()).unwrap_or(PAGE_LIMIT);
         let mut page_cursor = None;
         for ListElement { seq, value } in page {
-            frames.push(
-                serde_json::from_value(value)
-                    .map_err(|error| SessionError::Message(format!("Pending assistant frame is malformed: {error}")))?,
-            );
+            frames.push(serde_json::from_value(value).map_err(|error| {
+                SessionError::Message(format!("Pending assistant frame is malformed: {error}"))
+            })?);
             page_cursor = Some(ListCursor { seq });
         }
         if page_len < PAGE_LIMIT {
@@ -125,17 +127,20 @@ pub async fn read_assistant_frames(
 /// One write's settlement, upstream's `latest` promise state.
 type WriteSettlement = Option<Result<(), WriteFailure>>;
 
+/// The shared plan closure that turns one published item into the write to
+/// commit, upstream's `commit` argument to `openProgress`.
+type CommitWrite<T> = Arc<dyn Fn(&T) -> Result<Write, SessionError> + Send + Sync>;
+
 /// The shared channel state the write, seal, and drain closures share.
 struct ChannelShared {
     sealed: AtomicBool,
     latest: Mutex<Option<tokio::sync::watch::Receiver<WriteSettlement>>>,
 }
 
-fn lock_latest(shared: &ChannelShared) -> MutexGuard<'_, Option<tokio::sync::watch::Receiver<WriteSettlement>>> {
-    shared
-        .latest
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+fn lock_latest(
+    shared: &ChannelShared,
+) -> MutexGuard<'_, Option<tokio::sync::watch::Receiver<WriteSettlement>>> {
+    shared.latest.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The shared progress machinery, upstream's `openProgress`. `T` is `Sync`
@@ -144,7 +149,7 @@ fn lock_latest(shared: &ChannelShared) -> MutexGuard<'_, Option<tokio::sync::wat
 fn open_progress<T: Send + Sync + 'static>(
     lane: &Arc<Lane>,
     drive: &Arc<Drive>,
-    commit_write: Arc<dyn Fn(&T) -> Result<Write, SessionError> + Send + Sync>,
+    commit_write: CommitWrite<T>,
     still_owns: Arc<dyn Fn(&LaneState) -> bool + Send + Sync>,
 ) -> ProgressChannel<T> {
     let shared = Arc::new(ChannelShared {
@@ -152,7 +157,7 @@ fn open_progress<T: Send + Sync + 'static>(
         latest: Mutex::new(None),
     });
     let lane = Arc::clone(lane);
-    let drive = Arc::clone(&drive);
+    let drive = Arc::clone(drive);
     let write_shared = Arc::clone(&shared);
     let write_fn = Arc::new(move |item: T| {
         if write_shared.sealed.load(Ordering::SeqCst) {
@@ -170,7 +175,9 @@ fn open_progress<T: Send + Sync + 'static>(
         tokio::spawn(async move {
             let outcome = lane
                 .command(
-                    move |state, _session: Arc<dyn crate::harness::session::types::Session>, _context| {
+                    move |state,
+                          _session: Arc<dyn crate::harness::session::types::Session>,
+                          _context| {
                         if !still_owns(&state) {
                             let skip: BoxedFuture<'static, Result<LaneCommand<()>, LaneError>> =
                                 Box::pin(async move { Ok(LaneCommand::Return { result: () }) });
@@ -191,7 +198,7 @@ fn open_progress<T: Send + Sync + 'static>(
                     &drive.context,
                 )
                 .await;
-            let _ = settlement_tx.send(Some(outcome.map_err(Arc::from)));
+            let _ = settlement_tx.send(Some(outcome));
         });
     });
     let seal_shared = Arc::clone(&shared);
@@ -254,8 +261,12 @@ pub fn open_frame_progress(
                 return false;
             };
             match &operation.state {
-                OperationState::AssistantEffectPending(leaf) => leaf.response_entry_id == response_entry_id,
-                OperationState::DeferredEffectPending(leaf) => leaf.response_entry_id == response_entry_id,
+                OperationState::AssistantEffectPending(leaf) => {
+                    leaf.response_entry_id == response_entry_id
+                }
+                OperationState::DeferredEffectPending(leaf) => {
+                    leaf.response_entry_id == response_entry_id
+                }
                 _ => false,
             }
         }),
@@ -282,7 +293,7 @@ pub fn open_tool_progress(
             let payload = ToolOutputPayload {
                 content: snapshot.content.clone(),
                 details: snapshot.details.clone(),
-                usage: snapshot.usage.clone(),
+                usage: snapshot.usage,
                 added_tool_names: snapshot.added_tool_names.clone(),
                 terminate: snapshot.terminate,
             };

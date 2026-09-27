@@ -115,7 +115,6 @@ use crate::harness::events::ResnapshotCapture;
 use crate::harness::events::WatchFilter;
 use crate::harness::execution::tools::tool_result_from_message;
 use crate::harness::prompt_templates::format_prompt_template_invocation;
-use crate::harness::skills::format_skill_invocation;
 use crate::harness::result::HarnessClosed;
 use crate::harness::result::HarnessError;
 use crate::harness::runtime::progress::read_assistant_frames;
@@ -125,9 +124,6 @@ use crate::harness::runtime::transcript::read_lane_queues;
 use crate::harness::runtime::types::Config;
 use crate::harness::runtime::types::ContinueOperationResult;
 use crate::harness::runtime::types::Drive;
-use crate::harness::runtime::types::any_payload;
-use crate::harness::runtime::types::from_arc;
-use crate::harness::runtime::types::lane_error;
 use crate::harness::runtime::types::LaneCommand;
 use crate::harness::runtime::types::LaneError;
 use crate::harness::runtime::types::LanePatch;
@@ -135,6 +131,9 @@ use crate::harness::runtime::types::LaneState;
 use crate::harness::runtime::types::LiveOperation;
 use crate::harness::runtime::types::OperationCommand;
 use crate::harness::runtime::types::SliceNotImplemented;
+use crate::harness::runtime::types::any_payload;
+use crate::harness::runtime::types::from_arc;
+use crate::harness::runtime::types::lane_error;
 use crate::harness::session::types::BranchScan;
 use crate::harness::session::types::BranchScanOrder;
 use crate::harness::session::types::CommitResult;
@@ -160,8 +159,8 @@ use crate::harness::session::types::SessionMutationCallback;
 use crate::harness::session::types::SessionMutator;
 use crate::harness::session::types::SessionReader;
 use crate::harness::session::types::StartingOperation;
-use crate::harness::session::types::UsageWriteRow;
 use crate::harness::session::types::UsageRow;
+use crate::harness::session::types::UsageWriteRow;
 use crate::harness::session::values::EntryWrite;
 use crate::harness::session::values::StoredValue;
 use crate::harness::session::values::UsageWrite;
@@ -177,6 +176,7 @@ use crate::harness::session::values::operation_tool_args;
 use crate::harness::session::values::pending_entry;
 use crate::harness::session::values::pending_tool_output;
 use crate::harness::session::values::set_value_write;
+use crate::harness::skills::format_skill_invocation;
 use crate::types::AgentMessage;
 use crate::types::AgentToolResult;
 use crate::types::QueueMode;
@@ -188,13 +188,16 @@ const ABORT_ERROR_MESSAGE: &str = "The operation was aborted";
 pub type FaultHandler = Arc<dyn Fn(LaneError, &Context) -> LaneError + Send + Sync>;
 
 /// The event publisher the harness installs, upstream's `EmitBatch`.
-pub type EmitBatch =
-    Arc<dyn Fn(Vec<HarnessEvent>, Context) -> BoxedFuture<'static, Result<(), LaneError>> + Send + Sync>;
+pub type EmitBatch = Arc<
+    dyn Fn(Vec<HarnessEvent>, Context) -> BoxedFuture<'static, Result<(), LaneError>> + Send + Sync,
+>;
 
 /// The watcher installer the harness installs, upstream's `WatchHandler`
-/// narrowed to the lane-snapshot watch the lane constructs. The initial
-/// snapshot restates as the absence of one: the lane captures and sets it
-/// after the install, upstream's `{} as LaneSnapshot` + assignment.
+/// narrowed to the lane-snapshot watch the lane constructs.
+///
+/// The initial snapshot restates as the absence of one: the lane captures
+/// and sets it after the install, upstream's `{} as LaneSnapshot` +
+/// assignment.
 pub type WatchInstaller = Arc<
     dyn Fn(
             WatchFilter,
@@ -277,7 +280,8 @@ pub(crate) fn select_accepted_inbox(
     for item in inbox {
         let eligible = item.kind == InboxItemKind::Write
             || item.kind == InboxItemKind::NextRun
-            || (item.kind == InboxItemKind::Steer && (steering_mode == QueueMode::All || !steer_taken))
+            || (item.kind == InboxItemKind::Steer
+                && (steering_mode == QueueMode::All || !steer_taken))
             || (item.kind == InboxItemKind::FollowUp
                 && (follow_up_mode == QueueMode::All || !follow_up_taken));
         if eligible {
@@ -295,7 +299,7 @@ pub(crate) fn select_accepted_inbox(
     (selected, remainder)
 }
 
-fn captured_settings(config: &Config) -> RunSettings {
+const fn captured_settings(config: &Config) -> RunSettings {
     RunSettings {
         compaction: config.compaction,
         steering_mode: config.steering_mode,
@@ -330,13 +334,13 @@ fn apply_lane_patch(state: &LaneState, patch: Option<&LanePatch>) -> LaneState {
     };
     let mut next = state.clone();
     if let Some(tip_id) = &patch.tip_id {
-        next.tip_id = tip_id.clone();
+        next.tip_id.clone_from(tip_id);
     }
     if let Some(configuration) = &patch.configuration {
         next.configuration = configuration.clone();
     }
     if let Some(inbox) = &patch.inbox {
-        next.inbox = inbox.clone();
+        next.inbox.clone_from(inbox);
     }
     next
 }
@@ -351,7 +355,10 @@ fn pending_entry_write(entry_id: &str, pending: &PendingEntry) -> NewEntry {
                 terminate: None,
             }),
         },
-        PendingEntry::Custom { custom_type, payload } => NewEntry::Custom {
+        PendingEntry::Custom {
+            custom_type,
+            payload,
+        } => NewEntry::Custom {
             id: entry_id.to_owned(),
             parent_id: None,
             body: crate::harness::session::types::CustomEntryBody {
@@ -365,7 +372,7 @@ fn pending_entry_write(entry_id: &str, pending: &PendingEntry) -> NewEntry {
 /// Builds one plain-text user message, upstream's prompt payloads'
 /// `{ type: "user", content: prompt }` construction.
 #[must_use]
-fn user_text_message(text: String, timestamp: i64) -> AgentMessage {
+const fn user_text_message(text: String, timestamp: i64) -> AgentMessage {
     AgentMessage::Standard(Message::User(UserMessage {
         content: UserContent::Text(text),
         timestamp,
@@ -377,17 +384,27 @@ fn user_text_message(text: String, timestamp: i64) -> AgentMessage {
 #[must_use]
 pub(crate) fn captured_model(operation: &OperationState) -> Option<ModelIdentity> {
     match operation {
-        OperationState::AssistantReady(leaf) => Some(leaf.generation_context.configuration.model.clone()),
-        OperationState::AssistantEffectPending(leaf) => Some(leaf.generation_context.configuration.model.clone()),
-        OperationState::AssistantRetryWait(leaf) => Some(leaf.generation_context.configuration.model.clone()),
+        OperationState::AssistantReady(leaf) => {
+            Some(leaf.generation_context.configuration.model.clone())
+        }
+        OperationState::AssistantEffectPending(leaf) => {
+            Some(leaf.generation_context.configuration.model.clone())
+        }
+        OperationState::AssistantRetryWait(leaf) => {
+            Some(leaf.generation_context.configuration.model.clone())
+        }
         OperationState::Tools(leaf) => Some(leaf.batch.configuration.model.clone()),
         OperationState::DeferredSuspended(leaf) => Some(leaf.deferred.configuration.model.clone()),
         OperationState::DeferredEffectPending(leaf) => Some(leaf.scope.configuration.model.clone()),
-        OperationState::SummaryReady(leaf) => Some(leaf.generation.summary_context.configuration.model.clone()),
+        OperationState::SummaryReady(leaf) => {
+            Some(leaf.generation.summary_context.configuration.model.clone())
+        }
         OperationState::SummaryEffectPending(leaf) => {
             Some(leaf.generation.summary_context.configuration.model.clone())
         }
-        OperationState::SummaryRetryWait(leaf) => Some(leaf.generation.summary_context.configuration.model.clone()),
+        OperationState::SummaryRetryWait(leaf) => {
+            Some(leaf.generation.summary_context.configuration.model.clone())
+        }
         _ => None,
     }
 }
@@ -402,15 +419,19 @@ fn abort_reason_error(reason: Option<AbortReason>) -> LaneError {
     from_arc(Arc::new(SessionError::Message(message)))
 }
 
-fn intent_kind_of(meta: &OperationMeta) -> OperationKind {
+const fn intent_kind_of(meta: &OperationMeta) -> OperationKind {
     match meta.intent {
         crate::harness::session::types::OperationIntent::Run { .. } => OperationKind::Run,
-        crate::harness::session::types::OperationIntent::Compaction { .. } => OperationKind::Compaction,
-        crate::harness::session::types::OperationIntent::Navigation { .. } => OperationKind::Navigation,
+        crate::harness::session::types::OperationIntent::Compaction { .. } => {
+            OperationKind::Compaction
+        }
+        crate::harness::session::types::OperationIntent::Navigation { .. } => {
+            OperationKind::Navigation
+        }
     }
 }
 
-fn inbox_kind_name(kind: InboxItemKind) -> &'static str {
+const fn inbox_kind_name(kind: InboxItemKind) -> &'static str {
     match kind {
         InboxItemKind::Steer => "steer",
         InboxItemKind::FollowUp => "followUp",
@@ -428,85 +449,84 @@ fn quoted(name: &str) -> String {
 #[must_use]
 pub fn operation_state_with_scope(state: &OperationState, scope: OperationScope) -> OperationState {
     match state {
-        OperationState::Starting(leaf) => OperationState::Starting(StartingOperation {
-            scope: scope.clone(),
-            ..leaf.clone()
-        }),
-        OperationState::Checkpoint(leaf) => OperationState::Checkpoint(
-            crate::harness::session::types::CheckpointOperation {
-                scope: scope.clone(),
+        OperationState::Starting(_) => OperationState::Starting(StartingOperation { scope }),
+        OperationState::Checkpoint(leaf) => {
+            OperationState::Checkpoint(crate::harness::session::types::CheckpointOperation {
+                scope,
                 ..leaf.clone()
-            },
-        ),
+            })
+        }
         OperationState::AssistantReady(leaf) => OperationState::AssistantReady(
             crate::harness::session::types::AssistantReadyOperation {
-                scope: scope.clone(),
+                scope,
                 ..leaf.clone()
             },
         ),
-        OperationState::AssistantEffectPending(leaf) => {
-            OperationState::AssistantEffectPending(crate::harness::session::types::AssistantEffectPendingOperation {
-                scope: scope.clone(),
+        OperationState::AssistantEffectPending(leaf) => OperationState::AssistantEffectPending(
+            crate::harness::session::types::AssistantEffectPendingOperation {
+                scope,
+                ..leaf.clone()
+            },
+        ),
+        OperationState::AssistantRetryWait(leaf) => OperationState::AssistantRetryWait(
+            crate::harness::session::types::AssistantRetryWaitOperation {
+                scope,
+                ..leaf.clone()
+            },
+        ),
+        OperationState::Tools(leaf) => {
+            OperationState::Tools(crate::harness::session::types::ToolsOperation {
+                scope,
                 ..leaf.clone()
             })
         }
-        OperationState::AssistantRetryWait(leaf) => {
-            OperationState::AssistantRetryWait(crate::harness::session::types::AssistantRetryWaitOperation {
-                scope: scope.clone(),
-                ..leaf.clone()
-            })
-        }
-        OperationState::Tools(leaf) => OperationState::Tools(crate::harness::session::types::ToolsOperation {
-            scope: scope.clone(),
-            ..leaf.clone()
-        }),
-        OperationState::DeferredSuspended(leaf) => {
-            OperationState::DeferredSuspended(crate::harness::session::types::DeferredSuspendedOperation {
+        OperationState::DeferredSuspended(leaf) => OperationState::DeferredSuspended(
+            crate::harness::session::types::DeferredSuspendedOperation {
                 deferred: crate::harness::session::types::DeferredScope {
-                    scope: scope.clone(),
+                    scope,
                     ..leaf.deferred.clone()
                 },
-            })
-        }
-        OperationState::DeferredEffectPending(leaf) => {
-            OperationState::DeferredEffectPending(crate::harness::session::types::DeferredEffectPendingOperation {
+            },
+        ),
+        OperationState::DeferredEffectPending(leaf) => OperationState::DeferredEffectPending(
+            crate::harness::session::types::DeferredEffectPendingOperation {
                 scope: crate::harness::session::types::DeferredScope {
-                    scope: scope.clone(),
+                    scope,
                     ..leaf.scope.clone()
                 },
                 ..leaf.clone()
-            })
-        }
-        OperationState::SummaryDeciding(leaf) => {
-            OperationState::SummaryDeciding(crate::harness::session::types::SummaryDecidingOperation {
-                scope: scope.clone(),
+            },
+        ),
+        OperationState::SummaryDeciding(leaf) => OperationState::SummaryDeciding(
+            crate::harness::session::types::SummaryDecidingOperation {
+                scope,
                 ..leaf.clone()
-            })
-        }
+            },
+        ),
         OperationState::SummaryReady(leaf) => {
             OperationState::SummaryReady(crate::harness::session::types::SummaryReadyOperation {
-                scope: scope.clone(),
+                scope,
                 ..leaf.clone()
             })
         }
         OperationState::SummaryEffectPending(leaf) => OperationState::SummaryEffectPending(
             crate::harness::session::types::SummaryEffectPendingOperation {
-                scope: scope.clone(),
+                scope,
                 ..leaf.clone()
             },
         ),
-        OperationState::SummaryRetryWait(leaf) => {
-            OperationState::SummaryRetryWait(crate::harness::session::types::SummaryRetryWaitOperation {
-                scope: scope.clone(),
+        OperationState::SummaryRetryWait(leaf) => OperationState::SummaryRetryWait(
+            crate::harness::session::types::SummaryRetryWaitOperation {
+                scope,
+                ..leaf.clone()
+            },
+        ),
+        OperationState::NavigationReadyToCommit(leaf) => {
+            OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
+                scope,
                 ..leaf.clone()
             })
         }
-        OperationState::NavigationReadyToCommit(leaf) => OperationState::NavigationReadyToCommit(
-            NavigationReadyToCommitOperation {
-                scope: scope.clone(),
-                ..leaf.clone()
-            },
-        ),
     }
 }
 
@@ -543,15 +563,12 @@ impl LaneShared {
     }
 
     fn assert_open(&self) -> Result<(), LaneError> {
-        match self.sealed_error() {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        self.sealed_error().map_or(Ok(()), Err)
     }
 
     fn signal_state_change(&self) {
         let core = lock_core(self);
-        let _ = core.state_change.send_modify(|version| *version += 1);
+        let () = core.state_change.send_modify(|version| *version += 1);
     }
 
     fn state_change_receiver(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -589,7 +606,10 @@ async fn wait_state_change(mut receiver: tokio::sync::watch::Receiver<u64>) {
 
 /// Races the idle owner's release against the next state change, upstream's
 /// `Promise.race([idleOwner, stateChange])`.
-async fn wait_owner_or_change(owner: &CancellationToken, receiver: tokio::sync::watch::Receiver<u64>) {
+async fn wait_owner_or_change(
+    owner: &CancellationToken,
+    receiver: tokio::sync::watch::Receiver<u64>,
+) {
     tokio::select! {
         () = owner.cancelled() => (),
         () = wait_state_change(receiver) => (),
@@ -746,10 +766,9 @@ impl Lane {
                 match (body)(&inner, mutator, mutation_context).await {
                     Ok(payload) => Ok(any_payload(ReadOutcome::Payload(payload))),
                     Err(error) => {
-                        let thrown = match inner.sealed_error() {
-                            Some(sealed) => sealed,
-                            None => (inner.on_fault)(error, mutation_context),
-                        };
+                        let thrown = inner
+                            .sealed_error()
+                            .unwrap_or_else(|| (inner.on_fault)(error, mutation_context));
                         Ok(any_payload(ReadOutcome::<T>::Threw(thrown)))
                     }
                 }
@@ -759,15 +778,16 @@ impl Lane {
         let payload = match payload {
             Ok(payload) => payload,
             Err(error) => {
-                return match self.inner.sealed_error() {
-                    Some(sealed) => Err(sealed),
-                    None => Err(lane_error(error)),
-                };
+                return Err(self
+                    .inner
+                    .sealed_error()
+                    .unwrap_or_else(|| lane_error(error)));
             }
         };
         let outcome = payload.downcast::<ReadOutcome<T>>().map_err(|_| {
-            from_arc(Arc::new(SessionError::Message("lane mutation returned an unexpected payload".to_owned()))
-               )
+            from_arc(Arc::new(SessionError::Message(
+                "lane mutation returned an unexpected payload".to_owned(),
+            )))
         })?;
         match *outcome {
             ReadOutcome::Threw(error) => Err(error),
@@ -812,10 +832,23 @@ impl Lane {
     /// commit, publish memory, and resolve without another open check.
     /// Providers, tools, hooks, timers, event handlers, and effect waits
     /// never run inside a planner.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a context abort
+    /// while an idle owner holds the lane; and any planner, commit, or
+    /// event-delivery failure the harness faults with.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single command method"
+    )]
     pub async fn command<T, F>(&self, plan: F, context: &Context) -> Result<T, LaneError>
     where
         T: Send + 'static,
-        F: Fn(LaneState, Arc<dyn Session>, Context) -> BoxedFuture<'static, Result<LaneCommand<T>, LaneError>>
+        F: Fn(
+                LaneState,
+                Arc<dyn Session>,
+                Context,
+            ) -> BoxedFuture<'static, Result<LaneCommand<T>, LaneError>>
             + Send
             + Sync
             + 'static,
@@ -850,45 +883,61 @@ impl Lane {
                         move |inner, mutator, mutation_context| {
                             let plan = Arc::clone(&plan);
                             Box::pin(async move {
-                                {
+                                // The idle-owner read and the change
+                                // subscription hold one lock for a
+                                // consistent observation.
+                                let blocked = {
                                     let core = lock_core(inner);
-                                    if let Some(owner) = core.idle_owner.clone() {
-                                        let change = core.state_change.subscribe();
-                                        return Ok(CommandOutcome::<T>::IdleBlocked { owner, change });
-                                    }
+                                    core.idle_owner
+                                        .clone()
+                                        .map(|owner| (owner, core.state_change.subscribe()))
+                                };
+                                if let Some((owner, change)) = blocked {
+                                    return Ok(CommandOutcome::<T>::IdleBlocked { owner, change });
                                 }
                                 let state = lock_core(inner).state.clone();
                                 let session = Arc::clone(&inner.session);
-                                let decision = (plan)(state.clone(), session, mutation_context.clone()).await?;
+                                let decision =
+                                    (plan)(state.clone(), session, mutation_context.clone())
+                                        .await?;
                                 match decision {
-                                    LaneCommand::Return { result } => Ok(CommandOutcome::Returned {
-                                        result,
-                                        delivery: None,
-                                    }),
-                                    LaneCommand::Reject { error } => Ok(CommandOutcome::Threw(error)),
+                                    LaneCommand::Return { result } => {
+                                        Ok(CommandOutcome::Returned {
+                                            result,
+                                            delivery: None,
+                                        })
+                                    }
+                                    LaneCommand::Reject { error } => {
+                                        Ok(CommandOutcome::Threw(error))
+                                    }
                                     LaneCommand::Commit {
                                         writes,
                                         next,
                                         materialize,
                                         events,
                                     } => {
-                                        let commit = mutator.commit(writes, mutation_context)
+                                        let commit = mutator
+                                            .commit(writes, mutation_context)
                                             .await
                                             .map_err(lane_error)?;
                                         {
                                             let mut core = lock_core(inner);
                                             core.state = next;
-                                            let _ = core.state_change.send_modify(|version| *version += 1);
+                                            let () = core
+                                                .state_change
+                                                .send_modify(|version| *version += 1);
                                         }
                                         let result = (materialize)(&commit);
-                                        let events = match &events {
-                                            Some(events) => (events)(&commit),
-                                            None => Vec::new(),
-                                        };
+                                        let events = events
+                                            .as_ref()
+                                            .map_or_else(Vec::new, |events| (events)(&commit));
                                         let delivery = if events.is_empty() {
                                             None
                                         } else {
-                                            Some((inner.emit_batch)(events, mutation_context.clone()))
+                                            Some((inner.emit_batch)(
+                                                events,
+                                                mutation_context.clone(),
+                                            ))
                                         };
                                         Ok(CommandOutcome::Returned { result, delivery })
                                     }
@@ -915,8 +964,6 @@ impl Lane {
                         return Err(abort_reason_error(None));
                     }
                     self.inner.assert_open()?;
-                    // Retry the plan against the latest committed memory.
-                    continue;
                 }
                 Ok(CommandOutcome::Threw(error)) | Err(error) => return Err(error),
             }
@@ -929,11 +976,25 @@ impl Lane {
     /// state; the drive continuation remains the sole top-level state
     /// writer. Upstream's type-level capability parameter erases into the
     /// planner's variant match.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the
+    /// no-active-operation invariant, and any planner, commit, or
+    /// event-delivery failure the harness faults with.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single settleOperation method"
+    )]
     pub async fn settle_operation<T, F>(&self, plan: F, context: &Context) -> Result<T, LaneError>
     where
         T: Send + 'static,
-        F: Fn(LaneState, &OperationState, &OperationMeta, Arc<dyn Session>, Context)
-                -> BoxedFuture<'static, Result<OperationCommand<T>, LaneError>>
+        F: Fn(
+                LaneState,
+                &OperationState,
+                &OperationMeta,
+                Arc<dyn Session>,
+                Context,
+            ) -> BoxedFuture<'static, Result<OperationCommand<T>, LaneError>>
             + Send
             + Sync
             + 'static,
@@ -949,8 +1010,14 @@ impl Lane {
                         ));
                         error
                     })?;
-                    let decision =
-                        (plan)(state.clone(), &operation.state, &operation.meta, session, command_context.clone()).await?;
+                    let decision = (plan)(
+                        state.clone(),
+                        &operation.state,
+                        &operation.meta,
+                        session,
+                        command_context.clone(),
+                    )
+                    .await?;
                     Ok(match decision {
                         OperationCommand::Commit {
                             writes,
@@ -967,7 +1034,10 @@ impl Lane {
                                 )
                                 .map_err(lane_error)?,
                             );
-                            if let Some(LanePatch { inbox: Some(inbox), .. }) = &lane {
+                            if let Some(LanePatch {
+                                inbox: Some(inbox), ..
+                            }) = &lane
+                            {
                                 writes.push(
                                     set_value_write(
                                         &lane_state(&operation.meta.lane),
@@ -1001,8 +1071,11 @@ impl Lane {
                         } => {
                             let mut writes = writes;
                             writes.push(
-                                set_value_write(&operation_result(&operation.meta.operation_id), record.clone())
-                                    .map_err(lane_error)?,
+                                set_value_write(
+                                    &operation_result(&operation.meta.operation_id),
+                                    record,
+                                )
+                                .map_err(lane_error)?,
                             );
                             let inbox = lane
                                 .as_ref()
@@ -1044,6 +1117,11 @@ impl Lane {
     /// hooks, effects, or forward progress. Returns
     /// [`ContinueOperationResult::CancelRequested`] without invoking the
     /// planner once cancellation is requested.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the
+    /// no-active-operation invariant, and any planner, commit, or
+    /// event-delivery failure the harness faults with.
     pub async fn continue_operation<T, F>(
         &self,
         plan: F,
@@ -1051,7 +1129,11 @@ impl Lane {
     ) -> Result<ContinueOperationResult<T>, LaneError>
     where
         T: Send + 'static,
-        F: Fn(LaneState, Arc<dyn Session>, Context) -> BoxedFuture<'static, Result<OperationCommand<T>, LaneError>>
+        F: Fn(
+                LaneState,
+                Arc<dyn Session>,
+                Context,
+            ) -> BoxedFuture<'static, Result<OperationCommand<T>, LaneError>>
             + Send
             + Sync
             + 'static,
@@ -1139,24 +1221,41 @@ impl Lane {
             | OperationRequest::Skill { operation_id, .. }
             | OperationRequest::PromptTemplate { operation_id, .. }
             | OperationRequest::Compaction { operation_id, .. }
-            | OperationRequest::Navigation { operation_id, .. } => match operation_id {
-                Some(operation_id) => operation_id.clone(),
-                None => self.inner.session.id_generator().next(Some(started_at)),
-            },
+            | OperationRequest::Navigation { operation_id, .. } => operation_id
+                .clone()
+                .unwrap_or_else(|| self.inner.session.id_generator().next(Some(started_at))),
         };
         let acceptance_config = self.read_config();
         match &request {
             OperationRequest::Compaction { .. } => {
-                self.accept_compaction(&request, operation_id, started_at, acceptance_config, context)
-                    .await
+                self.accept_compaction(
+                    &request,
+                    operation_id,
+                    started_at,
+                    acceptance_config,
+                    context,
+                )
+                .await
             }
             OperationRequest::Navigation { .. } => {
-                self.accept_navigation(&request, operation_id, started_at, acceptance_config, context)
-                    .await
+                self.accept_navigation(
+                    &request,
+                    operation_id,
+                    started_at,
+                    acceptance_config,
+                    context,
+                )
+                .await
             }
             _ => {
-                self.accept_run(&request, operation_id, started_at, acceptance_config, context)
-                    .await
+                self.accept_run(
+                    &request,
+                    operation_id,
+                    started_at,
+                    acceptance_config,
+                    context,
+                )
+                .await
             }
         }
     }
@@ -1169,20 +1268,19 @@ impl Lane {
     }
 
     /// Builds the prompt messages one run request replays, upstream's
-    /// `acceptRun`'s message switch. The outer result is the throw path (a
-    /// planner-internal failure), the inner the expected admission error.
+    /// `acceptRun`'s message switch. The result is the expected admission
+    /// error path.
     fn run_request_messages(
-        &self,
         request: &OperationRequest,
         started_at: i64,
         acceptance_config: &Config,
-    ) -> Result<Result<Vec<AgentMessage>, HarnessError>, LaneError> {
+    ) -> Result<Vec<AgentMessage>, HarnessError> {
         match request {
             OperationRequest::Prompt { prompt, .. } => match prompt.as_ref() {
                 PromptMessagesPayload::Text { prompt, images } => {
                     let images = images.clone().unwrap_or_default();
                     if prompt.is_empty() && images.is_empty() {
-                        return Ok(Ok(Vec::new()));
+                        return Ok(Vec::new());
                     }
                     let mut content: Vec<UserBlock> = Vec::new();
                     if !prompt.is_empty() {
@@ -1192,13 +1290,13 @@ impl Lane {
                         }));
                     }
                     content.extend(images.iter().cloned().map(UserBlock::Image));
-                    Ok(Ok(vec![AgentMessage::Standard(Message::User(UserMessage {
+                    Ok(vec![AgentMessage::Standard(Message::User(UserMessage {
                         content: UserContent::Blocks(content),
                         timestamp: started_at,
-                    }))]))
+                    }))])
                 }
-                PromptMessagesPayload::Message(message) => Ok(Ok(vec![(**message).clone()])),
-                PromptMessagesPayload::Messages(messages) => Ok(Ok(messages.clone())),
+                PromptMessagesPayload::Message(message) => Ok(vec![(**message).clone()]),
+                PromptMessagesPayload::Messages(messages) => Ok(messages.clone()),
             },
             OperationRequest::Skill {
                 name,
@@ -1211,13 +1309,13 @@ impl Lane {
                     .iter()
                     .find(|candidate| candidate.name == *name);
                 let Some(skill) = skill else {
-                    return Ok(Err(HarnessError::UnknownSkill {
+                    return Err(HarnessError::UnknownSkill {
                         name: name.clone(),
                         message: format!("Unknown skill: {name}"),
-                    }));
+                    });
                 };
                 let content = format_skill_invocation(skill, additional_instructions.as_deref());
-                Ok(Ok(vec![user_text_message(content, started_at)]))
+                Ok(vec![user_text_message(content, started_at)])
             }
             OperationRequest::PromptTemplate { name, args, .. } => {
                 let template = acceptance_config
@@ -1226,16 +1324,17 @@ impl Lane {
                     .iter()
                     .find(|candidate| candidate.name == *name);
                 let Some(template) = template else {
-                    return Ok(Err(HarnessError::UnknownTemplate {
+                    return Err(HarnessError::UnknownTemplate {
                         name: name.clone(),
                         message: format!("Unknown prompt template: {name}"),
-                    }));
+                    });
                 };
-                let content = format_prompt_template_invocation(template, args.as_deref().unwrap_or(&[]));
+                let content =
+                    format_prompt_template_invocation(template, args.as_deref().unwrap_or(&[]));
                 if content.is_empty() {
-                    Ok(Ok(Vec::new()))
+                    Ok(Vec::new())
                 } else {
-                    Ok(Ok(vec![user_text_message(content, started_at)]))
+                    Ok(vec![user_text_message(content, started_at)])
                 }
             }
             _ => unreachable!("accept_run takes run requests only"),
@@ -1243,6 +1342,10 @@ impl Lane {
     }
 
     /// Admits a run operation, upstream's `acceptRun`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single acceptRun method"
+    )]
     async fn accept_run(
         &self,
         request: &OperationRequest,
@@ -1251,25 +1354,29 @@ impl Lane {
         acceptance_config: Config,
         context: &Context,
     ) -> Result<OperationAdmissionResult, LaneError> {
-        let messages = self.run_request_messages(request, started_at, &acceptance_config)?;
-        let messages = match messages {
+        let messages = match Self::run_request_messages(request, started_at, &acceptance_config) {
             Ok(messages) => messages,
             Err(error) => return Ok(Err(error)),
         };
         for message in &messages {
-            if let AgentMessage::Standard(Message::Assistant(assistant)) = message {
-                if assistant.stop_reason == StopReason::Pending {
-                    return Ok(Err(HarnessError::InvalidMessage {
-                        lane: self.inner.name.clone(),
-                        reason: "pending_assistant".to_owned(),
-                        message: "Cannot accept a pending assistant message".to_owned(),
-                    }));
-                }
+            if let AgentMessage::Standard(Message::Assistant(assistant)) = message
+                && assistant.stop_reason == StopReason::Pending
+            {
+                return Ok(Err(HarnessError::InvalidMessage {
+                    lane: self.inner.name.clone(),
+                    reason: "pending_assistant".to_owned(),
+                    message: "Cannot accept a pending assistant message".to_owned(),
+                }));
             }
         }
         let prompt: Vec<(String, AgentMessage)> = messages
             .into_iter()
-            .map(|message| (self.inner.session.id_generator().next(Some(started_at)), message))
+            .map(|message| {
+                (
+                    self.inner.session.id_generator().next(Some(started_at)),
+                    message,
+                )
+            })
             .collect();
         let lane_name = self.inner.name.clone();
         let steering_mode = acceptance_config.steering_mode;
@@ -1302,7 +1409,7 @@ impl Lane {
                         let stored = session
                             .get_value(&pending_entry(&item.entry_id).address, &command_context)
                             .await
-                            .map_err(|error| lane_error(error))?;
+                            .map_err(lane_error)?;
                         let Some(stored) = stored else {
                             return Err(lane_error(SessionError::Invariant(format!(
                                 "Pending {} entry {} is missing its payload",
@@ -1310,11 +1417,12 @@ impl Lane {
                                 item.entry_id
                             ))));
                         };
-                        let pending: PendingEntry = serde_json::from_value(stored.value).map_err(|error| {
-                            lane_error(SessionError::Invariant(format!(
-                                "Pending entry payload is malformed: {error}"
-                            )))
-                        })?;
+                        let pending: PendingEntry =
+                            serde_json::from_value(stored.value).map_err(|error| {
+                                lane_error(SessionError::Invariant(format!(
+                                    "Pending entry payload is malformed: {error}"
+                                )))
+                            })?;
                         if item.kind != InboxItemKind::Write {
                             let PendingEntry::Message { payload } = &pending else {
                                 return Err(lane_error(SessionError::Invariant(format!(
@@ -1323,20 +1431,22 @@ impl Lane {
                                     item.entry_id
                                 ))));
                             };
-                            if let AgentMessage::Standard(Message::Assistant(assistant)) = payload.as_ref() {
-                                if assistant.stop_reason == StopReason::Pending {
-                                    return Err(lane_error(SessionError::Invariant(format!(
-                                        "Pending {} entry {} contains a pending assistant",
-                                        inbox_kind_name(item.kind),
-                                        item.entry_id
-                                    ))));
-                                }
+                            if let AgentMessage::Standard(Message::Assistant(assistant)) =
+                                payload.as_ref()
+                                && assistant.stop_reason == StopReason::Pending
+                            {
+                                return Err(lane_error(SessionError::Invariant(format!(
+                                    "Pending {} entry {} contains a pending assistant",
+                                    inbox_kind_name(item.kind),
+                                    item.entry_id
+                                ))));
                             }
                         }
                         captured_entries.push((item.clone(), pending));
                     }
-                    let has_captured_conversation =
-                        selected_items.iter().any(|item| item.kind != InboxItemKind::Write);
+                    let has_captured_conversation = selected_items
+                        .iter()
+                        .any(|item| item.kind != InboxItemKind::Write);
                     if prompt.is_empty() && !has_captured_conversation {
                         return Ok(LaneCommand::Return {
                             result: Err(HarnessError::InvalidMessage {
@@ -1383,12 +1493,13 @@ impl Lane {
                             latest_assistant_entry_id: None,
                         },
                     });
-                    let remaining_queues = read_lane_queues(session.as_ref(), &inbox, &command_context)
-                        .await
-                        .map_err(|error| lane_error(error))?;
+                    let remaining_queues =
+                        read_lane_queues(session.as_ref(), &inbox, &command_context)
+                            .await
+                            .map_err(lane_error)?;
                     let mut next = state.clone();
                     next.tip_id = Some(parent_id.clone());
-                    next.inbox = inbox.clone();
+                    next.inbox.clone_from(&inbox);
                     next.operation = Some(LiveOperation {
                         meta: meta.clone(),
                         state: next_operation_state.clone(),
@@ -1413,8 +1524,11 @@ impl Lane {
                             .map_err(lane_error)?,
                     );
                     writes.push(
-                        set_value_write(&operation_state(&operation_id), next_operation_state.clone())
-                            .map_err(lane_error)?,
+                        set_value_write(
+                            &operation_state(&operation_id),
+                            next_operation_state.clone(),
+                        )
+                        .map_err(lane_error)?,
                     );
                     writes.push(
                         set_value_write(
@@ -1431,7 +1545,7 @@ impl Lane {
                     let events_lane = lane_name.clone();
                     let events_operation_id = operation_id.clone();
                     let events_entries = entries.clone();
-                    let events_queues = remaining_queues.clone();
+                    let events_queues = remaining_queues;
                     let selected_count = selected_items.len();
                     Ok(LaneCommand::Commit {
                         writes,
@@ -1444,15 +1558,19 @@ impl Lane {
                             })
                         }),
                         events: Some(Arc::new(move |commit: &CommitResult| {
-                            let mut events: Vec<HarnessEvent> = vec![HarnessEvent::lane_scoped(
-                                &events_lane,
-                                false,
-                                HarnessEventPayload::RunStart {
-                                    run_id: events_operation_id.clone(),
-                                    started_at,
-                                },
-                            )
-                            .unwrap_or_else(|error| unreachable!("run_start is lane-scoped: {error}"))];
+                            let mut events: Vec<HarnessEvent> = vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::RunStart {
+                                        run_id: events_operation_id.clone(),
+                                        started_at,
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("run_start is lane-scoped: {error}")
+                                }),
+                            ];
                             events.extend(committed_entry_events(
                                 &events_entries,
                                 commit,
@@ -1487,6 +1605,11 @@ impl Lane {
     /// Admits a compaction operation, upstream's `acceptCompaction`. The
     /// preparation computation rides the compaction child; the staged seam
     /// raises until it lands.
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "mirrors upstream's async acceptCompaction; the lane's async method surface stays uniform"
+    )]
     async fn accept_compaction(
         &self,
         request: &OperationRequest,
@@ -1495,13 +1618,23 @@ impl Lane {
         acceptance_config: Config,
         context: &Context,
     ) -> Result<OperationAdmissionResult, LaneError> {
-        let _ = (request, operation_id, started_at, acceptance_config, context);
+        let _ = (
+            request,
+            operation_id,
+            started_at,
+            acceptance_config,
+            context,
+        );
         Err(Arc::new(SliceNotImplemented::new("compaction")))
     }
 
     /// Admits a navigation operation, upstream's `acceptNavigation`. The
     /// summarized path's branch preparation rides the compaction child; the
     /// staged seam raises before the retry loop until it lands.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single acceptNavigation method"
+    )]
     async fn accept_navigation(
         &self,
         request: &OperationRequest,
@@ -1511,9 +1644,7 @@ impl Lane {
         context: &Context,
     ) -> Result<OperationAdmissionResult, LaneError> {
         let OperationRequest::Navigation {
-            target_id,
-            options,
-            ..
+            target_id, options, ..
         } = request
         else {
             return Err(lane_error(SessionError::Invariant(
@@ -1523,7 +1654,9 @@ impl Lane {
         let options = options.clone().unwrap_or_default();
         let summarize = options.summarize.unwrap_or(false);
         if summarize {
-            return Err(lane_error(SliceNotImplemented::new("summarized navigation")));
+            return Err(lane_error(SliceNotImplemented::new(
+                "summarized navigation",
+            )));
         }
         let target_id = target_id.clone();
         let options_label = options.label.clone();
@@ -1557,7 +1690,8 @@ impl Lane {
                             result: Err(HarnessError::InvalidNavigation {
                                 lane: lane_name.clone(),
                                 reason: "current_tip".to_owned(),
-                                message: "Navigation target must differ from the current tip".to_owned(),
+                                message: "Navigation target must differ from the current tip"
+                                    .to_owned(),
                             }),
                         });
                     }
@@ -1574,7 +1708,7 @@ impl Lane {
                         let found = session
                             .get_entries(vec![target_id.clone()], &command_context)
                             .await
-                            .map_err(|error| lane_error(error))?;
+                            .map_err(lane_error)?;
                         if !found.contains_key(target_id) {
                             return Ok(LaneCommand::Return {
                                 result: Err(HarnessError::UnknownTarget {
@@ -1607,16 +1741,14 @@ impl Lane {
                             target_id: target_id.clone(),
                             label: options_label.clone(),
                         });
-                    let mut writes: Vec<Write> = Vec::new();
-                    writes.push(
+                    let writes: Vec<Write> = vec![
                         set_value_write(&operation_meta(&operation_id), meta.clone())
                             .map_err(lane_error)?,
-                    );
-                    writes.push(
-                        set_value_write(&operation_state(&operation_id), next_operation_state.clone())
-                            .map_err(lane_error)?,
-                    );
-                    writes.push(
+                        set_value_write(
+                            &operation_state(&operation_id),
+                            next_operation_state.clone(),
+                        )
+                        .map_err(lane_error)?,
                         set_value_write(
                             &lane_state(&lane_name),
                             durable_lane_state(
@@ -1626,11 +1758,11 @@ impl Lane {
                             ),
                         )
                         .map_err(lane_error)?,
-                    );
+                    ];
                     let mut next = state.clone();
                     next.operation = Some(LiveOperation {
-                        meta: meta.clone(),
-                        state: next_operation_state.clone(),
+                        meta,
+                        state: next_operation_state,
                     });
                     let events_lane = lane_name.clone();
                     let events_operation_id = operation_id.clone();
@@ -1646,16 +1778,20 @@ impl Lane {
                             })
                         }),
                         events: Some(Arc::new(move |_commit: &CommitResult| {
-                            vec![HarnessEvent::lane_scoped(
-                                &events_lane,
-                                false,
-                                HarnessEventPayload::NavigationStart {
-                                    run_id: events_operation_id.clone(),
-                                    target_id: events_target.clone(),
-                                    started_at,
-                                },
-                            )
-                            .unwrap_or_else(|error| unreachable!("navigation_start is lane-scoped: {error}"))]
+                            vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::NavigationStart {
+                                        run_id: events_operation_id.clone(),
+                                        target_id: events_target.clone(),
+                                        started_at,
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("navigation_start is lane-scoped: {error}")
+                                }),
+                            ]
                         })),
                     })
                 })
@@ -1674,6 +1810,10 @@ impl Lane {
     /// # Errors
     /// The sealed error when the lane sealed with a fault; the drive's
     /// settled outcome rides the inner result.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single drive method"
+    )]
     pub async fn drive_impl(
         &self,
         options: DriveOptions,
@@ -1710,7 +1850,7 @@ impl Lane {
                                 {
                                     let claimed = {
                                         let mut core = lock_core(&inner);
-                                        match core.active_drive.clone() {
+                                        let claim = match core.active_drive.clone() {
                                             Some(active)
                                                 if active.operation_id == options.operation_id =>
                                             {
@@ -1721,31 +1861,47 @@ impl Lane {
                                             }
                                             Some(active) => DriveClaim::Occupied { drive: active },
                                             None => {
-                                                let drive = Arc::new(Drive::new(&options, &command_context));
+                                                let drive = Arc::new(Drive::new(
+                                                    &options,
+                                                    &command_context,
+                                                ));
                                                 core.active_drive = Some(Arc::clone(&drive));
-                                                let _ =
-                                                    core.state_change.send_modify(|version| *version += 1);
+                                                let () = core
+                                                    .state_change
+                                                    .send_modify(|version| *version += 1);
                                                 DriveClaim::Observe {
                                                     drive,
                                                     installed: true,
                                                 }
                                             }
-                                        }
+                                        };
+                                        // The claim's observation and
+                                        // install hold the core lock
+                                        // across the whole match;
+                                        // releasing it here hands the
+                                        // lane back atomically.
+                                        drop(core);
+                                        claim
                                     };
                                     return Ok(LaneCommand::Return { result: claimed });
                                 }
                                 let stored = session
-                                    .get_value(&operation_result(&options.operation_id).address, &command_context)
+                                    .get_value(
+                                        &operation_result(&options.operation_id).address,
+                                        &command_context,
+                                    )
                                     .await
-                                    .map_err(|error| lane_error(error))?;
+                                    .map_err(lane_error)?;
                                 match stored {
                                     Some(stored) => {
-                                        let record: OperationResultRecord = serde_json::from_value(stored.value)
-                                            .map_err(|error| {
-                                                lane_error(SessionError::Invariant(format!(
-                                                    "Operation result is malformed: {error}"
-                                                )))
-                                            })?;
+                                        let record: OperationResultRecord = serde_json::from_value(
+                                            stored.value,
+                                        )
+                                        .map_err(|error| {
+                                            lane_error(SessionError::Invariant(format!(
+                                                "Operation result is malformed: {error}"
+                                            )))
+                                        })?;
                                         Ok(LaneCommand::Return {
                                             result: DriveClaim::Settled { outcome: record },
                                         })
@@ -1755,10 +1911,9 @@ impl Lane {
                                             error: mismatch_for(
                                                 &lane_name,
                                                 &options.operation_id,
-                                                state
-                                                    .operation
-                                                    .as_ref()
-                                                    .map(|operation| operation.meta.operation_id.clone()),
+                                                state.operation.as_ref().map(|operation| {
+                                                    operation.meta.operation_id.clone()
+                                                }),
                                                 state.last_operation_id.clone(),
                                             ),
                                         },
@@ -1784,7 +1939,9 @@ impl Lane {
                         // The context's abort fires first, upstream's thrown
                         // AbortError.
                         Err(reason) => return Err(abort_reason_error(Some(reason))),
-                        Ok(Ok(_outcome)) => continue,
+                        // The pass settled; the loop re-claims against the
+                        // settled operation.
+                        Ok(Ok(_outcome)) => {}
                     }
                 }
                 DriveClaim::Observe { drive, installed } => {
@@ -1804,7 +1961,7 @@ impl Lane {
                                 .is_some_and(|active| Arc::ptr_eq(active, &drive))
                             {
                                 core.active_drive = None;
-                                let _ = core.state_change.send_modify(|version| *version += 1);
+                                let () = core.state_change.send_modify(|version| *version += 1);
                             }
                         }
                         drive.fail(fault);
@@ -1830,6 +1987,10 @@ impl Lane {
     /// # Errors
     /// The sealed error when the lane sealed with a fault; the request's
     /// taxonomy errors ride the inner result.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single requestOperationAbort method"
+    )]
     pub async fn request_operation_abort(
         &self,
         operation_id: &str,
@@ -1860,10 +2021,8 @@ impl Lane {
             Arc::new(move |signal: bool| {
                 if !gate_settled.swap(true, Ordering::SeqCst) {
                     let _ = cancel_tx.send(());
-                    if signal {
-                        if let Some(drive) = &drive {
-                            drive.signal_abort();
-                        }
+                    if signal && let Some(drive) = &drive {
+                        drive.signal_abort();
                     }
                 }
             })
@@ -1880,20 +2039,25 @@ impl Lane {
                     let settle_gate = Arc::clone(&materialize_settle);
                     Box::pin(async move {
                         let operation = match &state.operation {
-                            Some(operation) if operation.meta.operation_id == operation_id => operation.clone(),
+                            Some(operation) if operation.meta.operation_id == operation_id => {
+                                operation.clone()
+                            }
                             other => {
                                 return Ok(LaneCommand::Return {
                                     result: Err(mismatch_for(
                                         &lane_name,
                                         &operation_id,
-                                        other.as_ref().map(|operation| operation.meta.operation_id.clone()),
+                                        other
+                                            .as_ref()
+                                            .map(|operation| operation.meta.operation_id.clone()),
                                         state.last_operation_id.clone(),
                                     )),
                                 });
                             }
                         };
                         if matches!(
-                            crate::harness::session::types::operation_scope_of(&operation.state).control,
+                            crate::harness::session::types::operation_scope_of(&operation.state)
+                                .control,
                             Control::CancelRequested { .. }
                         ) {
                             return Ok(LaneCommand::Return {
@@ -1909,7 +2073,9 @@ impl Lane {
                         let removed: Vec<InboxItem> = state
                             .inbox
                             .iter()
-                            .filter(|item| matches!(item.kind, InboxItemKind::Steer | InboxItemKind::FollowUp))
+                            .filter(|item| {
+                                matches!(item.kind, InboxItemKind::Steer | InboxItemKind::FollowUp)
+                            })
                             .cloned()
                             .collect();
                         let mut payloads: Vec<(InboxItemKind, AgentMessage)> = Vec::new();
@@ -1917,7 +2083,7 @@ impl Lane {
                             let stored = session
                                 .get_value(&pending_entry(&item.entry_id).address, &command_context)
                                 .await
-                                .map_err(|error| lane_error(error))?;
+                                .map_err(lane_error)?;
                             let pending = match stored {
                                 Some(StoredValue { value, .. }) => {
                                     serde_json::from_value::<PendingEntry>(value).map_err(|_| {
@@ -1965,22 +2131,26 @@ impl Lane {
                             .collect();
                         let queues = read_lane_queues(session.as_ref(), &inbox, &command_context)
                             .await
-                            .map_err(|error| lane_error(error))?;
+                            .map_err(lane_error)?;
                         let scope =
                             crate::harness::session::types::operation_scope_of(&operation.state);
                         let mut scope = scope;
                         scope.control = Control::CancelRequested {
                             requested_at: now_ms(),
                         };
-                        let next_operation_state = operation_state_with_scope(&operation.state, scope);
+                        let next_operation_state =
+                            operation_state_with_scope(&operation.state, scope);
 
                         let mut writes: Vec<Write> = Vec::new();
                         for item in &removed {
                             writes.push(delete_value_write(&pending_entry(&item.entry_id)));
                         }
                         writes.push(
-                            set_value_write(&operation_state(&operation_id), next_operation_state.clone())
-                                .map_err(lane_error)?,
+                            set_value_write(
+                                &operation_state(&operation_id),
+                                next_operation_state.clone(),
+                            )
+                            .map_err(lane_error)?,
                         );
                         writes.push(
                             set_value_write(
@@ -1994,17 +2164,17 @@ impl Lane {
                             .map_err(lane_error)?,
                         );
                         let mut next = state.clone();
-                        next.inbox = inbox.clone();
+                        next.inbox.clone_from(&inbox);
                         next.operation = Some(LiveOperation {
                             meta: operation.meta.clone(),
-                            state: next_operation_state.clone(),
+                            state: next_operation_state,
                         });
 
                         let events_lane = lane_name.clone();
                         let events_operation_id = operation_id.clone();
                         let events_steer = steer.clone();
                         let events_follow_up = follow_up.clone();
-                        let events_queues = queues.clone();
+                        let events_queues = queues;
                         let removed_count = removed.len();
                         Ok(LaneCommand::Commit {
                             writes,
@@ -2019,18 +2189,20 @@ impl Lane {
                                 })
                             }),
                             events: Some(Arc::new(move |_commit: &CommitResult| {
-                                let mut events = vec![HarnessEvent::lane_scoped(
-                                    &events_lane,
-                                    false,
-                                    HarnessEventPayload::OperationAbort {
-                                        operation_id: events_operation_id.clone(),
-                                        steer: events_steer.clone(),
-                                        follow_up: events_follow_up.clone(),
-                                    },
-                                )
-                                .unwrap_or_else(|error| {
-                                    unreachable!("operation_abort is lane-scoped: {error}")
-                                })];
+                                let mut events = vec![
+                                    HarnessEvent::lane_scoped(
+                                        &events_lane,
+                                        false,
+                                        HarnessEventPayload::OperationAbort {
+                                            operation_id: events_operation_id.clone(),
+                                            steer: events_steer.clone(),
+                                            follow_up: events_follow_up.clone(),
+                                        },
+                                    )
+                                    .unwrap_or_else(|error| {
+                                        unreachable!("operation_abort is lane-scoped: {error}")
+                                    }),
+                                ];
                                 if removed_count > 0 {
                                     events.push(
                                         HarnessEvent::lane_scoped(
@@ -2040,9 +2212,11 @@ impl Lane {
                                                 queues: events_queues.clone(),
                                             },
                                         )
-                                        .unwrap_or_else(|error| {
-                                            unreachable!("queue_update is lane-scoped: {error}")
-                                        }),
+                                        .unwrap_or_else(
+                                            |error| {
+                                                unreachable!("queue_update is lane-scoped: {error}")
+                                            },
+                                        ),
                                     );
                                 }
                                 events
@@ -2056,10 +2230,9 @@ impl Lane {
 
         match result {
             Ok(result) => {
-                let settle_now = match &result {
-                    Ok(outcome) => !outcome.newly_requested,
-                    Err(_) => false,
-                };
+                let settle_now = result
+                    .as_ref()
+                    .is_ok_and(|outcome| !outcome.newly_requested);
                 (settle_gate)(settle_now);
                 Ok(result)
             }
@@ -2077,6 +2250,9 @@ impl Lane {
     }
 
     /// The execution view one lane reports, upstream's `inspectExecution`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault.
     pub async fn inspect_execution_impl(
         &self,
         context: &Context,
@@ -2092,8 +2268,10 @@ impl Lane {
                             .as_ref()
                             .map(|operation| captured_model(&operation.state));
                         let current = operation.as_ref().map(|operation| {
-                            let status = match crate::harness::session::types::operation_scope_of(&operation.state)
-                                .control
+                            let status = match crate::harness::session::types::operation_scope_of(
+                                &operation.state,
+                            )
+                            .control
                             {
                                 Control::CancelRequested { .. } => OperationStatus::Aborting,
                                 Control::Running => OperationStatus::Open,
@@ -2125,6 +2303,10 @@ impl Lane {
     }
 
     /// Runs a text prompt to settlement, upstream's `prompt(text, images)`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the run's
+    /// taxonomy errors ride the inner result.
     pub async fn prompt_text_impl(
         &self,
         text: &str,
@@ -2146,6 +2328,10 @@ impl Lane {
 
     /// Runs a prebuilt prompt to settlement, upstream's
     /// `prompt(message | messages)`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the run's
+    /// taxonomy errors ride the inner result.
     pub async fn prompt_messages_impl(
         &self,
         prompt: PromptMessagesPayload,
@@ -2235,6 +2421,10 @@ impl Lane {
     }
 
     /// Invokes one skill, upstream's `skill`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the run's
+    /// taxonomy errors ride the inner result.
     pub async fn skill_impl(
         &self,
         name: &str,
@@ -2253,6 +2443,10 @@ impl Lane {
     }
 
     /// Invokes one prompt template, upstream's `promptFromTemplate`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the run's
+    /// taxonomy errors ride the inner result.
     pub async fn prompt_from_template_impl(
         &self,
         name: &str,
@@ -2439,7 +2633,9 @@ impl Lane {
             Ok(admission) => admission,
             Err(error) => {
                 return match &error {
-                    HarnessError::InvalidMessage { .. } | HarnessError::LaneBusy { .. } => Ok(Ok(None)),
+                    HarnessError::InvalidMessage { .. } | HarnessError::LaneBusy { .. } => {
+                        Ok(Ok(None))
+                    }
                     HarnessError::Closed { .. } => Ok(Err(error)),
                     _ => Err(self.fault(
                         from_arc(Arc::new(SessionError::Invariant(format!(
@@ -2503,10 +2699,7 @@ impl Lane {
     ///
     /// # Errors
     /// The sealed error when the lane sealed with a fault.
-    pub async fn resume_impl(
-        &self,
-        context: &Context,
-    ) -> Result<ResumeResult, LaneError> {
+    pub async fn resume_impl(&self, context: &Context) -> Result<ResumeResult, LaneError> {
         if self.inner.is_harness_closed() {
             return Ok(Err(HarnessError::Closed {
                 message: self.sealed_message(),
@@ -2519,20 +2712,20 @@ impl Lane {
                 move |state, _session, _context| {
                     let lane_name = lane_name.clone();
                     Box::pin(async move {
-                        match &state.operation {
-                            Some(operation) => Ok(LaneCommand::Return {
-                                result: Ok(operation.meta.operation_id.clone()),
-                            }),
-                            None => Ok(LaneCommand::Return {
-                                result: Err(HarnessError::NothingToResume {
-                                    lane: lane_name.clone(),
-                                    message: format!(
-                                        "Lane {} has no active operation to resume",
-                                        quoted(&lane_name)
-                                    ),
-                                }),
-                            }),
-                        }
+                        Ok(LaneCommand::Return {
+                            result: state.operation.as_ref().map_or_else(
+                                || {
+                                    Err(HarnessError::NothingToResume {
+                                        lane: lane_name.clone(),
+                                        message: format!(
+                                            "Lane {} has no active operation to resume",
+                                            quoted(&lane_name)
+                                        ),
+                                    })
+                                },
+                                |operation| Ok(operation.meta.operation_id.clone()),
+                            ),
+                        })
                     })
                 },
                 context,
@@ -2667,6 +2860,10 @@ impl Lane {
     }
 
     /// Queues one steering message, upstream's `steer`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; queue validation
+    /// errors ride the inner result.
     pub async fn steer_impl(
         &self,
         message: QueueMessage,
@@ -2678,6 +2875,10 @@ impl Lane {
     }
 
     /// Queues one follow-up message, upstream's `followUp`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; queue validation
+    /// errors ride the inner result.
     pub async fn follow_up_impl(
         &self,
         message: QueueMessage,
@@ -2689,6 +2890,10 @@ impl Lane {
     }
 
     /// Queues one next-run message, upstream's `nextRun`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; queue validation
+    /// errors ride the inner result.
     pub async fn next_run_impl(
         &self,
         message: QueueMessage,
@@ -2699,6 +2904,14 @@ impl Lane {
             .await
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single enqueue method"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "upstream builds the message content into `content`; the harness context parameter spells `context`"
+    )]
     async fn enqueue(
         &self,
         kind: InboxItemKind,
@@ -2738,19 +2951,16 @@ impl Lane {
             }
             QueueMessage::Message(input) => {
                 let input = *input;
-                if let AgentMessage::Standard(Message::Assistant(assistant)) = &input {
-                    if assistant.stop_reason == StopReason::Pending {
-                        return Ok(Err(HarnessError::InvalidMessage {
-                            lane: lane_name.clone(),
-                            reason: "pending_assistant".to_owned(),
-                            message: "Cannot queue a pending assistant message".to_owned(),
-                        }));
-                    }
+                if let AgentMessage::Standard(Message::Assistant(assistant)) = &input
+                    && assistant.stop_reason == StopReason::Pending
+                {
+                    return Ok(Err(HarnessError::InvalidMessage {
+                        lane: lane_name.clone(),
+                        reason: "pending_assistant".to_owned(),
+                        message: "Cannot queue a pending assistant message".to_owned(),
+                    }));
                 }
-                let is_user = matches!(
-                    &input,
-                    AgentMessage::Standard(Message::User(_))
-                );
+                let is_user = matches!(&input, AgentMessage::Standard(Message::User(_)));
                 if !images.is_empty() && !is_user {
                     return Ok(Err(HarnessError::InvalidMessage {
                         lane: lane_name.clone(),
@@ -2802,14 +3012,13 @@ impl Lane {
                     let mut queues =
                         read_lane_queues(session.as_ref(), &state.inbox, &command_context)
                             .await
-                            .map_err(|error| lane_error(error))?;
+                            .map_err(lane_error)?;
                     queues.push(LaneQueuedItem::Message {
                         entry_id: entry_id.clone(),
                         kind,
                         message: Box::new(message.clone()),
                     });
-                    let mut writes: Vec<Write> = Vec::new();
-                    writes.push(
+                    let writes: Vec<Write> = vec![
                         set_value_write(
                             &pending_entry(&entry_id),
                             PendingEntry::Message {
@@ -2817,18 +3026,19 @@ impl Lane {
                             },
                         )
                         .map_err(lane_error)?,
-                    );
-                    writes.push(
                         set_value_write(
                             &lane_state(&lane_name),
                             durable_lane_state(
-                                state.operation.as_ref().map(|operation| operation.meta.operation_id.as_str()),
+                                state
+                                    .operation
+                                    .as_ref()
+                                    .map(|operation| operation.meta.operation_id.as_str()),
                                 &inbox,
                                 state.last_operation_id.as_deref(),
                             ),
                         )
                         .map_err(lane_error)?,
-                    );
+                    ];
                     let mut next = state.clone();
                     next.inbox = inbox;
                     let events_lane = lane_name.clone();
@@ -2838,14 +3048,18 @@ impl Lane {
                         next,
                         materialize: Arc::new(move |_commit: &CommitResult| Ok(entry_id.clone())),
                         events: Some(Arc::new(move |_commit: &CommitResult| {
-                            vec![HarnessEvent::lane_scoped(
-                                &events_lane,
-                                false,
-                                HarnessEventPayload::QueueUpdate {
-                                    queues: events_queues.clone(),
-                                },
-                            )
-                            .unwrap_or_else(|error| unreachable!("queue_update is lane-scoped: {error}"))]
+                            vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::QueueUpdate {
+                                        queues: events_queues.clone(),
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("queue_update is lane-scoped: {error}")
+                                }),
+                            ]
                         })),
                     })
                 })
@@ -2860,6 +3074,10 @@ impl Lane {
     /// # Errors
     /// The taxonomy errors ride the result; the sealed error carries the
     /// closed/fault surface.
+    #[expect(
+        clippy::similar_names,
+        reason = "upstream names the matched inbox item `queued` and the rebuilt queue view `queues` in the same scope"
+    )]
     pub async fn cancel_queued_impl(
         &self,
         entry_id: &str,
@@ -2878,12 +3096,16 @@ impl Lane {
                 let lane_name = lane_name.clone();
                 let entry_id = entry_id_owned.clone();
                 Box::pin(async move {
-                    let queued = state.inbox.iter().find(|item| item.entry_id == entry_id).cloned();
+                    let queued = state
+                        .inbox
+                        .iter()
+                        .find(|item| item.entry_id == entry_id)
+                        .cloned();
                     let Some(queued) = queued else {
                         let entries = session
                             .get_entries(vec![entry_id.clone()], &command_context)
                             .await
-                            .map_err(|error| lane_error(error))?;
+                            .map_err(lane_error)?;
                         let consumed = entries.contains_key(&entry_id);
                         return Ok(LaneCommand::Return {
                             result: if consumed {
@@ -2896,7 +3118,7 @@ impl Lane {
                     let stored = session
                         .get_value(&pending_entry(&entry_id).address, &command_context)
                         .await
-                        .map_err(|error| lane_error(error))?;
+                        .map_err(lane_error)?;
                     if stored.is_none() {
                         return Err(lane_error(SessionError::Invariant(format!(
                             "Queued {} entry {} is missing its payload",
@@ -2912,39 +3134,43 @@ impl Lane {
                         .collect();
                     let queues = read_lane_queues(session.as_ref(), &inbox, &command_context)
                         .await
-                        .map_err(|error| lane_error(error))?;
-                    let mut writes: Vec<Write> = Vec::new();
-                    writes.push(delete_value_write(&pending_entry(&entry_id)));
-                    writes.push(
+                        .map_err(lane_error)?;
+                    let writes: Vec<Write> = vec![
+                        delete_value_write(&pending_entry(&entry_id)),
                         set_value_write(
                             &lane_state(&lane_name),
                             durable_lane_state(
-                                state.operation.as_ref().map(|operation| operation.meta.operation_id.as_str()),
+                                state
+                                    .operation
+                                    .as_ref()
+                                    .map(|operation| operation.meta.operation_id.as_str()),
                                 &inbox,
                                 state.last_operation_id.as_deref(),
                             ),
                         )
                         .map_err(lane_error)?,
-                    );
+                    ];
                     let mut next = state.clone();
                     next.inbox = inbox;
                     let events_lane = lane_name.clone();
-                    let events_queues = queues.clone();
+                    let events_queues = queues;
                     Ok(LaneCommand::Commit {
                         writes,
                         next,
-                        materialize: Arc::new(|_commit: &CommitResult| {
-                            CancelQueuedKind::Cancelled
-                        }),
+                        materialize: Arc::new(|_commit: &CommitResult| CancelQueuedKind::Cancelled),
                         events: Some(Arc::new(move |_commit: &CommitResult| {
-                            vec![HarnessEvent::lane_scoped(
-                                &events_lane,
-                                false,
-                                HarnessEventPayload::QueueUpdate {
-                                    queues: events_queues.clone(),
-                                },
-                            )
-                            .unwrap_or_else(|error| unreachable!("queue_update is lane-scoped: {error}"))]
+                            vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::QueueUpdate {
+                                        queues: events_queues.clone(),
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("queue_update is lane-scoped: {error}")
+                                }),
+                            ]
                         })),
                     })
                 })
@@ -2976,7 +3202,7 @@ impl Lane {
         self.command::<String, _>(
             move |state, session, _command_context| {
                 let lane_name = lane_name.clone();
-                let usage = usage.clone();
+                let usage = usage;
                 let entry_id = options.entry_id.clone();
                 let details = options.details.clone();
                 Box::pin(async move {
@@ -2993,7 +3219,7 @@ impl Lane {
                     Ok(LaneCommand::Commit {
                         writes: vec![Write::Usage(UsageWrite {
                             kind: "usage".to_owned(),
-                            row: row.clone(),
+                            row,
                         })],
                         next: state,
                         materialize: Arc::new(move |_commit: &CommitResult| usage_id.clone()),
@@ -3001,19 +3227,21 @@ impl Lane {
                             let seq = commit.seqs.first().copied().unwrap_or_else(|| {
                                 unreachable!("usage commit carries one sequence")
                             });
-                            vec![HarnessEvent::global(HarnessEventPayload::Usage {
-                                lane: events_lane.clone(),
-                                row: UsageRow {
-                                    seq,
-                                    id: events_row.id.clone(),
-                                    usage: events_row.usage.clone(),
-                                    entry_id: events_row.entry_id.clone(),
-                                    adjustment: events_row.adjustment,
-                                    details: events_row.details.clone(),
-                                },
-                                totals: commit.stats.usage.clone(),
-                            })
-                            .unwrap_or_else(|error| unreachable!("usage is global: {error}"))]
+                            vec![
+                                HarnessEvent::global(HarnessEventPayload::Usage {
+                                    lane: events_lane.clone(),
+                                    row: UsageRow {
+                                        seq,
+                                        id: events_row.id.clone(),
+                                        usage: events_row.usage,
+                                        entry_id: events_row.entry_id.clone(),
+                                        adjustment: events_row.adjustment,
+                                        details: events_row.details.clone(),
+                                    },
+                                    totals: commit.stats.usage,
+                                })
+                                .unwrap_or_else(|error| unreachable!("usage is global: {error}")),
+                            ]
                         })),
                     })
                 })
@@ -3024,6 +3252,10 @@ impl Lane {
     }
 
     /// Waits for the lane to idle, upstream's `waitForIdle`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a context abort
+    /// during the wait aborts the wait.
     pub async fn wait_for_idle_impl(&self, context: &Context) -> Result<(), LaneError> {
         loop {
             let observation = self
@@ -3071,6 +3303,10 @@ impl Lane {
     }
 
     /// Runs one callback when idle, upstream's `runWhenIdle`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a context abort
+    /// while waiting to claim the idle slot aborts the wait.
     pub async fn run_when_idle_impl(
         &self,
         callback: IdleCallback,
@@ -3100,7 +3336,7 @@ impl Lane {
                                 {
                                     let mut core = lock_core(&inner);
                                     core.idle_owner = Some(owner.clone());
-                                    let _ = core.state_change.send_modify(|version| *version += 1);
+                                    let () = core.state_change.send_modify(|version| *version += 1);
                                 }
                                 Ok(LaneCommand::Return {
                                     result: IdleClaimObservation::Claimed,
@@ -3137,17 +3373,22 @@ impl Lane {
         {
             let mut core = lock_core(&self.inner);
             core.idle_owner = None;
-            let _ = core.state_change.send_modify(|version| *version += 1);
+            let () = core.state_change.send_modify(|version| *version += 1);
         }
         owner.cancel();
         result
     }
 
     /// The configured model, upstream's `getModel`.
-    pub async fn get_model_impl(
-        &self,
-        _context: &Context,
-    ) -> Result<Option<Model>, LaneError> {
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault.
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "mirrors upstream's async getModel; the lane's async method surface stays uniform"
+    )]
+    pub async fn get_model_impl(&self, _context: &Context) -> Result<Option<Model>, LaneError> {
         self.inner.assert_open()?;
         let configuration = lock_core(&self.inner).state.configuration.clone();
         Ok(self
@@ -3157,6 +3398,10 @@ impl Lane {
     }
 
     /// Sets the model, upstream's `setModel`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a commit-write
+    /// construction or commit failure faults the harness.
     pub async fn set_model_impl(
         &self,
         model: ModelIdentity,
@@ -3184,6 +3429,14 @@ impl Lane {
     }
 
     /// The thinking level, upstream's `getThinkingLevel`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault.
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "mirrors upstream's async getThinkingLevel; the lane's async method surface stays uniform"
+    )]
     pub async fn get_thinking_level_impl(
         &self,
         _context: &Context,
@@ -3193,6 +3446,10 @@ impl Lane {
     }
 
     /// Sets the thinking level, upstream's `setThinkingLevel`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a commit-write
+    /// construction or commit failure faults the harness.
     pub async fn set_thinking_level_impl(
         &self,
         level: crate::types::ThinkingLevel,
@@ -3217,12 +3474,31 @@ impl Lane {
     }
 
     /// The active tools, upstream's `getActiveTools`.
-    pub async fn get_active_tools_impl(&self, _context: &Context) -> Result<Vec<String>, LaneError> {
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault.
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "mirrors upstream's async getActiveTools; the lane's async method surface stays uniform"
+    )]
+    pub async fn get_active_tools_impl(
+        &self,
+        _context: &Context,
+    ) -> Result<Vec<String>, LaneError> {
         self.inner.assert_open()?;
-        Ok(lock_core(&self.inner).state.configuration.active_tool_names.clone())
+        Ok(lock_core(&self.inner)
+            .state
+            .configuration
+            .active_tool_names
+            .clone())
     }
 
     /// Sets the active tools, upstream's `setActiveTools`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a commit-write
+    /// construction or commit failure faults the harness.
     pub async fn set_active_tools_impl(
         &self,
         names: Vec<String>,
@@ -3231,7 +3507,7 @@ impl Lane {
         self.set_configuration(
             move |configuration: &crate::harness::session::types::LaneConfiguration| {
                 let mut next = configuration.clone();
-                next.active_tool_names = names.clone();
+                next.active_tool_names.clone_from(&names);
                 next
             },
             |previous: &crate::harness::session::types::LaneConfiguration,
@@ -3273,7 +3549,7 @@ impl Lane {
                                 let lane = lane.clone();
                                 Box::pin(async move {
                                     let snapshot = lane
-                                        .capture_lane_snapshot_in_read(&resnapshot_context)
+                                        .capture_lane_snapshot_in_read(resnapshot_context)
                                         .await?;
                                     boundary.mark();
                                     Ok(snapshot)
@@ -3309,7 +3585,10 @@ impl Lane {
     /// # Errors
     /// The sealed error or any snapshot-read failure, boxed for the event
     /// listener surface.
-    async fn capture_lane_snapshot_in_read(&self, context: &Context) -> Result<LaneSnapshot, ListenerError> {
+    async fn capture_lane_snapshot_in_read(
+        &self,
+        context: &Context,
+    ) -> Result<LaneSnapshot, ListenerError> {
         self.read_lane::<LaneSnapshot, _>(
             {
                 let lane = self.clone();
@@ -3328,6 +3607,18 @@ impl Lane {
     }
 
     /// Captures one lane snapshot, upstream's `captureLaneSnapshot`.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single captureLaneSnapshot method"
+    )]
+    #[expect(
+        clippy::similar_names,
+        reason = "upstream reads `state` and `stats` side by side in captureLaneSnapshot"
+    )]
+    #[expect(
+        clippy::useless_let_if_seq,
+        reason = "the operation view fills through early-returning reads; hoisting it into an expression would indent the whole build"
+    )]
     async fn capture_lane_snapshot(
         &self,
         state: &LaneState,
@@ -3349,7 +3640,7 @@ impl Lane {
                         context,
                     )
                     .await
-                    .map_err(|error| lane_error(error))?;
+                    .map_err(lane_error)?;
                 let mut entries = entries;
                 entries.reverse();
                 entries
@@ -3357,14 +3648,14 @@ impl Lane {
         };
         let queues = read_lane_queues(reader, &captured.inbox, context)
             .await
-            .map_err(|error| lane_error(error))?;
+            .map_err(lane_error)?;
         let last_result = match &captured.last_operation_id {
             None => None,
             Some(last_operation_id) => {
                 let stored = reader
                     .get_value(&operation_result(last_operation_id).address, context)
                     .await
-                    .map_err(|error| lane_error(error))?;
+                    .map_err(lane_error)?;
                 let Some(stored) = stored else {
                     return Err(Arc::new(SessionError::Invariant(format!(
                         "Lane {} is missing result {}",
@@ -3372,17 +3663,18 @@ impl Lane {
                         last_operation_id
                     ))));
                 };
-                Some(serde_json::from_value::<OperationResultRecord>(stored.value).map_err(|error| {
-                    lane_error(SessionError::Invariant(format!(
-                        "Operation result is malformed: {error}"
-                    )))
-                })?)
+                Some(
+                    serde_json::from_value::<OperationResultRecord>(stored.value).map_err(
+                        |error| {
+                            lane_error(SessionError::Invariant(format!(
+                                "Operation result is malformed: {error}"
+                            )))
+                        },
+                    )?,
+                )
             }
         };
-        let stats = reader
-            .get_stats(context)
-            .await
-            .map_err(|error| lane_error(error))?;
+        let stats = reader.get_stats(context).await.map_err(lane_error)?;
         let operation = &captured.operation;
 
         let mut operation_snapshot: Option<LiveOperationView> = None;
@@ -3402,7 +3694,12 @@ impl Lane {
                 }
                 OperationState::AssistantEffectPending(leaf) => {
                     streaming_message = self
-                        .read_streaming_message(reader, &operation_id, &leaf.response_entry_id, context)
+                        .read_streaming_message(
+                            reader,
+                            &operation_id,
+                            &leaf.response_entry_id,
+                            context,
+                        )
                         .await?;
                 }
                 OperationState::DeferredSuspended(leaf) => {
@@ -3412,23 +3709,27 @@ impl Lane {
                     );
                 }
                 OperationState::DeferredEffectPending(leaf) => {
-                    deferred = Some(
-                        self.deferred_view_of(reader, &leaf.scope, context)
-                            .await?,
-                    );
+                    deferred = Some(self.deferred_view_of(reader, &leaf.scope, context).await?);
                     streaming_message = self
-                        .read_streaming_message(reader, &operation_id, &leaf.response_entry_id, context)
+                        .read_streaming_message(
+                            reader,
+                            &operation_id,
+                            &leaf.response_entry_id,
+                            context,
+                        )
                         .await?;
                 }
                 OperationState::Tools(leaf) => {
                     let entries = reader
                         .get_entries(vec![leaf.batch.assistant_entry_id.clone()], context)
                         .await
-                        .map_err(|error| lane_error(error))?;
+                        .map_err(lane_error)?;
                     let assistant = entries.get(&leaf.batch.assistant_entry_id);
                     let assistant_message = match assistant {
                         Some(Entry::Message { body, .. }) => match &body.message {
-                            AgentMessage::Standard(Message::Assistant(assistant)) => Some(assistant),
+                            AgentMessage::Standard(Message::Assistant(assistant)) => {
+                                Some(assistant)
+                            }
                             _ => None,
                         },
                         _ => None,
@@ -3449,112 +3750,123 @@ impl Lane {
                         let block = assistant_message
                             .content
                             .get(usize::try_from(call.source_index).unwrap_or(usize::MAX));
-                        let block = match block {
-                            Some(pi_ai::types::AssistantBlock::ToolCall(block)) => block,
-                            _ => {
-                                return Err(lane_error(SessionError::Invariant(format!(
-                                    "Tool call source index {} does not name a tool-call block",
-                                    call.source_index
-                                ))));
-                            }
+                        let Some(pi_ai::types::AssistantBlock::ToolCall(block)) = block else {
+                            return Err(lane_error(SessionError::Invariant(format!(
+                                "Tool call source index {} does not name a tool-call block",
+                                call.source_index
+                            ))));
                         };
                         let args = reader
                             .get_value(
-                                &operation_tool_args(&operation_id, &leaf.batch.turn_id, call.source_index).address,
+                                &operation_tool_args(
+                                    &operation_id,
+                                    &leaf.batch.turn_id,
+                                    call.source_index,
+                                )
+                                .address,
                                 context,
                             )
                             .await
-                            .map_err(|error| lane_error(error))?;
-                        match call.status() {
-                            crate::harness::session::types::ToolCallStatus::EffectPending { .. } => {
-                                let Some(args) = args else {
-                                    return Err(lane_error(SessionError::Invariant(format!(
-                                        "Tool call {} is missing persisted arguments",
-                                        block.id
-                                    ))));
-                                };
-                                let args: serde_json::Map<String, serde_json::Value> =
-                                    serde_json::from_value(args.value).map_err(|error| {
+                            .map_err(lane_error)?;
+                        if let crate::harness::session::types::ToolCallStatus::EffectPending {
+                            ..
+                        } = call.status()
+                        {
+                            let Some(args) = args else {
+                                return Err(lane_error(SessionError::Invariant(format!(
+                                    "Tool call {} is missing persisted arguments",
+                                    block.id
+                                ))));
+                            };
+                            let args: serde_json::Map<String, serde_json::Value> =
+                                serde_json::from_value(args.value).map_err(|error| {
+                                    lane_error(SessionError::Invariant(format!(
+                                        "Tool arguments are malformed: {error}"
+                                    )))
+                                })?;
+                            let checkpoint = reader
+                                .get_value(
+                                    &pending_tool_output(&operation_id, &call.result_entry_id)
+                                        .address,
+                                    context,
+                                )
+                                .await
+                                .map_err(lane_error)?;
+                            let checkpoint: Option<
+                                crate::harness::session::values::ToolOutputPayload,
+                            > = match checkpoint {
+                                Some(StoredValue { value, .. }) => {
+                                    Some(serde_json::from_value(value).map_err(|error| {
                                         lane_error(SessionError::Invariant(format!(
-                                            "Tool arguments are malformed: {error}"
+                                            "Pending tool output is malformed: {error}"
                                         )))
-                                    })?;
-                                let checkpoint = reader
-                                    .get_value(
-                                        &pending_tool_output(&operation_id, &call.result_entry_id).address,
-                                        context,
-                                    )
-                                    .await
-                                    .map_err(|error| lane_error(error))?;
-                                let checkpoint: Option<crate::harness::session::values::ToolOutputPayload> =
-                                    match checkpoint {
-                                        Some(StoredValue { value, .. }) => Some(serde_json::from_value(value).map_err(|error| {
-                                            lane_error(SessionError::Invariant(format!(
-                                                "Pending tool output is malformed: {error}"
-                                            )))
-                                        })?),
-                                        None => None,
-                                    };
-                                running_tools.push(LaneSnapshotTool::Running {
-                                    tool_call_id: block.id.clone(),
-                                    tool_name: block.name.clone(),
-                                    args: serde_json::Value::Object(args),
-                                    result: checkpoint.map(tool_output_payload_to_result),
-                                });
-                            }
-                            _ => {
-                                let staged = reader
-                                    .get_value(&pending_entry(&call.result_entry_id).address, context)
-                                    .await
-                                    .map_err(|error| lane_error(error))?;
-                                let staged = match staged {
-                                    Some(StoredValue { value, .. }) => {
-                                        serde_json::from_value::<PendingEntry>(value).map_err(|error| {
+                                    })?)
+                                }
+                                None => None,
+                            };
+                            running_tools.push(LaneSnapshotTool::Running {
+                                tool_call_id: block.id.clone(),
+                                tool_name: block.name.clone(),
+                                args: serde_json::Value::Object(args),
+                                result: checkpoint.map(tool_output_payload_to_result),
+                            });
+                        } else {
+                            let staged = reader
+                                .get_value(&pending_entry(&call.result_entry_id).address, context)
+                                .await
+                                .map_err(lane_error)?;
+                            let staged = match staged {
+                                Some(StoredValue { value, .. }) => {
+                                    serde_json::from_value::<PendingEntry>(value).map_err(
+                                        |error| {
                                             lane_error(SessionError::Invariant(format!(
                                                 "Pending entry payload is malformed: {error}"
                                             )))
-                                        })?
-                                    }
-                                    None => {
-                                        return Err(lane_error(SessionError::Invariant(format!(
-                                            "Tool call {} is missing its staged result",
-                                            call.result_entry_id
-                                        ))));
-                                    }
-                                };
-                                let PendingEntry::Message { payload } = &staged else {
+                                        },
+                                    )?
+                                }
+                                None => {
                                     return Err(lane_error(SessionError::Invariant(format!(
                                         "Tool call {} is missing its staged result",
-                                        call.result_entry_id
-                                    ))));
-                                };
-                                let AgentMessage::Standard(Message::ToolResult(tool_result)) = payload.as_ref()
-                                else {
-                                    return Err(lane_error(SessionError::Invariant(format!(
-                                        "Tool call {} is missing its staged result",
-                                        call.result_entry_id
-                                    ))));
-                                };
-                                if tool_result.tool_call_id != block.id || tool_result.tool_name != block.name {
-                                    return Err(lane_error(SessionError::Invariant(format!(
-                                        "Tool call {} has a mismatched staged result",
                                         call.result_entry_id
                                     ))));
                                 }
-                                running_tools.push(LaneSnapshotTool::Settled {
-                                    tool_call_id: block.id.clone(),
-                                    tool_name: block.name.clone(),
-                                    args: match &args {
-                                        Some(StoredValue { value, .. }) => value.clone(),
-                                        None => serde_json::Value::Object(block.arguments.clone()),
-                                    },
-                                    result: tool_result_from_message(
-                                        tool_result,
-                                        call.terminate().unwrap_or(false),
-                                    ),
-                                    is_error: tool_result.is_error,
-                                });
+                            };
+                            let PendingEntry::Message { payload } = &staged else {
+                                return Err(lane_error(SessionError::Invariant(format!(
+                                    "Tool call {} is missing its staged result",
+                                    call.result_entry_id
+                                ))));
+                            };
+                            let AgentMessage::Standard(Message::ToolResult(tool_result)) =
+                                payload.as_ref()
+                            else {
+                                return Err(lane_error(SessionError::Invariant(format!(
+                                    "Tool call {} is missing its staged result",
+                                    call.result_entry_id
+                                ))));
+                            };
+                            if tool_result.tool_call_id != block.id
+                                || tool_result.tool_name != block.name
+                            {
+                                return Err(lane_error(SessionError::Invariant(format!(
+                                    "Tool call {} has a mismatched staged result",
+                                    call.result_entry_id
+                                ))));
                             }
+                            running_tools.push(LaneSnapshotTool::Settled {
+                                tool_call_id: block.id.clone(),
+                                tool_name: block.name.clone(),
+                                args: match &args {
+                                    Some(StoredValue { value, .. }) => value.clone(),
+                                    None => serde_json::Value::Object(block.arguments.clone()),
+                                },
+                                result: tool_result_from_message(
+                                    tool_result,
+                                    call.terminate().unwrap_or(false),
+                                ),
+                                is_error: tool_result.is_error,
+                            });
                         }
                     }
                 }
@@ -3573,7 +3885,9 @@ impl Lane {
                 kind: intent_kind_of(&operation.meta),
                 started_at: operation.meta.started_at,
                 from_tip_id: operation.meta.source_tip_id.clone(),
-                status: match crate::harness::session::types::operation_scope_of(&operation.state).control {
+                status: match crate::harness::session::types::operation_scope_of(&operation.state)
+                    .control
+                {
                     Control::CancelRequested { .. } => OperationStatus::Aborting,
                     Control::Running => OperationStatus::Open,
                 },
@@ -3587,7 +3901,11 @@ impl Lane {
         let faulted = lock_core(&self.inner)
             .closed_error
             .as_ref()
-            .is_some_and(|error| error.downcast_ref::<crate::harness::result::HarnessFault>().is_some());
+            .is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::harness::result::HarnessFault>()
+                    .is_some()
+            });
 
         Ok(LaneSnapshot {
             lane: self.inner.name.clone(),
@@ -3611,7 +3929,7 @@ impl Lane {
     ) -> Result<Option<pi_ai::types::AssistantMessage>, LaneError> {
         let frames = read_assistant_frames(reader, operation_id, response_entry_id, context)
             .await
-            .map_err(|error| lane_error(error))?;
+            .map_err(lane_error)?;
         let reduced = reduce_assistant_message_frames(frames)
             .map_err(|error| lane_error(SessionError::Message(error)))?;
         Ok(reduced)
@@ -3634,7 +3952,7 @@ impl Lane {
         let entries = reader
             .get_entries(vec![source_entry_id.clone()], context)
             .await
-            .map_err(|error| lane_error(error))?;
+            .map_err(lane_error)?;
         let source = entries.get(&source_entry_id);
         let valid = match source {
             Some(Entry::Message { body, .. }) => match &body.message {
@@ -3654,9 +3972,16 @@ impl Lane {
         })
     }
 
-    async fn set_configuration<F, E>(&self, update: F, event: E, context: &Context) -> Result<(), LaneError>
+    async fn set_configuration<F, E>(
+        &self,
+        update: F,
+        event: E,
+        context: &Context,
+    ) -> Result<(), LaneError>
     where
-        F: Fn(&crate::harness::session::types::LaneConfiguration) -> crate::harness::session::types::LaneConfiguration
+        F: Fn(
+                &crate::harness::session::types::LaneConfiguration,
+            ) -> crate::harness::session::types::LaneConfiguration
             + Send
             + Sync
             + 'static,
@@ -3679,26 +4004,33 @@ impl Lane {
                 Box::pin(async move {
                     let configuration = (update)(&state.configuration);
                     let event_payload = (event)(&state.configuration, &configuration);
-                    let writes = vec![set_value_write(&lane_config(&lane_name), configuration.clone())
-                        .map_err(lane_error)?];
+                    let writes = vec![
+                        set_value_write(&lane_config(&lane_name), configuration.clone())
+                            .map_err(lane_error)?,
+                    ];
                     let mut next = state.clone();
-                    next.configuration = configuration.clone();
+                    next.configuration = configuration;
                     let events_lane = lane_name.clone();
                     Ok(LaneCommand::Commit {
                         writes,
                         next,
                         materialize: Arc::new(|_commit: &CommitResult| ()),
                         events: Some(Arc::new(move |_commit: &CommitResult| {
-                            vec![HarnessEvent::lane_scoped(
-                                &events_lane,
-                                false,
-                                HarnessEventPayload::ConfigUpdate {
-                                    property: crate::harness::agent_harness::ConfigUpdateKind::Lane(
-                                        event_payload.clone(),
-                                    ),
-                                },
-                            )
-                            .unwrap_or_else(|error| unreachable!("config_update is lane-scoped: {error}"))]
+                            vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::ConfigUpdate {
+                                        property:
+                                            crate::harness::agent_harness::ConfigUpdateKind::Lane(
+                                                event_payload.clone(),
+                                            ),
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("config_update is lane-scoped: {error}")
+                                }),
+                            ]
                         })),
                     })
                 })
@@ -3709,6 +4041,10 @@ impl Lane {
     }
 
     /// Scans the branch path, upstream's `findEntries`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the branch
+    /// scan's storage error.
     pub async fn find_entries_impl(
         &self,
         query: Option<&BranchScan>,
@@ -3716,7 +4052,10 @@ impl Lane {
     ) -> Result<Vec<Entry>, LaneError> {
         self.inner.assert_open()?;
         let query = query.cloned().unwrap_or_default();
-        let start = query.start.clone().or_else(|| lock_core(&self.inner).state.tip_id.clone());
+        let start = query
+            .start
+            .clone()
+            .or_else(|| lock_core(&self.inner).state.tip_id.clone());
         let Some(start) = start else {
             return Ok(Vec::new());
         };
@@ -3736,21 +4075,26 @@ impl Lane {
                 context,
             )
             .await
-            .map_err(|error| lane_error(error))
+            .map_err(lane_error)
     }
 
     /// First match on the branch path, upstream's `findEntry`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; the branch
+    /// scan's storage error.
     pub async fn find_entry_impl(
         &self,
         query: Option<&BranchScan>,
         context: &Context,
     ) -> Result<Option<Entry>, LaneError> {
         let mut query = query.cloned().unwrap_or_default();
-        query.limit = Some(match query.limit {
-            Some(limit) => limit.min(1),
-            None => 1,
-        });
-        Ok(self.find_entries_impl(Some(&query), context).await?.into_iter().next())
+        query.limit = Some(query.limit.map_or(1, |limit| limit.min(1)));
+        Ok(self
+            .find_entries_impl(Some(&query), context)
+            .await?
+            .into_iter()
+            .next())
     }
 
     /// One operation's settled record, upstream's `getResult`.
@@ -3782,18 +4126,30 @@ impl Lane {
     }
 
     /// Appends one message at the tip, upstream's `appendMessage`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; a pending
+    /// assistant message rejects; storage and invariant failures fault the
+    /// harness.
     pub async fn append_message_impl(
         &self,
         message: AgentMessage,
         context: &Context,
     ) -> Result<String, LaneError> {
-        self.append(PendingEntry::Message {
-            payload: Box::new(message),
-        }, context)
+        self.append(
+            PendingEntry::Message {
+                payload: Box::new(message),
+            },
+            context,
+        )
         .await
     }
 
     /// Appends one custom entry at the tip, upstream's `appendCustomEntry`.
+    ///
+    /// # Errors
+    /// The sealed error when the lane sealed with a fault; storage and
+    /// invariant failures fault the harness.
     pub async fn append_custom_entry_impl(
         &self,
         custom_type: &str,
@@ -3810,14 +4166,21 @@ impl Lane {
         .await
     }
 
+    #[expect(
+        clippy::similar_names,
+        reason = "upstream names the matched write items `queued` and the rebuilt queue view `queues` in the same scope"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single append method"
+    )]
     async fn append(&self, pending: PendingEntry, context: &Context) -> Result<String, LaneError> {
         self.inner.assert_open()?;
-        if let PendingEntry::Message { payload } = &pending {
-            if let AgentMessage::Standard(Message::Assistant(assistant)) = payload.as_ref() {
-                if assistant.stop_reason == StopReason::Pending {
-                    return Err(lane_error(SessionError::PendingAssistantMessage));
-                }
-            }
+        if let PendingEntry::Message { payload } = &pending
+            && let AgentMessage::Standard(Message::Assistant(assistant)) = payload.as_ref()
+            && assistant.stop_reason == StopReason::Pending
+        {
+            return Err(lane_error(SessionError::PendingAssistantMessage));
         }
         let id = self.inner.session.id_generator().next(None);
         let lane_name = self.inner.name.clone();
@@ -3836,7 +4199,7 @@ impl Lane {
                             let stored = session
                                 .get_value(&pending_entry(&item.entry_id).address, &command_context)
                                 .await
-                                .map_err(|error| lane_error(error))?;
+                                .map_err(lane_error)?;
                             let Some(stored) = stored else {
                                 return Err(lane_error(SessionError::Invariant(format!(
                                     "Pending write {} is missing its payload",
@@ -3857,14 +4220,11 @@ impl Lane {
                         } else {
                             Some(read_lane_queues(session.as_ref(), &inbox, &command_context).await)
                         };
-                        let entries = chain_entries(
-                            state.tip_id.clone(),
-                            {
-                                let mut chained = captured;
-                                chained.push(pending_entry_write(&id, &pending));
-                                chained
-                            },
-                        );
+                        let entries = chain_entries(state.tip_id.clone(), {
+                            let mut chained = captured;
+                            chained.push(pending_entry_write(&id, &pending));
+                            chained
+                        });
                         let mut writes: Vec<Write> = Vec::new();
                         for entry in &entries {
                             writes.push(Write::Entry(Box::new(EntryWrite {
@@ -3882,7 +4242,11 @@ impl Lane {
                         writes.push(
                             set_value_write(
                                 &lane_state(&lane_name),
-                                durable_lane_state(None, &inbox, state.last_operation_id.as_deref()),
+                                durable_lane_state(
+                                    None,
+                                    &inbox,
+                                    state.last_operation_id.as_deref(),
+                                ),
                             )
                             .map_err(lane_error)?,
                         );
@@ -3890,15 +4254,20 @@ impl Lane {
                         next.tip_id = Some(id.clone());
                         next.inbox = inbox;
                         let events_lane = lane_name.clone();
-                        let events_entries = entries.clone();
-                        let events_queues = queues.clone();
+                        let events_entries = entries;
+                        let events_queues = queues;
                         return Ok(LaneCommand::Commit {
                             writes,
                             next,
                             materialize: Arc::new(move |_commit: &CommitResult| id.clone()),
                             events: Some(Arc::new(move |commit: &CommitResult| {
-                                let mut events =
-                                    committed_entry_events(&events_entries, commit, &events_lane, None, 0);
+                                let mut events = committed_entry_events(
+                                    &events_entries,
+                                    commit,
+                                    &events_lane,
+                                    None,
+                                    0,
+                                );
                                 if let Some(Ok(queues)) = &events_queues {
                                     events.push(
                                         HarnessEvent::lane_scoped(
@@ -3908,9 +4277,11 @@ impl Lane {
                                                 queues: queues.clone(),
                                             },
                                         )
-                                        .unwrap_or_else(|error| {
-                                            unreachable!("queue_update is lane-scoped: {error}")
-                                        }),
+                                        .unwrap_or_else(
+                                            |error| {
+                                                unreachable!("queue_update is lane-scoped: {error}")
+                                            },
+                                        ),
                                     );
                                 }
                                 events
@@ -3923,28 +4294,29 @@ impl Lane {
                         entry_id: id.clone(),
                         kind: InboxItemKind::Write,
                     });
-                    let mut queues = read_lane_queues(session.as_ref(), &state.inbox, &command_context)
-                        .await
-                        .map_err(|error| lane_error(error))?;
+                    let mut queues =
+                        read_lane_queues(session.as_ref(), &state.inbox, &command_context)
+                            .await
+                            .map_err(lane_error)?;
                     queues.push(match &pending {
                         PendingEntry::Message { payload } => LaneQueuedItem::Message {
                             entry_id: id.clone(),
                             kind: InboxItemKind::Write,
                             message: payload.clone(),
                         },
-                        PendingEntry::Custom { custom_type, payload } => LaneQueuedItem::Custom {
+                        PendingEntry::Custom {
+                            custom_type,
+                            payload,
+                        } => LaneQueuedItem::Custom {
                             entry_id: id.clone(),
                             kind: InboxItemKind::Write,
                             custom_type: custom_type.clone(),
                             data: payload.clone(),
                         },
                     });
-                    let mut writes: Vec<Write> = Vec::new();
-                    writes.push(
+                    let writes: Vec<Write> = vec![
                         set_value_write(&pending_entry(&id), pending.clone())
                             .map_err(lane_error)?,
-                    );
-                    writes.push(
                         set_value_write(
                             &lane_state(&lane_name),
                             durable_lane_state(
@@ -3954,7 +4326,7 @@ impl Lane {
                             ),
                         )
                         .map_err(lane_error)?,
-                    );
+                    ];
                     let mut next = state.clone();
                     next.inbox = inbox;
                     let events_lane = lane_name.clone();
@@ -3964,14 +4336,18 @@ impl Lane {
                         next,
                         materialize: Arc::new(move |_commit: &CommitResult| id.clone()),
                         events: Some(Arc::new(move |_commit: &CommitResult| {
-                            vec![HarnessEvent::lane_scoped(
-                                &events_lane,
-                                false,
-                                HarnessEventPayload::QueueUpdate {
-                                    queues: events_queues.clone(),
-                                },
-                            )
-                            .unwrap_or_else(|error| unreachable!("queue_update is lane-scoped: {error}"))]
+                            vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::QueueUpdate {
+                                        queues: events_queues.clone(),
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("queue_update is lane-scoped: {error}")
+                                }),
+                            ]
                         })),
                     })
                 })
@@ -4030,14 +4406,11 @@ fn mismatch_for(
         expected_operation_id: expected.to_owned(),
         current_operation_id,
         last_operation_id,
-        message: format!(
-            "Operation {expected} does not own lane {}",
-            quoted(lane)
-        ),
+        message: format!("Operation {expected} does not own lane {}", quoted(lane)),
     }
 }
 
-fn admission_kind_name(kind: OperationKind) -> &'static str {
+const fn admission_kind_name(kind: OperationKind) -> &'static str {
     match kind {
         OperationKind::Run => "run",
         OperationKind::Compaction => "compaction",
@@ -4045,14 +4418,16 @@ fn admission_kind_name(kind: OperationKind) -> &'static str {
     }
 }
 
-fn wait_reason_name(reason: &crate::harness::agent_harness::DriveWaitReason) -> &'static str {
+const fn wait_reason_name(reason: &crate::harness::agent_harness::DriveWaitReason) -> &'static str {
     match reason {
         crate::harness::agent_harness::DriveWaitReason::Retry { .. } => "retry",
         crate::harness::agent_harness::DriveWaitReason::Deferred { .. } => "deferred",
     }
 }
 
-fn tool_output_payload_to_result(payload: crate::harness::session::values::ToolOutputPayload) -> AgentToolResult {
+fn tool_output_payload_to_result(
+    payload: crate::harness::session::values::ToolOutputPayload,
+) -> AgentToolResult {
     AgentToolResult {
         content: payload.content,
         details: payload.details,
@@ -4082,7 +4457,7 @@ fn closed_harness_error(error: &LaneError) -> HarnessError {
 
 impl AgentLane for Lane {
     fn name(&self) -> &str {
-        Lane::name(self)
+        Self::name(self)
     }
 
     fn get_tip_id(
