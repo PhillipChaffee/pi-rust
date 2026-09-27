@@ -219,3 +219,11 @@ async fn resolve_kind_walks_symlinks_and_drops_unresolvable_paths() {
     // `not_found` on the canonical target stays silent.
     assert!(diagnostics.is_empty());
 }
+
+/// The frontmatter error displays its message, the diagnostic text.
+#[test]
+fn the_frontmatter_error_displays_its_message() {
+    let error = parse_frontmatter("---\na: b\na: c\n---\nbody").expect_err("duplicate keys fail");
+    assert_eq!(error.to_string(), error.0);
+    assert!(!error.0.is_empty());
+}

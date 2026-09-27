@@ -12,8 +12,9 @@
 use crate::harness::context::background_context;
 use crate::harness::fs_scan::{DiagnosticSeverity, SourcedPath};
 use crate::harness::prompt_templates::{
-    SourcedPromptTemplate, format_prompt_template_invocation, load_prompt_templates,
-    load_sourced_prompt_templates, load_sourced_prompt_templates_mapped, parse_command_args,
+    PromptTemplateDiagnostic, PromptTemplateDiagnosticCode, SourcedPromptTemplate,
+    format_prompt_template_invocation, load_prompt_templates, load_sourced_prompt_templates,
+    load_sourced_prompt_templates_mapped, load_template_from_file, parse_command_args,
     substitute_args,
 };
 use crate::harness::test_support::{TestSource, env_for, file_path, mkdir, write};
@@ -403,4 +404,130 @@ async fn the_sourced_mapper_converts_to_the_application_template_type() {
             source: TestSource::User,
         }]
     );
+}
+
+// --- boundary: the loader's error-diagnostic branches, bound through the
+// --- fault-injecting environment.
+
+use crate::harness::test_support::{Fault, FaultEnv};
+use crate::harness::types::FileErrorCode;
+
+const BOOM: Fault = Fault {
+    path_contains: "",
+    code: FileErrorCode::Unknown,
+    message: "boom",
+};
+
+/// A root file-info failure outside `not_found` reports the diagnostic;
+/// `not_found` stays silent.
+#[tokio::test]
+async fn a_file_info_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let context = background_context();
+
+    let mut env = FaultEnv::new(root.path());
+    env.file_info_fault = Some(BOOM);
+    let loaded = load_prompt_templates(&env, &["prompts".to_owned()], &context).await;
+    assert!(loaded.prompt_templates.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![PromptTemplateDiagnostic::warning(
+            PromptTemplateDiagnosticCode::FileInfoFailed,
+            "boom",
+            "prompts",
+        )]
+    );
+
+    env.file_info_fault = Some(Fault {
+        code: FileErrorCode::NotFound,
+        ..BOOM
+    });
+    let loaded = load_prompt_templates(&env, &["prompts".to_owned()], &context).await;
+    assert!(loaded.prompt_templates.is_empty());
+    assert!(loaded.diagnostics.is_empty());
+}
+
+/// A listing failure reports the `list_failed` diagnostic.
+#[tokio::test]
+async fn a_listing_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    mkdir(&env, "prompts", &context).await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.list_dir_fault = Some(BOOM);
+    let loaded = load_prompt_templates(&faulted, &["prompts".to_owned()], &context).await;
+    assert!(loaded.prompt_templates.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![PromptTemplateDiagnostic::warning(
+            PromptTemplateDiagnosticCode::ListFailed,
+            "boom",
+            root.path().join("prompts").to_string_lossy().as_ref(),
+        )]
+    );
+}
+
+/// A template read failure reports `read_failed`.
+#[tokio::test]
+async fn a_read_failure_reports_the_diagnostic() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    write(&env, "prompts/keep.md", "Body", &context).await;
+
+    let mut faulted = FaultEnv::new(root.path());
+    faulted.read_text_file_fault = Some(BOOM);
+    let loaded = load_prompt_templates(&faulted, &["prompts/keep.md".to_owned()], &context).await;
+    assert!(loaded.prompt_templates.is_empty());
+    assert_eq!(
+        loaded.diagnostics,
+        vec![PromptTemplateDiagnostic::warning(
+            PromptTemplateDiagnosticCode::ReadFailed,
+            "boom",
+            root.path()
+                .join("prompts/keep.md")
+                .to_string_lossy()
+                .as_ref(),
+        )]
+    );
+}
+
+/// An explicit path that resolves through a broken symlink skips silently,
+/// the loader's `_ => {}` arm.
+#[tokio::test]
+async fn an_explicit_broken_symlink_path_skips_silently() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    std::os::unix::fs::symlink(
+        file_path(root.path(), "missing.md"),
+        file_path(root.path(), "broken-link.md"),
+    )
+    .expect("symlink");
+
+    let paths = vec!["broken-link.md".to_owned()];
+    let loaded = load_prompt_templates(&env, &paths, &context).await;
+    assert!(loaded.prompt_templates.is_empty());
+    assert!(loaded.diagnostics.is_empty());
+}
+
+/// The name strip is case-insensitive, upstream's `/\.md$/i`: the four
+/// case shapes strip. The loader's case-sensitive selection never routes
+/// these through, so the restatement binds by calling the loader's file
+/// reader directly.
+#[tokio::test]
+async fn the_name_strip_is_case_insensitive() {
+    let root = tempfile::tempdir().expect("temp root");
+    let env = env_for(root.path());
+    let context = background_context();
+    write(&env, "notes.md", "Body", &context).await;
+
+    for file_name in ["notes.md", "notes.MD", "notes.Md", "notes.mD"] {
+        let (template, diagnostics) =
+            load_template_from_file(&env, "notes.md", file_name, &context).await;
+        assert!(diagnostics.is_empty());
+        assert_eq!(template.expect("template").name, "notes");
+    }
 }
