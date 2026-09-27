@@ -10,10 +10,12 @@
 //! skills child, and the drive-pass procedure loop rides the drive child.
 
 #[cfg(test)]
-pub(crate) mod test_support;
+mod boundary;
 pub mod lane;
 pub mod progress;
 pub mod reducer;
 pub mod restore;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod transcript;
 pub mod types;

@@ -265,7 +265,7 @@ fn without_inbox_items(inbox: &[InboxItem], removed: &[InboxItem]) -> Vec<InboxI
 }
 
 /// The inbox admission split, upstream's `selectAcceptedInbox`.
-fn select_accepted_inbox(
+pub(crate) fn select_accepted_inbox(
     inbox: &[InboxItem],
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
@@ -307,7 +307,7 @@ fn captured_settings(config: &Config) -> RunSettings {
 /// The durable lane record one commit publishes, upstream's
 /// `durableLaneState` — only the fields the durable layer stores; the live
 /// operation rides its own writes.
-fn durable_lane_state(
+pub(crate) fn durable_lane_state(
     current_operation_id: Option<&str>,
     inbox: &[InboxItem],
     last_operation_id: Option<&str>,
@@ -375,7 +375,7 @@ fn user_text_message(text: String, timestamp: i64) -> AgentMessage {
 /// The model identity the operation's live state captured, upstream's
 /// `capturedModel`.
 #[must_use]
-fn captured_model(operation: &OperationState) -> Option<ModelIdentity> {
+pub(crate) fn captured_model(operation: &OperationState) -> Option<ModelIdentity> {
     match operation {
         OperationState::AssistantReady(leaf) => Some(leaf.generation_context.configuration.model.clone()),
         OperationState::AssistantEffectPending(leaf) => Some(leaf.generation_context.configuration.model.clone()),
@@ -668,10 +668,16 @@ impl Lane {
     }
 
     /// Installs or clears the active drive pass; package-internal, the
-    /// procedure tests' direct-owner statement.
-    #[expect(
-        dead_code,
-        reason = "the drive child's deterministic procedure tests install exact owners through this setter; the runtime child's own drive path mutates the core under its lock"
+    /// procedure tests' direct-owner statement. The lib build sees no
+    /// caller (the lane's own drive path mutates the core under its lock)
+    /// until the drive child lands; the test builds reach it through the
+    /// progress and boundary suites.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the drive child's deterministic procedure tests install exact owners through this setter; until then only the runtime suites call it"
+        )
     )]
     pub(crate) fn set_active_drive(&self, drive: Option<Arc<Drive>>) {
         lock_core(&self.inner).active_drive = drive;
@@ -4533,3 +4539,6 @@ impl AgentLane for Lane {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

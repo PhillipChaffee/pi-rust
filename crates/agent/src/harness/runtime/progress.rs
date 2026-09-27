@@ -304,3 +304,6 @@ pub fn open_tool_progress(
         }),
     )
 }
+
+#[cfg(test)]
+mod tests;

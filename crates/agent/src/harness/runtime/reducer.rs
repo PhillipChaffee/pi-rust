@@ -376,3 +376,6 @@ fn compaction_end_record(
         ended_at,
     }
 }
+
+#[cfg(test)]
+mod tests;
