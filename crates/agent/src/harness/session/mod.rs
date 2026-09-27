@@ -13,6 +13,7 @@ pub mod context;
 pub mod fork;
 pub mod fork_policy;
 pub mod in_memory_storage_state;
+pub mod jsonl;
 pub mod memory;
 pub mod mutation_line;
 #[expect(

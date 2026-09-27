@@ -1074,7 +1074,7 @@ impl Session for StorageBackedSession {
         }
         self.core
             .mutation_line
-            .seal(SessionError::Message("Session is closed".to_owned()));
+            .latch(SessionError::Message("Session is closed".to_owned()));
         let core = self.core.clone();
         let context = context.clone();
         Box::pin(async move {
