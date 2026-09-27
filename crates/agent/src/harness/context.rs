@@ -19,6 +19,28 @@ pub use pi_chord::context::{
 use std::sync::OnceLock;
 
 use pi_telemetry::{NOOP_TELEMETRY_CONTEXT, TelemetryHandle};
+use tokio_util::sync::CancellationToken;
+
+/// The cancellation token a provider request carries for one context,
+/// upstream's `signal: context.abortSignal` option field.
+///
+/// pi-ai's transport options cancel through a `CancellationToken`; the
+/// chord signal links to a fresh one. The link task cancels the token when
+/// the signal aborts and exits when either side settles, so it lives as
+/// long as the operation the context belongs to. A context without an
+/// abort signal returns `None`, the un-cancellable request.
+pub(crate) fn request_signal(context: &Context) -> Option<CancellationToken> {
+    let signal = context.abort_signal()?;
+    let token = CancellationToken::new();
+    let linked = token.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = signal.wait() => linked.cancel(),
+            () = linked.cancelled() => {},
+        }
+    });
+    Some(token)
+}
 
 /// The key the telemetry parent is stored under, upstream's
 /// `TELEMETRY_CONTEXT_KEY` (`"pi.telemetryContext"`).
