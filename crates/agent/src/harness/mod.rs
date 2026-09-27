@@ -26,6 +26,7 @@ pub mod hooks;
 pub mod messages;
 pub mod prompt_templates;
 pub mod result;
+pub mod runtime;
 pub mod session;
 pub mod skills;
 pub mod system_prompt;

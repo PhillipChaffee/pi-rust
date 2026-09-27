@@ -1742,6 +1742,7 @@ pub type PromptProvider = Arc<
 
 /// The system-prompt source, upstream's
 /// `string | ((toolContext, context) => string | Promise<string>)`.
+#[derive(Clone)]
 pub enum SystemPromptSource {
     /// One static prompt.
     Static(String),
@@ -1910,6 +1911,7 @@ pub trait AgentLane: Send + Sync {
     fn steer(
         &self,
         message: QueueMessage,
+        images: QueueImages,
         context: &Context,
     ) -> BoxedFuture<'_, Result<QueueResult, LaneOperationError>>;
 
@@ -1917,6 +1919,7 @@ pub trait AgentLane: Send + Sync {
     fn follow_up(
         &self,
         message: QueueMessage,
+        images: QueueImages,
         context: &Context,
     ) -> BoxedFuture<'_, Result<QueueResult, LaneOperationError>>;
 
@@ -1924,6 +1927,7 @@ pub trait AgentLane: Send + Sync {
     fn next_run(
         &self,
         message: QueueMessage,
+        images: QueueImages,
         context: &Context,
     ) -> BoxedFuture<'_, Result<QueueResult, LaneOperationError>>;
 

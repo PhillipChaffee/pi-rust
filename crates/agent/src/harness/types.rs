@@ -210,6 +210,7 @@ pub type ToolContextProvider =
 ///
 /// The resolved context is the erased [`ToolContext`]; the provider receives
 /// the chord `Context` and returns the turn's context value or `None`.
+#[derive(Clone)]
 pub enum AgentHarnessToolContextSource {
     /// One static context value shared by every turn.
     Static(ToolContext),

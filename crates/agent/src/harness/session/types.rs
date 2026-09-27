@@ -856,6 +856,25 @@ pub struct ToolCall {
     status: ToolCallStatus,
 }
 
+impl ToolCall {
+    /// The call's phase, upstream's `ToolCall.status`.
+    #[must_use]
+    pub const fn status(&self) -> &ToolCallStatus {
+        &self.status
+    }
+
+    /// Whether the phase carries the terminate hint, upstream's
+    /// `call.terminate` reads on the completed/outcome-ready phases.
+    #[must_use]
+    pub const fn terminate(&self) -> Option<bool> {
+        match &self.status {
+            ToolCallStatus::Planned | ToolCallStatus::EffectPending { .. } => None,
+            ToolCallStatus::OutcomeReady { terminate }
+            | ToolCallStatus::Completed { terminate } => Some(*terminate),
+        }
+    }
+}
+
 /// The tool-call phase, upstream's `ToolCall["status"]` union.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -1309,6 +1328,28 @@ pub enum OperationState {
     /// A navigation is ready to commit.
     #[serde(rename = "navigation.ready_to_commit")]
     NavigationReadyToCommit(NavigationReadyToCommitOperation),
+}
+
+impl OperationState {
+    /// The wire `at` discriminator, upstream's `OperationState["at"]`.
+    #[must_use]
+    pub const fn at(&self) -> &'static str {
+        match self {
+            Self::Starting(_) => "starting",
+            Self::Checkpoint(_) => "checkpoint",
+            Self::AssistantReady(_) => "assistant.ready",
+            Self::AssistantEffectPending(_) => "assistant.effect_pending",
+            Self::AssistantRetryWait(_) => "assistant.retry_wait",
+            Self::Tools(_) => "tools",
+            Self::DeferredSuspended(_) => "deferred.suspended",
+            Self::DeferredEffectPending(_) => "deferred.effect_pending",
+            Self::SummaryDeciding(_) => "summary.deciding",
+            Self::SummaryReady(_) => "summary.ready",
+            Self::SummaryEffectPending(_) => "summary.effect_pending",
+            Self::SummaryRetryWait(_) => "summary.retry_wait",
+            Self::NavigationReadyToCommit(_) => "navigation.ready_to_commit",
+        }
+    }
 }
 
 /// Copies only the uniform operation scope when constructing a successor
