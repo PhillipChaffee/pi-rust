@@ -9,15 +9,17 @@
 //! message helpers, the effect gate, the hook registry, the event bus, and
 //! the agent-harness type surface, plus the prompt-surface loaders
 //! (skills, prompt templates, system prompt; map child "pi-agent-core:
-//! skills, prompt templates, and system prompt"). The nodejs execution
-//! environment, the session and compaction implementations, and the
-//! runtime constructor ride their own tickets.
+//! skills, prompt templates, and system prompt"); the execution layer (the
+//! tool-call pipeline and the assistant stream runner) rides the execution
+//! child. The nodejs execution environment, the session and compaction
+//! implementations, and the runtime constructor ride their own tickets.
 pub mod agent_harness;
 pub mod compaction;
 pub mod config;
 pub mod context;
 pub mod env;
 pub mod events;
+pub mod execution;
 pub mod fs_scan;
 pub mod gate;
 pub mod hooks;

@@ -633,7 +633,11 @@ impl AssistantMessageFrameEncoder {
     }
 }
 
-const fn event_type_name(event: &AssistantMessageEvent) -> &'static str {
+/// The event's wire name, the `type` discriminator the protocol carries;
+/// shared with the harness assistant runner's protocol-violation
+/// messages.
+#[must_use]
+pub const fn event_type_name(event: &AssistantMessageEvent) -> &'static str {
     match event {
         AssistantMessageEvent::Start { .. } => "start",
         AssistantMessageEvent::TextStart { .. } => "text_start",
