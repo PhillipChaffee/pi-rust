@@ -53,22 +53,35 @@ use crate::harness::agent_harness::OperationRequest;
 use crate::harness::agent_harness::PromptMessagesPayload;
 use crate::harness::agent_harness::QueueMessage;
 use crate::harness::context::background_context;
-use crate::harness::hooks::HookErrorReporter;
 use crate::harness::hooks::HookRegistry;
 use crate::harness::result::HarnessClosed;
 use crate::harness::runtime::lane::EmitBatch;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::restore::restore_lane;
 use crate::harness::runtime::test_support::ControlledStorage;
+use crate::harness::runtime::test_support::accept_text;
 use crate::harness::runtime::test_support::commit_failure;
+use crate::harness::runtime::test_support::commit_writes;
 use crate::harness::runtime::test_support::deferred;
 use crate::harness::runtime::test_support::empty_lane_snapshot;
+use crate::harness::runtime::test_support::finish_operation;
+use crate::harness::runtime::test_support::gate_next_commit;
+use crate::harness::runtime::test_support::generation_context;
 use crate::harness::runtime::test_support::lane_configuration;
+use crate::harness::runtime::test_support::main_lane_seed_writes;
+use crate::harness::runtime::test_support::memory_session_with_seed;
 use crate::harness::runtime::test_support::noop_emit_batch;
+use crate::harness::runtime::test_support::noop_hook_reporter;
+use crate::harness::runtime::test_support::operation_scope;
 use crate::harness::runtime::test_support::passthrough_fault_handler;
+use crate::harness::runtime::test_support::patch_live_state;
 use crate::harness::runtime::test_support::recording_watch_installer;
+use crate::harness::runtime::test_support::restored_lane_with_config;
 use crate::harness::runtime::test_support::runtime_config;
 use crate::harness::runtime::test_support::runtime_session;
+use crate::harness::runtime::test_support::user_blocks_message;
+use crate::harness::runtime::test_support::user_text_message;
+use crate::harness::runtime::types::Config;
 use crate::harness::runtime::types::ContinueOperationResult;
 use crate::harness::runtime::types::LaneCommand;
 use crate::harness::runtime::types::LaneError;
@@ -100,10 +113,6 @@ fn next_session_id() -> String {
     format!("runtime-lane-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
-fn noop_hook_reporter() -> HookErrorReporter {
-    Arc::new(|_error, _name, _site, _context| Box::pin(std::future::ready(())))
-}
-
 /// The fixture upstream's `createLane` builds: the storage-backed session
 /// over the controlled memory backend, seeded with the branch tip, the lane
 /// configuration, and the lane state; the faux provider registered into a
@@ -131,36 +140,9 @@ async fn lane_seeded(emit_batch: EmitBatch, extra: Vec<stored_values::Write>) ->
         MemoryStorageOptions::default(),
     ))));
     let session = Arc::new(runtime_session(next_session_id(), storage.clone()));
-    let mut writes = vec![
-        set_value_write(&stored_values::branch_tip("main"), Option::<String>::None)
-            .expect("tip write"),
-        set_value_write(&stored_values::lane_config("main"), configuration.clone())
-            .expect("config write"),
-        set_value_write(
-            &stored_values::lane_state("main"),
-            crate::harness::session::types::LaneState {
-                current_operation_id: None,
-                last_operation_id: None,
-                inbox: Vec::new(),
-            },
-        )
-        .expect("state write"),
-    ];
+    let mut writes = main_lane_seed_writes(&configuration).expect("seed writes");
     writes.extend(extra);
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("seed commit");
+    commit_writes(&session, writes).await;
     let faux = faux_provider(RegisterFauxProviderOptions::default());
     let models = Arc::new(create_models(None));
     models.set_provider(Arc::new(faux.provider.clone()));
@@ -302,17 +284,7 @@ async fn reads_and_replaces_configuration_from_owned_state() {
 #[tokio::test]
 async fn derives_queued_configuration_updates_from_the_latest_committed_state() {
     let fixture = create_lane().await;
-    let (commit_started, started) = deferred();
-    let (release, release_rx) = deferred();
-    fixture
-        .storage
-        .set_before_next_commit(Some(Box::new(move || {
-            Box::pin(async move {
-                let _ = commit_started.send(());
-                let _ = release_rx.await;
-                Ok(())
-            })
-        })));
+    let (started, release) = gate_next_commit(&fixture.storage);
 
     let identity = ModelIdentity {
         provider: fixture.model.provider.0.clone(),
@@ -581,17 +553,7 @@ async fn preserves_committed_memory_when_synchronous_event_publication_fails() {
 #[tokio::test]
 async fn rejects_work_after_sealing_while_an_admitted_commit_finishes() {
     let fixture = create_lane().await;
-    let (commit_started, started) = deferred();
-    let (release, release_rx) = deferred();
-    fixture
-        .storage
-        .set_before_next_commit(Some(Box::new(move || {
-            Box::pin(async move {
-                let _ = commit_started.send(());
-                let _ = release_rx.await;
-                Ok(())
-            })
-        })));
+    let (started, release) = gate_next_commit(&fixture.storage);
 
     let admitted = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
     started.await.expect("commit started");
@@ -633,17 +595,7 @@ async fn rejects_work_after_sealing_while_an_admitted_commit_finishes() {
 #[tokio::test]
 async fn publishes_memory_only_after_the_durable_commit_succeeds() {
     let fixture = create_lane().await;
-    let (commit_started, started) = deferred();
-    let (release, release_rx) = deferred();
-    fixture
-        .storage
-        .set_before_next_commit(Some(Box::new(move || {
-            Box::pin(async move {
-                let _ = commit_started.send(());
-                let _ = release_rx.await;
-                Ok(())
-            })
-        })));
+    let (started, release) = gate_next_commit(&fixture.storage);
 
     let command = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
     started.await.expect("commit started");
@@ -768,21 +720,7 @@ async fn commit_cancelled_control(
 #[tokio::test]
 async fn diverts_ordinary_work_but_settles_against_latest_cancelled_control() {
     let fixture = create_lane().await;
-    let accepted = fixture
-        .lane
-        .accept(
-            OperationRequest::Prompt {
-                operation_id: None,
-                prompt: Box::new(PromptMessagesPayload::Text {
-                    prompt: "hello".to_owned(),
-                    images: None,
-                }),
-            },
-            &background_context(),
-        )
-        .await
-        .expect("accept serves")
-        .expect("the admission succeeds");
+    let accepted = accept_text(&fixture.lane, "hello").await;
     let operation = fixture
         .lane
         .state()
@@ -885,17 +823,7 @@ async fn diverts_ordinary_work_but_settles_against_latest_cancelled_control() {
 #[tokio::test]
 async fn plans_queued_commands_from_the_latest_committed_memory() {
     let fixture = create_lane().await;
-    let (commit_started, started) = deferred();
-    let (release, release_rx) = deferred();
-    fixture
-        .storage
-        .set_before_next_commit(Some(Box::new(move || {
-            Box::pin(async move {
-                let _ = commit_started.send(());
-                let _ = release_rx.await;
-                Ok(())
-            })
-        })));
+    let (started, release) = gate_next_commit(&fixture.storage);
     let observed = Arc::new(Mutex::new(Vec::new()));
 
     let first = tokio::spawn(set_thinking_level(
@@ -980,30 +908,6 @@ fn closed_message(error: LaneOperationError) -> String {
     match error {
         LaneOperationError::Closed(reason) => reason.to_string(),
     }
-}
-
-/// The user message the boundary fixtures build, upstream's inline
-/// `{ role: "user", content: text }` literals.
-fn boundary_user_message(text: &str) -> AgentMessage {
-    AgentMessage::Standard(Message::User(pi_ai::types::UserMessage {
-        content: pi_ai::types::UserContent::Text(text.to_owned()),
-        timestamp: 1,
-    }))
-}
-
-/// The zero usage wire the boundary fixtures' assistant literals carry.
-/// The queued text message enqueue builds: the content is blocks with the
-/// text first, upstream's `{ type: "user", content: [...] }` construction.
-fn steer_message(text: &str) -> AgentMessage {
-    AgentMessage::Standard(Message::User(pi_ai::types::UserMessage {
-        content: pi_ai::types::UserContent::Blocks(vec![pi_ai::types::UserBlock::Text(
-            pi_ai::types::TextContent {
-                text: text.to_owned(),
-                text_signature: None,
-            },
-        )]),
-        timestamp: 1,
-    }))
 }
 
 /// The message's content wire, the shape the queued/committed comparisons
@@ -1126,7 +1030,7 @@ async fn cancel_queued_reports_not_found_and_already_consumed() {
 
     let appended = fixture
         .lane
-        .append_message(boundary_user_message("tail"), &background_context())
+        .append_message(user_text_message("tail"), &background_context())
         .await
         .expect("append serves");
     let consumed = fixture
@@ -1255,7 +1159,7 @@ async fn append_during_a_run_queues_the_write() {
         .expect("the admission");
     let entry_id = fixture
         .lane
-        .append_message(boundary_user_message("tail"), &background_context())
+        .append_message(user_text_message("tail"), &background_context())
         .await
         .expect("append queues");
     assert_eq!(
@@ -1382,24 +1286,6 @@ fn settled_record(operation_id: &str, tip_id: Option<&str>) -> OperationResultRe
     }
 }
 
-async fn commit_writes(fixture: &LaneFixture, writes: Vec<stored_values::Write>) {
-    let session = Arc::clone(&fixture.session);
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("the commit settles");
-}
-
 async fn accepted_operation(fixture: &LaneFixture) -> String {
     fixture
         .lane
@@ -1456,7 +1342,7 @@ async fn accept_captures_a_queued_steer_into_the_run() {
         crate::harness::session::types::Entry::Message { body, .. } => {
             assert_eq!(
                 content_wire(&body.message),
-                content_wire(&steer_message("steer"))
+                content_wire(&user_blocks_message("steer"))
             );
         }
         other => panic!("the steer entry: {other:?}"),
@@ -1487,7 +1373,7 @@ async fn accept_captures_a_queued_steer_into_the_run() {
 async fn drive_returns_the_settled_record_of_a_finished_operation() {
     let fixture = create_lane().await;
     commit_writes(
-        &fixture,
+        &fixture.session,
         vec![
             set_value_write(
                 &stored_values::operation_result("settled"),
@@ -1783,7 +1669,7 @@ async fn request_abort_returns_the_queued_steer_and_follow_up() {
     assert!(outcome.newly_requested);
     assert_eq!(
         outcome.steer.iter().map(content_wire).collect::<Vec<_>>(),
-        vec![content_wire(&steer_message("steer"))],
+        vec![content_wire(&user_blocks_message("steer"))],
     );
     assert_eq!(
         outcome
@@ -1791,7 +1677,7 @@ async fn request_abort_returns_the_queued_steer_and_follow_up() {
             .iter()
             .map(content_wire)
             .collect::<Vec<_>>(),
-        vec![content_wire(&steer_message("follow"))],
+        vec![content_wire(&user_blocks_message("follow"))],
     );
     assert!(
         fixture.lane.state().inbox.is_empty(),
@@ -1969,7 +1855,7 @@ async fn prompt_messages_accepts_prebuilt_payloads() {
     let single = fixture
         .lane
         .prompt_messages(
-            PromptMessagesPayload::Message(Box::new(boundary_user_message("hello"))),
+            PromptMessagesPayload::Message(Box::new(user_text_message("hello"))),
             &background_context(),
         )
         .await;
@@ -1982,8 +1868,8 @@ async fn prompt_messages_accepts_prebuilt_payloads() {
         .lane
         .prompt_messages(
             PromptMessagesPayload::Messages(vec![
-                boundary_user_message("first"),
-                boundary_user_message("second"),
+                user_text_message("first"),
+                user_text_message("second"),
             ]),
             &background_context(),
         )
@@ -2042,6 +1928,20 @@ async fn skill_reports_unknown_skills() {
     assert_eq!(error.tag(), "UnknownSkill");
 }
 
+/// The seeded lane over one resource-configured runtime, the staged-seam
+/// invocation tests' fixture.
+async fn seeded_lane_with_config(config: Config) -> Lane {
+    let configuration = lane_configuration();
+    let session = memory_session_with_seed(None).await;
+    restored_lane_with_config(
+        session,
+        noop_emit_batch(),
+        recording_watch_installer(empty_lane_snapshot("main", &configuration)),
+        Arc::new(move || config.clone()),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn skill_formats_a_known_invocation() {
     let mut config = runtime_config();
@@ -2052,54 +1952,7 @@ async fn skill_formats_a_known_invocation() {
         file_path: "/skills/greet/SKILL.md".to_owned(),
         disable_model_invocation: None,
     }];
-    let configuration = lane_configuration();
-    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
-        MemoryStorageOptions::default(),
-    ))));
-    let session = Arc::new(runtime_session(next_session_id(), storage));
-    let writes = vec![
-        set_value_write(&stored_values::branch_tip("main"), Option::<String>::None)
-            .expect("tip write"),
-        set_value_write(&stored_values::lane_config("main"), configuration.clone())
-            .expect("config write"),
-        set_value_write(
-            &stored_values::lane_state("main"),
-            crate::harness::session::types::LaneState {
-                current_operation_id: None,
-                last_operation_id: None,
-                inbox: Vec::new(),
-            },
-        )
-        .expect("state write"),
-    ];
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("seed commit");
-    let restored = restore_lane(session.clone(), "main", &background_context())
-        .await
-        .expect("restore");
-    let lane = Lane::new(
-        "main",
-        session,
-        Arc::new(create_models(None)),
-        Arc::new(HookRegistry::new(noop_hook_reporter())),
-        restored,
-        passthrough_fault_handler(),
-        noop_emit_batch(),
-        recording_watch_installer(empty_lane_snapshot("main", &configuration)),
-        Arc::new(move || config.clone()),
-    );
+    let lane = seeded_lane_with_config(config).await;
     let result = lane
         .skill("greet", Some("be kind".to_owned()), &background_context())
         .await;
@@ -2149,54 +2002,7 @@ async fn prompt_from_template_formats_known_templates() {
         description: None,
         content: "Args: $1?".to_owned(),
     }];
-    let configuration = lane_configuration();
-    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
-        MemoryStorageOptions::default(),
-    ))));
-    let session = Arc::new(runtime_session(next_session_id(), storage));
-    let writes = vec![
-        set_value_write(&stored_values::branch_tip("main"), Option::<String>::None)
-            .expect("tip write"),
-        set_value_write(&stored_values::lane_config("main"), configuration.clone())
-            .expect("config write"),
-        set_value_write(
-            &stored_values::lane_state("main"),
-            crate::harness::session::types::LaneState {
-                current_operation_id: None,
-                last_operation_id: None,
-                inbox: Vec::new(),
-            },
-        )
-        .expect("state write"),
-    ];
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("seed commit");
-    let restored = restore_lane(session.clone(), "main", &background_context())
-        .await
-        .expect("restore");
-    let lane = Lane::new(
-        "main",
-        session,
-        Arc::new(create_models(None)),
-        Arc::new(HookRegistry::new(noop_hook_reporter())),
-        restored,
-        passthrough_fault_handler(),
-        noop_emit_batch(),
-        recording_watch_installer(empty_lane_snapshot("main", &configuration)),
-        Arc::new(move || config.clone()),
-    );
+    let lane = seeded_lane_with_config(config).await;
     let result = lane
         .prompt_from_template(
             "greet",
@@ -2333,7 +2139,7 @@ async fn steer_rejects_a_pending_assistant_message() {
 #[tokio::test]
 async fn steer_merges_images_into_a_prebuilt_user_message() {
     let fixture = create_lane().await;
-    let user = boundary_user_message("hello");
+    let user = user_text_message("hello");
     let entry_id = fixture
         .lane
         .steer(
@@ -2424,7 +2230,7 @@ async fn cancel_queued_reports_the_missing_payload_invariant() {
     let deleted = vec![stored_values::delete_value_write(
         &stored_values::pending_entry(&entry_id),
     )];
-    commit_writes(&fixture, deleted).await;
+    commit_writes(&fixture.session, deleted).await;
 
     let error = fixture
         .lane
@@ -2486,7 +2292,7 @@ async fn find_entries_scan_from_the_tip_and_get_result_reads_records() {
 
     let appended = fixture
         .lane
-        .append_message(boundary_user_message("tail"), &background_context())
+        .append_message(user_text_message("tail"), &background_context())
         .await
         .expect("append serves");
     let entries = AgentLane::find_entries(&fixture.lane, None, &background_context())
@@ -2539,7 +2345,7 @@ async fn wait_for_idle_wakes_on_state_changes_until_the_lane_idles() {
     );
 
     // Finishing the operation idles the lane; the wait returns.
-    finish_operation(&fixture).await;
+    finish_operation(&fixture.lane).await;
     waiting
         .await
         .expect("wait join")
@@ -2548,38 +2354,6 @@ async fn wait_for_idle_wakes_on_state_changes_until_the_lane_idles() {
         fixture.lane.state().last_operation_id.is_some(),
         "the finished operation recorded",
     );
-}
-
-/// Finishes the admitted operation through `settleOperation`, the lane's
-/// own finish path: the result record writes and the operation clears.
-async fn finish_operation(fixture: &LaneFixture) {
-    let operation_id = fixture
-        .lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the active operation");
-    let record = settled_record(&operation_id, None);
-    fixture
-        .lane
-        .settle_operation::<(), _>(
-            move |_state, _operation_state, _meta, _session, _context| {
-                let record = record.clone();
-                Box::pin(async move {
-                    Ok(OperationCommand::Finish {
-                        writes: Vec::new(),
-                        record,
-                        lane: None,
-                        materialize: Arc::new(|_commit| ()),
-                        events: None,
-                    })
-                })
-            },
-            &background_context(),
-        )
-        .await
-        .expect("the finish settles");
 }
 
 #[tokio::test]
@@ -2652,7 +2426,7 @@ async fn run_when_idle_waits_for_the_operation_to_finish() {
         "the active operation blocks the claim"
     );
 
-    finish_operation(&fixture).await;
+    finish_operation(&fixture.lane).await;
     waiting
         .await
         .expect("claim join")
@@ -2783,12 +2557,12 @@ async fn navigation_admits_against_a_known_target_and_validates_its_shapes() {
     let fixture = create_lane().await;
     let first = fixture
         .lane
-        .append_message(boundary_user_message("root"), &background_context())
+        .append_message(user_text_message("root"), &background_context())
         .await
         .expect("append serves");
     let second = fixture
         .lane
-        .append_message(boundary_user_message("head"), &background_context())
+        .append_message(user_text_message("head"), &background_context())
         .await
         .expect("append serves");
 
@@ -2959,17 +2733,7 @@ async fn continue_operation_commits_and_finishes_through_the_wrappers() {
                         writes: Vec::new(),
                         operation_state: crate::harness::session::types::OperationState::Checkpoint(
                             crate::harness::session::types::CheckpointOperation {
-                                scope: OperationScope {
-                                    control: Control::Running,
-                                    settings: crate::harness::session::types::RunSettings {
-                                        compaction:
-                                            crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-                                        steering_mode: crate::types::QueueMode::All,
-                                        follow_up_mode: crate::types::QueueMode::All,
-                                        tool_execution: crate::types::ToolExecutionMode::Parallel,
-                                    },
-                                    latest_assistant_entry_id: None,
-                                },
+                                scope: operation_scope(),
                                 checkpoint: crate::harness::session::types::CheckpointData {
                                     continuation:
                                         crate::harness::session::types::Continuation::NeedAssistant {
@@ -3119,7 +2883,7 @@ async fn run_when_idle_joins_the_installed_drive_pass() {
 async fn get_result_reports_the_malformed_record() {
     let fixture = create_lane().await;
     commit_writes(
-        &fixture,
+        &fixture.session,
         vec![raw_set(
             &stored_values::operation_result("broken").address,
             json!(42),
@@ -3394,7 +3158,7 @@ async fn append_captures_the_queued_writes_when_idle() {
     let fixture = seeded_write_lane().await;
     let appended = fixture
         .lane
-        .append_message(boundary_user_message("tail"), &background_context())
+        .append_message(user_text_message("tail"), &background_context())
         .await
         .expect("append serves");
 
@@ -3471,7 +3235,7 @@ async fn append_faults_on_the_corrupt_write_inbox() {
         let message = closed_message(
             fixture
                 .lane
-                .append_message(boundary_user_message("tail"), &background_context())
+                .append_message(user_text_message("tail"), &background_context())
                 .await
                 .expect_err("the corrupt write inbox faults the append"),
         );
@@ -3628,7 +3392,7 @@ async fn drive_rejects_an_already_aborted_context() {
 async fn drive_faults_on_a_malformed_settled_record() {
     let fixture = create_lane().await;
     commit_writes(
-        &fixture,
+        &fixture.session,
         vec![raw_set(
             &stored_values::operation_result("broken").address,
             json!(42),
@@ -3703,32 +3467,12 @@ async fn navigation_on_a_busy_lane_reports_lane_busy() {
 async fn inspect_execution_carries_the_captured_model() {
     let fixture = create_lane().await;
     accepted_operation(&fixture).await;
-    patch_live_operation(
-        &fixture,
+    patch_live_state(
+        &fixture.lane,
         crate::harness::session::types::OperationState::AssistantEffectPending(
             crate::harness::session::types::AssistantEffectPendingOperation {
-                scope: OperationScope {
-                    control: Control::Running,
-                    settings: crate::harness::session::types::RunSettings {
-                        compaction: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-                        steering_mode: crate::types::QueueMode::All,
-                        follow_up_mode: crate::types::QueueMode::All,
-                        tool_execution: crate::types::ToolExecutionMode::Parallel,
-                    },
-                    latest_assistant_entry_id: None,
-                },
-                generation_context: crate::harness::session::types::GenerationContext {
-                    step_id: "step".to_owned(),
-                    trigger_entry_id: "trigger".to_owned(),
-                    configuration: lane_configuration(),
-                    stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-                    retry_policy: crate::harness::session::types::NormalizedRetryPolicy {
-                        max_attempts: 2,
-                        base_delay_ms: 1,
-                        max_agent_delay_ms: 30_000,
-                    },
-                    overflow_recovery_used: false,
-                },
+                scope: operation_scope(),
+                generation_context: generation_context(),
                 attempt: 1,
                 response_entry_id: "response".to_owned(),
                 usage_id: "usage".to_owned(),
@@ -3755,47 +3499,6 @@ async fn inspect_execution_carries_the_captured_model() {
     );
 }
 
-/// Swaps the live operation's durable leaf, the capture fixtures' patch.
-async fn patch_live_operation(
-    fixture: &LaneFixture,
-    next_state: crate::harness::session::types::OperationState,
-) {
-    let live = fixture.lane.state().operation.expect("the live operation");
-    let operation_id = live.meta.operation_id.clone();
-    let meta = live.meta;
-    fixture
-        .lane
-        .command::<(), _>(
-            move |state, _session, _context| {
-                let operation_id = operation_id.clone();
-                let meta = meta.clone();
-                let next_state = next_state.clone();
-                Box::pin(async move {
-                    let mut next = state.clone();
-                    next.operation = Some(LiveOperation {
-                        meta,
-                        state: next_state.clone(),
-                    });
-                    Ok(LaneCommand::Commit {
-                        writes: vec![
-                            set_value_write(
-                                &stored_values::operation_state(&operation_id),
-                                next_state,
-                            )
-                            .expect("state write"),
-                        ],
-                        next,
-                        materialize: Arc::new(|_commit| ()),
-                        events: None,
-                    })
-                })
-            },
-            &background_context(),
-        )
-        .await
-        .expect("the patch commits");
-}
-
 #[test]
 fn the_trait_name_reads_the_lane_name() {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3820,7 +3523,7 @@ async fn cancel_queued_names_the_next_run_queue_in_the_invariant() {
         .expect("nextRun serves")
         .expect("the next-run");
     commit_writes(
-        &fixture,
+        &fixture.session,
         vec![stored_values::delete_value_write(
             &stored_values::pending_entry(&entry_id),
         )],
@@ -3844,12 +3547,12 @@ async fn navigation_reports_its_kind_through_the_inspection() {
     let fixture = create_lane().await;
     let first = fixture
         .lane
-        .append_message(boundary_user_message("root"), &background_context())
+        .append_message(user_text_message("root"), &background_context())
         .await
         .expect("append serves");
     fixture
         .lane
-        .append_message(boundary_user_message("head"), &background_context())
+        .append_message(user_text_message("head"), &background_context())
         .await
         .expect("append serves");
     let error = fixture
@@ -3887,7 +3590,7 @@ async fn cancel_queued_names_the_follow_up_queue_in_the_invariant() {
         .expect("followUp serves")
         .expect("the follow-up");
     commit_writes(
-        &fixture,
+        &fixture.session,
         vec![stored_values::delete_value_write(
             &stored_values::pending_entry(&entry_id),
         )],
@@ -3950,9 +3653,9 @@ async fn seal_closes_the_installed_drive_and_waits_out_the_idle_owner() {
         tokio::spawn(async move { lane.seal(closed).await })
     };
     tokio::task::yield_now().await;
-    assert!(!sealed.is_finished(), "the seal waits out the idle owner",);
+    assert!(!sealed.is_finished(), "the seal waits out the idle owner");
     let completion = drive.completion().await;
-    assert!(completion.is_err(), "the seal closed the installed pass",);
+    assert!(completion.is_err(), "the seal closed the installed pass");
     let _ = release.send(());
     sealed.await.expect("seal join");
     idle.await

@@ -15,31 +15,35 @@
 )]
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
-use pi_ai::models::create_models;
 use serde_json::json;
 
 use crate::harness::agent_harness::DriveOptions;
 use crate::harness::agent_harness::NavigateOptions;
 use crate::harness::agent_harness::OperationRequest;
 use crate::harness::context::background_context;
-use crate::harness::hooks::HookErrorReporter;
-use crate::harness::hooks::HookRegistry;
 use crate::harness::result::HarnessError;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::lane::captured_model;
 use crate::harness::runtime::lane::durable_lane_state;
 use crate::harness::runtime::lane::select_accepted_inbox;
-use crate::harness::runtime::restore::restore_lane;
 use crate::harness::runtime::test_support::ControlledStorage;
+use crate::harness::runtime::test_support::assistant_wire_value;
+use crate::harness::runtime::test_support::commit_writes;
+use crate::harness::runtime::test_support::empty_lane_snapshot;
+use crate::harness::runtime::test_support::finish_operation;
+use crate::harness::runtime::test_support::generation_context;
+use crate::harness::runtime::test_support::lane_configuration;
+use crate::harness::runtime::test_support::memory_session_with_seed;
 use crate::harness::runtime::test_support::noop_emit_batch;
-use crate::harness::runtime::test_support::passthrough_fault_handler;
+use crate::harness::runtime::test_support::operation_scope;
+use crate::harness::runtime::test_support::patch_live_state;
+use crate::harness::runtime::test_support::raw_write;
+use crate::harness::runtime::test_support::restored_lane;
 use crate::harness::runtime::test_support::runtime_config;
-use crate::harness::runtime::test_support::runtime_session;
-use crate::harness::runtime::test_support::seed_main_lane_values;
 use crate::harness::runtime::test_support::unused_watch_installer;
+use crate::harness::runtime::test_support::user_text_message;
+use crate::harness::runtime::test_support::zero_usage_wire;
 use crate::harness::runtime::types::SliceNotImplemented;
 use crate::harness::session::memory::MemoryStorage;
 use crate::harness::session::memory::MemoryStorageOptions;
@@ -53,16 +57,13 @@ use crate::harness::session::types::Control;
 use crate::harness::session::types::DeferredEffectPendingOperation;
 use crate::harness::session::types::DeferredScope;
 use crate::harness::session::types::DeferredSuspendedOperation;
-use crate::harness::session::types::GenerationContext;
 use crate::harness::session::types::InboxItem;
 use crate::harness::session::types::InboxItemKind;
 use crate::harness::session::types::NavigationReadyToCommitOperation;
-use crate::harness::session::types::NormalizedRetryPolicy;
 use crate::harness::session::types::OperationScope;
 use crate::harness::session::types::OperationState;
 use crate::harness::session::types::ResultBoundary;
 use crate::harness::session::types::RetryWait;
-use crate::harness::session::types::RunSettings;
 use crate::harness::session::types::SummaryContext;
 use crate::harness::session::types::SummaryDecidingOperation;
 use crate::harness::session::types::SummaryEffectPendingOperation;
@@ -73,49 +74,6 @@ use crate::harness::session::types::SummaryTask;
 use crate::harness::session::types::ToolBatch;
 use crate::harness::session::types::ToolsOperation;
 use crate::types::QueueMode;
-use crate::types::ToolExecutionMode;
-
-fn next_session_id() -> String {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    format!(
-        "runtime-boundary-{}",
-        COUNTER.fetch_add(1, Ordering::SeqCst)
-    )
-}
-
-fn noop_hook_reporter() -> HookErrorReporter {
-    Arc::new(|_error, _name, _site, _context| Box::pin(std::future::ready(())))
-}
-
-/// The scope every leaf fixture carries.
-fn operation_scope() -> OperationScope {
-    OperationScope {
-        control: Control::Running,
-        settings: RunSettings {
-            compaction: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-            steering_mode: QueueMode::All,
-            follow_up_mode: QueueMode::All,
-            tool_execution: ToolExecutionMode::Parallel,
-        },
-        latest_assistant_entry_id: None,
-    }
-}
-
-/// The generation inputs the model-carrying leaves carry.
-fn generation_context() -> GenerationContext {
-    GenerationContext {
-        step_id: "step".to_owned(),
-        trigger_entry_id: "trigger".to_owned(),
-        configuration: crate::harness::runtime::test_support::lane_configuration(),
-        stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-        retry_policy: NormalizedRetryPolicy {
-            max_attempts: 2,
-            base_delay_ms: 1,
-            max_agent_delay_ms: 30_000,
-        },
-        overflow_recovery_used: false,
-    }
-}
 
 /// The structural task the summary leaves carry.
 fn summary_task() -> SummaryTask {
@@ -131,7 +89,7 @@ fn summary_task() -> SummaryTask {
 fn summary_context() -> SummaryContext {
     SummaryContext {
         result_entry_id: "summary".to_owned(),
-        configuration: crate::harness::runtime::test_support::lane_configuration(),
+        configuration: lane_configuration(),
         stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
         retry_policy: generation_context().retry_policy,
     }
@@ -141,27 +99,8 @@ fn summary_context() -> SummaryContext {
 /// tests admit through; `Some(operation_id)` seeds an admitted starting
 /// operation for the drive-fault path.
 async fn seam_lane(operation_id: Option<&str>) -> Lane {
-    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
-        MemoryStorageOptions::default(),
-    ))));
-    let session = Arc::new(runtime_session(next_session_id(), storage.clone()));
-    seed_main_lane_values(&session, operation_id)
-        .await
-        .expect("seed commit");
-    let restored = restore_lane(session.clone(), "main", &background_context())
-        .await
-        .expect("restore");
-    Lane::new(
-        "main",
-        session.clone(),
-        Arc::new(create_models(None)),
-        Arc::new(HookRegistry::new(noop_hook_reporter())),
-        restored,
-        passthrough_fault_handler(),
-        noop_emit_batch(),
-        unused_watch_installer(),
-        Arc::new(runtime_config),
-    )
+    let session = memory_session_with_seed(operation_id).await;
+    restored_lane(session, noop_emit_batch(), unused_watch_installer()).await
 }
 
 /// The staged seam error the result carries, unwrapped.
@@ -394,7 +333,7 @@ fn select_accepted_inbox_modes_independent_per_queue() {
 
 /// The leaves whose generation or batch context captures a model.
 fn model_carrying_leaves(scope: OperationScope) -> Vec<OperationState> {
-    let configuration = crate::harness::runtime::test_support::lane_configuration();
+    let configuration = lane_configuration();
     vec![
         OperationState::AssistantReady(AssistantReadyOperation {
             scope: scope.clone(),
@@ -500,7 +439,7 @@ fn deferred_scope(scope: OperationScope) -> DeferredScope {
         step_id: "step".to_owned(),
         source_entry_id: "source".to_owned(),
         poll: 0,
-        configuration: crate::harness::runtime::test_support::lane_configuration(),
+        configuration: lane_configuration(),
         stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
     }
 }
@@ -516,7 +455,7 @@ fn summary_generation() -> SummaryGenerationScope {
 /// a generation or batch context capture nothing.
 #[test]
 fn captured_model_reads_the_configuration_over_the_state_leaves() {
-    let expected = crate::harness::runtime::test_support::lane_configuration().model;
+    let expected = lane_configuration().model;
     for state in model_carrying_leaves(operation_scope()) {
         assert_eq!(
             captured_model(&state),
@@ -555,121 +494,27 @@ fn slice_not_implemented_reports_the_operation_it_names() {
 use crate::harness::agent_harness::AgentLane;
 use crate::harness::agent_harness::WatchHandle;
 use crate::harness::runtime::lane::operation_state_with_scope;
-use crate::harness::runtime::test_support::empty_lane_snapshot;
 use crate::harness::runtime::test_support::recording_watch_installer;
-use crate::harness::runtime::types::LiveOperation;
 use crate::harness::session::types::Entry;
 use crate::harness::session::types::Storage;
 use crate::types::AgentMessage;
-use pi_ai::types::Message;
 
 /// The capturing fixture: the seam lane over a recording watch, the watch
 /// surface the capture tests drive.
 async fn capturing_lane(operation_id: Option<&str>) -> Lane {
-    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
-        MemoryStorageOptions::default(),
-    ))));
-    let session = Arc::new(runtime_session(next_session_id(), storage));
-    seed_main_lane_values(&session, operation_id)
-        .await
-        .expect("seed commit");
-    let restored = restore_lane(session.clone(), "main", &background_context())
-        .await
-        .expect("restore");
-    Lane::new(
-        "main",
+    let session = memory_session_with_seed(operation_id).await;
+    restored_lane(
         session,
-        Arc::new(create_models(None)),
-        Arc::new(HookRegistry::new(noop_hook_reporter())),
-        restored,
-        passthrough_fault_handler(),
         noop_emit_batch(),
-        recording_watch_installer(empty_lane_snapshot(
-            "main",
-            &crate::harness::runtime::test_support::lane_configuration(),
-        )),
-        Arc::new(runtime_config),
-    )
-}
-
-async fn commit_writes(lane: &Lane, writes: Vec<crate::harness::session::values::Write>) {
-    let session = Arc::clone(lane.session());
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("the commit settles");
-}
-
-/// Swaps the live operation's durable state leaf, the patch the capture
-/// fixtures drive.
-async fn patch_operation(lane: &Lane, next_state: OperationState) {
-    let live = lane.state().operation.expect("the live operation");
-    let operation_id = live.meta.operation_id.clone();
-    let meta = live.meta;
-    lane.command::<(), _>(
-        move |state, _session, _context| {
-            let operation_id = operation_id.clone();
-            let meta = meta.clone();
-            let next_state = next_state.clone();
-            Box::pin(async move {
-                let mut next = state.clone();
-                next.operation = Some(LiveOperation {
-                    meta,
-                    state: next_state.clone(),
-                });
-                Ok(crate::harness::runtime::types::LaneCommand::Commit {
-                    writes: vec![
-                        crate::harness::session::values::set_value_write(
-                            &crate::harness::session::values::operation_state(&operation_id),
-                            next_state,
-                        )
-                        .expect("state write"),
-                    ],
-                    next,
-                    materialize: Arc::new(|_commit| ()),
-                    events: None,
-                })
-            })
-        },
-        &background_context(),
+        recording_watch_installer(empty_lane_snapshot("main", &lane_configuration())),
     )
     .await
-    .expect("the patch commits");
-}
-
-fn user_agent_message(text: &str) -> AgentMessage {
-    AgentMessage::Standard(Message::User(pi_ai::types::UserMessage {
-        content: pi_ai::types::UserContent::Text(text.to_owned()),
-        timestamp: 1,
-    }))
 }
 
 /// The assistant wire the deferred and tool fixtures build, the deferred
 /// handle and the tool-call blocks free.
 fn assistant_wire(content: &serde_json::Value, stop_reason: &str, deferred: bool) -> AgentMessage {
-    let mut wire = json!({
-        "role": "assistant",
-        "content": content,
-        "api": "anthropic-messages",
-        "provider": "test",
-        "model": "model",
-        "usage": {
-            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
-        },
-        "stopReason": stop_reason,
-        "timestamp": 1,
-    });
+    let mut wire = assistant_wire_value(content, stop_reason);
     if deferred {
         wire["deferred"] = json!({
             "provider": "provider",
@@ -680,62 +525,6 @@ fn assistant_wire(content: &serde_json::Value, stop_reason: &str, deferred: bool
         });
     }
     serde_json::from_value(wire).expect("assistant wire")
-}
-
-fn raw_write(
-    address: &crate::harness::session::values::ValueAddress,
-    value: serde_json::Value,
-) -> crate::harness::session::values::Write {
-    crate::harness::session::values::Write::ValueSet(
-        crate::harness::session::values::ValueSetWrite {
-            kind: "value".to_owned(),
-            op: "set".to_owned(),
-            namespace: address.namespace.clone(),
-            key: address.key.clone(),
-            value,
-        },
-    )
-}
-
-fn settled_record(operation_id: &str) -> crate::harness::session::types::OperationResultRecord {
-    crate::harness::session::types::OperationResultRecord {
-        operation_id: operation_id.to_owned(),
-        kind: crate::harness::session::types::OperationKind::Run,
-        status: crate::harness::session::types::TerminalStatus::Completed,
-        error: None,
-        from_tip_id: None,
-        tip_id: None,
-        started_at: 1,
-        ended_at: 2,
-    }
-}
-
-/// Finishes the admitted operation, the record the last-result capture reads.
-async fn finish_operation(lane: &Lane) {
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the live operation");
-    let record = settled_record(&operation_id);
-    lane.settle_operation::<(), _>(
-        move |_state, _operation_state, _meta, _session, _context| {
-            let record = record.clone();
-            Box::pin(async move {
-                Ok(crate::harness::runtime::types::OperationCommand::Finish {
-                    writes: Vec::new(),
-                    record,
-                    lane: None,
-                    materialize: Arc::new(|_commit| ()),
-                    events: None,
-                })
-            })
-        },
-        &background_context(),
-    )
-    .await
-    .expect("the finish settles");
 }
 
 #[tokio::test]
@@ -751,7 +540,7 @@ async fn watch_captures_the_lane_snapshot_over_the_durable_values() {
         .expect("the live operation");
     finish_operation(&lane).await;
     let appended =
-        AgentLane::append_message(&lane, user_agent_message("history"), &background_context())
+        AgentLane::append_message(&lane, user_text_message("history"), &background_context())
             .await
             .expect("append serves");
 
@@ -803,7 +592,7 @@ async fn watch_reports_the_streaming_message_from_the_stored_frames() {
     .await
     .expect("accept serves")
     .expect("the admission");
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
             scope: operation_scope(),
@@ -839,7 +628,7 @@ async fn watch_reports_the_streaming_message_from_the_stored_frames() {
     let address =
         crate::harness::session::values::pending_assistant_frames(&operation_id, "response");
     commit_writes(
-        &lane,
+        lane.session(),
         vec![
             crate::harness::session::values::append_list_write(
                 &address,
@@ -902,7 +691,7 @@ async fn watch_reports_the_deferred_view_from_the_source_entry() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::DeferredSuspended(DeferredSuspendedOperation {
             deferred: DeferredScope {
@@ -910,7 +699,7 @@ async fn watch_reports_the_deferred_view_from_the_source_entry() {
                 step_id: "step".to_owned(),
                 source_entry_id: source.clone(),
                 poll: 3,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
             },
         }),
@@ -941,13 +730,13 @@ async fn watch_faults_when_the_deferred_source_lacks_its_handle() {
     let lane = capturing_lane(None).await;
     let source = AgentLane::append_message(
         &lane,
-        user_agent_message("not deferred"),
+        user_text_message("not deferred"),
         &background_context(),
     )
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::DeferredSuspended(DeferredSuspendedOperation {
             deferred: DeferredScope {
@@ -955,7 +744,7 @@ async fn watch_faults_when_the_deferred_source_lacks_its_handle() {
                 step_id: "step".to_owned(),
                 source_entry_id: source,
                 poll: 0,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
             },
         }),
@@ -1001,13 +790,13 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry.clone(),
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: vec![
                     serde_json::from_value(json!({
@@ -1043,7 +832,7 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
         .map(|operation| operation.meta.operation_id.clone())
         .expect("the live operation");
     commit_writes(
-        &lane,
+        lane.session(),
         vec![
             raw_write(
                 &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0)
@@ -1155,13 +944,13 @@ async fn watch_faults_on_the_tools_batch_invariants() {
     // The invalid assistant entry.
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: "absent".to_owned(),
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: Vec::new(),
             },
@@ -1196,13 +985,13 @@ async fn watch_faults_on_the_tools_batch_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: vec![
                     serde_json::from_value(json!({
@@ -1245,13 +1034,13 @@ async fn watch_faults_on_the_tools_batch_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: vec![
                     serde_json::from_value(json!({
@@ -1303,7 +1092,7 @@ async fn accept_prompt(lane: &Lane) {
 async fn watch_reports_the_retry_views() {
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::AssistantRetryWait(AssistantRetryWaitOperation {
             scope: operation_scope(),
@@ -1332,7 +1121,7 @@ async fn watch_reports_the_retry_views() {
     assert_eq!(retry.next_attempt_at, 10);
     watch.unsubscribe();
 
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::SummaryRetryWait(SummaryRetryWaitOperation {
             scope: operation_scope(),
@@ -1397,7 +1186,7 @@ fn deferred_effect_pending(source_entry_id: &str, response_entry_id: &str) -> Op
             step_id: "step".to_owned(),
             source_entry_id: source_entry_id.to_owned(),
             poll: 1,
-            configuration: crate::harness::runtime::test_support::lane_configuration(),
+            configuration: lane_configuration(),
             stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
         },
         response_entry_id: response_entry_id.to_owned(),
@@ -1416,17 +1205,14 @@ async fn watch_reports_the_deferred_and_streaming_views_together() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(&lane, deferred_effect_pending(&source, "response")).await;
+    patch_live_state(&lane, deferred_effect_pending(&source, "response")).await;
 
     let partial: pi_ai::types::AssistantMessage = serde_json::from_value(json!({
         "content": [],
         "api": "anthropic-messages",
         "provider": "test",
         "model": "model",
-        "usage": {
-            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
-        },
+        "usage": zero_usage_wire(),
         "stopReason": "pending",
         "timestamp": 1,
     }))
@@ -1441,7 +1227,7 @@ async fn watch_reports_the_deferred_and_streaming_views_together() {
         "response",
     );
     commit_writes(
-        &lane,
+        lane.session(),
         vec![
             crate::harness::session::values::append_list_write(
                 &address,
@@ -1498,7 +1284,7 @@ async fn watch_reports_the_aborting_operation_status() {
         .as_ref()
         .map(|operation| operation.state.clone())
         .expect("the accepted operation");
-    patch_operation(
+    patch_live_state(
         &lane,
         operation_state_with_scope(
             &accepted,
@@ -1540,7 +1326,7 @@ async fn watch_faults_on_the_last_result_invariants() {
         .expect("the live operation");
     finish_operation(&lane).await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![crate::harness::session::values::delete_value_write(
             &crate::harness::session::values::operation_result(&operation_id),
         )],
@@ -1571,7 +1357,7 @@ async fn watch_faults_on_the_last_result_invariants() {
         .expect("the live operation");
     finish_operation(&lane).await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![raw_write(
             &crate::harness::session::values::operation_result(&operation_id).address,
             json!(42),
@@ -1615,7 +1401,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry_id.to_owned(),
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls,
             },
@@ -1636,7 +1422,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         batch(
             &assistant_entry,
@@ -1645,7 +1431,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![raw_write(
             &crate::harness::session::values::operation_tool_args(
                 &lane
@@ -1696,7 +1482,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
         .as_ref()
         .map(|operation| operation.meta.operation_id.clone())
         .expect("the operation");
-    patch_operation(
+    patch_live_state(
         &lane,
         batch(
             &assistant_entry,
@@ -1705,7 +1491,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![raw_write(
             &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0).address,
             json!(42),
@@ -1744,7 +1530,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
         .as_ref()
         .map(|operation| operation.meta.operation_id.clone())
         .expect("the operation");
-    patch_operation(
+    patch_live_state(
         &lane,
         batch(
             &assistant_entry,
@@ -1753,7 +1539,7 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![
             raw_write(
                 &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0)
@@ -1796,13 +1582,13 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         batch(&assistant_entry, vec![call(0, "result-2", "outcome_ready")]),
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![
             crate::harness::session::values::set_value_write(
                 &crate::harness::session::values::pending_entry("result-2"),
@@ -2004,13 +1790,13 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: vec![call()],
             },
@@ -2018,7 +1804,7 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![raw_write(
             &crate::harness::session::values::pending_entry("result-1").address,
             json!(42),
@@ -2053,13 +1839,13 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: vec![call()],
             },
@@ -2067,7 +1853,7 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![
             crate::harness::session::values::set_value_write(
                 &crate::harness::session::values::pending_entry("result-1"),
@@ -2108,13 +1894,13 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_operation(
+    patch_live_state(
         &lane,
         OperationState::Tools(ToolsOperation {
             scope: operation_scope(),
             batch: ToolBatch {
                 assistant_entry_id: assistant_entry,
-                configuration: crate::harness::runtime::test_support::lane_configuration(),
+                configuration: lane_configuration(),
                 turn_id: "turn".to_owned(),
                 calls: vec![call()],
             },
@@ -2122,7 +1908,7 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
     )
     .await;
     commit_writes(
-        &lane,
+        lane.session(),
         vec![staged_for(json!({
             "role": "user",
             "content": "not a result",

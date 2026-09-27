@@ -38,6 +38,25 @@ fn matching_operation<'a>(
     None
 }
 
+fn admit_operation(
+    snapshot: &mut LaneSnapshot,
+    run_id: &str,
+    kind: crate::harness::session::types::OperationKind,
+    started_at: i64,
+) {
+    snapshot.operation = Some(LiveOperationView {
+        id: run_id.to_owned(),
+        kind,
+        started_at,
+        from_tip_id: snapshot.tip_id.clone(),
+        status: OperationStatus::Open,
+        retry: None,
+        deferred: None,
+        streaming_message: None,
+        running_tools: Vec::new(),
+    });
+}
+
 /// Applies one harness event to a lane snapshot, upstream's
 /// `reduceLaneSnapshot`. Navigation completion requires a fresh snapshot.
 #[expect(
@@ -68,17 +87,12 @@ pub fn reduce_lane_snapshot(
     }
     match &event.payload {
         HarnessEventPayload::RunStart { run_id, started_at } => {
-            snapshot.operation = Some(LiveOperationView {
-                id: run_id.clone(),
-                kind: crate::harness::session::types::OperationKind::Run,
-                started_at: *started_at,
-                from_tip_id: snapshot.tip_id.clone(),
-                status: OperationStatus::Open,
-                retry: None,
-                deferred: None,
-                streaming_message: None,
-                running_tools: Vec::new(),
-            });
+            admit_operation(
+                snapshot,
+                run_id,
+                crate::harness::session::types::OperationKind::Run,
+                *started_at,
+            );
         }
         HarnessEventPayload::CompactionStart {
             run_id, started_at, ..
@@ -86,32 +100,22 @@ pub fn reduce_lane_snapshot(
             if snapshot.operation.is_some() {
                 return LaneSnapshotReduction::Applied;
             }
-            snapshot.operation = Some(LiveOperationView {
-                id: run_id.clone(),
-                kind: crate::harness::session::types::OperationKind::Compaction,
-                started_at: *started_at,
-                from_tip_id: snapshot.tip_id.clone(),
-                status: OperationStatus::Open,
-                retry: None,
-                deferred: None,
-                streaming_message: None,
-                running_tools: Vec::new(),
-            });
+            admit_operation(
+                snapshot,
+                run_id,
+                crate::harness::session::types::OperationKind::Compaction,
+                *started_at,
+            );
         }
         HarnessEventPayload::NavigationStart {
             run_id, started_at, ..
         } => {
-            snapshot.operation = Some(LiveOperationView {
-                id: run_id.clone(),
-                kind: crate::harness::session::types::OperationKind::Navigation,
-                started_at: *started_at,
-                from_tip_id: snapshot.tip_id.clone(),
-                status: OperationStatus::Open,
-                retry: None,
-                deferred: None,
-                streaming_message: None,
-                running_tools: Vec::new(),
-            });
+            admit_operation(
+                snapshot,
+                run_id,
+                crate::harness::session::types::OperationKind::Navigation,
+                *started_at,
+            );
         }
         HarnessEventPayload::OperationAbort { operation_id, .. } => {
             if let Some(operation) = matching_operation(snapshot, operation_id) {
@@ -406,6 +410,27 @@ const fn args_of(tool: &LaneSnapshotTool) -> &serde_json::Value {
     }
 }
 
+fn operation_result_record(
+    operation: &LiveOperationView,
+    kind: crate::harness::session::types::OperationKind,
+    status: crate::harness::session::types::TerminalStatus,
+    error: Option<crate::harness::session::types::OperationError>,
+    from_tip_id: Option<String>,
+    tip_id: Option<String>,
+    ended_at: i64,
+) -> crate::harness::session::types::OperationResultRecord {
+    crate::harness::session::types::OperationResultRecord {
+        operation_id: operation.id.clone(),
+        kind,
+        status,
+        error,
+        from_tip_id,
+        tip_id,
+        started_at: operation.started_at,
+        ended_at,
+    }
+}
+
 fn run_end_record(
     status: &crate::harness::agent_harness::RunEndStatus,
     from_tip_id: Option<&String>,
@@ -428,16 +453,15 @@ fn run_end_record(
             Some(error.clone()),
         ),
     };
-    crate::harness::session::types::OperationResultRecord {
-        operation_id: operation.id.clone(),
-        kind: crate::harness::session::types::OperationKind::Run,
-        status: terminal_status,
+    operation_result_record(
+        operation,
+        crate::harness::session::types::OperationKind::Run,
+        terminal_status,
         error,
-        from_tip_id: from_tip_id.cloned(),
-        tip_id: tip_id.cloned(),
-        started_at: operation.started_at,
+        from_tip_id.cloned(),
+        tip_id.cloned(),
         ended_at,
-    }
+    )
 }
 
 fn compaction_end_record(
@@ -460,21 +484,23 @@ fn compaction_end_record(
             crate::harness::session::types::TerminalStatus::Aborted,
             None,
         ),
-        CompactionEndStatus::Failed { error } => (
-            crate::harness::session::types::TerminalStatus::Failed,
-            Some(error.clone()),
-        ),
+        CompactionEndStatus::Failed { error } => {
+            let error = error.clone();
+            (
+                crate::harness::session::types::TerminalStatus::Failed,
+                Some(error),
+            )
+        }
     };
-    crate::harness::session::types::OperationResultRecord {
-        operation_id: operation.id.clone(),
-        kind: crate::harness::session::types::OperationKind::Compaction,
-        status: terminal_status,
+    operation_result_record(
+        operation,
+        crate::harness::session::types::OperationKind::Compaction,
+        terminal_status,
         error,
-        from_tip_id: operation.from_tip_id.clone(),
-        tip_id: tip_id.cloned(),
-        started_at: operation.started_at,
+        operation.from_tip_id.clone(),
+        tip_id.cloned(),
         ended_at,
-    }
+    )
 }
 
 #[cfg(test)]

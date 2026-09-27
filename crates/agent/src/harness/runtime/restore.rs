@@ -207,6 +207,21 @@ enum RestoreOutcome {
     Threw(SessionError),
 }
 
+/// Runs one restore mutation and unpacks its outcome payload; a payload of
+/// any other shape is a message error naming `owner`, the restore function
+/// whose callback ran.
+async fn run_restore_mutation(
+    session: &dyn Session,
+    mutation: SessionMutationCallback,
+    context: &Context,
+    owner: &'static str,
+) -> Result<Box<RestoreOutcome>, SessionError> {
+    let restored = session.mutate(mutation, context).await?;
+    restored
+        .downcast::<RestoreOutcome>()
+        .map_err(|_| SessionError::Message(format!("{owner}'s callback returns a restore outcome")))
+}
+
 /// Restores every complete configured lane in one coherent session read,
 /// upstream's `restoreSession`.
 ///
@@ -282,10 +297,8 @@ pub async fn restore_session(
             }
         })
     });
-    let restored = session.mutate(mutation, context).await?;
-    let restored = restored.downcast::<RestoreOutcome>().map_err(|_| {
-        SessionError::Message("restore_session's callback returns a restore outcome".to_owned())
-    })?;
+    let restored =
+        run_restore_mutation(session.as_ref(), mutation, context, "restore_session").await?;
     match *restored {
         RestoreOutcome::Lanes(restored) => Ok(restored),
         RestoreOutcome::Threw(error) => Err(error),
@@ -347,10 +360,8 @@ pub async fn restore_lane(
             }
         })
     });
-    let restored = session.mutate(mutation, context).await?;
-    let restored = restored.downcast::<RestoreOutcome>().map_err(|_| {
-        SessionError::Message("restore_lane's callback returns a restore outcome".to_owned())
-    })?;
+    let restored =
+        run_restore_mutation(session.as_ref(), mutation, context, "restore_lane").await?;
     match *restored {
         RestoreOutcome::Lane(state) => Ok(*state),
         RestoreOutcome::Threw(error) => Err(error),

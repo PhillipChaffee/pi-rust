@@ -17,12 +17,16 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::harness::context::background_context;
 use crate::harness::runtime::restore::restore_lane;
 use crate::harness::runtime::restore::restore_session;
+use crate::harness::runtime::test_support::commit_writes;
+use crate::harness::runtime::test_support::lane_state_write;
+use crate::harness::runtime::test_support::next_session_id;
+use crate::harness::runtime::test_support::operation_scope;
+use crate::harness::runtime::test_support::raw_write;
 use crate::harness::session::memory::MemoryStorage;
 use crate::harness::session::memory::MemoryStorageOptions;
 use crate::harness::session::session::StorageBackedSession;
@@ -30,64 +34,32 @@ use crate::harness::session::types::CheckpointData;
 use crate::harness::session::types::CheckpointOperation;
 use crate::harness::session::types::CompactionReason;
 use crate::harness::session::types::Continuation;
-use crate::harness::session::types::Control;
-use crate::harness::session::types::LaneConfiguration;
 use crate::harness::session::types::OperationIntent;
+use crate::harness::session::types::OperationKind;
 use crate::harness::session::types::OperationMeta;
-use crate::harness::session::types::OperationScope;
 use crate::harness::session::types::OperationState;
 use crate::harness::session::types::ResultBoundary;
-use crate::harness::session::types::RunSettings;
-use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::types::SessionReader;
 use crate::harness::session::types::SummaryDecidingOperation;
 use crate::harness::session::types::SummaryTask;
 use crate::harness::session::values as stored_values;
-use crate::harness::session::values::ValueSetWrite;
 use crate::harness::session::values::Write;
-use crate::types::QueueMode;
-use crate::types::ToolExecutionMode;
-
-fn next_session_id() -> String {
-    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    format!(
-        "runtime-restore-{}",
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    )
-}
 
 /// The session upstream's `createSession` builds: the storage-backed
 /// session over a fresh memory backend, seeded with the idle `main` lane.
 async fn create_session() -> Arc<StorageBackedSession> {
-    let session = Arc::new(StorageBackedSession::new(
+    crate::harness::runtime::test_support::memory_session_with_seed(None).await
+}
+
+/// The bare storage-backed session the restore-session fixtures start
+/// from: a fresh memory backend with no values written.
+fn bare_session() -> Arc<StorageBackedSession> {
+    Arc::new(StorageBackedSession::new(
         crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
         Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
         crate::harness::session::session::StorageBackedSessionOptions::default(),
-    ));
-    commit_writes(
-        &session,
-        vec![
-            seed_write(&stored_values::branch_tip("main"), Option::<String>::None)
-                .expect("tip write"),
-            seed_write(
-                &stored_values::lane_config("main"),
-                crate::harness::runtime::test_support::lane_configuration(),
-            )
-            .expect("config write"),
-            seed_write(
-                &stored_values::lane_state("main"),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: None,
-                    last_operation_id: None,
-                    inbox: Vec::new(),
-                },
-            )
-            .expect("state write"),
-        ],
-    )
-    .await;
-    session
+    ))
 }
 
 /// The typed seed write upstream's `storedValues.setValue` restates.
@@ -96,49 +68,6 @@ fn seed_write<T: serde::Serialize>(
     value: T,
 ) -> Result<Write, SessionError> {
     crate::harness::session::values::set_value_write(address, value)
-}
-
-/// The raw value-set write the malformed fixtures build: the serialized
-/// payload bypasses the typed setter, mirroring a corrupted store.
-fn raw_write(address: &stored_values::ValueAddress, value: serde_json::Value) -> Write {
-    Write::ValueSet(ValueSetWrite {
-        kind: "value".to_owned(),
-        op: "set".to_owned(),
-        namespace: address.namespace.clone(),
-        key: address.key.clone(),
-        value,
-    })
-}
-
-async fn commit_writes(session: &Arc<StorageBackedSession>, writes: Vec<Write>) {
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("the commit settles");
-}
-
-/// The scope every leaf fixture carries, upstream's `operationScope()`.
-fn operation_scope() -> OperationScope {
-    OperationScope {
-        control: Control::Running,
-        settings: RunSettings {
-            compaction: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-            steering_mode: QueueMode::All,
-            follow_up_mode: QueueMode::All,
-            tool_execution: ToolExecutionMode::Parallel,
-        },
-        latest_assistant_entry_id: None,
-    }
 }
 
 /// The checkpoint leaf upstream's `runState(triggerEntryId)` builds.
@@ -172,6 +101,35 @@ fn summary_state(boundary: ResultBoundary) -> OperationState {
     })
 }
 
+/// The retry policy the fixture summary context carries, the
+/// generation-context fixture's numbers.
+fn fixture_retry_policy() -> crate::harness::session::types::NormalizedRetryPolicy {
+    crate::harness::session::types::NormalizedRetryPolicy {
+        max_attempts: 2,
+        base_delay_ms: 1,
+        max_agent_delay_ms: 30_000,
+    }
+}
+
+/// The generation scope the generation-carrying summary leaves carry:
+/// the finish-boundary task over the fixture's summary context.
+fn summary_generation() -> crate::harness::session::types::SummaryGenerationScope {
+    crate::harness::session::types::SummaryGenerationScope {
+        task: SummaryTask {
+            task_id: "task".to_owned(),
+            reason: Some(CompactionReason::Manual),
+            custom_instructions: None,
+            boundary: ResultBoundary::Finish,
+        },
+        summary_context: crate::harness::session::types::SummaryContext {
+            result_entry_id: "summary".to_owned(),
+            configuration: crate::harness::runtime::test_support::lane_configuration(),
+            stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
+            retry_policy: fixture_retry_policy(),
+        },
+    }
+}
+
 /// The run meta upstream's fixtures build.
 fn run_meta(operation_id: &str) -> OperationMeta {
     OperationMeta {
@@ -182,6 +140,22 @@ fn run_meta(operation_id: &str) -> OperationMeta {
         intent: OperationIntent::Run {
             prompt_entry_ids: Vec::new(),
         },
+    }
+}
+
+/// The navigation intent the matrix cases build, upstream's
+/// `OperationIntent.Navigation` literals.
+fn navigation_intent(
+    target_id: Option<&str>,
+    summarize: bool,
+    label: Option<&str>,
+    custom_instructions: Option<&str>,
+) -> OperationIntent {
+    OperationIntent::Navigation {
+        target_id: target_id.map(str::to_owned),
+        summarize,
+        label: label.map(str::to_owned),
+        custom_instructions: custom_instructions.map(str::to_owned),
     }
 }
 
@@ -200,18 +174,45 @@ async fn seed_current_operation(
                 .expect("meta write"),
             seed_write(&stored_values::operation_state(operation_id), state.clone())
                 .expect("state write"),
-            seed_write(
-                &stored_values::lane_state(&meta.lane),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: Some(operation_id.to_owned()),
-                    last_operation_id: None,
-                    inbox: Vec::new(),
-                },
-            )
-            .expect("state write"),
+            lane_state_write(&meta.lane, Some(operation_id), None, Vec::new())
+                .expect("state write"),
         ],
     )
     .await;
+}
+
+/// The three storage reads the write-parity assertion compares: the tip
+/// inventory, the main lane's configuration, and the worker lane's state.
+async fn storage_snapshot(
+    session: &Arc<StorageBackedSession>,
+) -> (
+    Vec<stored_values::StoredValue>,
+    Option<stored_values::StoredValue>,
+    Option<stored_values::StoredValue>,
+) {
+    (
+        session
+            .scan_values(
+                &stored_values::branch_tip_inventory_prefix().address,
+                &background_context(),
+            )
+            .await
+            .expect("tip scan"),
+        session
+            .get_value(
+                &stored_values::lane_config("main").address,
+                &background_context(),
+            )
+            .await
+            .expect("main config read"),
+        session
+            .get_value(
+                &stored_values::lane_state("worker").address,
+                &background_context(),
+            )
+            .await
+            .expect("worker state read"),
+    )
 }
 
 #[tokio::test]
@@ -219,7 +220,7 @@ async fn restores_an_idle_lanes_latest_operation_id_without_reading_its_result()
     let session = create_session().await;
     let result = crate::harness::session::types::OperationResultRecord {
         operation_id: "settled".to_owned(),
-        kind: crate::harness::session::types::OperationKind::Navigation,
+        kind: OperationKind::Navigation,
         status: crate::harness::session::types::TerminalStatus::Completed,
         error: None,
         from_tip_id: None,
@@ -231,15 +232,7 @@ async fn restores_an_idle_lanes_latest_operation_id_without_reading_its_result()
         &session,
         vec![
             seed_write(&stored_values::operation_result("settled"), result).expect("result write"),
-            seed_write(
-                &stored_values::lane_state("main"),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: None,
-                    last_operation_id: Some("settled".to_owned()),
-                    inbox: Vec::new(),
-                },
-            )
-            .expect("state write"),
+            lane_state_write("main", None, Some("settled"), Vec::new()).expect("state write"),
         ],
     )
     .await;
@@ -320,15 +313,7 @@ async fn validates_current_operation_identity_lane_ownership_and_intent_compatib
         commit_writes(
             &session,
             vec![
-                seed_write(
-                    &stored_values::lane_state("main"),
-                    crate::harness::session::types::LaneState {
-                        current_operation_id: Some("operation".to_owned()),
-                        last_operation_id: None,
-                        inbox: Vec::new(),
-                    },
-                )
-                .expect("state write"),
+                lane_state_write("main", Some("operation"), None, Vec::new()).expect("state write"),
             ],
         )
         .await;
@@ -434,92 +419,47 @@ async fn accepts_exactly_the_family_neutral_state_reachability_matrix() {
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: None,
-                summarize: false,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(None, false, None, None),
             ready(None, None),
             true,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: false,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), false, None, None),
             ready(Some("different"), None),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: false,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), false, None, None),
             summary_state(navigation.clone()),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: true,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), true, None, None),
             summary_state(navigation.clone()),
             true,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("different".to_owned()),
-                summarize: true,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("different"), true, None, None),
             summary_state(navigation.clone()),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: true,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), true, None, None),
             ready(Some("target"), None),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: true,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), true, None, None),
             summary_state(finish.clone()),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: true,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), true, None, None),
             summary_state(resume.clone()),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: false,
-                label: None,
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), false, None, None),
             run_state("trigger"),
             false,
         ),
@@ -528,42 +468,22 @@ async fn accepts_exactly_the_family_neutral_state_reachability_matrix() {
     // and the summary instructions; upstream's matrix omits both shapes.
     let label_cases: Vec<(OperationIntent, OperationState, bool)> = vec![
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: false,
-                label: Some("label".to_owned()),
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), false, Some("label"), None),
             ready(Some("target"), None),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: false,
-                label: Some("label".to_owned()),
-                custom_instructions: None,
-            },
+            navigation_intent(Some("target"), false, Some("label"), None),
             ready(Some("target"), Some("label")),
             true,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: true,
-                label: Some("label".to_owned()),
-                custom_instructions: Some("instructions".to_owned()),
-            },
+            navigation_intent(Some("target"), true, Some("label"), Some("instructions")),
             summary_state(navigation_labeled.clone()),
             false,
         ),
         (
-            OperationIntent::Navigation {
-                target_id: Some("target".to_owned()),
-                summarize: true,
-                label: Some("label".to_owned()),
-                custom_instructions: Some("instructions".to_owned()),
-            },
+            navigation_intent(Some("target"), true, Some("label"), Some("instructions")),
             OperationState::SummaryDeciding(SummaryDecidingOperation {
                 scope: operation_scope(),
                 task: SummaryTask {
@@ -674,15 +594,7 @@ async fn requires_op_meta_and_op_state_for_the_current_operation() {
             );
         }
         writes.push(
-            seed_write(
-                &stored_values::lane_state("main"),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: Some("operation".to_owned()),
-                    last_operation_id: None,
-                    inbox: Vec::new(),
-                },
-            )
-            .expect("state write"),
+            lane_state_write("main", Some("operation"), None, Vec::new()).expect("state write"),
         );
         commit_writes(&session, writes).await;
 
@@ -695,14 +607,10 @@ async fn requires_op_meta_and_op_state_for_the_current_operation() {
     }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the two lanes' seeds, the parity reads, and the map assertions are one case"
-)]
 #[tokio::test]
 async fn restores_every_configured_lane_exactly_once_without_writing() {
     let session = create_session().await;
-    let worker_configuration = LaneConfiguration {
+    let worker_configuration = crate::harness::session::types::LaneConfiguration {
         model: crate::harness::session::types::ModelIdentity {
             provider: "test".to_owned(),
             model_id: "worker".to_owned(),
@@ -720,15 +628,7 @@ async fn restores_every_configured_lane_exactly_once_without_writing() {
                 worker_configuration.clone(),
             )
             .expect("config write"),
-            seed_write(
-                &stored_values::lane_state("worker"),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: None,
-                    last_operation_id: None,
-                    inbox: Vec::new(),
-                },
-            )
-            .expect("state write"),
+            lane_state_write("worker", None, None, Vec::new()).expect("state write"),
         ],
     )
     .await;
@@ -739,29 +639,7 @@ async fn restores_every_configured_lane_exactly_once_without_writing() {
     let state = run_state("trigger");
     seed_current_operation(&session, "operation", &meta, &state).await;
 
-    let before = (
-        session
-            .scan_values(
-                &stored_values::branch_tip_inventory_prefix().address,
-                &background_context(),
-            )
-            .await
-            .expect("tip scan"),
-        session
-            .get_value(
-                &stored_values::lane_config("main").address,
-                &background_context(),
-            )
-            .await
-            .expect("main config read"),
-        session
-            .get_value(
-                &stored_values::lane_state("worker").address,
-                &background_context(),
-            )
-            .await
-            .expect("worker state read"),
-    );
+    let before = storage_snapshot(&session).await;
 
     let lanes = restore_session(session.clone(), &background_context())
         .await
@@ -787,39 +665,13 @@ async fn restores_every_configured_lane_exactly_once_without_writing() {
         Some((&meta, &state)),
     );
 
-    let after = (
-        session
-            .scan_values(
-                &stored_values::branch_tip_inventory_prefix().address,
-                &background_context(),
-            )
-            .await
-            .expect("tip scan"),
-        session
-            .get_value(
-                &stored_values::lane_config("main").address,
-                &background_context(),
-            )
-            .await
-            .expect("main config read"),
-        session
-            .get_value(
-                &stored_values::lane_state("worker").address,
-                &background_context(),
-            )
-            .await
-            .expect("worker state read"),
-    );
+    let after = storage_snapshot(&session).await;
     assert_eq!(before, after, "the restore wrote nothing");
 }
 
 #[tokio::test]
 async fn allows_an_empty_inventory_but_rejects_lane_values_without_a_branch() {
-    let empty = Arc::new(StorageBackedSession::new(
-        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
-        Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
-    ));
+    let empty = bare_session();
     let lanes = restore_session(empty, &background_context())
         .await
         .expect("the empty inventory restores");
@@ -891,15 +743,7 @@ async fn reports_malformed_operation_meta_and_state_values() {
         let mut writes = vec![
             seed_write(&stored_values::operation_meta("operation"), meta).expect("meta write"),
             seed_write(&stored_values::operation_state("operation"), state).expect("state write"),
-            seed_write(
-                &stored_values::lane_state("main"),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: Some("operation".to_owned()),
-                    last_operation_id: None,
-                    inbox: Vec::new(),
-                },
-            )
-            .expect("state write"),
+            lane_state_write("main", Some("operation"), None, Vec::new()).expect("state write"),
         ];
         writes.push(raw_write(&address, serde_json::json!(42)));
         commit_writes(&session, writes).await;
@@ -916,34 +760,13 @@ async fn reports_malformed_operation_meta_and_state_values() {
 }
 /// The generation-carrying summary leaves' boundary reads, the matrix's
 /// deeper leaves: the task hides inside each generation.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the three leaves' fixtures share one body; splitting would hide the boundary read"
-)]
 #[tokio::test]
 async fn reads_the_summary_boundary_over_every_summary_leaf() {
     for (state, accepted) in [
         (
             OperationState::SummaryReady(crate::harness::session::types::SummaryReadyOperation {
                 scope: operation_scope(),
-                generation: crate::harness::session::types::SummaryGenerationScope {
-                    task: SummaryTask {
-                        task_id: "task".to_owned(),
-                        reason: Some(CompactionReason::Manual),
-                        custom_instructions: None,
-                        boundary: ResultBoundary::Finish,
-                    },
-                    summary_context: crate::harness::session::types::SummaryContext {
-                        result_entry_id: "summary".to_owned(),
-                        configuration: crate::harness::runtime::test_support::lane_configuration(),
-                        stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-                        retry_policy: crate::harness::session::types::NormalizedRetryPolicy {
-                            max_attempts: 2,
-                            base_delay_ms: 1,
-                            max_agent_delay_ms: 30_000,
-                        },
-                    },
-                },
+                generation: summary_generation(),
                 next_attempt: 1,
             }),
             true,
@@ -952,26 +775,7 @@ async fn reads_the_summary_boundary_over_every_summary_leaf() {
             OperationState::SummaryEffectPending(
                 crate::harness::session::types::SummaryEffectPendingOperation {
                     scope: operation_scope(),
-                    generation: crate::harness::session::types::SummaryGenerationScope {
-                        task: SummaryTask {
-                            task_id: "task".to_owned(),
-                            reason: Some(CompactionReason::Manual),
-                            custom_instructions: None,
-                            boundary: ResultBoundary::Finish,
-                        },
-                        summary_context: crate::harness::session::types::SummaryContext {
-                            result_entry_id: "summary".to_owned(),
-                            configuration:
-                                crate::harness::runtime::test_support::lane_configuration(),
-                            stream_options:
-                                crate::harness::types::AgentHarnessStreamOptions::default(),
-                            retry_policy: crate::harness::session::types::NormalizedRetryPolicy {
-                                max_attempts: 2,
-                                base_delay_ms: 1,
-                                max_agent_delay_ms: 30_000,
-                            },
-                        },
-                    },
+                    generation: summary_generation(),
                     attempt: 1,
                     request: None,
                     usage_ids: Vec::new(),
@@ -983,26 +787,7 @@ async fn reads_the_summary_boundary_over_every_summary_leaf() {
             OperationState::SummaryRetryWait(
                 crate::harness::session::types::SummaryRetryWaitOperation {
                     scope: operation_scope(),
-                    generation: crate::harness::session::types::SummaryGenerationScope {
-                        task: SummaryTask {
-                            task_id: "task".to_owned(),
-                            reason: Some(CompactionReason::Manual),
-                            custom_instructions: None,
-                            boundary: ResultBoundary::Finish,
-                        },
-                        summary_context: crate::harness::session::types::SummaryContext {
-                            result_entry_id: "summary".to_owned(),
-                            configuration:
-                                crate::harness::runtime::test_support::lane_configuration(),
-                            stream_options:
-                                crate::harness::types::AgentHarnessStreamOptions::default(),
-                            retry_policy: crate::harness::session::types::NormalizedRetryPolicy {
-                                max_attempts: 2,
-                                base_delay_ms: 1,
-                                max_agent_delay_ms: 30_000,
-                            },
-                        },
-                    },
+                    generation: summary_generation(),
                     retry_wait: crate::harness::session::types::RetryWait {
                         next_attempt: 2,
                         not_before: 10,
@@ -1049,11 +834,7 @@ async fn restore_session_skips_the_branch_only_lanes() {
     assert!(!lanes.contains_key("orphan"), "the orphan lane skipped");
 
     // The absent lane's restore names its missing tip.
-    let empty = Arc::new(StorageBackedSession::new(
-        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
-        Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
-    ));
+    let empty = bare_session();
     let restored = restore_lane(empty, "main", &background_context()).await;
     let error = restored.expect_err("the absent lane rejects");
     assert!(

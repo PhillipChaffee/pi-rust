@@ -12,7 +12,6 @@
     reason = "the tests pin outcomes; a violated expectation panics the test by design"
 )]
 
-use std::any::Any;
 use std::sync::Arc;
 
 use pi_ai::types::Message;
@@ -22,11 +21,12 @@ use crate::harness::agent_harness::AgentLane;
 use crate::harness::agent_harness::DriveOptions;
 use crate::harness::agent_harness::HarnessEventPayload;
 use crate::harness::agent_harness::LaneQueuedItem;
-use crate::harness::agent_harness::OperationRequest;
-use crate::harness::agent_harness::PromptMessagesPayload;
 use crate::harness::context::background_context;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::restore::restore_lane;
+use crate::harness::runtime::test_support::accept_text;
+use crate::harness::runtime::test_support::commit_writes;
+use crate::harness::runtime::test_support::compaction_entry_body;
 use crate::harness::runtime::test_support::empty_lane_snapshot;
 use crate::harness::runtime::test_support::lane_configuration;
 use crate::harness::runtime::test_support::noop_emit_batch;
@@ -35,6 +35,7 @@ use crate::harness::runtime::test_support::passthrough_fault_handler;
 use crate::harness::runtime::test_support::recording_watch_installer;
 use crate::harness::runtime::test_support::runtime_config;
 use crate::harness::runtime::test_support::seed_main_lane_values;
+use crate::harness::runtime::test_support::user_text_message;
 use crate::harness::runtime::transcript::chain_entries;
 use crate::harness::runtime::transcript::committed_entry_events;
 use crate::harness::runtime::transcript::entry_lifecycle_events;
@@ -54,7 +55,6 @@ use crate::harness::session::types::InboxItemKind;
 use crate::harness::session::types::MessageEntry;
 use crate::harness::session::types::NewEntry;
 use crate::harness::session::types::PendingEntry;
-use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionStats;
 use crate::harness::session::values as stored_values;
 use crate::harness::session::values::ValueAddress;
@@ -70,19 +70,12 @@ fn next_session_id() -> String {
     )
 }
 
-fn user_message(text: &str) -> AgentMessage {
-    AgentMessage::Standard(Message::User(pi_ai::types::UserMessage {
-        content: pi_ai::types::UserContent::Text(text.to_owned()),
-        timestamp: 1,
-    }))
-}
-
 fn user_new_entry(id: &str, text: &str) -> NewEntry {
     NewEntry::Message {
         id: id.to_owned(),
         parent_id: None,
         body: Box::new(MessageEntry {
-            message: user_message(text),
+            message: user_text_message(text),
             terminate: None,
         }),
     }
@@ -110,23 +103,6 @@ fn committed_entries(events: &[crate::harness::agent_harness::HarnessEvent]) -> 
             _ => None,
         })
         .collect()
-}
-
-async fn commit_writes(session: &Arc<StorageBackedSession>, writes: Vec<Write>) {
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("the commit settles");
 }
 
 /// The raw value-set write the malformed fixtures build: the serialized
@@ -222,7 +198,7 @@ fn announces_message_entries_start_end_and_commit() {
         seq: 1,
         timestamp: 1,
         body: Box::new(MessageEntry {
-            message: user_message("hello"),
+            message: user_text_message("hello"),
             terminate: None,
         }),
     };
@@ -231,7 +207,7 @@ fn announces_message_entries_start_end_and_commit() {
     match &events[0].payload {
         HarnessEventPayload::MessageStart { run_id, message } => {
             assert_eq!(*run_id, None, "the run-less commit announces no run");
-            assert_eq!(message, &user_message("hello"));
+            assert_eq!(message, &user_text_message("hello"));
         }
         other => panic!("the first event: {other:?}"),
     }
@@ -242,7 +218,7 @@ fn announces_message_entries_start_end_and_commit() {
             entry_id,
         } => {
             assert_eq!(*run_id, None);
-            assert_eq!(message, &user_message("hello"));
+            assert_eq!(message, &user_text_message("hello"));
             assert_eq!(entry_id.as_deref(), Some("entry"));
         }
         other => panic!("the second event: {other:?}"),
@@ -279,14 +255,7 @@ fn announces_message_entries_start_end_and_commit() {
         parent_id: None,
         seq: 2,
         timestamp: 2,
-        body: crate::harness::session::types::CompactionEntryBody {
-            summary: "summary".to_owned(),
-            retained_tail: Vec::new(),
-            tokens_before: 0,
-            details: None,
-            usage: None,
-            from_hook: false,
-        },
+        body: compaction_entry_body("summary"),
     };
     let events = entry_lifecycle_events(compaction, "main", None);
     assert_eq!(
@@ -351,20 +320,7 @@ fn materializes_committed_entries_with_their_storage_metadata() {
 /// tip commits the prompt's user message.
 async fn admitted_run() -> (Arc<Lane>, Arc<StorageBackedSession>, Drive) {
     let (lane, session) = lane_fixture().await;
-    let admission = lane
-        .accept(
-            OperationRequest::Prompt {
-                operation_id: None,
-                prompt: Box::new(PromptMessagesPayload::Text {
-                    prompt: "hello".to_owned(),
-                    images: None,
-                }),
-            },
-            &background_context(),
-        )
-        .await
-        .expect("accept serves")
-        .expect("the admission");
+    let admission = accept_text(&lane, "hello").await;
     let drive = Drive::new(
         &DriveOptions {
             operation_id: admission.operation_id,
@@ -507,7 +463,7 @@ async fn queued_session() -> Arc<StorageBackedSession> {
             crate::harness::session::values::set_value_write(
                 &stored_values::pending_entry("steer-1"),
                 PendingEntry::Message {
-                    payload: Box::new(user_message("steer")),
+                    payload: Box::new(user_text_message("steer")),
                 },
             )
             .expect("steer pending write"),
@@ -550,7 +506,7 @@ async fn reads_the_lane_queues_from_the_inbox_payloads() {
         } => {
             assert_eq!(entry_id, "steer-1");
             assert_eq!(*kind, InboxItemKind::Steer);
-            assert_eq!(message.as_ref(), &user_message("steer"));
+            assert_eq!(message.as_ref(), &user_text_message("steer"));
         }
         other @ LaneQueuedItem::Custom { .. } => panic!("the custom queue item: {other:?}"),
     }
@@ -680,7 +636,7 @@ async fn reads_the_pending_message_payloads() {
     .expect("the pending read");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].0, "steer-1");
-    assert_eq!(messages[0].1, user_message("steer"));
+    assert_eq!(messages[0].1, user_text_message("steer"));
 
     let missing = read_pending_messages(
         session.as_ref(),
@@ -730,14 +686,7 @@ fn chains_the_structural_and_custom_entry_shapes() {
     let compaction = NewEntry::Compaction {
         id: "compact".to_owned(),
         parent_id: None,
-        body: crate::harness::session::types::CompactionEntryBody {
-            summary: "summary".to_owned(),
-            retained_tail: Vec::new(),
-            tokens_before: 0,
-            details: None,
-            usage: None,
-            from_hook: false,
-        },
+        body: compaction_entry_body("summary"),
     };
     let branch_summary = NewEntry::BranchSummary {
         id: "summary".to_owned(),

@@ -17,15 +17,9 @@
 )]
 #[cfg(test)]
 mod events;
+use serde_json::json;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::MutexGuard;
-use std::sync::PoisonError;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-
-use pi_ai::models::create_models;
-use serde_json::json;
 
 use pi_ai::types::Message;
 use pi_ai::types::ToolResultBlock;
@@ -35,27 +29,23 @@ use crate::harness::agent_harness::AgentLane;
 use crate::harness::agent_harness::EventListener;
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::HarnessEventPayload;
-use crate::harness::agent_harness::LaneQueuedItem;
-use crate::harness::agent_harness::LaneSnapshot;
-use crate::harness::agent_harness::LaneSnapshotTool;
-use crate::harness::agent_harness::LiveOperationView;
 use crate::harness::agent_harness::OperationStatus;
 use crate::harness::agent_harness::QueueMessage;
+use crate::harness::agent_harness::{
+    LaneQueuedItem, LaneSnapshot, LaneSnapshotTool, LiveOperationView,
+};
 use crate::harness::context::background_context;
 use crate::harness::events::HarnessEventBus;
-use crate::harness::hooks::HookRegistry;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::reducer::LaneSnapshotReduction;
 use crate::harness::runtime::reducer::reduce_lane_snapshot;
-use crate::harness::runtime::restore::restore_lane;
+use crate::harness::runtime::test_support::bus_emit_batch;
+use crate::harness::runtime::test_support::bus_watch_installer;
 use crate::harness::runtime::test_support::lane_configuration;
-use crate::harness::runtime::test_support::noop_hook_reporter;
-use crate::harness::runtime::test_support::passthrough_fault_handler;
-use crate::harness::runtime::test_support::runtime_config;
-use crate::harness::runtime::test_support::seed_main_lane_values;
+use crate::harness::runtime::test_support::lock;
+use crate::harness::runtime::test_support::memory_session_with_seed;
+use crate::harness::runtime::test_support::restored_lane;
 use crate::harness::runtime::test_support::settle_events;
-use crate::harness::session::memory::MemoryStorage;
-use crate::harness::session::memory::MemoryStorageOptions;
 use crate::harness::session::session::StorageBackedSession;
 use crate::harness::session::types::CompactionReason;
 use crate::harness::session::types::Entry;
@@ -337,45 +327,17 @@ fn collector(sink: Arc<Mutex<Vec<HarnessEvent>>>) -> EventListener {
     })
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-fn next_session_id() -> String {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    format!("reducer-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
-}
-
 /// The lane the queue-replication case constructs directly, upstream's
 /// `createFixture` + `lane.watch`: a real session, the bus-backed emit and
 /// watch surfaces, no drive.
 async fn bus_lane(bus: &Arc<HarnessEventBus>) -> (Lane, Arc<StorageBackedSession>) {
-    let storage = Arc::new(MemoryStorage::new(MemoryStorageOptions::default()));
-    let session = Arc::new(StorageBackedSession::new(
-        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
-        storage,
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
-    ));
-    seed_main_lane_values(&session, None)
-        .await
-        .expect("seed commit");
-    let restored = restore_lane(session.clone(), "main", &background_context())
-        .await
-        .expect("restore");
-    let lane = Lane::new(
-        "main",
+    let session = memory_session_with_seed(None).await;
+    let lane = restored_lane(
         session.clone(),
-        Arc::new(create_models(None)),
-        Arc::new(HookRegistry::new(noop_hook_reporter())),
-        restored,
-        passthrough_fault_handler(),
-        crate::harness::runtime::test_support::bus_emit_batch(Arc::clone(bus)),
-        crate::harness::runtime::test_support::bus_watch_installer(
-            Arc::clone(bus),
-            empty_snapshot(),
-        ),
-        Arc::new(runtime_config),
-    );
+        bus_emit_batch(Arc::clone(bus)),
+        bus_watch_installer(Arc::clone(bus), empty_snapshot()),
+    )
+    .await;
     (lane, session)
 }
 

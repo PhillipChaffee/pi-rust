@@ -14,14 +14,12 @@
 
 use std::sync::Arc;
 
-use crate::harness::agent_harness::DriveOptions;
 use crate::harness::agent_harness::DriveOutcome;
 use crate::harness::agent_harness::DriveWaitReason;
-use crate::harness::context::background_context;
 use crate::harness::gate::GateRejection;
+use crate::harness::runtime::test_support::drive_pass;
 use crate::harness::runtime::test_support::runtime_config;
 use crate::harness::runtime::types::ContinueOperationResult;
-use crate::harness::runtime::types::Drive;
 use crate::harness::runtime::types::DriveCompletion;
 use crate::harness::runtime::types::LaneCommand;
 use crate::harness::runtime::types::LaneError;
@@ -42,17 +40,6 @@ fn settled_record() -> OperationResultRecord {
         started_at: 1,
         ended_at: 2,
     }
-}
-
-fn drive() -> Arc<Drive> {
-    Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "operation".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ))
 }
 
 fn waiting_outcome() -> DriveOutcome {
@@ -115,20 +102,7 @@ fn the_command_vocabulary_renders_its_debug_surfaces() {
 
     let commit: OperationCommand<()> = OperationCommand::Commit {
         writes: Vec::new(),
-        operation_state: crate::harness::session::types::OperationState::Starting(
-            crate::harness::session::types::StartingOperation {
-                scope: crate::harness::session::types::OperationScope {
-                    control: crate::harness::session::types::Control::Running,
-                    settings: crate::harness::session::types::RunSettings {
-                        compaction: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-                        steering_mode: crate::types::QueueMode::All,
-                        follow_up_mode: crate::types::QueueMode::All,
-                        tool_execution: crate::types::ToolExecutionMode::Parallel,
-                    },
-                    latest_assistant_entry_id: None,
-                },
-            },
-        ),
+        operation_state: crate::harness::runtime::test_support::starting_run_state(),
         lane: None,
         materialize: Arc::new(|_commit| ()),
         events: None,
@@ -189,7 +163,7 @@ fn the_drive_completion_clones_and_renders_its_states() {
 
 #[test]
 fn the_drive_debug_names_its_pass() {
-    let debug = format!("{:?}", drive());
+    let debug = format!("{:?}", drive_pass("operation"));
     assert!(
         debug.contains("operation_id: \"operation\""),
         "the pass names its operation"
@@ -202,7 +176,7 @@ fn the_drive_debug_names_its_pass() {
 
 #[tokio::test]
 async fn begin_abort_gates_admission_and_carries_the_cancellation() {
-    let pass = drive();
+    let pass = drive_pass("operation");
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
     pass.begin_abort(cancel_rx);
     pass.begin_abort(tokio::sync::watch::channel(()).1);
@@ -225,7 +199,7 @@ async fn begin_abort_gates_admission_and_carries_the_cancellation() {
 
 #[test]
 fn signal_abort_fires_only_once_aborting() {
-    let pass = drive();
+    let pass = drive_pass("operation");
     pass.signal_abort();
     assert!(
         !pass.gate.signal().aborted(),
@@ -243,7 +217,7 @@ fn signal_abort_fires_only_once_aborting() {
 
 #[tokio::test]
 async fn close_gate_closes_once_and_fails_the_completion() {
-    let pass = drive();
+    let pass = drive_pass("operation");
     let error: LaneError = crate::harness::runtime::test_support::commit_failure("closed");
     pass.close_gate(Arc::clone(&error));
 
@@ -285,7 +259,7 @@ async fn close_gate_closes_once_and_fails_the_completion() {
 /// the vocabulary's `settle`/`fail` pair.
 #[tokio::test]
 async fn the_completion_settles_exactly_once() {
-    let pass = drive();
+    let pass = drive_pass("operation");
     let outcome = waiting_outcome();
     pass.settle(outcome.clone());
     pass.fail(lane_error(SessionError::Message("late".to_owned())));

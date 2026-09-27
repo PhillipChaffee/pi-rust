@@ -22,40 +22,52 @@
     reason = "the unused watch installer raises deliberately, upstream's `unusedWatch` throw"
 )]
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
-use std::sync::PoisonError;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use pi_ai::types::BoxedFuture;
+use pi_ai::models::create_models;
+use pi_ai::types::{BoxedFuture, Message, TextContent, UserBlock, UserContent, UserMessage};
 
+use crate::harness::agent_harness::AgentLane;
+use crate::harness::agent_harness::DriveOptions;
 use crate::harness::agent_harness::EventListener;
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::LaneSnapshot;
+use crate::harness::agent_harness::OperationAdmission;
+use crate::harness::agent_harness::OperationRequest;
+use crate::harness::agent_harness::PromptMessagesPayload;
 use crate::harness::agent_harness::WatchHandle;
 use crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS;
 use crate::harness::context::Context;
+use crate::harness::context::background_context;
 use crate::harness::events::ListenerError;
 use crate::harness::events::ResnapshotCapture;
 use crate::harness::events::WatchFilter;
 use crate::harness::messages::convert_to_llm;
+use crate::harness::runtime::lane::ConfigProvider;
 use crate::harness::runtime::lane::EmitBatch;
 use crate::harness::runtime::lane::FaultHandler;
+use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::lane::WatchInstaller;
+use crate::harness::runtime::restore::restore_lane;
 use crate::harness::runtime::types::Config;
+use crate::harness::runtime::types::Drive;
 use crate::harness::runtime::types::LaneError;
 use crate::harness::runtime::types::lane_error;
 use crate::harness::session::memory::MemoryStorage;
+use crate::harness::session::memory::MemoryStorageOptions;
 use crate::harness::session::session::StorageBackedSession;
 use crate::harness::session::session::StorageBackedSessionOptions;
 use crate::harness::session::types::CommitResult;
 use crate::harness::session::types::Entry;
 use crate::harness::session::types::EntryScan;
 use crate::harness::session::types::EntryStructure;
+use crate::harness::session::types::GenerationContext;
+use crate::harness::session::types::InboxItem;
 use crate::harness::session::types::LaneConfiguration;
 use crate::harness::session::types::ModelIdentity;
+use crate::harness::session::types::OperationResultRecord;
+use crate::harness::session::types::OperationScope;
 use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::types::SessionMetadata;
@@ -73,6 +85,7 @@ use crate::harness::session::values::Write;
 use crate::harness::session::values::set_value_write;
 use crate::harness::types::AgentHarnessResources;
 use crate::harness::types::AgentHarnessStreamOptions;
+use crate::types::AgentMessage;
 use crate::types::QueueMode;
 use crate::types::ThinkingLevel;
 use crate::types::ToolExecutionMode;
@@ -144,7 +157,431 @@ pub(super) fn deferred() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::sync::oneshot::Receiver<()>,
 ) {
-    tokio::sync::oneshot::channel()
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    (sender, receiver)
+}
+
+/// The session id counter every runtime suite shares: one id per fixture
+/// session within the test process, the uniqueness the per-suite counters
+/// gave.
+#[must_use]
+pub(super) fn next_session_id() -> String {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    format!("runtime-fixture-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Locks one mutex, poisoned-lock recovery included, upstream's plain
+/// field reads under the single event loop.
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Builds one plain user text message, upstream's `{ role: "user",
+/// content: text, timestamp: 1 }` literals.
+#[must_use]
+pub(super) fn user_text_message(text: &str) -> AgentMessage {
+    AgentMessage::Standard(Message::User(UserMessage {
+        timestamp: 1,
+        content: UserContent::Text(text.to_owned()),
+    }))
+}
+
+/// Builds one blocks-carried user message, upstream's
+/// `{ type: "user", content: [...] }` construction.
+#[must_use]
+pub(super) fn user_blocks_message(text: &str) -> AgentMessage {
+    AgentMessage::Standard(Message::User(UserMessage {
+        timestamp: 1,
+        content: UserContent::Blocks(vec![UserBlock::Text(TextContent {
+            text: text.to_owned(),
+            text_signature: None,
+        })]),
+    }))
+}
+
+/// The running scope every leaf fixture carries, upstream's
+/// `operationScope()` / `runScope()` fixtures.
+#[must_use]
+pub(super) fn operation_scope() -> OperationScope {
+    OperationScope {
+        control: crate::harness::session::types::Control::Running,
+        settings: crate::harness::session::types::RunSettings {
+            compaction: DEFAULT_COMPACTION_SETTINGS,
+            steering_mode: QueueMode::All,
+            follow_up_mode: QueueMode::All,
+            tool_execution: ToolExecutionMode::Parallel,
+        },
+        latest_assistant_entry_id: None,
+    }
+}
+
+/// The starting leaf the seeded operations carry, upstream's
+/// `{ at: "starting", ... }` fixtures.
+#[must_use]
+pub(super) fn starting_run_state() -> crate::harness::session::types::OperationState {
+    crate::harness::session::types::OperationState::Starting(
+        crate::harness::session::types::StartingOperation {
+            scope: operation_scope(),
+        },
+    )
+}
+
+/// The generation inputs the model-carrying leaves carry, upstream's
+/// `generationContext()` fixture.
+#[must_use]
+pub(super) fn generation_context() -> GenerationContext {
+    GenerationContext {
+        step_id: "step".to_owned(),
+        trigger_entry_id: "trigger".to_owned(),
+        configuration: lane_configuration(),
+        stream_options: AgentHarnessStreamOptions::default(),
+        retry_policy: crate::harness::session::types::NormalizedRetryPolicy {
+            max_attempts: 2,
+            base_delay_ms: 1,
+            max_agent_delay_ms: 30_000,
+        },
+        overflow_recovery_used: false,
+    }
+}
+
+/// The compaction entry body the fixtures build, upstream's inline
+/// `{ summary, retainedTail: [], ... }` literals.
+#[must_use]
+pub(super) fn compaction_entry_body(
+    summary: &str,
+) -> crate::harness::session::types::CompactionEntryBody {
+    crate::harness::session::types::CompactionEntryBody {
+        summary: summary.to_owned(),
+        retained_tail: Vec::new(),
+        tokens_before: 0,
+        details: None,
+        usage: None,
+        from_hook: false,
+    }
+}
+
+/// The raw value-set write the malformed fixtures build: the serialized
+/// payload bypasses the typed setter, mirroring a corrupted store.
+#[must_use]
+pub(super) fn raw_write(address: &ValueAddress, value: serde_json::Value) -> Write {
+    Write::ValueSet(crate::harness::session::values::ValueSetWrite {
+        value,
+        key: address.key.clone(),
+        namespace: address.namespace.clone(),
+        op: "set".to_owned(),
+        kind: "value".to_owned(),
+    })
+}
+
+/// The zeroed usage block the test assistant wires carry, upstream's
+/// inline `usage: { input: 0, ... }` literals.
+#[must_use]
+pub(super) fn zero_usage_wire() -> serde_json::Value {
+    let zero = 0;
+    serde_json::json!({
+        "input": zero, "output": zero, "cacheRead": zero, "cacheWrite": zero, "totalTokens": zero,
+        "cost": { "input": zero, "output": zero, "cacheRead": zero, "cacheWrite": zero, "total": zero },
+    })
+}
+
+/// The assistant wire the fixtures parse, upstream's inline assistant
+/// literals with the zero usage and the free stop reason.
+#[must_use]
+pub(super) fn assistant_wire_value(
+    content: &serde_json::Value,
+    stop_reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "role": "assistant",
+        "content": content,
+        "api": "anthropic-messages",
+        "provider": "test",
+        "model": "model",
+        "usage": zero_usage_wire(),
+        "stopReason": stop_reason,
+        "timestamp": 1,
+    })
+}
+
+/// The lane record write one commit publishes, upstream's
+/// `storedValues.setValue(storedValues.laneState(...), ...)` calls.
+///
+/// # Errors
+/// The write's serialization failure.
+pub(super) fn lane_state_write(
+    lane: &str,
+    current_operation_id: Option<&str>,
+    last_operation_id: Option<&str>,
+    inbox: Vec<InboxItem>,
+) -> Result<Write, SessionError> {
+    set_value_write(
+        &crate::harness::session::values::lane_state(lane),
+        crate::harness::session::types::LaneState {
+            current_operation_id: current_operation_id.map(str::to_owned),
+            last_operation_id: last_operation_id.map(str::to_owned),
+            inbox,
+        },
+    )
+}
+
+/// The main lane's seed writes, upstream's `createLane`'s commit list: the
+/// branch tip at none, the lane configuration, and the idle lane state.
+///
+/// # Errors
+/// A write's serialization failure.
+pub(super) fn main_lane_seed_writes(
+    configuration: &LaneConfiguration,
+) -> Result<Vec<Write>, SessionError> {
+    Ok(vec![
+        set_value_write(
+            &crate::harness::session::values::branch_tip("main"),
+            Option::<String>::None,
+        )?,
+        set_value_write(
+            &crate::harness::session::values::lane_config("main"),
+            configuration.clone(),
+        )?,
+        lane_state_write("main", None, None, Vec::new())?,
+    ])
+}
+
+/// Commits one write transaction through the session's mutation line,
+/// upstream's fixtures' `mutator.commit(writes)` callbacks; an unexpected
+/// result panics the test by design.
+pub(super) async fn commit_writes<S>(session: &Arc<S>, writes: Vec<Write>)
+where
+    S: Session + ?Sized,
+{
+    session
+        .mutate(
+            Box::new(move |mutator, context| {
+                let writes = writes.clone();
+                Box::pin(async move {
+                    mutator.commit(writes, context).await?;
+                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
+                    Ok(payload)
+                })
+            }),
+            &background_context(),
+        )
+        .await
+        .expect("the commit settles");
+}
+
+/// The session over a plain memory backend, seeded with the idle (or the
+/// seeded-started) `main` lane, upstream's `createSession` fixtures.
+///
+/// # Panics
+/// The seed commit's failure.
+pub(super) async fn memory_session_with_seed(
+    operation_id: Option<&str>,
+) -> Arc<StorageBackedSession> {
+    let session = Arc::new(StorageBackedSession::new(
+        runtime_session_metadata(next_session_id()),
+        Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
+        StorageBackedSessionOptions::default(),
+    ));
+    seed_main_lane_values(&session, operation_id)
+        .await
+        .expect("seed commit");
+    session
+}
+
+/// The lane over one restored `main` state with the standard fixture
+/// arguments, upstream's `createLane`'s `new Lane(...)` call.
+///
+/// # Panics
+/// The restore's failure.
+pub(super) async fn restored_lane(
+    session: Arc<StorageBackedSession>,
+    emit_batch: EmitBatch,
+    install_watch: WatchInstaller,
+) -> Lane {
+    restored_lane_with_config(session, emit_batch, install_watch, Arc::new(runtime_config)).await
+}
+
+/// The lane variant the resource-configuring suites drive: one custom
+/// config provider over the restored `main` state.
+///
+/// # Panics
+/// The restore's failure.
+pub(super) async fn restored_lane_with_config(
+    session: Arc<StorageBackedSession>,
+    emit_batch: EmitBatch,
+    install_watch: WatchInstaller,
+    read_config: ConfigProvider,
+) -> Lane {
+    let restored = restore_lane(session.clone(), "main", &background_context())
+        .await
+        .expect("restore");
+    Lane::new(
+        "main",
+        session,
+        Arc::new(create_models(None)),
+        Arc::new(crate::harness::hooks::HookRegistry::new(
+            noop_hook_reporter(),
+        )),
+        restored,
+        passthrough_fault_handler(),
+        emit_batch,
+        install_watch,
+        read_config,
+    )
+}
+
+/// Gates one commit behind the test's release, upstream's
+/// `beforeNextCommit` fixtures: the hook signals `commit_started` and parks
+/// until released. Returns `(started, release)`.
+#[must_use]
+pub(super) fn gate_next_commit(
+    storage: &ControlledStorage,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (commit_started, started) = deferred();
+    let (release, release_rx) = deferred();
+    storage.set_before_next_commit(Some(Box::new(move || {
+        Box::pin(async move {
+            let _ = commit_started.send(());
+            let _ = release_rx.await;
+            Ok(())
+        })
+    })));
+    (started, release)
+}
+
+/// One plain drive pass over the background context, the fixtures' `Drive`
+/// constructions.
+#[must_use]
+pub(super) fn drive_pass(operation_id: &str) -> Arc<Drive> {
+    Arc::new(Drive::new(
+        &DriveOptions {
+            operation_id: operation_id.to_owned(),
+            wait_for_retry: None,
+            poll_deferred: None,
+        },
+        &background_context(),
+    ))
+}
+
+/// The settled run record the fixtures write, upstream's
+/// `{ status: "completed", startedAt: 1, endedAt: 2 }` literals.
+#[must_use]
+pub(super) fn settled_run_record(operation_id: &str) -> OperationResultRecord {
+    OperationResultRecord {
+        operation_id: operation_id.to_owned(),
+        kind: crate::harness::session::types::OperationKind::Run,
+        status: crate::harness::session::types::TerminalStatus::Completed,
+        error: None,
+        from_tip_id: None,
+        tip_id: None,
+        started_at: 1,
+        ended_at: 2,
+    }
+}
+
+/// The admitted operation's id, upstream's
+/// `lane.state().operation!.meta.operationId` reads; an unexpected absence
+/// panics the test by design.
+#[must_use]
+pub(super) fn live_operation_id(lane: &Lane) -> String {
+    lane.state()
+        .operation
+        .as_ref()
+        .map(|operation| operation.meta.operation_id.clone())
+        .expect("the live operation")
+}
+
+/// Swaps the live operation's durable state leaf, the capture fixtures'
+/// patch, upstream's per-case operation-state commits.
+///
+/// # Panics
+/// The live operation's absence or the patch's failure.
+pub(super) async fn patch_live_state(
+    lane: &Lane,
+    next_state: crate::harness::session::types::OperationState,
+) {
+    let live = lane.state().operation.expect("the live operation");
+    let operation_id = live.meta.operation_id.clone();
+    let meta = live.meta;
+    lane.command::<(), _>(
+        move |state, _session, _context| {
+            let operation_id = operation_id.clone();
+            let meta = meta.clone();
+            let next_state = next_state.clone();
+            Box::pin(async move {
+                let mut next = state.clone();
+                next.operation = Some(crate::harness::runtime::types::LiveOperation {
+                    meta,
+                    state: next_state.clone(),
+                });
+                Ok(crate::harness::runtime::types::LaneCommand::Commit {
+                    writes: vec![
+                        set_value_write(
+                            &crate::harness::session::values::operation_state(&operation_id),
+                            next_state,
+                        )
+                        .expect("state write"),
+                    ],
+                    next,
+                    materialize: Arc::new(|_commit| ()),
+                    events: None,
+                })
+            })
+        },
+        &background_context(),
+    )
+    .await
+    .expect("the patch commits");
+}
+
+/// Accepts one text prompt admission, the fixtures' `lane.accept` calls.
+///
+/// # Panics
+/// The accept surface's failure or the admission's rejection.
+pub(super) async fn accept_text(lane: &Lane, prompt: &str) -> OperationAdmission {
+    lane.accept(
+        OperationRequest::Prompt {
+            operation_id: None,
+            prompt: Box::new(PromptMessagesPayload::Text {
+                prompt: prompt.to_owned(),
+                images: None,
+            }),
+        },
+        &background_context(),
+    )
+    .await
+    .expect("accept serves")
+    .expect("the admission")
+}
+
+/// Finishes the active operation through the lane's own finish path: the
+/// result record writes and the operation clears, upstream's
+/// `settleOperation` finish fixtures.
+///
+/// # Panics
+/// The active operation's absence or the finish's failure.
+pub(super) async fn finish_operation(lane: &Lane) {
+    let operation_id = live_operation_id(lane);
+    let record = settled_run_record(&operation_id);
+    lane.settle_operation::<(), _>(
+        move |_state, _operation_state, _meta, _session, _context| {
+            let record = record.clone();
+            Box::pin(async move {
+                Ok(crate::harness::runtime::types::OperationCommand::Finish {
+                    writes: Vec::new(),
+                    record,
+                    lane: None,
+                    materialize: Arc::new(|_commit| ()),
+                    events: None,
+                })
+            })
+        },
+        &background_context(),
+    )
+    .await
+    .expect("the finish settles");
 }
 
 /// The settle upstream's `setTimeout(resolve, 0)` await restates: yields
@@ -162,10 +599,6 @@ pub(super) async fn settle_events() {
 /// throw, and the throw becomes the commit's error.
 pub(super) type BeforeCommitFn =
     Box<dyn FnOnce() -> BoxedFuture<'static, Result<(), SessionError>> + Send + Sync>;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// The controlled memory storage the runtime suites drive, upstream's
 /// `ControlledMemoryStorage` / `FailingStorage` / `FailingMemoryStorage`
@@ -393,7 +826,8 @@ pub(super) fn runtime_session_metadata(id: String) -> SessionMetadata {
 ///
 /// The branch tip sits at none with the lane configuration and the empty
 /// lane state; `Some(operation_id)` additionally persists an admitted
-/// starting operation under that id (the drive-fault fixture's seed).
+/// starting operation under that id (the drive-fault fixture's seed) and
+/// points the lane record at it.
 ///
 /// # Errors
 /// The seed commit's failure.
@@ -401,8 +835,8 @@ pub(super) async fn seed_main_lane_values(
     session: &Arc<StorageBackedSession>,
     operation_id: Option<&str>,
 ) -> Result<(), SessionError> {
-    let writes = {
-        let mut writes = vec![
+    let mut writes = if operation_id.is_some() {
+        vec![
             set_value_write(
                 &crate::harness::session::values::branch_tip("main"),
                 Option::<String>::None,
@@ -411,49 +845,30 @@ pub(super) async fn seed_main_lane_values(
                 &crate::harness::session::values::lane_config("main"),
                 lane_configuration(),
             )?,
-            set_value_write(
-                &crate::harness::session::values::lane_state("main"),
-                crate::harness::session::types::LaneState {
-                    current_operation_id: operation_id.map(str::to_owned),
-                    last_operation_id: None,
-                    inbox: Vec::new(),
-                },
-            )?,
-        ];
-        if let Some(operation_id) = operation_id {
-            let meta = crate::harness::session::types::OperationMeta {
-                operation_id: operation_id.to_owned(),
-                lane: "main".to_owned(),
-                source_tip_id: None,
-                started_at: 1,
-                intent: crate::harness::session::types::OperationIntent::Run {
-                    prompt_entry_ids: Vec::new(),
-                },
-            };
-            writes.push(set_value_write(
-                &crate::harness::session::values::operation_meta(operation_id),
-                meta,
-            )?);
-            writes.push(set_value_write(
-                &crate::harness::session::values::operation_state(operation_id),
-                crate::harness::session::types::OperationState::Starting(
-                    crate::harness::session::types::StartingOperation {
-                        scope: crate::harness::session::types::OperationScope {
-                            control: crate::harness::session::types::Control::Running,
-                            settings: crate::harness::session::types::RunSettings {
-                                compaction: DEFAULT_COMPACTION_SETTINGS,
-                                steering_mode: QueueMode::All,
-                                follow_up_mode: QueueMode::All,
-                                tool_execution: ToolExecutionMode::Parallel,
-                            },
-                            latest_assistant_entry_id: None,
-                        },
-                    },
-                ),
-            )?);
-        }
-        writes
+            lane_state_write("main", operation_id, None, Vec::new())?,
+        ]
+    } else {
+        main_lane_seed_writes(&lane_configuration())?
     };
+    if let Some(operation_id) = operation_id {
+        let meta = crate::harness::session::types::OperationMeta {
+            operation_id: operation_id.to_owned(),
+            lane: "main".to_owned(),
+            source_tip_id: None,
+            started_at: 1,
+            intent: crate::harness::session::types::OperationIntent::Run {
+                prompt_entry_ids: Vec::new(),
+            },
+        };
+        writes.push(set_value_write(
+            &crate::harness::session::values::operation_meta(operation_id),
+            meta,
+        )?);
+        writes.push(set_value_write(
+            &crate::harness::session::values::operation_state(operation_id),
+            starting_run_state(),
+        )?);
+    }
     session
         .mutate(
             Box::new(move |mutator, context| {
@@ -464,7 +879,7 @@ pub(super) async fn seed_main_lane_values(
                     Ok(payload)
                 })
             }),
-            &crate::harness::context::background_context(),
+            &background_context(),
         )
         .await
         .map(|_| ())

@@ -9,12 +9,7 @@
 //! the settlement (upstream's `latest` rejection) and surface through
 //! `drain`.
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
-use std::sync::PoisonError;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, atomic::AtomicBool, atomic::Ordering};
 
 use pi_ai::types::BoxedFuture;
 use pi_ai::utils::assistant_message_frame::AssistantMessageFrame;

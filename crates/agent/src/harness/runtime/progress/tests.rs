@@ -31,20 +31,23 @@ use serde_json::json;
 use crate::harness::agent_harness::DriveOptions;
 use crate::harness::agent_harness::DriveOutcome;
 use crate::harness::agent_harness::DriveWaitReason;
-use crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS;
 use crate::harness::context::background_context;
 use crate::harness::context::with_abort_signal;
-use crate::harness::hooks::HookErrorReporter;
 use crate::harness::hooks::HookRegistry;
 use crate::harness::runtime::lane::EmitBatch;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::progress::open_frame_progress;
 use crate::harness::runtime::progress::open_tool_progress;
 use crate::harness::runtime::test_support::ControlledStorage;
-use crate::harness::runtime::test_support::deferred;
+use crate::harness::runtime::test_support::commit_writes;
+use crate::harness::runtime::test_support::gate_next_commit;
+use crate::harness::runtime::test_support::generation_context;
 use crate::harness::runtime::test_support::lane_configuration;
 use crate::harness::runtime::test_support::noop_emit_batch;
+use crate::harness::runtime::test_support::noop_hook_reporter;
+use crate::harness::runtime::test_support::operation_scope;
 use crate::harness::runtime::test_support::passthrough_fault_handler;
+use crate::harness::runtime::test_support::patch_live_state;
 use crate::harness::runtime::test_support::runtime_config;
 use crate::harness::runtime::test_support::unused_watch_installer;
 use crate::harness::runtime::types::Drive;
@@ -57,17 +60,11 @@ use crate::harness::session::types::AssistantEffectPendingOperation;
 use crate::harness::session::types::CheckpointData;
 use crate::harness::session::types::CheckpointOperation;
 use crate::harness::session::types::Continuation;
-use crate::harness::session::types::Control;
 use crate::harness::session::types::DeferredEffectPendingOperation;
 use crate::harness::session::types::DeferredScope;
-use crate::harness::session::types::GenerationContext;
-use crate::harness::session::types::NormalizedRetryPolicy;
 use crate::harness::session::types::OperationIntent;
 use crate::harness::session::types::OperationMeta;
-use crate::harness::session::types::OperationScope;
 use crate::harness::session::types::OperationState;
-use crate::harness::session::types::RunSettings;
-use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::values as stored_values;
 use crate::harness::session::values::delete_value_write;
@@ -75,8 +72,6 @@ use crate::harness::session::values::set_value_write;
 use crate::harness::types::AgentHarnessStreamOptions;
 use crate::types::AgentToolContent;
 use crate::types::AgentToolResult;
-use crate::types::QueueMode;
-use crate::types::ToolExecutionMode;
 use pi_ai::types::TextContent;
 
 fn next_session_id() -> String {
@@ -84,42 +79,12 @@ fn next_session_id() -> String {
     format!("progress-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
 }
 
-fn noop_hook_reporter() -> HookErrorReporter {
-    Arc::new(|_error, _name, _site, _context| Box::pin(std::future::ready(())))
-}
-
-/// The scope upstream's `runScope()` builds: a running operation under the
-/// fixture's settings.
-fn run_scope() -> OperationScope {
-    OperationScope {
-        control: Control::Running,
-        settings: RunSettings {
-            compaction: DEFAULT_COMPACTION_SETTINGS,
-            steering_mode: QueueMode::All,
-            follow_up_mode: QueueMode::All,
-            tool_execution: ToolExecutionMode::Parallel,
-        },
-        latest_assistant_entry_id: None,
-    }
-}
-
 /// The assistant-effect-pending leaf upstream's `assistantEffectPending`
 /// builds.
 fn assistant_effect_pending(response_entry_id: &str) -> OperationState {
     OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
-        scope: run_scope(),
-        generation_context: GenerationContext {
-            step_id: "step".to_owned(),
-            trigger_entry_id: "trigger".to_owned(),
-            configuration: lane_configuration(),
-            stream_options: AgentHarnessStreamOptions::default(),
-            retry_policy: NormalizedRetryPolicy {
-                max_attempts: 2,
-                base_delay_ms: 1,
-                max_agent_delay_ms: 30_000,
-            },
-            overflow_recovery_used: false,
-        },
+        scope: operation_scope(),
+        generation_context: generation_context(),
         attempt: 1,
         response_entry_id: response_entry_id.to_owned(),
         usage_id: "usage".to_owned(),
@@ -132,7 +97,7 @@ fn assistant_effect_pending(response_entry_id: &str) -> OperationState {
 /// `{ ...runScope(), at: "tools", batch: { ... } }`.
 fn tools_state(invocation_id: &str) -> OperationState {
     OperationState::Tools(crate::harness::session::types::ToolsOperation {
-        scope: run_scope(),
+        scope: operation_scope(),
         batch: crate::harness::session::types::ToolBatch {
             assistant_entry_id: "assistant".to_owned(),
             configuration: lane_configuration(),
@@ -217,20 +182,7 @@ async fn create_fixture(state: OperationState) -> ProgressFixture {
             .expect("meta write"),
         set_value_write(&stored_values::operation_state("operation"), state).expect("state write"),
     ];
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("seed commit");
+    commit_writes(&session, writes).await;
     let drive = Arc::new(Drive::new(
         &DriveOptions {
             operation_id: "operation".to_owned(),
@@ -359,58 +311,27 @@ async fn declines_a_queued_frame_after_the_authoritative_projection_leaves_its_p
     let response_entry_id = "response";
     let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
     let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
-    let (commit_started, started) = deferred();
-    let (release, release_rx) = deferred();
-    fixture
-        .storage
-        .set_before_next_commit(Some(Box::new(move || {
-            Box::pin(async move {
-                let _ = commit_started.send(());
-                let _ = release_rx.await;
-                Ok(())
-            })
-        })));
+    let (started, release) = gate_next_commit(&fixture.storage);
     let moving = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move {
-            lane.command::<(), _>(
-                move |state, _session, _context| {
-                    Box::pin(async move {
-                        let operation = state.operation.clone().expect("the live operation");
-                        let next_state = OperationState::Checkpoint(CheckpointOperation {
-                            scope: crate::harness::session::types::operation_scope_of(
-                                &operation.state,
-                            ),
-                            checkpoint: CheckpointData {
-                                continuation: Continuation::MayFinish {
-                                    include_final_assistant: true,
-                                },
-                                trigger_entry_id: response_entry_id.to_owned(),
-                            },
-                        });
-                        let mut next = state.clone();
-                        next.operation = Some(LiveOperation {
-                            meta: operation.meta,
-                            state: next_state.clone(),
-                        });
-                        Ok(crate::harness::runtime::types::LaneCommand::Commit {
-                            writes: vec![
-                                set_value_write(
-                                    &stored_values::operation_state("operation"),
-                                    next_state,
-                                )
-                                .expect("state write"),
-                            ],
-                            next,
-                            materialize: Arc::new(|_commit| ()),
-                            events: None,
-                        })
-                    })
+            let live_state = lane
+                .state()
+                .operation
+                .as_ref()
+                .expect("the live operation")
+                .state
+                .clone();
+            let next_state = OperationState::Checkpoint(CheckpointOperation {
+                scope: crate::harness::session::types::operation_scope_of(&live_state),
+                checkpoint: CheckpointData {
+                    continuation: Continuation::MayFinish {
+                        include_final_assistant: true,
+                    },
+                    trigger_entry_id: response_entry_id.to_owned(),
                 },
-                &background_context(),
-            )
-            .await
-            .expect("the phase move commits");
+            });
+            patch_live_state(&lane, next_state).await;
         })
     };
     started.await.expect("commit started");
@@ -445,17 +366,7 @@ async fn declines_a_queued_frame_after_terminal_projection_publication() {
     let response_entry_id = "response";
     let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
     let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
-    let (commit_started, started) = deferred();
-    let (release, release_rx) = deferred();
-    fixture
-        .storage
-        .set_before_next_commit(Some(Box::new(move || {
-            Box::pin(async move {
-                let _ = commit_started.send(());
-                let _ = release_rx.await;
-                Ok(())
-            })
-        })));
+    let (started, release) = gate_next_commit(&fixture.storage);
     let ending = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move {
@@ -581,34 +492,13 @@ fn frame_delta(index: u64, delta: &str) -> AssistantMessageFrame {
     }
 }
 
-async fn commit_writes(
-    fixture: &ProgressFixture,
-    writes: Vec<crate::harness::session::values::Write>,
-) {
-    let session = Arc::clone(fixture.lane.session());
-    session
-        .mutate(
-            Box::new(move |mutator, context| {
-                let writes = writes.clone();
-                Box::pin(async move {
-                    mutator.commit(writes, context).await?;
-                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
-                    Ok(payload)
-                })
-            }),
-            &background_context(),
-        )
-        .await
-        .expect("the commit settles");
-}
-
 #[tokio::test]
 async fn reads_the_pending_assistant_frames_oldest_first() {
     let response_entry_id = "response";
     let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
     let address = stored_values::pending_assistant_frames("operation", response_entry_id);
     commit_writes(
-        &fixture,
+        fixture.lane.session(),
         vec![
             crate::harness::session::values::append_list_write(&address, frame_delta(0, "a"))
                 .expect("frame append"),
@@ -630,7 +520,7 @@ async fn reads_the_pending_assistant_frames_oldest_first() {
 
     // A malformed stored element reports its parse failure.
     commit_writes(
-        &fixture,
+        fixture.lane.session(),
         vec![crate::harness::session::values::Write::ListAppend(
             crate::harness::session::values::ListAppendWrite {
                 kind: "list".to_owned(),
@@ -674,7 +564,7 @@ async fn pages_long_frame_lists_through_the_cursor() {
             .expect("frame append"),
         );
     }
-    commit_writes(&fixture, writes).await;
+    commit_writes(fixture.lane.session(), writes).await;
 
     let frames = crate::harness::runtime::progress::read_assistant_frames(
         fixture.lane.session().as_ref(),
@@ -715,7 +605,7 @@ async fn the_progress_channel_renders_a_summary_debug() {
 fn deferred_effect_pending(response_entry_id: &str) -> OperationState {
     OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
         scope: DeferredScope {
-            scope: run_scope(),
+            scope: operation_scope(),
             step_id: "step".to_owned(),
             source_entry_id: "source".to_owned(),
             poll: 0,

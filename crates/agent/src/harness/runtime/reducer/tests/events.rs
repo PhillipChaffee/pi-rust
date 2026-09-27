@@ -13,6 +13,8 @@
 )]
 
 use super::*;
+use crate::harness::runtime::test_support::assistant_wire_value;
+use crate::harness::runtime::test_support::compaction_entry_body;
 use crate::harness::session::types::ModelIdentity;
 use crate::types::ThinkingLevel;
 
@@ -29,22 +31,13 @@ fn deferred_handle() -> pi_ai::types::DeferredHandle {
     .expect("deferred handle")
 }
 
-/// The assistant wire the streaming fixtures build, `lane/tests.rs`'s
+/// The assistant wire the streaming fixtures build, the shared fixture
 /// assistant literal with the stop reason free.
 fn assistant_wire(stop_reason: &str, text: &str) -> AgentMessage {
-    serde_json::from_value(json!({
-        "role": "assistant",
-        "content": [{ "type": "text", "text": text }],
-        "api": "anthropic-messages",
-        "provider": "test",
-        "model": "model",
-        "usage": {
-            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
-        },
-        "stopReason": stop_reason,
-        "timestamp": 1,
-    }))
+    serde_json::from_value(assistant_wire_value(
+        &json!([{ "type": "text", "text": text }]),
+        stop_reason,
+    ))
     .expect("assistant wire")
 }
 
@@ -599,14 +592,7 @@ fn folds_entry_additions_tip_transcript_and_counts() {
         parent_id: None,
         seq: 3,
         timestamp: 3,
-        body: crate::harness::session::types::CompactionEntryBody {
-            summary: "summary".to_owned(),
-            retained_tail: Vec::new(),
-            tokens_before: 0,
-            details: None,
-            usage: None,
-            from_hook: false,
-        },
+        body: compaction_entry_body("summary"),
     };
     reduce_lane_snapshot(
         &mut snapshot,
