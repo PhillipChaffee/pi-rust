@@ -641,3 +641,162 @@ async fn clear_operation(lane: &Lane) {
     .await
     .expect("the terminal projection commits");
 }
+
+// The storage-error arms and the channel guards: the failing frame read,
+// the failing write plan, the vanished writer, and the completed call's
+// late checkpoint.
+
+use crate::harness::runtime::progress::open_progress;
+
+/// The tools leaf the planned-call checkpoint test builds: the call never
+/// reached its effect, the still-owns guard declines the write.
+fn planned_tools_state(invocation_id: &str) -> OperationState {
+    tools_batch_state(
+        "assistant",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": invocation_id,
+                "status": "planned",
+            }))
+            .expect("tool call wire"),
+        ],
+    )
+}
+
+#[tokio::test]
+async fn a_failing_frame_read_reports_its_storage_error() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    fixture.storage.arm_read_failure(
+        None,
+        Some(&format!("operation:{response_entry_id}")),
+        SessionError::Message("read failed".to_owned()),
+    );
+    let read = crate::harness::runtime::progress::read_assistant_frames(
+        fixture.lane.session().as_ref(),
+        "operation",
+        response_entry_id,
+        &background_context(),
+    )
+    .await;
+    let error = read.expect_err("the frame read rejects");
+    assert_eq!(
+        error.to_string(),
+        "read failed",
+        "the list read's storage error carried",
+    );
+}
+
+/// The write plan's failure retains in the settlement and surfaces through
+/// the drain, upstream's rejected `latest` promise.
+#[tokio::test]
+async fn a_failing_write_plan_retains_its_failure_in_the_drain() {
+    let fixture = create_fixture(assistant_effect_pending("response")).await;
+    let progress = open_progress::<AssistantMessageFrame>(
+        &fixture.lane,
+        &fixture.drive,
+        Arc::new(|_frame: &AssistantMessageFrame| {
+            Err(SessionError::Message("plan failed".to_owned()))
+        }),
+        Arc::new(|_state: &LaneState| true),
+    );
+    progress.write(frame_delta(0, "lost"));
+    let error = progress
+        .drain()
+        .await
+        .expect_err("drain propagates the plan failure");
+    assert_eq!(error.to_string(), "plan failed");
+}
+
+/// The writer vanishing between the write and its settlement releases the
+/// drain, upstream's `latest` rejection never surfacing.
+#[tokio::test]
+async fn a_vanished_writer_releases_the_drain() {
+    let fixture = create_fixture(assistant_effect_pending("response")).await;
+    let progress = open_progress::<AssistantMessageFrame>(
+        &fixture.lane,
+        &fixture.drive,
+        Arc::new(|_frame: &AssistantMessageFrame| {
+            Ok(stored_values::append_list_write(
+                &stored_values::pending_assistant_frames("operation", "response"),
+                frame_delta(0, "lost"),
+            )
+            .expect("frame write"))
+        }),
+        Arc::new(|_state: &LaneState| -> bool { panic!("the writer vanished") }),
+    );
+    progress.write(frame_delta(0, "lost"));
+    progress
+        .drain()
+        .await
+        .expect("the vanished writer's drain resolved");
+}
+
+/// The completed call declines its late checkpoint: the still-owns guard's
+/// phase match leaves only the effect-pending calls.
+#[tokio::test]
+async fn a_completed_call_declines_its_late_checkpoint() {
+    let invocation_id = "result";
+    let fixture = create_fixture(planned_tools_state(invocation_id)).await;
+    let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, invocation_id);
+    progress.write(checkpoint_of("late"));
+    progress.drain().await.expect("drain");
+    let stored = declined_tool_checkpoint(&fixture).await;
+    assert!(
+        stored.is_none(),
+        "the planned call's checkpoint never landed",
+    );
+}
+
+/// The fixture commits' failures surface as the helpers' panics, upstream's
+/// awaited `commit` throw.
+#[tokio::test]
+async fn the_fixture_commit_helpers_panic_on_their_failures() {
+    // The commit-writes helper's seeded commit.
+    let fixture = create_fixture(assistant_effect_pending("response")).await;
+    fixture
+        .storage
+        .set_failure(Some(SessionError::Message("commit failed".to_owned())));
+    let joined = {
+        let session = fixture.lane.session().clone();
+        tokio::spawn(async move { commit_writes(&session, Vec::new()).await })
+    };
+    assert!(
+        joined.await.is_err(),
+        "the failing commit panicked the helper",
+    );
+
+    // The seed helper's commit.
+    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
+        MemoryStorageOptions::default(),
+    ))));
+    let session = Arc::new(crate::harness::runtime::test_support::runtime_session(
+        next_session_id(),
+        storage.clone(),
+    ));
+    storage.set_failure(Some(SessionError::Message("seed failed".to_owned())));
+    let joined = tokio::spawn(async move {
+        crate::harness::runtime::test_support::seed_main_lane_values(&session, None).await
+    });
+    let outcome = joined.await.expect("seed join");
+    assert!(outcome.is_err(), "the armed failure rejected the seed");
+}
+
+/// The unused watch installer raises when reached, upstream's `unusedWatch`
+/// throw the module docs pin.
+#[tokio::test]
+async fn the_unused_watch_installer_raises_when_reached() {
+    let fixture = create_fixture(assistant_effect_pending("response")).await;
+    let joined = {
+        let lane = Arc::clone(&fixture.lane);
+        tokio::spawn(async move {
+            crate::harness::agent_harness::AgentLane::watch(lane.as_ref(), &background_context())
+                .await
+        })
+    };
+    assert!(
+        joined.await.is_err(),
+        "reaching the unused watch raised, upstream's unusedWatch throw",
+    );
+}

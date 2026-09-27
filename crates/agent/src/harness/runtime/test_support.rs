@@ -460,6 +460,28 @@ pub(super) fn gate_next_commit(
     (started, release)
 }
 
+/// Gates one read behind the test's release: the read signals `started` and
+/// parks until released, the read-side rig the capture-mid-seal tests
+/// sequence against. Returns `(started, release)`.
+#[must_use]
+pub(super) fn gate_next_read(
+    storage: &ControlledStorage,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (read_started, started) = deferred();
+    let (release, release_rx) = deferred();
+    storage.arm_read_gate(Box::new(move || {
+        Box::pin(async move {
+            let _ = read_started.send(());
+            let _ = release_rx.await;
+            Ok(())
+        })
+    }));
+    (started, release)
+}
+
 /// One plain drive pass over the background context, the fixtures' `Drive`
 /// constructions.
 #[must_use]
@@ -606,6 +628,16 @@ pub(super) async fn settle_events() {
 pub(super) type BeforeCommitFn =
     Box<dyn FnOnce() -> BoxedFuture<'static, Result<(), SessionError>> + Send + Sync>;
 
+/// One armed read rejection, upstream's `FailingMemoryStorage`: the
+/// namespace and key narrow the arm to one address family; `None` matches
+/// every read of that axis.
+#[derive(Clone)]
+struct ReadFailureArm {
+    namespace: Option<String>,
+    key: Option<String>,
+    error: SessionError,
+}
+
 /// The controlled memory storage the runtime suites drive, upstream's
 /// `ControlledMemoryStorage` / `FailingStorage` / `FailingMemoryStorage`
 /// subclasses: one hook ahead of the next commit, one one-shot commit
@@ -615,6 +647,9 @@ pub(super) struct ControlledStorage {
     memory: Arc<MemoryStorage>,
     before_next_commit: Mutex<Option<BeforeCommitFn>>,
     failure: Mutex<Option<SessionError>>,
+    read_failure: Mutex<Option<ReadFailureArm>>,
+    stats_failure: Mutex<Option<SessionError>>,
+    read_gate: Mutex<Option<BeforeCommitFn>>,
     get_value_calls: AtomicUsize,
 }
 
@@ -637,6 +672,9 @@ impl ControlledStorage {
             memory: delegate,
             before_next_commit: Mutex::new(None),
             failure: Mutex::new(None),
+            read_failure: Mutex::new(None),
+            stats_failure: Mutex::new(None),
+            read_gate: Mutex::new(None),
             get_value_calls: AtomicUsize::new(0),
         }
     }
@@ -652,10 +690,80 @@ impl ControlledStorage {
         *lock(&self.failure) = failure;
     }
 
+    /// Arms the read rejection, upstream's `FailingMemoryStorage`: the
+    /// armed namespace and key narrow the arm (`None` matches the axis
+    /// whole), and the arm stays until re-armed or cleared.
+    pub(super) fn arm_read_failure(
+        &self,
+        namespace: Option<&str>,
+        key: Option<&str>,
+        failure: SessionError,
+    ) {
+        *lock(&self.read_failure) = Some(ReadFailureArm {
+            namespace: namespace.map(str::to_owned),
+            key: key.map(str::to_owned),
+            error: failure,
+        });
+    }
+
+    /// Clears the armed read rejection.
+    pub(super) fn clear_read_failure(&self) {
+        *lock(&self.read_failure) = None;
+    }
+
+    /// Arms one stats-read failure, the one-shot the snapshot capture's
+    /// `get_stats` arm drives.
+    pub(super) fn arm_stats_failure(&self, failure: SessionError) {
+        *lock(&self.stats_failure) = Some(failure);
+    }
+
+    /// Arms the next read's gate: the read signals `started` and parks
+    /// until released, the sequencing hook the capture-mid-seal tests
+    /// drive.
+    pub(super) fn arm_read_gate(&self, hook: BeforeCommitFn) {
+        *lock(&self.read_gate) = Some(hook);
+    }
+
     /// The recorded value-read count, upstream's `getValue` spy.
     #[must_use]
     pub(super) fn get_value_calls(&self) -> usize {
         self.get_value_calls.load(Ordering::SeqCst)
+    }
+
+    /// The armed rejection one address read carries, upstream's
+    /// `FailingMemoryStorage` method guard.
+    fn read_rejection(&self, namespace: &str, key: &str) -> Option<SessionError> {
+        let arm = lock(&self.read_failure).clone()?;
+        if arm
+            .namespace
+            .as_ref()
+            .is_some_and(|armed| armed != namespace)
+        {
+            return None;
+        }
+        if arm.key.as_ref().is_some_and(|armed| armed != key) {
+            return None;
+        }
+        Some(arm.error)
+    }
+
+    /// The armed rejection one key-scoped read (an entry-id read or a
+    /// branch-scan start) carries.
+    fn key_rejection(&self, key: &str) -> Option<SessionError> {
+        let arm = lock(&self.read_failure).clone()?;
+        if arm.namespace.is_some() {
+            return None;
+        }
+        if arm.key.as_ref().is_some_and(|armed| armed != key) {
+            return None;
+        }
+        Some(arm.error)
+    }
+
+    /// Runs the armed read gate, the parked read the sequencing tests
+    /// release.
+    fn run_read_gate(&self) -> Option<BeforeCommitFn> {
+        lock(&self.read_gate).take()
     }
 }
 
@@ -685,6 +793,18 @@ impl Storage for ControlledStorage {
         address: &ValueAddress,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Option<StoredValue>, SessionError>> {
+        if let Some(hook) = self.run_read_gate() {
+            let memory = Arc::clone(&self.memory);
+            let context = context.clone();
+            let address = address.clone();
+            return Box::pin(async move {
+                hook().await?;
+                memory.get_value(&address, &context).await
+            });
+        }
+        if let Some(error) = self.read_rejection(&address.namespace, &address.key) {
+            return Box::pin(async move { Err(error) });
+        }
         self.get_value_calls.fetch_add(1, Ordering::SeqCst);
         self.memory.get_value(address, context)
     }
@@ -694,6 +814,9 @@ impl Storage for ControlledStorage {
         prefix: &ValueAddress,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<StoredValue>, SessionError>> {
+        if let Some(error) = self.read_rejection(&prefix.namespace, &prefix.key) {
+            return Box::pin(async move { Err(error) });
+        }
         self.memory.scan_values(prefix, context)
     }
 
@@ -702,6 +825,9 @@ impl Storage for ControlledStorage {
         ids: Vec<String>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<std::collections::BTreeMap<String, Entry>, SessionError>> {
+        if let Some(error) = ids.iter().find_map(|id| self.key_rejection(id)) {
+            return Box::pin(async move { Err(error) });
+        }
         self.memory.get_entries(ids, context)
     }
 
@@ -711,6 +837,9 @@ impl Storage for ControlledStorage {
         options: Option<ListReadOptions>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
+        if let Some(error) = self.read_rejection(&address.namespace, &address.key) {
+            return Box::pin(async move { Err(error) });
+        }
         self.memory.read_list(address, options, context)
     }
 
@@ -719,6 +848,18 @@ impl Storage for ControlledStorage {
         query: &StorageBranchScan,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
+        if let Some(hook) = self.run_read_gate() {
+            let memory = Arc::clone(&self.memory);
+            let context = context.clone();
+            let query = query.clone();
+            return Box::pin(async move {
+                hook().await?;
+                memory.scan_branch(&query, &context).await
+            });
+        }
+        if let Some(error) = self.key_rejection(&query.start) {
+            return Box::pin(async move { Err(error) });
+        }
         self.memory.scan_branch(query, context)
     }
 
@@ -727,6 +868,9 @@ impl Storage for ControlledStorage {
         query: &StorageBranchScan,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<EntryStructure>, SessionError>> {
+        if let Some(error) = self.key_rejection(&query.start) {
+            return Box::pin(async move { Err(error) });
+        }
         self.memory.scan_branch_structure(query, context)
     }
 
@@ -747,6 +891,10 @@ impl Storage for ControlledStorage {
     }
 
     fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
+        let failure = lock(&self.stats_failure).take();
+        if let Some(error) = failure {
+            return Box::pin(async move { Err(error) });
+        }
         self.memory.get_stats(context)
     }
 

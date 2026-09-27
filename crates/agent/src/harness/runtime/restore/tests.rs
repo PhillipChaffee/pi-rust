@@ -59,7 +59,7 @@ fn bare_session() -> Arc<StorageBackedSession> {
     Arc::new(StorageBackedSession::new(
         crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
         Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
+        StorageBackedSessionOptions::default(),
     ))
 }
 
@@ -805,4 +805,188 @@ async fn restore_session_skips_the_branch_only_lanes() {
             .contains("Lane \"main\" is missing branch.tip"),
         "the absent lane names its missing tip: {error}",
     );
+}
+
+// The storage-error reads: the restores' reads fault through the
+// controlled backend, upstream's `FailingMemoryStorage` rig.
+
+use serde_json::json;
+
+use crate::harness::runtime::test_support::ControlledStorage;
+use crate::harness::session::session::StorageBackedSessionOptions;
+
+/// The seeded session over the controlled backend plus its storage handle.
+async fn controlled_session() -> (Arc<StorageBackedSession>, Arc<ControlledStorage>) {
+    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
+        MemoryStorageOptions::default(),
+    ))));
+    let session = Arc::new(StorageBackedSession::new(
+        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
+        storage.clone(),
+        StorageBackedSessionOptions::default(),
+    ));
+    seed_storage(&session, &storage).await;
+    (session, storage)
+}
+
+/// Seeds the idle `main` lane, upstream's `createSession` fixtures.
+async fn seed_storage(session: &Arc<StorageBackedSession>, storage: &Arc<ControlledStorage>) {
+    let _ = storage;
+    crate::harness::runtime::test_support::seed_main_lane_values(session, None)
+        .await
+        .expect("seed commit");
+}
+
+fn arm_read_failure(storage: &Arc<ControlledStorage>, namespace: Option<&str>, key: Option<&str>) {
+    storage.arm_read_failure(
+        namespace,
+        key,
+        SessionError::Message("read failed".to_owned()),
+    );
+}
+
+/// The lane restore's value reads fault, the three-way classification
+/// read's arms included.
+#[tokio::test]
+async fn the_lane_restore_carries_the_storage_failures() {
+    // Every read fails; the classification read rejects first.
+    let (session, storage) = controlled_session().await;
+    arm_read_failure(&storage, None, None);
+    let restored = restore_lane(session, "main", &background_context()).await;
+    let error = restored.expect_err("the armed read rejects");
+    assert_eq!(
+        error.to_string(),
+        "read failed",
+        "the lane read's failure carried: {error}",
+    );
+
+    // The operation meta's read fails under a live operation.
+    let (session, storage) = controlled_session().await;
+    let writes = vec![
+        seed_write(&stored_values::branch_tip("main"), Option::<String>::None).expect("tip write"),
+        seed_write(
+            &stored_values::lane_config("main"),
+            crate::harness::runtime::test_support::lane_configuration(),
+        )
+        .expect("config write"),
+        lane_state_write("main", Some("op"), None, Vec::new()).expect("state write"),
+    ];
+    commit_writes(&session, writes).await;
+    arm_read_failure(&storage, Some("pi.op.meta"), None);
+    let restored = restore_lane(session, "main", &background_context()).await;
+    let error = restored.expect_err("the meta read rejects");
+    assert_eq!(
+        error.to_string(),
+        "read failed",
+        "the meta read's failure carried: {error}",
+    );
+
+    // The operation state's read fails under a live operation.
+    let (session, storage) = controlled_session().await;
+    let writes = vec![
+        seed_write(&stored_values::branch_tip("main"), Option::<String>::None).expect("tip write"),
+        seed_write(
+            &stored_values::lane_config("main"),
+            crate::harness::runtime::test_support::lane_configuration(),
+        )
+        .expect("config write"),
+        lane_state_write("main", Some("op"), None, Vec::new()).expect("state write"),
+        seed_write(&stored_values::operation_meta("op"), run_meta("op")).expect("meta write"),
+    ];
+    commit_writes(&session, writes).await;
+    arm_read_failure(&storage, Some("pi.op.state"), None);
+    let restored = restore_lane(session, "main", &background_context()).await;
+    let error = restored.expect_err("the state read rejects");
+    assert_eq!(
+        error.to_string(),
+        "read failed",
+        "the state read's failure carried: {error}",
+    );
+}
+
+/// The session restore's inventory scans fault per namespace.
+#[tokio::test]
+async fn the_session_restore_carries_the_scan_failures() {
+    for namespace in ["pi.branch.tip", "pi.lane.config", "pi.lane.state"] {
+        let (session, storage) = controlled_session().await;
+        arm_read_failure(&storage, Some(namespace), None);
+        let restored = restore_session(session, &background_context()).await;
+        let error = restored.expect_err("the armed scan rejects");
+        assert_eq!(
+            error.to_string(),
+            "read failed",
+            "the {namespace} scan's failure carried: {error}",
+        );
+    }
+}
+
+/// The session restore carries a lane's state-restore failure, the
+/// malformed lane record the state restore rejects.
+#[tokio::test]
+async fn the_session_restore_carries_the_state_restore_failure() {
+    let (session, _storage) = controlled_session().await;
+    commit_writes(
+        &session,
+        vec![
+            seed_write(
+                &stored_values::branch_tip("corrupt"),
+                Option::<String>::None,
+            )
+            .expect("tip write"),
+            seed_write(
+                &stored_values::lane_config("corrupt"),
+                crate::harness::runtime::test_support::lane_configuration(),
+            )
+            .expect("config write"),
+            raw_write(&stored_values::lane_state("corrupt").address, json!(42)),
+        ],
+    )
+    .await;
+    let restored = restore_session(session, &background_context()).await;
+    let error = restored.expect_err("the corrupt lane rejects");
+    assert!(
+        error.to_string().contains("is malformed"),
+        "the corrupt lane named its parse failure: {error}",
+    );
+}
+
+/// The restores after the session closed fault at the mutation's grant.
+#[tokio::test]
+async fn the_restores_after_the_session_closed_fault() {
+    // The lane restore.
+    let (session, _storage) = controlled_session().await;
+    crate::harness::session::types::Session::close(session.as_ref(), &background_context())
+        .await
+        .expect("close");
+    let restored = restore_lane(session, "main", &background_context()).await;
+    let error = restored.expect_err("the closed session faults the restore");
+    assert!(
+        !error.to_string().is_empty(),
+        "the closed mutation's error carried: {error}",
+    );
+
+    // The session restore.
+    let (session, _storage) = controlled_session().await;
+    crate::harness::session::types::Session::close(session.as_ref(), &background_context())
+        .await
+        .expect("close");
+    let restored = restore_session(session, &background_context()).await;
+    restored.expect_err("the closed session faults the session restore");
+}
+
+/// The classification read's per-address arms: each value read's failure
+/// rejects at its own `?`.
+#[tokio::test]
+async fn the_classification_reads_reject_per_address() {
+    for namespace in ["pi.lane.config", "pi.lane.state"] {
+        let (session, storage) = controlled_session().await;
+        arm_read_failure(&storage, Some(namespace), None);
+        let restored = restore_lane(session, "main", &background_context()).await;
+        let error = restored.expect_err("the armed read rejects");
+        assert_eq!(
+            error.to_string(),
+            "read failed",
+            "the {namespace} read's failure carried: {error}",
+        );
+    }
 }

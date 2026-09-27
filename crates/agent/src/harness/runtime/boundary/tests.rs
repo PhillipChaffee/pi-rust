@@ -1597,3 +1597,595 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
         }
     }
 }
+
+// The capture's storage-error arms and the faulted flag: the reads fault
+// through the controlled backend, upstream's `FailingMemoryStorage` rig,
+// and the faulted flag reads the sealed fault mid-capture.
+
+use crate::harness::runtime::test_support::gate_next_read;
+use crate::harness::runtime::test_support::next_session_id;
+use crate::harness::runtime::test_support::runtime_session;
+use crate::harness::runtime::test_support::seed_main_lane_values;
+use crate::harness::session::session::StorageBackedSession;
+
+/// The capturing lane over the controlled backend, the read-failure rig's
+/// fixture: the seam lane plus the storage handle the arms re-arm against.
+async fn controlled_capture_lane(
+    operation_id: Option<&str>,
+) -> (Lane, Arc<StorageBackedSession>, Arc<ControlledStorage>) {
+    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
+        MemoryStorageOptions::default(),
+    ))));
+    let session = Arc::new(runtime_session(next_session_id(), storage.clone()));
+    seed_main_lane_values(&session, operation_id)
+        .await
+        .expect("seed commit");
+    let lane = restored_lane(
+        session.clone(),
+        noop_emit_batch(),
+        recording_watch_installer(empty_lane_snapshot("main", &lane_configuration())),
+    )
+    .await;
+    (lane, session, storage)
+}
+
+/// Arms one address-keyed read rejection, the rig's per-address arm.
+fn arm_read_failure(storage: &Arc<ControlledStorage>, key: &str) {
+    storage.arm_read_failure(
+        None,
+        Some(key),
+        crate::harness::session::types::SessionError::Message("read failed".to_owned()),
+    );
+}
+
+/// The watch rejection's message, the capture errors' read.
+fn watch_fault_message(error: crate::harness::agent_harness::LaneOperationError) -> String {
+    match error {
+        crate::harness::agent_harness::LaneOperationError::Closed(reason) => reason.to_string(),
+    }
+}
+
+/// The watch's fault message, the failing capture's read.
+async fn watch_fault(lane: &Lane) -> String {
+    let Err(error) = AgentLane::watch(lane, &background_context()).await else {
+        panic!("the capture faulted");
+    };
+    watch_fault_message(error)
+}
+
+/// The capture's read failures fault the watch with the storage's error.
+#[tokio::test]
+async fn watch_faults_on_the_capture_read_failures() {
+    // The transcript branch scan.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    let tip = AgentLane::append_message(&lane, user_text_message("history"), &background_context())
+        .await
+        .expect("append serves");
+    arm_read_failure(&storage, &tip);
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the scan faults: {message}"
+    );
+
+    // The queue read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    let steer = steer_text(&lane).await;
+    arm_read_failure(&storage, &steer);
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the queues fault: {message}"
+    );
+
+    // The last-result read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    accept_prompt(&lane).await;
+    let operation_id = live_operation_id(&lane);
+    finish_operation(&lane).await;
+    arm_read_failure(&storage, &operation_id);
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the result faults: {message}"
+    );
+
+    // The stats read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    accept_prompt(&lane).await;
+    storage.arm_stats_failure(crate::harness::session::types::SessionError::Message(
+        "stats failed".to_owned(),
+    ));
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("stats failed"),
+        "the stats fault: {message}"
+    );
+}
+
+/// The steer enqueue the capture queue fixtures share.
+async fn steer_text(lane: &Lane) -> String {
+    lane.steer(
+        crate::harness::agent_harness::QueueMessage::Text("queued".to_owned()),
+        Vec::new(),
+        &background_context(),
+    )
+    .await
+    .expect("steer serves")
+    .expect("the steer")
+}
+
+/// The operation leaf reads the capture's deferred and streaming arms make:
+/// each read failure faults the watch, and the deferred-effect-pending leaf
+/// reads both its deferred handle and its frames.
+#[tokio::test]
+async fn watch_faults_on_the_operation_leaf_read_failures() {
+    // The streaming leaf's frames read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    accept_prompt(&lane).await;
+    let operation_id = live_operation_id(&lane);
+    patch_live_state(
+        &lane,
+        OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
+            scope: operation_scope(),
+            generation_context: generation_context(),
+            attempt: 1,
+            response_entry_id: "response".to_owned(),
+            usage_id: "usage".to_owned(),
+            intended_output_limit: 100,
+            context_window: 1_000,
+        }),
+    )
+    .await;
+    arm_read_failure(&storage, &format!("{operation_id}:response"));
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the frames fault: {message}"
+    );
+
+    // The deferred leaf's source read, then the deferred-effect-pending
+    // leaf's frames read once the deferred read succeeded.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    let source = AgentLane::append_message(
+        &lane,
+        assistant_wire(&json!([]), "stop", true),
+        &background_context(),
+    )
+    .await
+    .expect("append serves");
+    accept_prompt(&lane).await;
+    let operation_id = live_operation_id(&lane);
+    patch_live_state(
+        &lane,
+        OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
+            scope: deferred_scope(operation_scope(), &source, 0),
+            response_entry_id: "response".to_owned(),
+            usage_id: "usage".to_owned(),
+        }),
+    )
+    .await;
+    arm_read_failure(&storage, &source);
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the deferred faults: {message}"
+    );
+
+    arm_read_failure(&storage, &format!("{operation_id}:response"));
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the frames fault: {message}"
+    );
+}
+
+/// The tools batch's read failures: the assistant entry read, the args
+/// read, the checkpoint read, and the staged-result read.
+#[tokio::test]
+async fn watch_faults_on_the_tools_batch_read_failures() {
+    let call = |source_index: u64, result_entry_id: &str, status: &str| {
+        serde_json::from_value::<crate::harness::session::types::ToolCall>(json!({
+            "sourceIndex": source_index,
+            "resultEntryId": result_entry_id,
+            "status": status,
+            "replay": "safe",
+            "terminate": false,
+        }))
+        .expect("the call wire")
+    };
+
+    // The assistant entry read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    let assistant_entry = admitted_tools_batch(
+        &lane,
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-1", "effect_pending")],
+    )
+    .await;
+    arm_read_failure(&storage, &assistant_entry);
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the assistant faults: {message}"
+    );
+
+    // The args read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    admitted_tools_batch(
+        &lane,
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-1", "effect_pending")],
+    )
+    .await;
+    let operation_id = live_operation_id(&lane);
+    arm_read_failure(&storage, &format!("{operation_id}:turn:0"));
+    let message = watch_fault(&lane).await;
+    assert!(message.contains("read failed"), "the args fault: {message}");
+
+    // The checkpoint read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    admitted_tools_batch(
+        &lane,
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-1", "effect_pending")],
+    )
+    .await;
+    let operation_id = live_operation_id(&lane);
+    commit_writes(
+        lane.session(),
+        vec![raw_write(
+            &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0).address,
+            json!({}),
+        )],
+    )
+    .await;
+    arm_read_failure(&storage, &format!("{operation_id}:result-1"));
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the checkpoint faults: {message}",
+    );
+
+    // The staged-result read.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    admitted_tools_batch(
+        &lane,
+        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-2", "outcome_ready")],
+    )
+    .await;
+    arm_read_failure(&storage, "result-2");
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("read failed"),
+        "the staged fault: {message}"
+    );
+}
+
+/// The capture's success-shape arms the error suites leave: the
+/// checkpoint-less running call, the settled call's persisted args, the
+/// non-assistant batch entry, and the absent deferred source.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the four shapes share the fixture rig; one body keeps the shape visible"
+)]
+#[tokio::test]
+async fn watch_reports_the_remaining_capture_shapes() {
+    // The effect-pending call without its checkpoint: the running tool
+    // carries no result.
+    let (lane, _session, _storage) = controlled_capture_lane(None).await;
+    admitted_tools_batch(
+        &lane,
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": "result-1",
+                "status": "effect_pending",
+                "replay": "safe",
+            }))
+            .expect("the effect-pending call wire"),
+        ],
+    )
+    .await;
+    let operation_id = live_operation_id(&lane);
+    commit_writes(
+        lane.session(),
+        vec![raw_write(
+            &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0).address,
+            json!({ "k": "persisted" }),
+        )],
+    )
+    .await;
+    let (_watch, snapshot) = watch_snapshot(&lane).await;
+    match &snapshot
+        .operation
+        .as_ref()
+        .expect("the operation view")
+        .running_tools[0]
+    {
+        crate::harness::agent_harness::LaneSnapshotTool::Running { result, .. } => {
+            assert!(
+                result.is_none(),
+                "the checkpoint-less call carries no result"
+            );
+        }
+        other @ crate::harness::agent_harness::LaneSnapshotTool::Settled { .. } => {
+            panic!("the running tool: {other:?}")
+        }
+    }
+
+    // The settled call whose args persisted: the stored args ride.
+    let (lane, _session, _storage) = controlled_capture_lane(None).await;
+    admitted_tools_batch(
+        &lane,
+        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        "toolUse",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": "result-2",
+                "status": "outcome_ready",
+                "terminate": false,
+            }))
+            .expect("the outcome-ready call wire"),
+        ],
+    )
+    .await;
+    let operation_id = live_operation_id(&lane);
+    commit_writes(
+        lane.session(),
+        vec![
+            raw_write(
+                &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0)
+                    .address,
+                json!({ "k": "persisted" }),
+            ),
+            crate::harness::session::values::set_value_write(
+                &crate::harness::session::values::pending_entry("result-2"),
+                crate::harness::session::types::PendingEntry::Message {
+                    payload: Box::new(
+                        serde_json::from_value(json!({
+                            "role": "toolResult",
+                            "toolCallId": "call-2",
+                            "toolName": "tool-2",
+                            "content": [{ "type": "text", "text": "done" }],
+                            "isError": false,
+                            "timestamp": 2,
+                        }))
+                        .expect("the tool result wire"),
+                    ),
+                },
+            )
+            .expect("staged write"),
+        ],
+    )
+    .await;
+    let (_watch, snapshot) = watch_snapshot(&lane).await;
+    match &snapshot
+        .operation
+        .as_ref()
+        .expect("the operation view")
+        .running_tools[0]
+    {
+        crate::harness::agent_harness::LaneSnapshotTool::Settled { args, .. } => {
+            assert_eq!(
+                *args,
+                json!({ "k": "persisted" }),
+                "the stored args rode the settled call",
+            );
+        }
+        other @ crate::harness::agent_harness::LaneSnapshotTool::Running { .. } => {
+            panic!("the settled tool: {other:?}")
+        }
+    }
+
+    // The batch's assistant entry holding a user message: the inner
+    // shape guard rejects.
+    let (lane, _session, _storage) = controlled_capture_lane(None).await;
+    let user_entry = AgentLane::append_message(
+        &lane,
+        user_text_message("not an assistant"),
+        &background_context(),
+    )
+    .await
+    .expect("append serves");
+    accept_prompt(&lane).await;
+    patch_live_state(&lane, tools_batch_state(&user_entry, Vec::new())).await;
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("Tool batch assistant entry is invalid"),
+        "the non-assistant entry names its invariant: {message}",
+    );
+
+    // The deferred source absent from storage: the outer shape guard
+    // rejects.
+    let (lane, _session, _storage) = controlled_capture_lane(None).await;
+    accept_prompt(&lane).await;
+    patch_live_state(
+        &lane,
+        OperationState::DeferredSuspended(DeferredSuspendedOperation {
+            deferred: deferred_scope(operation_scope(), "absent-source", 0),
+        }),
+    )
+    .await;
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("Deferred source is missing its assistant handle"),
+        "the absent source names its invariant: {message}",
+    );
+}
+
+/// The streaming message's reduce failure: frames that parse but reduce
+/// against the frame sequence's rules fault the capture.
+#[tokio::test]
+async fn watch_faults_on_the_streaming_reduce_failure() {
+    let (lane, _session, _storage) = controlled_capture_lane(None).await;
+    accept_prompt(&lane).await;
+    patch_live_state(
+        &lane,
+        OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
+            scope: operation_scope(),
+            generation_context: generation_context(),
+            attempt: 1,
+            response_entry_id: "response".to_owned(),
+            usage_id: "usage".to_owned(),
+            intended_output_limit: 100,
+            context_window: 1_000,
+        }),
+    )
+    .await;
+    let operation_id = live_operation_id(&lane);
+    let address =
+        crate::harness::session::values::pending_assistant_frames(&operation_id, "response");
+    let partial = pending_partial_wire();
+    commit_writes(
+        lane.session(),
+        vec![
+            crate::harness::session::values::append_list_write(
+                &address,
+                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextDelta {
+                    content_index: 0,
+                    delta: "before the start".to_owned(),
+                },
+            )
+            .expect("frame append"),
+            crate::harness::session::values::append_list_write(
+                &address,
+                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::Start {
+                    partial: partial.clone(),
+                },
+            )
+            .expect("frame append"),
+        ],
+    )
+    .await;
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("appears before the start frame"),
+        "the reduce failure names its sequence rule: {message}",
+    );
+}
+
+/// The snapshot's faulted flag reads the sealed fault: the capture that
+/// runs while the seal lands reports it.
+#[tokio::test]
+async fn watch_reports_the_sealed_fault_in_the_snapshot() {
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    let tip = AgentLane::append_message(&lane, user_text_message("history"), &background_context())
+        .await
+        .expect("append serves");
+    let _ = tip;
+    let fault = crate::harness::result::HarnessFault::new(
+        "harness faulted",
+        Box::new(crate::harness::session::types::SessionError::Message(
+            "cause".to_owned(),
+        )),
+    );
+    let fault: crate::harness::runtime::types::LaneError = Arc::new(fault);
+    let (started, release) = gate_next_read(&storage);
+    let watching = {
+        let lane = lane.clone();
+        tokio::spawn(async move { AgentLane::watch(&lane, &background_context()).await })
+    };
+    started.await.expect("the capture's first read parked");
+    lane.seal(fault).await;
+    let _ = release.send(());
+
+    let (_, snapshot) = match watching.await.expect("watch join") {
+        Ok(watch) => {
+            let snapshot = WatchHandle::<LaneSnapshot>::snapshot(&*watch);
+            watch.unsubscribe();
+            (watch, snapshot)
+        }
+        Err(error) => panic!("the capture served: {error:?}"),
+    };
+    assert!(snapshot.faulted, "the sealed fault flagged the snapshot");
+}
+
+/// The watcher's resnapshot after the seal faults: the capture's sealed
+/// read rides the listener surface.
+#[tokio::test]
+async fn the_resnapshot_after_the_seal_faults() {
+    let bus = Arc::new(crate::harness::events::HarnessEventBus::new());
+    let session = memory_session_with_seed(None).await;
+    let lane = restored_lane(
+        session,
+        crate::harness::runtime::test_support::bus_emit_batch(Arc::clone(&bus)),
+        crate::harness::runtime::test_support::bus_watch_installer(
+            bus,
+            empty_lane_snapshot("main", &lane_configuration()),
+        ),
+    )
+    .await;
+    let watch = AgentLane::watch(&lane, &background_context())
+        .await
+        .expect("watch serves");
+
+    let fault = crate::harness::result::HarnessFault::new(
+        "harness faulted",
+        Box::new(crate::harness::session::types::SessionError::Message(
+            "cause".to_owned(),
+        )),
+    );
+    lane.seal(Arc::new(fault)).await;
+
+    let error = watch
+        .resnapshot(&background_context())
+        .await
+        .expect_err("the sealed resnapshot faults");
+    assert!(
+        error.to_string().contains("did not mark"),
+        "the sealed capture never marked its boundary: {error}",
+    );
+}
+
+/// The capture's gated read failing at its own gate, and the structure
+/// scan's armed rejection: the gate and the arm carry their errors.
+#[tokio::test]
+async fn the_capture_gate_and_the_structure_scan_carry_their_errors() {
+    // The capture's first read fails at the gate's own error.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    AgentLane::append_message(&lane, user_text_message("history"), &background_context())
+        .await
+        .expect("append serves");
+    storage.arm_read_gate(Box::new(|| {
+        Box::pin(async {
+            Err(crate::harness::session::types::SessionError::Message(
+                "gate failed".to_owned(),
+            ))
+        })
+    }));
+    let message = watch_fault(&lane).await;
+    assert!(
+        message.contains("gate failed"),
+        "the gate's error carried: {message}",
+    );
+
+    // The structure scan's key-scoped rejection.
+    let (lane, _session, storage) = controlled_capture_lane(None).await;
+    let tip = AgentLane::append_message(&lane, user_text_message("history"), &background_context())
+        .await
+        .expect("append serves");
+    arm_read_failure(&storage, &tip);
+    let query = crate::harness::session::types::StorageBranchScan {
+        start: tip.clone(),
+        ..Default::default()
+    };
+    let read = storage
+        .scan_branch_structure(&query, &background_context())
+        .await;
+    let error = read.expect_err("the structure scan's armed rejection");
+    assert_eq!(
+        error.to_string(),
+        "read failed",
+        "the structure scan's rejection carried: {error}",
+    );
+    let _ = lane;
+}

@@ -66,6 +66,7 @@ use crate::harness::runtime::test_support::deferred;
 use crate::harness::runtime::test_support::empty_lane_snapshot;
 use crate::harness::runtime::test_support::finish_operation;
 use crate::harness::runtime::test_support::gate_next_commit;
+use crate::harness::runtime::test_support::gate_next_read;
 use crate::harness::runtime::test_support::generation_context;
 use crate::harness::runtime::test_support::lane_configuration;
 use crate::harness::runtime::test_support::main_lane_seed_writes;
@@ -102,6 +103,7 @@ use crate::harness::session::types::SessionReader;
 use crate::harness::session::values as stored_values;
 use crate::harness::session::values::set_value_write;
 use crate::types::AgentMessage;
+use crate::types::QueueMode;
 use crate::types::ThinkingLevel;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -135,6 +137,16 @@ async fn create_lane_with_emit(emit_batch: EmitBatch) -> LaneFixture {
 /// The fixture variant the corrupt-inbox and queued-write tests drive: the
 /// extra writes commit with the seed, before the lane's restore reads.
 async fn lane_seeded(emit_batch: EmitBatch, extra: Vec<stored_values::Write>) -> LaneFixture {
+    lane_seeded_with_config(emit_batch, extra, runtime_config()).await
+}
+
+/// The fixture variant the mode-dependent tests drive: the runtime
+/// configuration the acceptance reads comes from the given config.
+async fn lane_seeded_with_config(
+    emit_batch: EmitBatch,
+    extra: Vec<stored_values::Write>,
+    config: Config,
+) -> LaneFixture {
     let configuration = lane_configuration();
     let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
         MemoryStorageOptions::default(),
@@ -159,7 +171,7 @@ async fn lane_seeded(emit_batch: EmitBatch, extra: Vec<stored_values::Write>) ->
         passthrough_fault_handler(),
         emit_batch,
         recording_watch_installer(empty_lane_snapshot("main", &configuration)),
-        Arc::new(runtime_config),
+        Arc::new(move || config.clone()),
     );
     LaneFixture {
         lane,
@@ -3690,4 +3702,1785 @@ async fn cancel_queued_names_the_write_queue_in_the_invariant() {
             .contains("Queued write entry orphan-write is missing its payload"),
         "the missing payload names the write queue: {error}",
     );
+}
+
+// The margin suite: the sealed-fault surfaces, the sealed-callback carry,
+// and the idle-owner sequencing the 1:1 suite's driver surface reaches.
+
+use crate::harness::result::HarnessFault;
+
+/// The fault error the seal fixtures carry, upstream's sealed `HarnessFault`
+/// instance: the closed-error slot holds a fault the closed checks do not
+/// collapse, so the open asserts surface it.
+fn fault_sealed_error() -> LaneError {
+    Arc::new(HarnessFault::new(
+        "harness faulted",
+        Box::new(crate::harness::session::types::SessionError::Message(
+            "cause".to_owned(),
+        )),
+    ))
+}
+
+/// Parks the session's mutation line: one direct mutate job signals it
+/// holds the line, then waits out the test's release. Jobs spawned while
+/// parked queue behind it, the FIFO order the interleaving tests sequence.
+fn park_mutation_line(
+    session: &Arc<StorageBackedSession>,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, entered_rx) = deferred();
+    let (release, release_rx) = deferred();
+    let entered_cell = Arc::new(Mutex::new(Some(entered)));
+    let release_cell = Arc::new(Mutex::new(Some(release_rx)));
+    let session = Arc::clone(session);
+    tokio::spawn(async move {
+        let entered_cell = Arc::clone(&entered_cell);
+        let release_cell = Arc::clone(&release_cell);
+        let _ = session
+            .mutate(
+                Box::new(move |_mutator, _context| {
+                    let entered_cell = Arc::clone(&entered_cell);
+                    let release_cell = Arc::clone(&release_cell);
+                    Box::pin(async move {
+                        let sender = lock(&entered_cell).take();
+                        if let Some(sender) = sender {
+                            let _ = sender.send(());
+                        }
+                        let receiver = lock(&release_cell).take();
+                        if let Some(receiver) = receiver {
+                            let _ = receiver.await;
+                        }
+                        let payload: Box<dyn std::any::Any + Send> = Box::new(());
+                        Ok(payload)
+                    })
+                }),
+                &background_context(),
+            )
+            .await;
+    });
+    (entered_rx, release)
+}
+
+/// The surface rejection the fault-sealed sweeps pin: the collapsed closed
+/// error carries the fault's message.
+fn expect_fault_sealed(result: Result<impl std::fmt::Debug, LaneOperationError>) {
+    let error = result.expect_err("the fault-sealed surface rejects");
+    assert_eq!(
+        closed_message(error),
+        "harness faulted",
+        "the sealed fault collapses to its message"
+    );
+}
+
+/// The fault-sealed lane rejects every surface at its open asserts and its
+/// collapsed trait surfaces, and a second seal keeps the first error.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the sealed surface sweep reads one fixture; the surfaces' list stays explicit"
+)]
+#[tokio::test]
+async fn fault_sealed_lanes_reject_every_surface_at_the_open_asserts() {
+    let fixture = create_lane().await;
+    let fault = fault_sealed_error();
+    fixture.lane.seal(Arc::clone(&fault)).await;
+    // The double seal keeps the first error, the idempotent seal restated.
+    fixture.lane.seal(Arc::new(HarnessClosed)).await;
+
+    expect_fault_sealed(
+        fixture
+            .lane
+            .accept(prompt_request("late"), &background_context())
+            .await,
+    );
+    expect_fault_sealed(
+        fixture
+            .lane
+            .drive(
+                DriveOptions {
+                    operation_id: "any".to_owned(),
+                    wait_for_retry: None,
+                    poll_deferred: None,
+                },
+                &background_context(),
+            )
+            .await,
+    );
+    expect_fault_sealed(
+        fixture
+            .lane
+            .request_abort("any", &background_context())
+            .await,
+    );
+    expect_fault_sealed(fixture.lane.resume(&background_context()).await);
+    expect_fault_sealed(fixture.lane.abort(&background_context()).await);
+    expect_fault_sealed(
+        fixture
+            .lane
+            .steer(
+                QueueMessage::Text("late".to_owned()),
+                Vec::new(),
+                &background_context(),
+            )
+            .await,
+    );
+    expect_fault_sealed(
+        fixture
+            .lane
+            .follow_up(
+                QueueMessage::Text("late".to_owned()),
+                Vec::new(),
+                &background_context(),
+            )
+            .await,
+    );
+    expect_fault_sealed(
+        fixture
+            .lane
+            .next_run(
+                QueueMessage::Text("late".to_owned()),
+                Vec::new(),
+                &background_context(),
+            )
+            .await,
+    );
+    let cancel_error = fixture
+        .lane
+        .cancel_queued("absent", &background_context())
+        .await
+        .expect_err("the fault-sealed cancel rejects");
+    assert_eq!(cancel_error.tag(), "Closed");
+    assert_eq!(cancel_error.message(), "harness faulted");
+    let usage_error = fixture
+        .lane
+        .record_usage(pi_ai::types::Usage::default(), None, &background_context())
+        .await
+        .expect_err("the fault-sealed usage rejects");
+    assert_eq!(usage_error.tag(), "Closed");
+    assert_eq!(usage_error.message(), "harness faulted");
+    expect_fault_sealed(fixture.lane.wait_for_idle(&background_context()).await);
+    let idle: crate::harness::agent_harness::IdleCallback =
+        Arc::new(|_context| Box::pin(std::future::ready(())));
+    expect_fault_sealed(
+        fixture
+            .lane
+            .run_when_idle(idle, &background_context())
+            .await,
+    );
+    expect_fault_sealed(fixture.lane.get_model(&background_context()).await);
+    expect_fault_sealed(
+        fixture
+            .lane
+            .set_model(
+                ModelIdentity {
+                    provider: fixture.model.provider.0.clone(),
+                    model_id: fixture.model.id.clone(),
+                },
+                &background_context(),
+            )
+            .await,
+    );
+    expect_fault_sealed(fixture.lane.get_thinking_level(&background_context()).await);
+    expect_fault_sealed(
+        fixture
+            .lane
+            .set_thinking_level(ThinkingLevel::High, &background_context())
+            .await,
+    );
+    expect_fault_sealed(fixture.lane.get_active_tools(&background_context()).await);
+    expect_fault_sealed(
+        fixture
+            .lane
+            .set_active_tools(Vec::new(), &background_context())
+            .await,
+    );
+    expect_fault_sealed(AgentLane::find_entries(&fixture.lane, None, &background_context()).await);
+    expect_fault_sealed(AgentLane::find_entry(&fixture.lane, None, &background_context()).await);
+    expect_fault_sealed(
+        fixture
+            .lane
+            .append_message(user_text_message("late"), &background_context())
+            .await,
+    );
+    expect_fault_sealed(
+        fixture
+            .lane
+            .append_custom_entry("note", None, &background_context())
+            .await,
+    );
+    expect_fault_sealed(
+        AgentLane::get_result(&fixture.lane, "absent", &background_context()).await,
+    );
+    expect_fault_sealed(fixture.lane.inspect_execution(&background_context()).await);
+}
+
+/// Work queued while the lane sat open carries the sealed fault: the
+/// callbacks' open asserts fail when the fault-seal lands before they run.
+#[tokio::test]
+async fn work_queued_open_fault_seals_through_the_callback_asserts() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let leveled = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.abort(&background_context()).await })
+    };
+    let resumed = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.resume(&background_context()).await })
+    };
+    let idle_wait = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.wait_for_idle(&background_context()).await })
+    };
+    let idle: crate::harness::agent_harness::IdleCallback =
+        Arc::new(|_context| Box::pin(std::future::ready(())));
+    let idle_claim = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.run_when_idle(idle, &background_context()).await })
+    };
+    let prompted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.prompt_text("late", None, &background_context()).await })
+    };
+    // The queued surfaces' entry asserts ran while the lane sat open; the
+    // fault-seal lands before their callbacks start.
+    tokio::task::yield_now().await;
+
+    fixture.lane.seal(fault_sealed_error()).await;
+    let _ = release.send(());
+
+    let leveled_error = leveled
+        .await
+        .expect("level join")
+        .expect_err("the sealed command rejects");
+    assert_eq!(
+        leveled_error.to_string(),
+        "harness faulted",
+        "the queued command carries the sealed fault"
+    );
+    let aborted_error = aborted
+        .await
+        .expect("abort join")
+        .expect_err("the sealed abort rejects");
+    assert_eq!(
+        closed_message(aborted_error),
+        "harness faulted",
+        "the queued abort carries the sealed fault"
+    );
+    let resumed_error = resumed
+        .await
+        .expect("resume join")
+        .expect_err("the sealed resume rejects");
+    assert_eq!(
+        closed_message(resumed_error),
+        "harness faulted",
+        "the queued resume carries the sealed fault"
+    );
+    let idle_wait_error = idle_wait
+        .await
+        .expect("wait join")
+        .expect_err("the sealed wait rejects");
+    assert_eq!(
+        closed_message(idle_wait_error),
+        "harness faulted",
+        "the queued wait carries the sealed fault"
+    );
+    let idle_claim_error = idle_claim
+        .await
+        .expect("claim join")
+        .expect_err("the sealed claim rejects");
+    assert_eq!(
+        closed_message(idle_claim_error),
+        "harness faulted",
+        "the queued claim carries the sealed fault"
+    );
+    let prompted_error = prompted
+        .await
+        .expect("prompt join")
+        .expect_err("the sealed prompt rejects");
+    assert_eq!(
+        closed_message(prompted_error),
+        "harness faulted",
+        "the queued prompt carries the sealed fault"
+    );
+}
+
+/// The idle owner's parked callback and the release gate, the sequencing
+/// fixture the idle-owner tests share: the claim installs the owner, the
+/// callback parks until released.
+async fn gated_idle_claim(
+    fixture: &LaneFixture,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), LaneOperationError>>,
+) {
+    let (release, release_rx) = deferred();
+    let release_cell = Arc::new(Mutex::new(Some(release_rx)));
+    let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
+        let release_cell = Arc::clone(&release_cell);
+        Box::pin(async move {
+            let receiver = lock(&release_cell).take();
+            if let Some(receiver) = receiver {
+                let _ = receiver.await;
+            }
+        })
+    });
+    let idle = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
+    };
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    (release, idle)
+}
+
+/// The command waiting out the idle owner wakes on the seal's state change
+/// while the owner still holds, and the open assert faults it there.
+#[tokio::test]
+async fn the_command_waiting_out_the_idle_owner_faults_when_sealed() {
+    let fixture = create_lane().await;
+    let (release, idle) = gated_idle_claim(&fixture).await;
+
+    let blocked = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
+    tokio::task::yield_now().await;
+    assert!(
+        !blocked.is_finished(),
+        "the idle owner blocks the command's outer wait"
+    );
+
+    let closed: LaneError = Arc::new(HarnessClosed);
+    let sealed = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.seal(closed).await })
+    };
+    tokio::task::yield_now().await;
+    let _ = release.send(());
+    sealed.await.expect("seal join");
+    idle.await
+        .expect("idle join")
+        .expect("the callback settled");
+
+    let error = blocked
+        .await
+        .expect("command join")
+        .expect_err("the sealed wait faults the command");
+    assert_eq!(
+        error.to_string(),
+        "AgentHarness was closed while the operation was active",
+        "the wake on the seal's state change faults at the open assert: {error}",
+    );
+}
+
+/// The command whose callback starts after the idle owner claimed requeues:
+/// the idle-blocked outcome waits out the owner, then the command reruns.
+#[tokio::test]
+async fn the_idle_blocked_command_requeues_after_the_owner_releases() {
+    let fixture = create_lane().await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let (callback_release, idle) = {
+        // The claim command queues behind the parked job; the callback's
+        // own park gate opens after the claim.
+        let (release, release_rx) = deferred();
+        let release_cell = Arc::new(Mutex::new(Some(release_rx)));
+        let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
+            let release_cell = Arc::clone(&release_cell);
+            Box::pin(async move {
+                let receiver = lock(&release_cell).take();
+                if let Some(receiver) = receiver {
+                    let _ = receiver.await;
+                }
+            })
+        });
+        let idle = {
+            let lane = fixture.lane.clone();
+            tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
+        };
+        (release, idle)
+    };
+    let blocked = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
+    tokio::task::yield_now().await;
+
+    // The parked job frees the line: the claim runs, the owner installs,
+    // and the command's already-queued callback observes the owner.
+    let _ = release.send(());
+    tokio::task::yield_now().await;
+    assert!(
+        !blocked.is_finished(),
+        "the idle-blocked outcome waits out the owner"
+    );
+    let _ = callback_release.send(());
+    blocked
+        .await
+        .expect("blocked join")
+        .expect("the requeued command ran after the owner released");
+    idle.await
+        .expect("idle join")
+        .expect("the callback settled");
+    assert_eq!(
+        fixture.lane.state().configuration.thinking_level,
+        ThinkingLevel::High,
+        "the requeued command committed after the owner released"
+    );
+}
+
+// The storage-error arms: the reads the mutating surfaces make fault the
+// harness through the arm the controlled storage carries, upstream's
+// `FailingMemoryStorage`.
+
+/// Arms one address-keyed read rejection, the fixture's per-address
+/// `FailingMemoryStorage` arm.
+fn arm_read_failure(storage: &Arc<ControlledStorage>, key: &str) {
+    use crate::harness::session::types::SessionError;
+    storage.arm_read_failure(
+        None,
+        Some(key),
+        SessionError::Message("read failed".to_owned()),
+    );
+}
+
+/// The queued steer's entry id, the enqueue fixture's read.
+async fn steer_text(lane: &Lane, text: &str) -> String {
+    lane.steer(
+        QueueMessage::Text(text.to_owned()),
+        Vec::new(),
+        &background_context(),
+    )
+    .await
+    .expect("steer serves")
+    .expect("the steer")
+}
+
+/// The acceptance's storage reads fault the harness: the captured payload
+/// read and the remainder's queue read, each arm in its own fixture.
+#[tokio::test]
+async fn the_acceptance_read_failures_fault_the_harness() {
+    // The captured pending payload's read.
+    let fixture = create_lane().await;
+    let steer = steer_text(&fixture.lane, "queued").await;
+    arm_read_failure(&fixture.storage, &steer);
+    let message = closed_message(
+        fixture
+            .lane
+            .accept(prompt_request("first"), &background_context())
+            .await
+            .expect_err("the capture read faults the acceptance"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the payload read's failure faults: {message}",
+    );
+
+    // The remainder queue's read: one-at-a-time steering leaves the second
+    // steer, whose pending read the remainder's queue read carries.
+    let mut config = runtime_config();
+    config.steering_mode = QueueMode::OneAtATime;
+    let fixture = lane_seeded_with_config(noop_emit_batch(), Vec::new(), config).await;
+    let _first = steer_text(&fixture.lane, "first").await;
+    let second = steer_text(&fixture.lane, "second").await;
+    arm_read_failure(&fixture.storage, &second);
+    let message = closed_message(
+        fixture
+            .lane
+            .accept(prompt_request("first"), &background_context())
+            .await
+            .expect_err("the remainder read faults the acceptance"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the remainder queue read's failure faults: {message}",
+    );
+}
+
+/// The drive claim's settled-record read faults the harness.
+#[tokio::test]
+async fn the_drive_claim_read_failure_faults_the_harness() {
+    let fixture = create_lane().await;
+    arm_read_failure(&fixture.storage, "absent");
+    let message = closed_message(
+        fixture
+            .lane
+            .drive(
+                DriveOptions {
+                    operation_id: "absent".to_owned(),
+                    wait_for_retry: None,
+                    poll_deferred: None,
+                },
+                &background_context(),
+            )
+            .await
+            .expect_err("the settled-record read faults the drive"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the claim read's failure faults: {message}",
+    );
+}
+
+/// The abort request's storage reads fault the harness: the removed
+/// payload's read, the remainder queue's read, and the commit itself.
+#[tokio::test]
+async fn the_abort_request_read_failures_fault_the_harness() {
+    // The removed steer payload's read.
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let steer = steer_text(&fixture.lane, "queued").await;
+    arm_read_failure(&fixture.storage, &steer);
+    let message = closed_message(
+        fixture
+            .lane
+            .request_abort(&operation_id, &background_context())
+            .await
+            .expect_err("the removed payload read faults the abort"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the removed payload read's failure faults: {message}",
+    );
+
+    // The remainder queue's read: the next-run item never rides the abort.
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let next_run = fixture
+        .lane
+        .next_run(
+            QueueMessage::Text("next".to_owned()),
+            Vec::new(),
+            &background_context(),
+        )
+        .await
+        .expect("nextRun serves")
+        .expect("the next run");
+    arm_read_failure(&fixture.storage, &next_run);
+    let message = closed_message(
+        fixture
+            .lane
+            .request_abort(&operation_id, &background_context())
+            .await
+            .expect_err("the remainder read faults the abort"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the remainder queue read's failure faults: {message}",
+    );
+
+    // The commit's failure releases the cancellation gate unsettled.
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    fixture
+        .storage
+        .set_failure(Some(crate::harness::session::types::SessionError::Message(
+            "commit failed".to_owned(),
+        )));
+    let message = closed_message(
+        fixture
+            .lane
+            .request_abort(&operation_id, &background_context())
+            .await
+            .expect_err("the commit failure faults the abort"),
+    );
+    assert!(
+        message.contains("commit failed"),
+        "the commit's failure faults: {message}",
+    );
+    assert!(
+        !matches!(
+            fixture.lane.state().operation.as_ref().map(|operation| {
+                crate::harness::session::types::operation_scope_of(&operation.state).control
+            }),
+            Some(Control::CancelRequested { .. })
+        ),
+        "the failed commit left the control running",
+    );
+}
+
+/// The cancel-queued surface's storage reads fault the harness, and the
+/// cancel during a run carries the operation id.
+#[tokio::test]
+async fn the_cancel_queued_reads_fault_and_the_run_carries_the_operation() {
+    // The not-found lookup's read.
+    let fixture = create_lane().await;
+    arm_read_failure(&fixture.storage, "absent");
+    let message = fixture
+        .lane
+        .cancel_queued("absent", &background_context())
+        .await
+        .expect_err("the lookup read faults the cancel");
+    assert!(
+        message.message().contains("read failed"),
+        "the lookup read's failure faults: {message}",
+    );
+
+    // The queued payload's read.
+    let fixture = create_lane().await;
+    let steer = steer_text(&fixture.lane, "queued").await;
+    arm_read_failure(&fixture.storage, &steer);
+    let message = fixture
+        .lane
+        .cancel_queued(&steer, &background_context())
+        .await
+        .expect_err("the payload read faults the cancel");
+    assert!(
+        message.message().contains("read failed"),
+        "the payload read's failure faults: {message}",
+    );
+
+    // The remainder queue's read.
+    let fixture = create_lane().await;
+    let first = steer_text(&fixture.lane, "first").await;
+    let second = steer_text(&fixture.lane, "second").await;
+    arm_read_failure(&fixture.storage, &second);
+    let message = fixture
+        .lane
+        .cancel_queued(&first, &background_context())
+        .await
+        .expect_err("the remainder read faults the cancel");
+    assert!(
+        message.message().contains("read failed"),
+        "the remainder read's failure faults: {message}",
+    );
+
+    // The cancel during a run carries the operation id in its record.
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let steer = steer_text(&fixture.lane, "queued").await;
+    fixture
+        .lane
+        .cancel_queued(&steer, &background_context())
+        .await
+        .expect("cancel serves");
+    let stored = fixture
+        .session
+        .get_value(
+            &stored_values::lane_state("main").address,
+            &background_context(),
+        )
+        .await
+        .expect("read lane state")
+        .expect("stored lane state");
+    assert_eq!(
+        stored.value.get("currentOperationId"),
+        Some(&serde_json::to_value(&operation_id).expect("id wire")),
+        "the cancel during a run kept the operation id",
+    );
+}
+
+/// The enqueue's queue read faults the harness.
+#[tokio::test]
+async fn the_enqueue_queue_read_failure_faults_the_harness() {
+    let fixture = create_lane().await;
+    let first = steer_text(&fixture.lane, "first").await;
+    arm_read_failure(&fixture.storage, &first);
+    let message = closed_message(
+        fixture
+            .lane
+            .steer(
+                QueueMessage::Text("second".to_owned()),
+                Vec::new(),
+                &background_context(),
+            )
+            .await
+            .expect_err("the queue read faults the steer"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the queue read's failure faults: {message}",
+    );
+}
+
+/// The append's storage reads fault the harness: the idle capture's
+/// payload read and the run's queue read.
+#[tokio::test]
+async fn the_append_read_failures_fault_the_harness() {
+    // The idle append's captured write payload read.
+    let fixture = seeded_write_lane().await;
+    arm_read_failure(&fixture.storage, "queued-write");
+    let message = closed_message(
+        fixture
+            .lane
+            .append_message(user_text_message("tail"), &background_context())
+            .await
+            .expect_err("the captured read faults the append"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the captured write read's failure faults: {message}",
+    );
+
+    // The run's queue read.
+    let fixture = create_lane().await;
+    let _operation_id = accepted_operation(&fixture).await;
+    let first = steer_text(&fixture.lane, "first").await;
+    arm_read_failure(&fixture.storage, &first);
+    let message = closed_message(
+        fixture
+            .lane
+            .append_message(user_text_message("tail"), &background_context())
+            .await
+            .expect_err("the queue read faults the append"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the run's queue read failure faults: {message}",
+    );
+}
+
+/// The get-result read faults the harness.
+#[tokio::test]
+async fn the_get_result_read_failure_faults_the_harness() {
+    let fixture = create_lane().await;
+    arm_read_failure(&fixture.storage, "absent");
+    let message = closed_message(
+        AgentLane::get_result(&fixture.lane, "absent", &background_context())
+            .await
+            .expect_err("the record read faults the result"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the record read's failure faults: {message}",
+    );
+}
+
+/// The find-entry clamp carries a caller limit and the scan's failure.
+#[tokio::test]
+async fn the_find_entry_clamps_its_limit_and_carries_the_scan_failure() {
+    let fixture = create_lane().await;
+    let appended = fixture
+        .lane
+        .append_message(user_text_message("tail"), &background_context())
+        .await
+        .expect("append serves");
+    let limited = crate::harness::session::types::BranchScan {
+        limit: Some(5),
+        ..Default::default()
+    };
+    let first = AgentLane::find_entry(&fixture.lane, Some(&limited), &background_context())
+        .await
+        .expect("the read");
+    assert!(first.is_some(), "the caller's limit clamped to one entry");
+
+    arm_read_failure(&fixture.storage, &appended);
+    let message = closed_message(
+        AgentLane::find_entry(&fixture.lane, None, &background_context())
+            .await
+            .expect_err("the scan failure faults the read"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the scan's failure faults: {message}",
+    );
+}
+
+// The interleaved surfaces: the abort and resume pipelines' reads of the
+// operation they inspected, sequenced against the mutation line's FIFO.
+
+/// Clears the live operation without writing its result record, the
+/// lane-losing rig the abort and resume mismatch tests share.
+async fn clear_operation_without_result(lane: &Lane) {
+    lane.command::<(), _>(
+        move |state, _session, _context| {
+            Box::pin(async move {
+                let mut next = state.clone();
+                next.operation = None;
+                Ok(LaneCommand::Commit {
+                    writes: vec![
+                        set_value_write(
+                            &stored_values::lane_state("main"),
+                            crate::harness::session::types::LaneState {
+                                current_operation_id: None,
+                                last_operation_id: None,
+                                inbox: state.inbox.clone(),
+                            },
+                        )
+                        .expect("state write"),
+                    ],
+                    next,
+                    materialize: Arc::new(|_commit| ()),
+                    events: None,
+                })
+            })
+        },
+        &background_context(),
+    )
+    .await
+    .expect("the clear commits");
+}
+
+/// The abort request's command faults when the lane seals while it waits
+/// for the line behind the inspected read.
+#[tokio::test]
+async fn the_abort_request_faults_when_the_lane_seals_under_it() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.abort(&background_context()).await })
+    };
+    // The second parked job holds the line again once the read ran; the
+    // abort's request command queues behind it and the fault-seal lands
+    // before its callback starts.
+    let (parked_again, release_again) = park_mutation_line(&fixture.session);
+    tokio::task::yield_now().await;
+
+    let _ = release.send(());
+    parked_again.await.expect("the line parked again");
+    fixture.lane.seal(fault_sealed_error()).await;
+    let _ = release_again.send(());
+
+    let error = aborted
+        .await
+        .expect("abort join")
+        .expect_err("the sealed request faults the abort");
+    assert_eq!(
+        closed_message(error),
+        "harness faulted",
+        "the request command carried the sealed fault"
+    );
+}
+
+/// The operation settling under the abort's inspection reports the
+/// inspected operation no longer active.
+#[tokio::test]
+async fn the_abort_reports_the_inspected_operation_no_longer_active() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.abort(&background_context()).await })
+    };
+    let finishing = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { finish_operation(&lane).await })
+    };
+    tokio::task::yield_now().await;
+
+    // The read captures the live id, the finish clears the operation, and
+    // the abort's request runs against the settled lane.
+    let _ = release.send(());
+    finishing.await.expect("finish join");
+    let aborted = aborted.await.expect("abort join").expect("abort serves");
+    let error = aborted.expect_err("the settled operation reports no active operation");
+    assert_eq!(error.tag(), "NoActiveOperation");
+    assert!(
+        error
+            .message()
+            .contains("no longer has the inspected operation"),
+        "the mismatch names the inspected operation: {error}",
+    );
+}
+
+/// The cancelled operation settling under the abort's commit serves: the
+/// drive re-claims against the settled record.
+#[tokio::test]
+async fn the_aborted_operation_settling_under_the_abort_serves() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (started, release) = gate_next_commit(&fixture.storage);
+
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.abort(&background_context()).await })
+    };
+    started.await.expect("the abort's commit parked");
+    let finishing = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { finish_operation(&lane).await })
+    };
+    tokio::task::yield_now().await;
+
+    let _ = release.send(());
+    finishing.await.expect("finish join");
+    let aborted = aborted.await.expect("abort join").expect("abort serves");
+    let outcome = aborted.expect("the settled abort serves");
+    assert!(
+        outcome.steer.is_empty() && outcome.follow_up.is_empty(),
+        "the settled abort carries no queued items",
+    );
+    assert_eq!(
+        fixture.lane.state().last_operation_id.as_deref(),
+        Some(outcome.operation_id.as_str()),
+        "the settled abort's operation recorded",
+    );
+}
+
+/// The cancelled operation losing its lane before the drive faults the
+/// abort, the mismatch invariant the cancelled drive carries.
+#[tokio::test]
+async fn the_cancelled_operation_losing_its_lane_faults_the_abort() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (started, release) = gate_next_commit(&fixture.storage);
+
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.abort(&background_context()).await })
+    };
+    started.await.expect("the abort's commit parked");
+    let clearing = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { clear_operation_without_result(&lane).await })
+    };
+    tokio::task::yield_now().await;
+
+    let _ = release.send(());
+    clearing.await.expect("clear join");
+    let error = aborted
+        .await
+        .expect("abort join")
+        .expect_err("the lane-less operation faults the abort");
+    assert!(
+        closed_message(error).contains("no longer matches its lane"),
+        "the cancelled drive's mismatch faults",
+    );
+}
+
+/// The resume's drive joins the settled record when the operation settles
+/// under the inspection.
+#[tokio::test]
+async fn the_resume_settles_when_the_operation_settles_under_it() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let resumed = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.resume(&background_context()).await })
+    };
+    let finishing = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { finish_operation(&lane).await })
+    };
+    tokio::task::yield_now().await;
+
+    let _ = release.send(());
+    finishing.await.expect("finish join");
+    let resumed = resumed.await.expect("resume join").expect("resume serves");
+    let outcome = resumed.expect("the settled resume serves");
+    match outcome {
+        crate::harness::agent_harness::RunOutcome::Settled(record) => {
+            assert_eq!(
+                record.operation_id,
+                fixture
+                    .lane
+                    .state()
+                    .last_operation_id
+                    .as_deref()
+                    .unwrap_or(""),
+                "the settled resume carried the settled record",
+            );
+        }
+        other @ crate::harness::agent_harness::RunOutcome::Suspended(_) => {
+            panic!("the resume: {other:?}")
+        }
+    }
+}
+
+/// The resume faults when the operation loses its lane under the
+/// inspection, the mismatch invariant the drive's claim carries.
+#[tokio::test]
+async fn the_resume_faults_when_the_operation_loses_its_lane() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let resumed = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.resume(&background_context()).await })
+    };
+    let clearing = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { clear_operation_without_result(&lane).await })
+    };
+    tokio::task::yield_now().await;
+
+    let _ = release.send(());
+    clearing.await.expect("clear join");
+    let error = resumed
+        .await
+        .expect("resume join")
+        .expect_err("the lane-less operation faults the resume");
+    assert!(
+        closed_message(error).contains("no longer matches its lane"),
+        "the resumed drive's mismatch faults",
+    );
+}
+
+// The remaining surface shapes: the message-content arms, the navigation
+// root, the idle-blocked wait's interruptions, and the intent names.
+
+/// The idle-blocked wait's seal: the command requeued behind the idle
+/// owner faults at the requeue's open assert.
+#[tokio::test]
+async fn the_idle_blocked_command_faults_when_sealed_under_it() {
+    let fixture = create_lane().await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let (callback_release, idle) = {
+        let (release, release_rx) = deferred();
+        let release_cell = Arc::new(Mutex::new(Some(release_rx)));
+        let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
+            let release_cell = Arc::clone(&release_cell);
+            Box::pin(async move {
+                let receiver = lock(&release_cell).take();
+                if let Some(receiver) = receiver {
+                    let _ = receiver.await;
+                }
+            })
+        });
+        let idle = {
+            let lane = fixture.lane.clone();
+            tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
+        };
+        (release, idle)
+    };
+    let blocked = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
+    tokio::task::yield_now().await;
+    let _ = release.send(()); // frees the line: the claim runs, the callback parks
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !blocked.is_finished(),
+        "the idle-blocked command waits out the owner"
+    );
+
+    let closed: LaneError = Arc::new(HarnessClosed);
+    let sealed = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.seal(closed).await })
+    };
+    let _ = callback_release.send(());
+    sealed.await.expect("seal join");
+    idle.await
+        .expect("idle join")
+        .expect("the callback settled");
+
+    let error = blocked
+        .await
+        .expect("blocked join")
+        .expect_err("the sealed requeue faults");
+    assert_eq!(
+        error.to_string(),
+        "AgentHarness was closed while the operation was active",
+        "the requeue's open assert faults: {error}",
+    );
+}
+
+/// The idle-blocked wait aborts with the context's reason.
+#[tokio::test]
+async fn the_idle_blocked_command_aborts_with_the_context_reason() {
+    let fixture = create_lane().await;
+    let (parked, release) = park_mutation_line(&fixture.session);
+    parked.await.expect("the line parked");
+
+    let (callback_release, idle) = {
+        let (release, release_rx) = deferred();
+        let release_cell = Arc::new(Mutex::new(Some(release_rx)));
+        let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
+            let release_cell = Arc::clone(&release_cell);
+            Box::pin(async move {
+                let receiver = lock(&release_cell).take();
+                if let Some(receiver) = receiver {
+                    let _ = receiver.await;
+                }
+            })
+        });
+        let idle = {
+            let lane = fixture.lane.clone();
+            tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
+        };
+        (release, idle)
+    };
+    let (_, controller) = pi_chord::context::with_cancel(&background_context());
+    let context = crate::harness::context::with_abort_signal(
+        controller.signal().clone(),
+        &background_context(),
+    );
+    let blocked = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.set_thinking_level(ThinkingLevel::High, &context).await })
+    };
+    tokio::task::yield_now().await;
+    let _ = release.send(());
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !blocked.is_finished(),
+        "the idle-blocked command waits out the owner"
+    );
+
+    controller.abort("stop");
+    let _ = callback_release.send(());
+    idle.await
+        .expect("idle join")
+        .expect("the callback settled");
+    let error = blocked
+        .await
+        .expect("blocked join")
+        .expect_err("the aborted requeue rejects");
+    assert_eq!(
+        closed_message(error),
+        "stop",
+        "the idle-blocked wait carried the context's reason",
+    );
+}
+
+/// The owner's release wakes the waiting commands through both race arms;
+/// the round loop makes the cancelled arm's race settled over the rounds.
+#[tokio::test]
+async fn the_owner_release_wakes_the_waiting_commands() {
+    let fixture = create_lane().await;
+    for round in 0..8 {
+        let (release, idle) = gated_idle_claim(&fixture).await;
+        let blocked = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "round {round}: the idle owner blocks the command"
+        );
+        let _ = release.send(());
+        idle.await
+            .expect("idle join")
+            .expect("the callback settled");
+        blocked
+            .await
+            .expect("blocked join")
+            .expect("the command ran after the release");
+    }
+}
+
+/// The image-only and prebuilt-blocks queued messages, the content arms
+/// the enqueue's message switch carries.
+#[tokio::test]
+async fn the_enqueued_message_content_shapes() {
+    // The empty text with an image queues the image block only.
+    let fixture = create_lane().await;
+    let image_only = fixture
+        .lane
+        .steer(
+            QueueMessage::Text(String::new()),
+            vec![image_content("first")],
+            &background_context(),
+        )
+        .await
+        .expect("steer serves")
+        .expect("the steer");
+    let stored = fixture
+        .session
+        .get_value(
+            &stored_values::pending_entry(&image_only).address,
+            &background_context(),
+        )
+        .await
+        .expect("read pending")
+        .expect("stored pending");
+    assert_eq!(
+        stored.value.get("payload").expect("payload").get("content"),
+        Some(&json!([{ "type": "image", "mimeType": "image/png", "data": "first" }])),
+        "the empty text contributed no block",
+    );
+
+    // The prebuilt blocks message merges the images into its blocks.
+    let blocks_user = AgentMessage::Standard(Message::User(pi_ai::types::UserMessage {
+        content: pi_ai::types::UserContent::Blocks(vec![pi_ai::types::UserBlock::Text(
+            pi_ai::types::TextContent {
+                text: "hello".to_owned(),
+                text_signature: None,
+            },
+        )]),
+        timestamp: 1,
+    }));
+    let merged = fixture
+        .lane
+        .steer(
+            QueueMessage::Message(Box::new(blocks_user)),
+            vec![image_content("second")],
+            &background_context(),
+        )
+        .await
+        .expect("steer serves")
+        .expect("the steer");
+    let stored = fixture
+        .session
+        .get_value(
+            &stored_values::pending_entry(&merged).address,
+            &background_context(),
+        )
+        .await
+        .expect("read pending")
+        .expect("stored pending");
+    assert_eq!(
+        stored.value.get("payload").expect("payload").get("content"),
+        Some(&json!([
+            { "type": "text", "text": "hello" },
+            { "type": "image", "mimeType": "image/png", "data": "second" },
+        ])),
+        "the images merged into the prebuilt blocks",
+    );
+}
+
+/// The acceptance's message shapes the run-request switch carries: the
+/// image-only prompt, the empty template's format, and the queued write
+/// riding the capture.
+#[tokio::test]
+async fn the_acceptance_message_shapes() {
+    // The image-only text prompt.
+    let fixture = create_lane().await;
+    let admitted = fixture
+        .lane
+        .accept(
+            OperationRequest::Prompt {
+                operation_id: None,
+                prompt: Box::new(PromptMessagesPayload::Text {
+                    prompt: String::new(),
+                    images: Some(vec![image_content("first")]),
+                }),
+            },
+            &background_context(),
+        )
+        .await
+        .expect("accept serves")
+        .expect("the admission");
+    assert_eq!(admitted.kind, OperationKind::Run);
+    finish_operation(&fixture.lane).await;
+
+    // The queued write rides the acceptance without the message guards.
+    let fixture = seeded_write_lane().await;
+    let admitted = fixture
+        .lane
+        .accept(prompt_request("first"), &background_context())
+        .await
+        .expect("accept serves")
+        .expect("the admission");
+    assert_eq!(admitted.operation_id, admitted.operation_id);
+    assert!(
+        fixture.lane.state().inbox.is_empty(),
+        "the queued write rode the admission"
+    );
+    let entries = AgentLane::find_entries(&fixture.lane, None, &background_context())
+        .await
+        .expect("the scan");
+    assert_eq!(entries.len(), 2, "the write and the prompt committed");
+
+    // The empty template's format rejects the acceptance as empty.
+    let mut config = runtime_config();
+    config.resources.prompt_templates = vec![crate::harness::types::PromptTemplate {
+        name: "empty".to_owned(),
+        description: None,
+        content: String::new(),
+    }];
+    let fixture = lane_seeded_with_config(noop_emit_batch(), Vec::new(), config).await;
+    let result = fixture
+        .lane
+        .accept(
+            OperationRequest::PromptTemplate {
+                operation_id: None,
+                name: "empty".to_owned(),
+                args: None,
+            },
+            &background_context(),
+        )
+        .await
+        .expect("accept serves");
+    let error = result.expect_err("the empty format rejects");
+    assert_eq!(error.tag(), "InvalidMessage");
+}
+
+/// The root navigation admits; the capture skips the target read.
+#[tokio::test]
+async fn the_root_navigation_admits() {
+    let fixture = create_lane().await;
+    let _appended = fixture
+        .lane
+        .append_message(user_text_message("head"), &background_context())
+        .await
+        .expect("append serves");
+    let error = fixture
+        .lane
+        .navigate_tree(None, None, &background_context())
+        .await
+        .expect_err("the admitted root navigation faults at the staged drive seam");
+    assert_eq!(
+        closed_message(error),
+        "drive operation is not implemented until its later AgentHarness slice",
+        "the root navigation admitted and drove to the staged seam",
+    );
+    let state = fixture.lane.state().operation.expect("the operation");
+    assert!(
+        matches!(
+            state.state,
+            crate::harness::session::types::OperationState::NavigationReadyToCommit(leaf)
+                if leaf.target_id.is_none() && leaf.label.is_none()
+        ),
+        "the root navigation's leaf carried no target",
+    );
+}
+
+/// The sealed request's drive reports the closed harness: the seal under
+/// the abort's commit rides the driven match's closed arm.
+#[tokio::test]
+async fn the_aborts_drive_reports_the_sealed_harness() {
+    let fixture = create_lane().await;
+    accepted_operation(&fixture).await;
+    let (started, release) = gate_next_commit(&fixture.storage);
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move { lane.abort(&background_context()).await })
+    };
+    started.await.expect("the abort's commit parked");
+    let closed: LaneError = Arc::new(HarnessClosed);
+    fixture.lane.seal(closed).await;
+    let _ = release.send(());
+
+    let aborted = aborted.await.expect("abort join").expect("abort serves");
+    let error = aborted.expect_err("the sealed drive rejects");
+    assert_eq!(error.tag(), "Closed", "the closed drive surfaced");
+}
+
+/// The structural intent's kind reads through the inspection and the busy
+/// rejection, the seeded compaction operation's meta.
+#[tokio::test]
+async fn the_structural_intent_names_its_kind() {
+    let meta = crate::harness::session::types::OperationMeta {
+        operation_id: "structural".to_owned(),
+        lane: "main".to_owned(),
+        source_tip_id: None,
+        started_at: 1,
+        intent: crate::harness::session::types::OperationIntent::Compaction {
+            custom_instructions: None,
+        },
+    };
+    let fixture = lane_seeded(
+        noop_emit_batch(),
+        vec![
+            set_value_write(&stored_values::operation_meta("structural"), meta.clone())
+                .expect("meta write"),
+            set_value_write(
+                &stored_values::operation_state("structural"),
+                crate::harness::session::types::OperationState::SummaryDeciding(
+                    crate::harness::session::types::SummaryDecidingOperation {
+                        scope: operation_scope(),
+                        task: crate::harness::runtime::test_support::summary_task(
+                            crate::harness::session::types::ResultBoundary::Finish,
+                        ),
+                    },
+                ),
+            )
+            .expect("state write"),
+            set_value_write(
+                &stored_values::lane_state("main"),
+                crate::harness::session::types::LaneState {
+                    current_operation_id: Some("structural".to_owned()),
+                    last_operation_id: None,
+                    inbox: Vec::new(),
+                },
+            )
+            .expect("state write"),
+        ],
+    )
+    .await;
+
+    let inspected = fixture
+        .lane
+        .inspect_execution(&background_context())
+        .await
+        .expect("inspect serves");
+    assert_eq!(
+        inspected
+            .current
+            .as_ref()
+            .expect("the current operation")
+            .kind,
+        OperationKind::Compaction,
+        "the compaction intent named its kind",
+    );
+    let busy = fixture
+        .lane
+        .accept(prompt_request("late"), &background_context())
+        .await
+        .expect("accept serves");
+    let error = busy.expect_err("the busy lane rejects");
+    assert_eq!(error.tag(), "LaneBusy");
+    match error {
+        crate::harness::result::HarnessError::LaneBusy { operation_kind, .. } => assert_eq!(
+            operation_kind,
+            OperationKind::Compaction,
+            "the busy rejection carried the compaction kind",
+        ),
+        other => panic!("the busy rejection: {other:?}"),
+    }
+}
+
+/// The navigation acceptance's target read faults, and the acceptance
+/// failure rides the navigate surface.
+#[tokio::test]
+async fn the_navigation_target_read_failure_faults_the_harness() {
+    let fixture = create_lane().await;
+    arm_read_failure(&fixture.storage, "absent");
+    let message = closed_message(
+        fixture
+            .lane
+            .navigate_tree(Some("absent".to_owned()), None, &background_context())
+            .await
+            .expect_err("the target read faults the navigation"),
+    );
+    assert!(
+        message.contains("read failed"),
+        "the target read's failure faults: {message}",
+    );
+}
+
+/// The abort request whose event delivery fails after the commit keeps
+/// its settled gate: the rejection rides with the cancellation recorded.
+#[tokio::test]
+async fn the_abort_request_survives_a_failed_event_delivery_with_its_gate_settled() {
+    let failure = commit_failure("uncloneable event");
+    let emit_batch: EmitBatch = {
+        let failure = Arc::clone(&failure);
+        Arc::new(move |_events: Vec<HarnessEvent>, _context| {
+            let failure = Arc::clone(&failure);
+            Box::pin(async move { Err(failure) })
+        })
+    };
+    let fixture = create_lane_with_emit(emit_batch).await;
+    // The admission's own event delivery fails; the operation still
+    // admitted, the committed memory published.
+    let _ = fixture
+        .lane
+        .accept(prompt_request("first"), &background_context())
+        .await;
+    let operation_id = fixture
+        .lane
+        .state()
+        .operation
+        .as_ref()
+        .map(|operation| operation.meta.operation_id.clone())
+        .expect("the admitted operation");
+    let message = closed_message(
+        fixture
+            .lane
+            .request_abort(&operation_id, &background_context())
+            .await
+            .expect_err("the delivery failure rejects the abort request"),
+    );
+    assert_eq!(message, "uncloneable event", "the delivery failure carried");
+    let state = fixture.lane.state().operation.expect("the operation").state;
+    assert!(
+        matches!(
+            &state,
+            crate::harness::session::types::OperationState::Starting(leaf)
+                if matches!(leaf.scope.control, Control::CancelRequested { .. })
+        ),
+        "the cancellation committed before the delivery failed",
+    );
+}
+
+/// The kind and wait-reason names cover their whole families, the
+/// procedure fault messages' vocabulary.
+#[test]
+fn the_kind_and_wait_reason_names_cover_their_families() {
+    use super::admission_kind_name;
+    use super::wait_reason_name;
+
+    assert_eq!(admission_kind_name(OperationKind::Run), "run");
+    assert_eq!(admission_kind_name(OperationKind::Compaction), "compaction");
+    assert_eq!(admission_kind_name(OperationKind::Navigation), "navigation");
+
+    let retry = crate::harness::agent_harness::DriveWaitReason::Retry { not_before: 1 };
+    assert_eq!(wait_reason_name(&retry), "retry");
+    let deferred = crate::harness::agent_harness::DriveWaitReason::Deferred {
+        deferred: deferred_handle(),
+    };
+    assert_eq!(wait_reason_name(&deferred), "deferred");
+}
+
+/// The deferred handle the wait-reason name's fixture carries, the
+/// reducer suite's wire.
+fn deferred_handle() -> pi_ai::types::DeferredHandle {
+    serde_json::from_value(json!({
+        "provider": "provider",
+        "modelId": "model",
+        "api": "api",
+        "id": "deferred",
+        "pollAfterMs": 1000,
+    }))
+    .expect("deferred handle")
+}
+
+/// The state wait ends when the channel's sender dies.
+#[tokio::test]
+async fn the_state_wait_ends_when_the_channel_dies() {
+    let (sender, receiver) = tokio::sync::watch::channel(0u64);
+    drop(sender);
+    super::wait_state_change(receiver).await;
+}
+
+/// The owner wait takes the cancelled arm when the owner already cancelled.
+#[tokio::test]
+async fn the_owner_wait_takes_the_cancelled_arm() {
+    let owner = tokio_util::sync::CancellationToken::new();
+    owner.cancel();
+    let (_, receiver) = tokio::sync::watch::channel(0u64);
+    super::wait_owner_or_change(&owner, receiver).await;
+}
+
+/// The read gate parks a lane command's storage read and releases it.
+#[tokio::test]
+async fn the_read_gate_parks_and_releases_a_lane_read() {
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let steer = steer_text(&fixture.lane, "queued").await;
+    let (started, release) = gate_next_read(&fixture.storage);
+
+    let aborted = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move {
+            lane.request_abort(&operation_id, &background_context())
+                .await
+        })
+    };
+    started.await.expect("the removed-payload read parked");
+    let _ = release.send(());
+
+    aborted
+        .await
+        .expect("abort join")
+        .expect("the abort serves")
+        .expect("the released read served the abort");
+    let _ = steer;
+}
+
+/// The namespace-scoped arm narrows the rejection: the key-scoped checks
+/// skip it and the reads proceed.
+#[tokio::test]
+async fn the_namespace_scoped_arm_leaves_the_key_scoped_checks_open() {
+    let fixture = create_lane().await;
+    let _appended = fixture
+        .lane
+        .append_message(user_text_message("tail"), &background_context())
+        .await
+        .expect("append serves");
+    fixture.storage.arm_read_failure(
+        Some("pi.branch.tip"),
+        None,
+        crate::harness::session::types::SessionError::Message("tip read failed".to_owned()),
+    );
+
+    // The entry-id read skips the namespace arm and finds the entry.
+    let found = AgentLane::find_entry(&fixture.lane, None, &background_context())
+        .await
+        .expect("the read");
+    assert!(found.is_some(), "the entry read skipped the namespace arm");
+
+    // The branch scan skips it too.
+    let entries = AgentLane::find_entries(&fixture.lane, None, &background_context())
+        .await
+        .expect("the scan");
+    assert_eq!(entries.len(), 1, "the scan skipped the namespace arm");
+}
+/// The occupied claim's post-settle loop re-claims: the rival pass settles,
+/// the drive installs its own pass, and the staged seam faults it.
+#[tokio::test]
+async fn the_occupied_drive_reclaims_after_the_rival_pass_settles() {
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let rival = Arc::new(Drive::new(
+        &DriveOptions {
+            operation_id: "rival".to_owned(),
+            wait_for_retry: None,
+            poll_deferred: None,
+        },
+        &background_context(),
+    ));
+    fixture.lane.set_active_drive(Some(Arc::clone(&rival)));
+
+    let waiting = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move {
+            lane.drive(
+                DriveOptions {
+                    operation_id,
+                    wait_for_retry: None,
+                    poll_deferred: None,
+                },
+                &background_context(),
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "the occupied claim waits out the rival"
+    );
+
+    fixture.lane.set_active_drive(None);
+    rival.settle(DriveOutcome::Settled {
+        outcome: settled_record("rival", None),
+    });
+    let error = waiting
+        .await
+        .expect("drive join")
+        .expect_err("the re-claimed drive faults at the staged seam");
+    assert_eq!(
+        closed_message(error),
+        "drive operation is not implemented until its later AgentHarness slice",
+        "the re-claim installed its own pass and hit the staged seam",
+    );
+}
+
+/// The occupied claim's completion await races the context's abort; the
+/// abort reason rides the rejection.
+#[tokio::test]
+async fn the_occupied_drive_reports_the_context_abort() {
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let rival = Arc::new(Drive::new(
+        &DriveOptions {
+            operation_id: "rival".to_owned(),
+            wait_for_retry: None,
+            poll_deferred: None,
+        },
+        &background_context(),
+    ));
+    fixture.lane.set_active_drive(Some(rival));
+
+    let (_, controller) = pi_chord::context::with_cancel(&background_context());
+    let context = crate::harness::context::with_abort_signal(
+        controller.signal().clone(),
+        &background_context(),
+    );
+    let waiting = {
+        let lane = fixture.lane.clone();
+        tokio::spawn(async move {
+            lane.drive(
+                DriveOptions {
+                    operation_id,
+                    wait_for_retry: None,
+                    poll_deferred: None,
+                },
+                &context,
+            )
+            .await
+        })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "the occupied claim waits out the rival"
+    );
+    controller.abort("stop");
+    let error = waiting
+        .await
+        .expect("drive join")
+        .expect_err("the aborted drive rejects");
+    assert_eq!(
+        closed_message(error),
+        "stop",
+        "the context abort fired before the rival settled",
+    );
+}
+
+/// The finish decision's inbox patch rides the durable lane record, the
+/// settle's `lane.inbox` commit branch.
+#[tokio::test]
+async fn the_settle_finish_patches_the_inbox() {
+    let fixture = create_lane().await;
+    let _operation_id = accepted_operation(&fixture).await;
+    let carried = vec![InboxItem {
+        entry_id: "carried-write".to_owned(),
+        kind: InboxItemKind::Write,
+    }];
+    let carried_for_plan = carried.clone();
+    let settled = fixture
+        .lane
+        .settle_operation::<Vec<InboxItem>, _>(
+            move |_state, _operation_state, meta, _session, _context| {
+                let operation_id = meta.operation_id.clone();
+                let carried = carried_for_plan.clone();
+                Box::pin(async move {
+                    Ok(OperationCommand::Finish {
+                        writes: Vec::new(),
+                        record: settled_record(&operation_id, None),
+                        lane: Some(LanePatch {
+                            inbox: Some(carried.clone()),
+                            ..LanePatch::default()
+                        }),
+                        materialize: Arc::new(move |_commit| carried.clone()),
+                        events: None,
+                    })
+                })
+            },
+            &background_context(),
+        )
+        .await
+        .expect("settle serves");
+    assert_eq!(settled, carried, "the materialized inbox");
+    assert_eq!(fixture.lane.state().inbox, carried, "the patched inbox");
+    assert!(
+        fixture.lane.state().operation.is_none(),
+        "the finish cleared"
+    );
+    let stored = fixture
+        .session
+        .get_value(
+            &stored_values::lane_state("main").address,
+            &background_context(),
+        )
+        .await
+        .expect("read lane state")
+        .expect("stored lane state");
+    assert_eq!(
+        stored.value.get("currentOperationId"),
+        Some(&serde_json::Value::Null),
+        "the finish's lane record cleared the operation",
+    );
+    assert_eq!(
+        stored.value.get("inbox"),
+        Some(&serde_json::to_value(&carried).expect("inbox wire")),
+        "the finish's lane record carried the patched inbox",
+    );
+}
+
+/// The read gate's own failure fails the read it gates: the abort's
+/// removed-payload read carries the gate's error.
+#[tokio::test]
+async fn the_read_gates_own_failure_fails_the_read() {
+    let fixture = create_lane().await;
+    let operation_id = accepted_operation(&fixture).await;
+    let steer = steer_text(&fixture.lane, "queued").await;
+    fixture.storage.arm_read_gate(Box::new(|| {
+        Box::pin(async {
+            Err(crate::harness::session::types::SessionError::Message(
+                "gate failed".to_owned(),
+            ))
+        })
+    }));
+
+    let message = closed_message(
+        fixture
+            .lane
+            .request_abort(&operation_id, &background_context())
+            .await
+            .expect_err("the gate's failure faults the abort"),
+    );
+    assert!(
+        message.contains("gate failed"),
+        "the gate's error carried: {message}",
+    );
+    let _ = steer;
 }

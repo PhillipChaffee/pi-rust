@@ -121,9 +121,9 @@ fn raw_write(address: &ValueAddress, value: serde_json::Value) -> Write {
 /// session over the memory backend.
 async fn lane_fixture() -> (Arc<Lane>, Arc<StorageBackedSession>) {
     let session = Arc::new(StorageBackedSession::new(
-        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
+        runtime_session_metadata(next_session_id()),
         Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
+        StorageBackedSessionOptions::default(),
     ));
     seed_main_lane_values(&session, None)
         .await
@@ -336,9 +336,9 @@ async fn admitted_run() -> (Arc<Lane>, Arc<StorageBackedSession>, Drive) {
 /// starting operation carries no branch tip.
 async fn tipless_operation_lane() -> (Arc<Lane>, Drive) {
     let session = Arc::new(StorageBackedSession::new(
-        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
+        runtime_session_metadata(next_session_id()),
         Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
+        StorageBackedSessionOptions::default(),
     ));
     seed_main_lane_values(&session, Some("operation"))
         .await
@@ -450,9 +450,9 @@ async fn reads_the_run_bounded_context_messages() {
 /// pending payloads committed.
 async fn queued_session() -> Arc<StorageBackedSession> {
     let session = Arc::new(StorageBackedSession::new(
-        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
+        runtime_session_metadata(next_session_id()),
         Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
-        crate::harness::session::session::StorageBackedSessionOptions::default(),
+        StorageBackedSessionOptions::default(),
     ));
     seed_main_lane_values(&session, None)
         .await
@@ -767,4 +767,189 @@ async fn the_queue_invariants_name_the_write_and_next_run_queues() {
             "the {kind:?} queue named the entry: {missing}",
         );
     }
+}
+
+// The storage-error reads and the follow-up naming: the reads the helpers
+// make fault through the controlled backend, upstream's
+// `FailingMemoryStorage` rig.
+
+use crate::harness::runtime::test_support::ControlledStorage;
+use crate::harness::runtime::test_support::runtime_session_metadata;
+use crate::harness::session::session::StorageBackedSessionOptions;
+
+/// The lane over the controlled backend, the read-failure rig's fixture
+/// plus its storage handle.
+async fn controlled_lane_fixture() -> (Arc<Lane>, Arc<StorageBackedSession>, Arc<ControlledStorage>)
+{
+    controlled_lane_fixture_with_config(runtime_config()).await
+}
+
+/// The fixture variant the projector-configured tests drive.
+async fn controlled_lane_fixture_with_config(
+    config: crate::harness::runtime::types::Config,
+) -> (Arc<Lane>, Arc<StorageBackedSession>, Arc<ControlledStorage>) {
+    let storage = Arc::new(ControlledStorage::new(Arc::new(MemoryStorage::new(
+        MemoryStorageOptions::default(),
+    ))));
+    let session = Arc::new(StorageBackedSession::new(
+        runtime_session_metadata(next_session_id()),
+        storage.clone(),
+        StorageBackedSessionOptions::default(),
+    ));
+    seed_main_lane_values(&session, None)
+        .await
+        .expect("seed commit");
+    let restored = restore_lane(session.clone(), "main", &background_context())
+        .await
+        .expect("restore");
+    let lane = Arc::new(Lane::new(
+        "main",
+        session.clone(),
+        Arc::new(pi_ai::models::create_models(None)),
+        Arc::new(crate::harness::hooks::HookRegistry::new(
+            noop_hook_reporter(),
+        )),
+        restored,
+        passthrough_fault_handler(),
+        noop_emit_batch(),
+        recording_watch_installer(empty_lane_snapshot("main", &lane_configuration())),
+        Arc::new(move || config.clone()),
+    ));
+    (lane, session, storage)
+}
+
+fn arm_read_failure(storage: &Arc<ControlledStorage>, namespace: Option<&str>, key: Option<&str>) {
+    storage.arm_read_failure(
+        namespace,
+        key,
+        crate::harness::session::types::SessionError::Message("read failed".to_owned()),
+    );
+}
+
+/// The bounded entries read carries its branch scan's storage error.
+#[tokio::test]
+async fn the_bounded_entries_read_carries_the_scan_failure() {
+    let (lane, _session, storage) = controlled_lane_fixture().await;
+    let admission = accept_text(&lane, "hello").await;
+    let tip = lane.state().tip_id.expect("the accepted tip");
+    let _ = admission;
+    arm_read_failure(&storage, None, Some(&tip));
+    let drive = Drive::new(
+        &DriveOptions {
+            operation_id: "any".to_owned(),
+            wait_for_retry: None,
+            poll_deferred: None,
+        },
+        &background_context(),
+    );
+    let read = read_bounded_entries(&lane, &drive).await;
+    let error = read.expect_err("the scan's failure rejects");
+    assert_eq!(
+        error.to_string(),
+        "read failed",
+        "the branch scan's storage error carried: {error}",
+    );
+}
+
+/// The bounded context carries the entries read's failure, the
+/// tipless operation's invariant.
+#[tokio::test]
+async fn the_bounded_context_carries_the_entries_failure() {
+    let (lane, drive) = tipless_operation_lane().await;
+    let read = read_bounded_context(&lane, &drive).await;
+    let error = read.expect_err("the entries failure rejects");
+    assert!(
+        error
+            .to_string()
+            .contains("Run operation has no Branch tip"),
+        "the entries read's failure carried: {error}",
+    );
+}
+
+/// The bounded context carries the context build's failure: the custom
+/// entry's projector throws.
+#[tokio::test]
+async fn the_bounded_context_carries_the_build_failure() {
+    let mut config = runtime_config();
+    config.entry_projectors.insert(
+        "note".to_owned(),
+        crate::harness::session::types::EntryProjector(Arc::new(
+            |_entry: &Entry, _context: &crate::harness::context::Context| {
+                Box::pin(async move {
+                    Err::<Option<Vec<AgentMessage>>, _>(
+                        crate::harness::session::types::SessionError::Message(
+                            "projector failed".to_owned(),
+                        ),
+                    )
+                })
+            },
+        )),
+    );
+    let (lane, _session, _storage) = controlled_lane_fixture_with_config(config).await;
+    let _note = lane
+        .append_custom_entry("note", Some(json!({ "k": "v" })), &background_context())
+        .await
+        .expect("append serves");
+    let _admission = accept_text(&lane, "hello").await;
+    let drive = Drive::new(
+        &DriveOptions {
+            operation_id: "any".to_owned(),
+            wait_for_retry: None,
+            poll_deferred: None,
+        },
+        &background_context(),
+    );
+    let read = read_bounded_context(&lane, &drive).await;
+    let error = read.expect_err("the build's failure rejects");
+    assert_eq!(
+        error.to_string(),
+        "projector failed",
+        "the context build's projector failure carried: {error}",
+    );
+}
+
+/// The queue and pending-message reads carry their storage failures.
+#[tokio::test]
+async fn the_queue_and_pending_reads_carry_the_storage_failures() {
+    let (lane, session, storage) = controlled_lane_fixture().await;
+    let steer = lane
+        .steer(
+            crate::harness::agent_harness::QueueMessage::Text("queued".to_owned()),
+            Vec::new(),
+            &background_context(),
+        )
+        .await
+        .expect("steer serves")
+        .expect("the steer");
+
+    // The queue read's storage failure.
+    arm_read_failure(&storage, None, None);
+    let read = read_lane_queues(session.as_ref(), &lane.state().inbox, &background_context()).await;
+    let error = read.expect_err("the queue read rejects");
+    assert_eq!(error.to_string(), "read failed");
+
+    // The pending-message read's storage failure.
+    let read = read_pending_messages(
+        session.as_ref(),
+        std::slice::from_ref(&steer),
+        "The cancelled steer",
+        &background_context(),
+    )
+    .await;
+    let error = read.expect_err("the pending read rejects");
+    assert_eq!(error.to_string(), "read failed");
+    storage.clear_read_failure();
+
+    // The follow-up queue names its queue in the non-message invariant.
+    let custom_session = queued_session().await;
+    let inbox = vec![InboxItem {
+        entry_id: "write-1".to_owned(),
+        kind: InboxItemKind::FollowUp,
+    }];
+    let read = read_lane_queues(custom_session.as_ref(), &inbox, &background_context()).await;
+    let error = read.expect_err("the follow-up's custom payload rejects");
+    assert!(
+        error.to_string().contains("Pending followUp entry"),
+        "the invariant named the follow-up queue: {error}",
+    );
 }

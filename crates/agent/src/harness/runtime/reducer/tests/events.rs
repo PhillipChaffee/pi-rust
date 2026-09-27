@@ -1143,3 +1143,135 @@ fn carries_the_declined_compaction_end_status() {
         "the declined compaction carries its status",
     );
 }
+
+#[test]
+fn the_foreign_run_drops_the_lifecycle_and_streaming_events() {
+    let mut snapshot = empty_snapshot();
+    snapshot.operation = Some(run_operation("run", OperationKind::Run));
+    let before = snapshot.clone();
+
+    // The foreign run's resume and retry transitions.
+    reduce_lane_snapshot(
+        &mut snapshot,
+        &lane_event(HarnessEventPayload::RunResume {
+            run_id: "foreign".to_owned(),
+        }),
+    );
+    reduce_lane_snapshot(
+        &mut snapshot,
+        &lane_event(HarnessEventPayload::RetryStart {
+            run_id: "foreign".to_owned(),
+            step: "assistant".to_owned(),
+            attempt: 2,
+        }),
+    );
+    reduce_lane_snapshot(
+        &mut snapshot,
+        &lane_event(HarnessEventPayload::RetryEnd {
+            run_id: "foreign".to_owned(),
+            step: "assistant".to_owned(),
+            attempt: 2,
+            success: true,
+            final_error: None,
+        }),
+    );
+
+    // The foreign run's streaming lifecycle.
+    reduce_lane_snapshot(
+        &mut snapshot,
+        &lane_event(HarnessEventPayload::MessageStart {
+            run_id: Some("foreign".to_owned()),
+            message: assistant_wire("pending", "partial"),
+        }),
+    );
+    reduce_lane_snapshot(
+        &mut snapshot,
+        &lane_event(HarnessEventPayload::MessageUpdate {
+            run_id: "foreign".to_owned(),
+            message: Box::new(assistant_wire("pending", "grown")),
+            event: Box::new(pi_ai::types::AssistantMessageEvent::Start {
+                partial: assistant_of(&assistant_wire("pending", "partial")).clone(),
+            }),
+            frame: None,
+        }),
+    );
+    reduce_lane_snapshot(
+        &mut snapshot,
+        &lane_event(HarnessEventPayload::MessageEnd {
+            run_id: Some("foreign".to_owned()),
+            message: assistant_wire("stop", "done"),
+            entry_id: None,
+        }),
+    );
+
+    assert_eq!(snapshot, before, "the foreign run's events touched nothing");
+}
+
+#[test]
+fn the_tool_result_entry_for_an_unstarted_call_pushes_the_transcript() {
+    let mut snapshot = empty_snapshot();
+    snapshot.operation = Some(run_operation("run", OperationKind::Run));
+    reduce_lane_snapshot(&mut snapshot, &tool_result_entry(7));
+    assert!(
+        running_tools(&snapshot).is_empty(),
+        "the unstarted call's result removed nothing",
+    );
+    let transcript_ids: Vec<String> = snapshot
+        .transcript
+        .iter()
+        .map(|entry| entry.id().to_owned())
+        .collect();
+    assert_eq!(
+        transcript_ids,
+        vec!["result-7"],
+        "the entry still committed"
+    );
+}
+
+#[test]
+fn the_tool_end_resettles_an_already_settled_call() {
+    let mut snapshot = empty_snapshot();
+    snapshot.operation = Some(run_operation("run", OperationKind::Run));
+    reduce_lane_snapshot(&mut snapshot, &tool_start_event(0));
+    reduce_lane_snapshot(&mut snapshot, &tool_end_event(0));
+    reduce_lane_snapshot(&mut snapshot, &tool_end_event(0));
+    let settled = &running_tools(&snapshot)[0];
+    match settled {
+        LaneSnapshotTool::Settled { args, result, .. } => {
+            assert_eq!(
+                *args,
+                json!({ "index": 0 }),
+                "the settled tool's args carried into the resettle"
+            );
+            assert_eq!(*result, tool_result("done-0"), "the result carried");
+        }
+        other @ LaneSnapshotTool::Running { .. } => panic!("the tool: {other:?}"),
+    }
+}
+
+#[test]
+fn the_global_event_carrying_a_lane_update_drops() {
+    let mut snapshot = empty_snapshot();
+    let event = HarnessEvent {
+        lane: None,
+        recovery: false,
+        payload: HarnessEventPayload::ConfigUpdate {
+            property: crate::harness::agent_harness::ConfigUpdateKind::Lane(
+                crate::harness::agent_harness::LaneConfigUpdate::ThinkingLevel {
+                    value: ThinkingLevel::High,
+                    previous: ThinkingLevel::Off,
+                },
+            ),
+        },
+    };
+    assert_eq!(
+        reduce_lane_snapshot(&mut snapshot, &event),
+        LaneSnapshotReduction::Applied,
+        "the lane-less carrier drops the lane property",
+    );
+    assert_eq!(
+        snapshot.configuration.thinking_level,
+        ThinkingLevel::Off,
+        "the foreign carrier folded nothing",
+    );
+}
