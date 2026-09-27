@@ -23,6 +23,7 @@ pub mod websocket;
 
 pub use client::{
     BoxHttpFuture, HttpByteStream, HttpClient, HttpError, HttpMethod, HttpRequest, HttpResponse,
+    status_reason,
 };
 pub use mock::{
     MockBody, MockHttpClient, MockResponse, MockWebSocketPeer, MockWebSocketTransport,

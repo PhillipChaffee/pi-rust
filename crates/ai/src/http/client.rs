@@ -217,3 +217,28 @@ pub async fn read_body_text(mut body: HttpByteStream) -> Result<String, HttpErro
     }
     Ok(text)
 }
+
+/// The status text the seam's consumers report for a failed call.
+///
+/// The wire's `statusText` for the statuses the APIs answer with — the
+/// seam's [`HttpResponse`] carries no reason phrase, so message builders
+/// that upstream formats as `{status} {statusText}` read it here. Unknown
+/// statuses report an empty reason.
+#[must_use]
+pub const fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}

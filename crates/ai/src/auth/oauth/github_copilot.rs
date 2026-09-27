@@ -28,6 +28,7 @@ use crate::auth::oauth::{
 };
 use crate::auth::types::ModelAuth;
 use crate::auth::types::{AuthError, AuthEvent, AuthPrompt, OAuthCredentials};
+use crate::http::client::status_reason;
 use crate::http::{HttpClient, HttpMethod, HttpRequest, HttpResponse};
 use crate::types::BoxedFuture;
 use crate::utils::sleep::sleep;
@@ -475,28 +476,6 @@ const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
-}
-
-/// The status text a failed Copilot call reports, the wire's `statusText`
-/// for the statuses the Copilot APIs answer with; unknown statuses report an
-/// empty reason.
-#[must_use]
-pub(crate) const fn status_reason(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        409 => "Conflict",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "",
-    }
 }
 
 /// The request headers a Copilot API call sends: the optional bearer
