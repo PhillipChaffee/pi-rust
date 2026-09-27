@@ -215,6 +215,20 @@ pub enum LaneCommand<T> {
     },
 }
 
+impl<T> std::fmt::Debug for LaneCommand<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Commit { writes, next, .. } => f
+                .debug_struct("Commit")
+                .field("writes", writes)
+                .field("next", next)
+                .finish_non_exhaustive(),
+            Self::Return { .. } => f.write_str("Return(..)"),
+            Self::Reject { error } => f.debug_tuple("Reject").field(error).finish(),
+        }
+    }
+}
+
 /// The result an operation continuation yields, upstream's
 /// `ContinueOperationResult<TResult>`.
 pub enum ContinueOperationResult<T> {
@@ -225,6 +239,15 @@ pub enum ContinueOperationResult<T> {
         /// The materialized value.
         value: T,
     },
+}
+
+impl<T> std::fmt::Debug for ContinueOperationResult<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CancelRequested => f.write_str("CancelRequested"),
+            Self::Result { .. } => f.write_str("Result(..)"),
+        }
+    }
 }
 
 /// One durable operation transition, upstream's `OperationCommand<TResult>`.
@@ -263,7 +286,38 @@ pub enum OperationCommand<T> {
     },
 }
 
+impl<T> std::fmt::Debug for OperationCommand<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Commit {
+                writes,
+                operation_state,
+                lane,
+                ..
+            } => f
+                .debug_struct("Commit")
+                .field("writes", writes)
+                .field("operation_state", operation_state)
+                .field("lane", lane)
+                .finish_non_exhaustive(),
+            Self::Finish {
+                writes,
+                record,
+                lane,
+                ..
+            } => f
+                .debug_struct("Finish")
+                .field("writes", writes)
+                .field("record", record)
+                .field("lane", lane)
+                .finish_non_exhaustive(),
+            Self::Return { .. } => f.write_str("Return(..)"),
+        }
+    }
+}
+
 /// The result one drive procedure yields, upstream's `ProcedureResult`.
+#[derive(Debug)]
 pub enum ProcedureResult {
     /// The drive continues with the next phase.
     Continue,

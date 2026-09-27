@@ -5,17 +5,18 @@
 //! child carries in [`crate::harness::session::context`]; the session-child
 //! reservation stands.
 
-use std::sync::Arc;
+
 
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::HarnessEventPayload;
 use crate::harness::agent_harness::LaneQueuedItem;
 use crate::harness::context::Context;
+use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::types::ContinueOperationResult;
 use crate::harness::runtime::types::Drive;
-use crate::harness::runtime::types::from_arc;
 use crate::harness::runtime::types::lane_error;
 use crate::harness::runtime::types::LaneError;
+use crate::harness::runtime::types::OperationCommand;
 use crate::harness::session::context::SessionContextBuildOptions;
 use crate::harness::session::context::build_session_context;
 use crate::harness::session::types::BranchScanOrder;
@@ -27,12 +28,10 @@ use crate::harness::session::types::InboxItemKind;
 use crate::harness::session::types::NewEntry;
 use crate::harness::session::types::PendingEntry;
 use crate::harness::session::types::SessionError;
-use crate::harness::session::types::SessionInvariantError;
 use crate::harness::session::types::SessionReader;
 use crate::harness::session::types::StorageBranchScan;
 use crate::harness::session::values::pending_entry;
 use crate::harness::session::values::StoredValue;
-use crate::harness::runtime::lane::Lane;
 use crate::types::AgentMessage;
 
 /// Links a list of new entries into one parent chain, upstream's
@@ -129,10 +128,10 @@ pub async fn read_bounded_entries(
     drive: &Drive,
 ) -> Result<ContinueOperationResult<Vec<Entry>>, LaneError> {
     lane.continue_operation(
-        |state: crate::harness::runtime::types::LaneState, session: Arc<dyn crate::harness::session::types::Session>, context| {
+        |state, session, context| {
             Box::pin(async move {
                 let Some(tip_id) = state.tip_id else {
-                    return Err(Arc::new(SessionInvariantError(
+                    return Err(lane_error(SessionError::Invariant(
                         "Run operation has no Branch tip".to_owned(),
                     )));
                 };
@@ -152,7 +151,6 @@ pub async fn read_bounded_entries(
                 entries.reverse();
                 Ok(OperationCommand::Return { result: entries })
             })
-                as BoxedFuture<'static, Result<OperationCommand<Vec<Entry>>, LaneError>>
         },
         &drive.context,
     )
@@ -170,9 +168,11 @@ pub async fn read_bounded_context(
         ContinueOperationResult::CancelRequested => Ok(ContinueOperationResult::CancelRequested),
         ContinueOperationResult::Result { value } => {
             let options = SessionContextBuildOptions {
-                entry_projectors: lane.read_config().entry_projectors,
+                entry_projectors: Some(lane.read_config().entry_projectors),
             };
-            let value = build_session_context(&value, Some(&options), &drive.context).await;
+            let value = build_session_context(&value, Some(&options), &drive.context)
+                .await
+                .map_err(lane_error)?;
             Ok(ContinueOperationResult::Result { value })
         }
     }
@@ -191,7 +191,7 @@ pub async fn read_lane_queues(
             .get_value(&pending_entry(&item.entry_id).address, context)
             .await?;
         let Some(stored) = stored else {
-            return Err(SessionInvariantError(format!(
+            return Err(SessionError::Invariant(format!(
                 "Pending {} entry {} is missing its payload",
                 inbox_item_kind(&item.kind),
                 item.entry_id
@@ -199,7 +199,7 @@ pub async fn read_lane_queues(
             .into());
         };
         let pending: PendingEntry = serde_json::from_value(stored.value)
-            .map_err(|error| SessionInvariantError(format!("Pending entry payload is malformed: {error}")))?;
+            .map_err(|error| SessionError::Invariant(format!("Pending entry payload is malformed: {error}")))?;
         match pending {
             PendingEntry::Message { payload } => {
                 queues.push(LaneQueuedItem::Message {
@@ -210,7 +210,7 @@ pub async fn read_lane_queues(
             }
             PendingEntry::Custom { custom_type, payload } => {
                 if item.kind != InboxItemKind::Write {
-                    return Err(SessionInvariantError(format!(
+                    return Err(SessionError::Invariant(format!(
                         "Pending {} entry {} is not a message",
                         inbox_item_kind(&item.kind),
                         item.entry_id
@@ -247,7 +247,7 @@ pub async fn read_pending_messages(
     context: &Context,
 ) -> Result<Vec<(String, AgentMessage)>, SessionError> {
     let missing = |entry_id: &str| {
-        SessionInvariantError(format!(
+        SessionError::Invariant(format!(
             "{description} {entry_id} is missing its message payload"
         ))
     };

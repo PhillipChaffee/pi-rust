@@ -25,6 +25,7 @@ use crate::harness::runtime::types::Drive;
 use crate::harness::runtime::types::LaneCommand;
 use crate::harness::runtime::types::LaneError;
 use crate::harness::runtime::types::LaneState;
+use crate::harness::runtime::types::lane_error;
 use crate::harness::session::types::CommitResult;
 use crate::harness::session::types::EntryScanOrder;
 use crate::harness::session::types::OperationState;
@@ -110,7 +111,7 @@ pub async fn read_assistant_frames(
         for ListElement { seq, value } in page {
             frames.push(
                 serde_json::from_value(value)
-                    .map_err(|error| SessionError(format!("Pending assistant frame is malformed: {error}")))?,
+                    .map_err(|error| SessionError::Message(format!("Pending assistant frame is malformed: {error}")))?,
             );
             page_cursor = Some(ListCursor { seq });
         }
@@ -137,8 +138,10 @@ fn lock_latest(shared: &ChannelShared) -> MutexGuard<'_, Option<tokio::sync::wat
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The shared progress machinery, upstream's `openProgress`.
-fn open_progress<T: Send + 'static>(
+/// The shared progress machinery, upstream's `openProgress`. `T` is `Sync`
+/// because the plan closure rides the lane's `Arc`-wrapped mutation
+/// contract, which shares it across calls.
+fn open_progress<T: Send + Sync + 'static>(
     lane: &Arc<Lane>,
     drive: &Arc<Drive>,
     commit_write: Arc<dyn Fn(&T) -> Result<Write, SessionError> + Send + Sync>,
@@ -169,10 +172,9 @@ fn open_progress<T: Send + 'static>(
                 .command(
                     move |state, _session: Arc<dyn crate::harness::session::types::Session>, _context| {
                         if !still_owns(&state) {
-                            return Box::pin(async move {
-                                Ok(LaneCommand::Return { result: () })
-                            })
-                                as BoxedFuture<'static, Result<LaneCommand<()>, LaneError>>;
+                            let skip: BoxedFuture<'static, Result<LaneCommand<()>, LaneError>> =
+                                Box::pin(async move { Ok(LaneCommand::Return { result: () }) });
+                            return skip;
                         }
                         match commit_write(&item) {
                             Ok(write) => Box::pin(async move {
@@ -199,7 +201,7 @@ fn open_progress<T: Send + 'static>(
     let drain_shared = Arc::clone(&shared);
     let drain_fn = Arc::new(move || {
         let drain_shared = Arc::clone(&drain_shared);
-        Box::pin(async move {
+        let drain: BoxedFuture<'static, Result<(), WriteFailure>> = Box::pin(async move {
             let receiver = {
                 let guard = lock_latest(&drain_shared);
                 guard.as_ref().map(tokio::sync::watch::Receiver::clone)
@@ -220,7 +222,8 @@ fn open_progress<T: Send + 'static>(
                     return Ok(());
                 }
             }
-        }) as BoxedFuture<'static, Result<(), WriteFailure>>
+        });
+        drain
     });
     ProgressChannel {
         write: write_fn,
@@ -271,6 +274,7 @@ pub fn open_tool_progress(
 ) -> ProgressChannel<AgentToolResult> {
     let address = pending_tool_output(&drive.operation_id, invocation_id);
     let turn_id = turn_id.to_owned();
+    let invocation_id = invocation_id.to_owned();
     open_progress(
         lane,
         drive,
@@ -284,7 +288,7 @@ pub fn open_tool_progress(
             };
             set_value(&address, payload).map(Write::ValueSet)
         }),
-        Arc::new(move |state| {
+        Arc::new(move |state: &LaneState| {
             let Some(operation) = &state.operation else {
                 return false;
             };
