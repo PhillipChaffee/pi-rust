@@ -867,11 +867,13 @@ impl Lane {
                     break;
                 };
                 let change = self.inner.state_change_receiver();
-                if await_with_context(Box::pin(wait_owner_or_change(&owner, change)), context)
-                    .await
-                    .is_err()
+                // The context's own abort reason rides the rejection,
+                // upstream's `abortError(signal)` rethrow.
+                if let Err(reason) =
+                    await_with_context(Box::pin(wait_owner_or_change(&owner, change)), context)
+                        .await
                 {
-                    return Err(abort_reason_error(None));
+                    return Err(abort_reason_error(Some(reason)));
                 }
                 self.inner.assert_open()?;
             }
@@ -957,11 +959,11 @@ impl Lane {
                     return Ok(result);
                 }
                 Ok(CommandOutcome::IdleBlocked { owner, change }) => {
-                    if await_with_context(Box::pin(wait_owner_or_change(&owner, change)), context)
-                        .await
-                        .is_err()
+                    if let Err(reason) =
+                        await_with_context(Box::pin(wait_owner_or_change(&owner, change)), context)
+                            .await
                     {
-                        return Err(abort_reason_error(None));
+                        return Err(abort_reason_error(Some(reason)));
                     }
                     self.inner.assert_open()?;
                 }
@@ -3294,8 +3296,8 @@ impl Lane {
                         }),
                         None => Box::pin(wait_state_change(change)),
                     };
-                    if await_with_context(wait, context).await.is_err() {
-                        return Err(abort_reason_error(None));
+                    if let Err(reason) = await_with_context(wait, context).await {
+                        return Err(abort_reason_error(Some(reason)));
                     }
                 }
             }
@@ -3356,8 +3358,8 @@ impl Lane {
                         }),
                         None => Box::pin(wait_state_change(change)),
                     };
-                    if await_with_context(wait, context).await.is_err() {
-                        return Err(abort_reason_error(None));
+                    if let Err(reason) = await_with_context(wait, context).await {
+                        return Err(abort_reason_error(Some(reason)));
                     }
                 }
             }

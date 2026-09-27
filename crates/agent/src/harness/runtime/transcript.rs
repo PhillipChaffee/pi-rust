@@ -282,3 +282,6 @@ pub async fn read_pending_messages(
     }
     Ok(messages)
 }
+
+#[cfg(test)]
+mod tests;

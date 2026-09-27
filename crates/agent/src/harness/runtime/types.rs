@@ -507,3 +507,6 @@ impl Drive {
         self.fail(error);
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -15,6 +15,8 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
+#[cfg(test)]
+mod events;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -29,6 +31,7 @@ use pi_ai::types::Message;
 use pi_ai::types::ToolResultBlock;
 use pi_ai::types::ToolResultMessage;
 
+use crate::harness::agent_harness::AgentLane;
 use crate::harness::agent_harness::EventListener;
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::HarnessEventPayload;
@@ -382,12 +385,12 @@ async fn bus_lane(bus: &Arc<HarnessEventBus>) -> (Lane, Arc<StorageBackedSession
 async fn replicates_globally_ordered_queue_changes() {
     let bus = Arc::new(HarnessEventBus::new());
     let (lane, _session) = bus_lane(&bus).await;
-    let watch = lane.watch_impl(&background_context()).await.expect("watch");
+    let watch = lane.watch(&background_context()).await.expect("watch");
     let delivered: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
     watch.start(collector(Arc::clone(&delivered)));
 
     let _next = lane
-        .next_run_impl(
+        .next_run(
             QueueMessage::Text("next".to_owned()),
             Vec::new(),
             &background_context(),
@@ -396,7 +399,7 @@ async fn replicates_globally_ordered_queue_changes() {
         .expect("nextRun serves")
         .expect("nextRun ok");
     let steer = lane
-        .steer_impl(
+        .steer(
             QueueMessage::Text("steer".to_owned()),
             Vec::new(),
             &background_context(),
@@ -405,7 +408,7 @@ async fn replicates_globally_ordered_queue_changes() {
         .expect("steer serves")
         .expect("steer ok");
     let _follow = lane
-        .follow_up_impl(
+        .follow_up(
             QueueMessage::Text("follow".to_owned()),
             Vec::new(),
             &background_context(),
@@ -413,7 +416,7 @@ async fn replicates_globally_ordered_queue_changes() {
         .await
         .expect("followUp serves")
         .expect("followUp ok");
-    lane.cancel_queued_impl(&steer, &background_context())
+    lane.cancel_queued(&steer, &background_context())
         .await
         .expect("cancelQueued serves");
     settle_events().await;

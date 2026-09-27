@@ -449,3 +449,6 @@ const fn intent_kind(meta: &OperationMeta) -> &'static str {
         OperationIntent::Navigation { .. } => "navigation",
     }
 }
+
+#[cfg(test)]
+mod tests;

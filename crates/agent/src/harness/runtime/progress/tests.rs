@@ -16,6 +16,10 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
+#![expect(
+    clippy::panic,
+    reason = "the boundary tests pin outcomes; a violated expectation panics the test by design"
+)]
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -54,6 +58,8 @@ use crate::harness::session::types::CheckpointData;
 use crate::harness::session::types::CheckpointOperation;
 use crate::harness::session::types::Continuation;
 use crate::harness::session::types::Control;
+use crate::harness::session::types::DeferredEffectPendingOperation;
+use crate::harness::session::types::DeferredScope;
 use crate::harness::session::types::GenerationContext;
 use crate::harness::session::types::NormalizedRetryPolicy;
 use crate::harness::session::types::OperationIntent;
@@ -563,4 +569,270 @@ async fn retains_the_rejecting_write_promise_so_drain_propagates_commit_failure(
     let drained = progress.drain().await;
     let error = drained.expect_err("drain propagates the failure");
     assert_eq!(error.to_string(), "frame commit failed");
+}
+
+// The boundary additions: the reader, the channel Debug, the write-less
+// drain, and the still-owns guards the 1:1 suite leaves.
+
+fn frame_delta(index: u64, delta: &str) -> AssistantMessageFrame {
+    AssistantMessageFrame::TextDelta {
+        content_index: index,
+        delta: delta.to_owned(),
+    }
+}
+
+async fn commit_writes(
+    fixture: &ProgressFixture,
+    writes: Vec<crate::harness::session::values::Write>,
+) {
+    let session = Arc::clone(fixture.lane.session());
+    session
+        .mutate(
+            Box::new(move |mutator, context| {
+                let writes = writes.clone();
+                Box::pin(async move {
+                    mutator.commit(writes, context).await?;
+                    let payload: Box<dyn std::any::Any + Send> = Box::new(());
+                    Ok(payload)
+                })
+            }),
+            &background_context(),
+        )
+        .await
+        .expect("the commit settles");
+}
+
+#[tokio::test]
+async fn reads_the_pending_assistant_frames_oldest_first() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    let address = stored_values::pending_assistant_frames("operation", response_entry_id);
+    commit_writes(
+        &fixture,
+        vec![
+            crate::harness::session::values::append_list_write(&address, frame_delta(0, "a"))
+                .expect("frame append"),
+            crate::harness::session::values::append_list_write(&address, frame_delta(0, "b"))
+                .expect("frame append"),
+        ],
+    )
+    .await;
+
+    let frames = crate::harness::runtime::progress::read_assistant_frames(
+        fixture.lane.session().as_ref(),
+        "operation",
+        response_entry_id,
+        &background_context(),
+    )
+    .await
+    .expect("the frames read");
+    assert_eq!(frames, vec![frame_delta(0, "a"), frame_delta(0, "b")]);
+
+    // A malformed stored element reports its parse failure.
+    commit_writes(
+        &fixture,
+        vec![crate::harness::session::values::Write::ListAppend(
+            crate::harness::session::values::ListAppendWrite {
+                kind: "list".to_owned(),
+                op: "append".to_owned(),
+                namespace: address.address.namespace.clone(),
+                key: address.address.key.clone(),
+                value: json!(42),
+            },
+        )],
+    )
+    .await;
+    let read = crate::harness::runtime::progress::read_assistant_frames(
+        fixture.lane.session().as_ref(),
+        "operation",
+        response_entry_id,
+        &background_context(),
+    )
+    .await;
+    let error = read.expect_err("the malformed frame rejects");
+    assert!(
+        error
+            .to_string()
+            .contains("Pending assistant frame is malformed"),
+        "the malformed frame names its parse failure: {error}",
+    );
+}
+
+#[tokio::test]
+async fn pages_long_frame_lists_through_the_cursor() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    let address = stored_values::pending_assistant_frames("operation", response_entry_id);
+    let count = 1_001;
+    let mut writes = Vec::new();
+    for index in 0..count {
+        writes.push(
+            crate::harness::session::values::append_list_write(
+                &address,
+                frame_delta(0, &format!("f-{index}")),
+            )
+            .expect("frame append"),
+        );
+    }
+    commit_writes(&fixture, writes).await;
+
+    let frames = crate::harness::runtime::progress::read_assistant_frames(
+        fixture.lane.session().as_ref(),
+        "operation",
+        response_entry_id,
+        &background_context(),
+    )
+    .await
+    .expect("the paged read");
+    assert_eq!(
+        frames.len(),
+        count,
+        "every element pages through the cursor"
+    );
+    let AssistantMessageFrame::TextDelta { delta, .. } = &frames[count - 1] else {
+        panic!("the last frame");
+    };
+    assert_eq!(delta, "f-1000", "the paged read preserves the order");
+}
+
+#[tokio::test]
+async fn drain_resolves_when_no_write_was_published() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
+    progress.drain().await.expect("the empty drain");
+}
+
+#[tokio::test]
+async fn the_progress_channel_renders_a_summary_debug() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
+    assert_eq!(format!("{progress:?}"), "ProgressChannel(..)");
+}
+
+/// The deferred-effect-pending leaf the deferred-phase fixture drives.
+fn deferred_effect_pending(response_entry_id: &str) -> OperationState {
+    OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
+        scope: DeferredScope {
+            scope: run_scope(),
+            step_id: "step".to_owned(),
+            source_entry_id: "source".to_owned(),
+            poll: 0,
+            configuration: lane_configuration(),
+            stream_options: AgentHarnessStreamOptions::default(),
+        },
+        response_entry_id: response_entry_id.to_owned(),
+        usage_id: "usage".to_owned(),
+    })
+}
+
+#[tokio::test]
+async fn writes_frames_through_a_deferred_effect_pending_phase() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(deferred_effect_pending(response_entry_id)).await;
+    let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
+    progress.write(frame_delta(0, "deferred"));
+    progress.drain().await.expect("drain");
+
+    let elements = fixture
+        .lane
+        .session()
+        .read_list(
+            &stored_values::pending_assistant_frames("operation", response_entry_id).address,
+            None,
+            &background_context(),
+        )
+        .await
+        .expect("read frames");
+    assert_eq!(elements.len(), 1, "the deferred phase still owns the write");
+}
+
+#[tokio::test]
+async fn declines_tool_checkpoints_outside_the_tools_phase() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, "result");
+    progress.write(checkpoint_of("late"));
+    progress.drain().await.expect("drain");
+
+    let stored = fixture
+        .lane
+        .session()
+        .get_value(
+            &stored_values::pending_tool_output("operation", "result").address,
+            &background_context(),
+        )
+        .await
+        .expect("read checkpoint");
+    assert!(stored.is_none(), "the non-tools phase declined the write");
+}
+
+#[tokio::test]
+async fn declines_tool_checkpoints_after_the_operation_clears() {
+    let fixture = create_fixture(tools_state("result")).await;
+    clear_operation(&fixture).await;
+    let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, "result");
+    progress.write(checkpoint_of("late"));
+    progress.drain().await.expect("drain");
+
+    let stored = fixture
+        .lane
+        .session()
+        .get_value(
+            &stored_values::pending_tool_output("operation", "result").address,
+            &background_context(),
+        )
+        .await
+        .expect("read checkpoint");
+    assert!(stored.is_none(), "the cleared operation declined the write");
+}
+
+fn checkpoint_of(text: &str) -> AgentToolResult {
+    AgentToolResult {
+        content: vec![AgentToolContent::Text(TextContent {
+            text: text.to_owned(),
+            text_signature: None,
+        })],
+        details: json!({}),
+        usage: None,
+        added_tool_names: None,
+        terminate: None,
+    }
+}
+
+/// Commits the terminal projection the cleared-operation fixture drives,
+/// the terminal test's write list restated.
+async fn clear_operation(fixture: &ProgressFixture) {
+    let lane = Arc::clone(&fixture.lane);
+    lane.command::<(), _>(
+        move |state, _session, _context| {
+            Box::pin(async move {
+                Ok(crate::harness::runtime::types::LaneCommand::Commit {
+                    writes: vec![
+                        delete_value_write(&stored_values::operation_meta("operation")),
+                        delete_value_write(&stored_values::operation_state("operation")),
+                        set_value_write(
+                            &stored_values::lane_state("main"),
+                            crate::harness::session::types::LaneState {
+                                current_operation_id: None,
+                                last_operation_id: None,
+                                inbox: state.inbox.clone(),
+                            },
+                        )
+                        .expect("state write"),
+                    ],
+                    next: LaneState {
+                        operation: None,
+                        ..state
+                    },
+                    materialize: Arc::new(|_commit| ()),
+                    events: None,
+                })
+            })
+        },
+        &background_context(),
+    )
+    .await
+    .expect("the terminal projection commits");
 }
