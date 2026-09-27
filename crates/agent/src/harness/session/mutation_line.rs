@@ -2,12 +2,14 @@
 //! ported from upstream `src/harness/session/mutation-line.ts`.
 //!
 //! Upstream chains a promise tail; the port restates the line as a FIFO
-//! mutex: [`MutationLine::acquire`] parks until the line is free and
-//! re-checks the seal after the grant (a job queued when close sealed the
-//! line still fails, upstream's queued-job check), and the guard's release
-//! is the tail advance. [`MutationLine::seal`] latches the first error and
-//! the close path drains by acquiring once.
+//! mutex: [`MutationLine::run`] parks until the line is free and re-checks
+//! the seal after the grant (a job queued when close sealed the line still
+//! fails, upstream's queued-job check), [`MutationLine::acquire`] is the
+//! grant-only form the explicit mutation barrier holds across `end`, and
+//! [`MutationLine::seal`] latches the first error and returns the tail the
+//! close path drains.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::harness::session::types::SessionError;
@@ -52,8 +54,9 @@ impl MutationLine {
             .clone()
     }
 
-    /// Latch the seal error; the first seal wins, upstream's `seal`.
-    pub fn seal(&self, error: SessionError) {
+    /// Latch the seal error without draining, the close path's synchronous
+    /// prologue; the first seal wins.
+    pub fn latch(&self, error: SessionError) {
         let mut sealed = self
             .inner
             .sealed
@@ -64,12 +67,53 @@ impl MutationLine {
         }
     }
 
-    /// Acquire the line for one job, upstream's `run`'s grant.
+    /// Latch the seal error and return the tail, upstream's `seal`: the
+    /// first seal wins, and awaiting the returned value drains the granted
+    /// job. The future owns the line handle.
+    pub fn seal(&self, error: SessionError) -> impl Future<Output = ()> {
+        self.latch(error);
+        let line = self.inner.line.clone();
+        async move {
+            drop(line.lock_owned().await);
+        }
+    }
+
+    /// Wait until the line is free, ignoring the seal: the close path's
+    /// drain after its own latch.
+    pub async fn drain(&self) {
+        drop(self.inner.line.clone().lock_owned().await);
+    }
+
+    /// Run one complete read-modify-write job on the line, upstream's `run`.
     ///
     /// # Errors
     /// The latched seal error, checked before parking (upstream's call-time
     /// check) and again after the grant (upstream's execution-time check for
-    /// jobs queued before the seal).
+    /// jobs queued before the seal); the operation's own error, which does
+    /// not stop later jobs.
+    pub async fn run<T, F, Fut>(&self, operation: F) -> Result<T, SessionError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<T, SessionError>>,
+    {
+        if let Some(error) = self.sealed_error() {
+            return Err(error);
+        }
+        let guard = self.inner.line.clone().lock_owned().await;
+        if let Some(error) = self.sealed_error() {
+            return Err(error);
+        }
+        let outcome = operation().await;
+        drop(guard);
+        outcome
+    }
+
+    /// Acquire the line for one job, the grant-only form the explicit
+    /// mutation barrier holds until `end`.
+    ///
+    /// # Errors
+    /// The latched seal error, checked before parking and again after the
+    /// grant.
     pub async fn acquire(&self) -> Result<MutationLineGuard, SessionError> {
         if let Some(error) = self.sealed_error() {
             return Err(error);
@@ -79,12 +123,5 @@ impl MutationLine {
             return Err(error);
         }
         Ok(MutationLineGuard { _guard: guard })
-    }
-
-    /// Wait until the line is free, ignoring the seal, upstream's `seal`
-    /// returning the tail: the close path drains the granted job without
-    /// failing on its own latch.
-    pub async fn drain(&self) {
-        drop(self.inner.line.clone().lock_owned().await);
     }
 }
