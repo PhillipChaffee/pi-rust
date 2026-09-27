@@ -44,6 +44,15 @@ tokio = { version = "1.47", default-features = false, features = [
   "fs",
   "io-util",
 ] }
+# The skills loader's ignore-file engine (.gitignore/.ignore/.fdignore),
+# upstream's npm `ignore` dependency: the crate's gitignore machinery with
+# npm's default case-insensitivity and its parent-first walk re-expressed
+# over `Gitignore::matched` (see the skills module's IgnoreMatcher).
+ignore = "0.4"
+# SKILL.md and prompt-template frontmatter parsing, upstream's npm `yaml`
+# dependency: yaml-rust2 rejects the same malformed inputs (unterminated flow
+# sequences, duplicate keys) the `yaml` parse throws on.
+yaml-rust2 = "0.13"
 
 [dev-dependencies]
 # macros: the test attribute macro; rt: the current-thread runtime the
