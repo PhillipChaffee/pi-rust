@@ -477,8 +477,10 @@ fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
     if pattern.starts_with('!') {
         negated = true;
         pattern = &pattern[1..];
-    } else if let Some(stripped) = pattern.strip_prefix("\\!") {
-        pattern = stripped;
+    } else if pattern.starts_with("\\!") {
+        // Upstream drops one character (the backslash), leaving the bang —
+        // which the matcher then reads as a negation of the bare pattern.
+        pattern = &pattern[1..];
     }
     if let Some(stripped) = pattern.strip_prefix('/') {
         pattern = stripped;
