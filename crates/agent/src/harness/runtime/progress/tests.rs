@@ -36,20 +36,19 @@ use crate::harness::context::with_abort_signal;
 use crate::harness::hooks::HookRegistry;
 use crate::harness::runtime::lane::EmitBatch;
 use crate::harness::runtime::lane::Lane;
+use crate::harness::runtime::progress::ProgressChannel;
 use crate::harness::runtime::progress::open_frame_progress;
 use crate::harness::runtime::progress::open_tool_progress;
 use crate::harness::runtime::test_support::ControlledStorage;
 use crate::harness::runtime::test_support::commit_writes;
-use crate::harness::runtime::test_support::gate_next_commit;
-use crate::harness::runtime::test_support::generation_context;
+use crate::harness::runtime::test_support::deferred_effect_pending;
 use crate::harness::runtime::test_support::lane_configuration;
-use crate::harness::runtime::test_support::noop_emit_batch;
-use crate::harness::runtime::test_support::noop_hook_reporter;
 use crate::harness::runtime::test_support::operation_scope;
-use crate::harness::runtime::test_support::passthrough_fault_handler;
-use crate::harness::runtime::test_support::patch_live_state;
-use crate::harness::runtime::test_support::runtime_config;
-use crate::harness::runtime::test_support::unused_watch_installer;
+use crate::harness::runtime::test_support::tools_batch_state;
+use crate::harness::runtime::test_support::{gate_next_commit, generation_context};
+use crate::harness::runtime::test_support::{noop_emit_batch, noop_hook_reporter};
+use crate::harness::runtime::test_support::{passthrough_fault_handler, patch_live_state};
+use crate::harness::runtime::test_support::{runtime_config, unused_watch_installer};
 use crate::harness::runtime::types::Drive;
 use crate::harness::runtime::types::LaneState;
 use crate::harness::runtime::types::LiveOperation;
@@ -60,16 +59,14 @@ use crate::harness::session::types::AssistantEffectPendingOperation;
 use crate::harness::session::types::CheckpointData;
 use crate::harness::session::types::CheckpointOperation;
 use crate::harness::session::types::Continuation;
-use crate::harness::session::types::DeferredEffectPendingOperation;
-use crate::harness::session::types::DeferredScope;
 use crate::harness::session::types::OperationIntent;
 use crate::harness::session::types::OperationMeta;
 use crate::harness::session::types::OperationState;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::values as stored_values;
+use crate::harness::session::values::StoredValue;
 use crate::harness::session::values::delete_value_write;
 use crate::harness::session::values::set_value_write;
-use crate::harness::types::AgentHarnessStreamOptions;
 use crate::types::AgentToolContent;
 use crate::types::AgentToolResult;
 use pi_ai::types::TextContent;
@@ -96,23 +93,18 @@ fn assistant_effect_pending(response_entry_id: &str) -> OperationState {
 /// The tools leaf the checkpoint test builds, upstream's
 /// `{ ...runScope(), at: "tools", batch: { ... } }`.
 fn tools_state(invocation_id: &str) -> OperationState {
-    OperationState::Tools(crate::harness::session::types::ToolsOperation {
-        scope: operation_scope(),
-        batch: crate::harness::session::types::ToolBatch {
-            assistant_entry_id: "assistant".to_owned(),
-            configuration: lane_configuration(),
-            turn_id: "turn".to_owned(),
-            calls: vec![
-                serde_json::from_value(json!({
-                    "sourceIndex": 0,
-                    "resultEntryId": invocation_id,
-                    "status": "effect_pending",
-                    "replay": "safe",
-                }))
-                .expect("tool call wire"),
-            ],
-        },
-    })
+    tools_batch_state(
+        "assistant",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": invocation_id,
+                "status": "effect_pending",
+                "replay": "safe",
+            }))
+            .expect("tool call wire"),
+        ],
+    )
 }
 
 /// The fixture upstream's `createFixture` builds: the storage-backed
@@ -197,6 +189,36 @@ async fn create_fixture(state: OperationState) -> ProgressFixture {
         drive,
         storage,
     }
+}
+
+/// The pending-frame list the drain tests inspect, oldest first, each
+/// element's wire value.
+async fn read_pending_frames(fixture: &ProgressFixture) -> Vec<serde_json::Value> {
+    let elements = fixture
+        .lane
+        .session()
+        .read_list(
+            &stored_values::pending_assistant_frames("operation", "response").address,
+            None,
+            &background_context(),
+        )
+        .await
+        .expect("read frames");
+    elements.into_iter().map(|element| element.value).collect()
+}
+
+/// The decline outcome the queued-frame tests pin: the frame list empty and
+/// the decline decided without control reads.
+async fn assert_queued_frame_declined(fixture: &ProgressFixture) {
+    assert!(
+        read_pending_frames(fixture).await.is_empty(),
+        "the queued frame was declined"
+    );
+    assert_eq!(
+        fixture.storage.get_value_calls(),
+        0,
+        "the decline decided without control reads"
+    );
 }
 
 #[tokio::test]
@@ -288,30 +310,32 @@ async fn enqueues_assistant_frames_in_order_seals_admission_and_drops_late_write
     });
     progress.drain().await.expect("drain");
 
-    let elements = fixture
-        .lane
-        .session()
-        .read_list(
-            &stored_values::pending_assistant_frames("operation", response_entry_id).address,
-            None,
-            &background_context(),
-        )
-        .await
-        .expect("read frames");
-    let values: Vec<serde_json::Value> =
-        elements.into_iter().map(|element| element.value).collect();
     assert_eq!(
-        serde_json::Value::Array(values),
+        serde_json::Value::Array(read_pending_frames(&fixture).await),
         serde_json::to_value(&frames).expect("frames wire"),
     );
 }
 
-#[tokio::test]
-async fn declines_a_queued_frame_after_the_authoritative_projection_leaves_its_phase() {
+/// The late-write rig the two queued-frame decline tests share: the fixture
+/// over the assistant-effect-pending projection, the frame channel opened on
+/// it, and the commit gate parked on the controlled storage with its release
+/// handle.
+async fn late_write_rig() -> (
+    ProgressFixture,
+    ProgressChannel<AssistantMessageFrame>,
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
     let response_entry_id = "response";
     let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
     let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
     let (started, release) = gate_next_commit(&fixture.storage);
+    (fixture, progress, started, release)
+}
+
+#[tokio::test]
+async fn declines_a_queued_frame_after_the_authoritative_projection_leaves_its_phase() {
+    let (fixture, progress, started, release) = late_write_rig().await;
     let moving = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move {
@@ -328,105 +352,35 @@ async fn declines_a_queued_frame_after_the_authoritative_projection_leaves_its_p
                     continuation: Continuation::MayFinish {
                         include_final_assistant: true,
                     },
-                    trigger_entry_id: response_entry_id.to_owned(),
+                    trigger_entry_id: "response".to_owned(),
                 },
             });
             patch_live_state(&lane, next_state).await;
         })
     };
     started.await.expect("commit started");
-    progress.write(AssistantMessageFrame::TextDelta {
-        content_index: 0,
-        delta: "late".to_owned(),
-    });
+    progress.write(frame_delta(0, "late"));
     let _ = release.send(());
     moving.await.expect("move join");
     progress.drain().await.expect("drain");
-
-    let elements = fixture
-        .lane
-        .session()
-        .read_list(
-            &stored_values::pending_assistant_frames("operation", response_entry_id).address,
-            None,
-            &background_context(),
-        )
-        .await
-        .expect("read frames");
-    assert!(elements.is_empty(), "the queued frame was declined");
-    assert_eq!(
-        fixture.storage.get_value_calls(),
-        0,
-        "the decline decided without control reads"
-    );
+    assert_queued_frame_declined(&fixture).await;
 }
 
 #[tokio::test]
 async fn declines_a_queued_frame_after_terminal_projection_publication() {
-    let response_entry_id = "response";
-    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
-    let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
-    let (started, release) = gate_next_commit(&fixture.storage);
+    let (fixture, progress, started, release) = late_write_rig().await;
     let ending = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move {
-            lane.command::<(), _>(
-                move |state, _session, _context| {
-                    Box::pin(async move {
-                        Ok(crate::harness::runtime::types::LaneCommand::Commit {
-                            writes: vec![
-                                delete_value_write(&stored_values::operation_meta("operation")),
-                                delete_value_write(&stored_values::operation_state("operation")),
-                                set_value_write(
-                                    &stored_values::lane_state("main"),
-                                    crate::harness::session::types::LaneState {
-                                        current_operation_id: None,
-                                        last_operation_id: None,
-                                        inbox: state.inbox.clone(),
-                                    },
-                                )
-                                .expect("state write"),
-                            ],
-                            next: LaneState {
-                                operation: None,
-                                ..state
-                            },
-                            materialize: Arc::new(|_commit| ()),
-                            events: None,
-                        })
-                    })
-                },
-                &background_context(),
-            )
-            .await
-            .expect("the terminal projection commits");
+            clear_operation(&lane).await;
         })
     };
     started.await.expect("commit started");
-    progress.write(AssistantMessageFrame::TextDelta {
-        content_index: 0,
-        delta: "late".to_owned(),
-    });
+    progress.write(frame_delta(0, "late"));
     let _ = release.send(());
     ending.await.expect("ending join");
     progress.drain().await.expect("drain");
-
-    let elements = fixture
-        .lane
-        .session()
-        .read_list(
-            &stored_values::pending_assistant_frames("operation", response_entry_id).address,
-            None,
-            &background_context(),
-        )
-        .await
-        .expect("read frames");
-    assert!(elements.is_empty(), "the queued frame was declined");
-    assert_eq!(
-        fixture.storage.get_value_calls(),
-        0,
-        "the decline decided without control reads"
-    );
+    assert_queued_frame_declined(&fixture).await;
 }
 
 #[tokio::test]
@@ -434,18 +388,8 @@ async fn replaces_tool_checkpoints_in_invocation_order() {
     let invocation_id = "result";
     let fixture = create_fixture(tools_state(invocation_id)).await;
     let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, invocation_id);
-    let checkpoint = |text: &str| AgentToolResult {
-        content: vec![AgentToolContent::Text(TextContent {
-            text: text.to_owned(),
-            text_signature: None,
-        })],
-        details: json!({}),
-        usage: None,
-        added_tool_names: None,
-        terminate: None,
-    };
-    progress.write(checkpoint("first"));
-    progress.write(checkpoint("second"));
+    progress.write(checkpoint_of("first"));
+    progress.write(checkpoint_of("second"));
     progress.drain().await.expect("drain");
     let stored = fixture
         .lane
@@ -601,80 +545,51 @@ async fn the_progress_channel_renders_a_summary_debug() {
     assert_eq!(format!("{progress:?}"), "ProgressChannel(..)");
 }
 
-/// The deferred-effect-pending leaf the deferred-phase fixture drives.
-fn deferred_effect_pending(response_entry_id: &str) -> OperationState {
-    OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
-        scope: DeferredScope {
-            scope: operation_scope(),
-            step_id: "step".to_owned(),
-            source_entry_id: "source".to_owned(),
-            poll: 0,
-            configuration: lane_configuration(),
-            stream_options: AgentHarnessStreamOptions::default(),
-        },
-        response_entry_id: response_entry_id.to_owned(),
-        usage_id: "usage".to_owned(),
-    })
-}
-
 #[tokio::test]
 async fn writes_frames_through_a_deferred_effect_pending_phase() {
     let response_entry_id = "response";
-    let fixture = create_fixture(deferred_effect_pending(response_entry_id)).await;
+    let fixture = create_fixture(deferred_effect_pending("source", response_entry_id, 0)).await;
     let progress = open_frame_progress(&fixture.lane, &fixture.drive, response_entry_id);
     progress.write(frame_delta(0, "deferred"));
     progress.drain().await.expect("drain");
 
-    let elements = fixture
+    assert_eq!(
+        read_pending_frames(&fixture).await.len(),
+        1,
+        "the deferred phase still owns the write"
+    );
+}
+
+/// The late tool-checkpoint the decline tests probe: the channel opened on
+/// the fixture, the write drained, and the stored checkpoint read back.
+async fn declined_tool_checkpoint(fixture: &ProgressFixture) -> Option<StoredValue> {
+    let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, "result");
+    progress.write(checkpoint_of("late"));
+    progress.drain().await.expect("drain");
+    fixture
         .lane
         .session()
-        .read_list(
-            &stored_values::pending_assistant_frames("operation", response_entry_id).address,
-            None,
+        .get_value(
+            &stored_values::pending_tool_output("operation", "result").address,
             &background_context(),
         )
         .await
-        .expect("read frames");
-    assert_eq!(elements.len(), 1, "the deferred phase still owns the write");
+        .expect("read checkpoint")
 }
 
 #[tokio::test]
 async fn declines_tool_checkpoints_outside_the_tools_phase() {
     let response_entry_id = "response";
     let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
-    let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, "result");
-    progress.write(checkpoint_of("late"));
-    progress.drain().await.expect("drain");
-
-    let stored = fixture
-        .lane
-        .session()
-        .get_value(
-            &stored_values::pending_tool_output("operation", "result").address,
-            &background_context(),
-        )
-        .await
-        .expect("read checkpoint");
+    let stored = declined_tool_checkpoint(&fixture).await;
     assert!(stored.is_none(), "the non-tools phase declined the write");
 }
 
 #[tokio::test]
 async fn declines_tool_checkpoints_after_the_operation_clears() {
     let fixture = create_fixture(tools_state("result")).await;
-    clear_operation(&fixture).await;
-    let progress = open_tool_progress(&fixture.lane, &fixture.drive, "turn", 0, "result");
-    progress.write(checkpoint_of("late"));
-    progress.drain().await.expect("drain");
-
-    let stored = fixture
-        .lane
-        .session()
-        .get_value(
-            &stored_values::pending_tool_output("operation", "result").address,
-            &background_context(),
-        )
-        .await
-        .expect("read checkpoint");
+    clear_operation(&fixture.lane).await;
+    let stored = declined_tool_checkpoint(&fixture).await;
     assert!(stored.is_none(), "the cleared operation declined the write");
 }
 
@@ -691,10 +606,10 @@ fn checkpoint_of(text: &str) -> AgentToolResult {
     }
 }
 
-/// Commits the terminal projection the cleared-operation fixture drives,
-/// the terminal test's write list restated.
-async fn clear_operation(fixture: &ProgressFixture) {
-    let lane = Arc::clone(&fixture.lane);
+/// Commits the terminal projection the queued-frame decline tests drive,
+/// upstream's cleared-operation write list restated: the operation's meta
+/// and state deleted and the lane state cleared.
+async fn clear_operation(lane: &Lane) {
     lane.command::<(), _>(
         move |state, _session, _context| {
             Box::pin(async move {

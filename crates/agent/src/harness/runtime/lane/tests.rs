@@ -713,10 +713,6 @@ async fn commit_cancelled_control(
 /// ordinary work but settles against latest cancelled control" case: one
 /// accept, one hand-built cancelled control, one declined continuation,
 /// one settle against the latest control.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the case is one continuous admission-settle flow; splitting it further would hide the sequence"
-)]
 #[tokio::test]
 async fn diverts_ordinary_work_but_settles_against_latest_cancelled_control() {
     let fixture = create_lane().await;

@@ -27,12 +27,13 @@ use crate::harness::runtime::test_support::lane_state_write;
 use crate::harness::runtime::test_support::next_session_id;
 use crate::harness::runtime::test_support::operation_scope;
 use crate::harness::runtime::test_support::raw_write;
+use crate::harness::runtime::test_support::summary_generation;
+use crate::harness::runtime::test_support::summary_task;
 use crate::harness::session::memory::MemoryStorage;
 use crate::harness::session::memory::MemoryStorageOptions;
 use crate::harness::session::session::StorageBackedSession;
 use crate::harness::session::types::CheckpointData;
 use crate::harness::session::types::CheckpointOperation;
-use crate::harness::session::types::CompactionReason;
 use crate::harness::session::types::Continuation;
 use crate::harness::session::types::OperationIntent;
 use crate::harness::session::types::OperationKind;
@@ -85,49 +86,10 @@ fn run_state(trigger_entry_id: &str) -> OperationState {
 
 /// The summary-deciding leaf upstream's `summaryState(boundary)` builds.
 fn summary_state(boundary: ResultBoundary) -> OperationState {
-    let reason = match &boundary {
-        ResultBoundary::Finish => Some(CompactionReason::Manual),
-        ResultBoundary::ResumeCheckpoint { .. } => Some(CompactionReason::Threshold),
-        ResultBoundary::CommitNavigation { .. } => None,
-    };
     OperationState::SummaryDeciding(SummaryDecidingOperation {
         scope: operation_scope(),
-        task: SummaryTask {
-            task_id: "task".to_owned(),
-            reason,
-            custom_instructions: None,
-            boundary,
-        },
+        task: summary_task(boundary),
     })
-}
-
-/// The retry policy the fixture summary context carries, the
-/// generation-context fixture's numbers.
-fn fixture_retry_policy() -> crate::harness::session::types::NormalizedRetryPolicy {
-    crate::harness::session::types::NormalizedRetryPolicy {
-        max_attempts: 2,
-        base_delay_ms: 1,
-        max_agent_delay_ms: 30_000,
-    }
-}
-
-/// The generation scope the generation-carrying summary leaves carry:
-/// the finish-boundary task over the fixture's summary context.
-fn summary_generation() -> crate::harness::session::types::SummaryGenerationScope {
-    crate::harness::session::types::SummaryGenerationScope {
-        task: SummaryTask {
-            task_id: "task".to_owned(),
-            reason: Some(CompactionReason::Manual),
-            custom_instructions: None,
-            boundary: ResultBoundary::Finish,
-        },
-        summary_context: crate::harness::session::types::SummaryContext {
-            result_entry_id: "summary".to_owned(),
-            configuration: crate::harness::runtime::test_support::lane_configuration(),
-            stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-            retry_policy: fixture_retry_policy(),
-        },
-    }
 }
 
 /// The run meta upstream's fixtures build.

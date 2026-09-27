@@ -28,8 +28,11 @@ use crate::harness::runtime::lane::captured_model;
 use crate::harness::runtime::lane::durable_lane_state;
 use crate::harness::runtime::lane::select_accepted_inbox;
 use crate::harness::runtime::test_support::ControlledStorage;
+use crate::harness::runtime::test_support::accept_text;
 use crate::harness::runtime::test_support::assistant_wire_value;
 use crate::harness::runtime::test_support::commit_writes;
+use crate::harness::runtime::test_support::deferred_effect_pending;
+use crate::harness::runtime::test_support::deferred_scope;
 use crate::harness::runtime::test_support::empty_lane_snapshot;
 use crate::harness::runtime::test_support::finish_operation;
 use crate::harness::runtime::test_support::generation_context;
@@ -41,6 +44,9 @@ use crate::harness::runtime::test_support::patch_live_state;
 use crate::harness::runtime::test_support::raw_write;
 use crate::harness::runtime::test_support::restored_lane;
 use crate::harness::runtime::test_support::runtime_config;
+use crate::harness::runtime::test_support::summary_generation;
+use crate::harness::runtime::test_support::summary_task;
+use crate::harness::runtime::test_support::tools_batch_state;
 use crate::harness::runtime::test_support::unused_watch_installer;
 use crate::harness::runtime::test_support::user_text_message;
 use crate::harness::runtime::test_support::zero_usage_wire;
@@ -55,7 +61,6 @@ use crate::harness::session::types::CheckpointOperation;
 use crate::harness::session::types::Continuation;
 use crate::harness::session::types::Control;
 use crate::harness::session::types::DeferredEffectPendingOperation;
-use crate::harness::session::types::DeferredScope;
 use crate::harness::session::types::DeferredSuspendedOperation;
 use crate::harness::session::types::InboxItem;
 use crate::harness::session::types::InboxItemKind;
@@ -64,36 +69,13 @@ use crate::harness::session::types::OperationScope;
 use crate::harness::session::types::OperationState;
 use crate::harness::session::types::ResultBoundary;
 use crate::harness::session::types::RetryWait;
-use crate::harness::session::types::SummaryContext;
 use crate::harness::session::types::SummaryDecidingOperation;
 use crate::harness::session::types::SummaryEffectPendingOperation;
-use crate::harness::session::types::SummaryGenerationScope;
 use crate::harness::session::types::SummaryReadyOperation;
 use crate::harness::session::types::SummaryRetryWaitOperation;
-use crate::harness::session::types::SummaryTask;
 use crate::harness::session::types::ToolBatch;
 use crate::harness::session::types::ToolsOperation;
 use crate::types::QueueMode;
-
-/// The structural task the summary leaves carry.
-fn summary_task() -> SummaryTask {
-    SummaryTask {
-        task_id: "task".to_owned(),
-        reason: Some(crate::harness::session::types::CompactionReason::Manual),
-        custom_instructions: None,
-        boundary: ResultBoundary::Finish,
-    }
-}
-
-/// The summary generation inputs the summary leaves carry.
-fn summary_context() -> SummaryContext {
-    SummaryContext {
-        result_entry_id: "summary".to_owned(),
-        configuration: lane_configuration(),
-        stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-        retry_policy: generation_context().retry_policy,
-    }
-}
 
 /// A configured `main` lane over a seeded session, the fixture the seam
 /// tests admit through; `Some(operation_id)` seeds an admitted starting
@@ -375,10 +357,10 @@ fn model_carrying_leaves(scope: OperationScope) -> Vec<OperationState> {
             },
         }),
         OperationState::DeferredSuspended(DeferredSuspendedOperation {
-            deferred: deferred_scope(scope.clone()),
+            deferred: deferred_scope(scope.clone(), "source", 0),
         }),
         OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
-            scope: deferred_scope(scope.clone()),
+            scope: deferred_scope(scope.clone(), "source", 0),
             response_entry_id: "response".to_owned(),
             usage_id: "usage".to_owned(),
         }),
@@ -423,7 +405,7 @@ fn model_less_leaves(scope: OperationScope) -> Vec<OperationState> {
         }),
         OperationState::SummaryDeciding(SummaryDecidingOperation {
             scope: scope.clone(),
-            task: summary_task(),
+            task: summary_task(ResultBoundary::Finish),
         }),
         OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
             scope,
@@ -431,24 +413,6 @@ fn model_less_leaves(scope: OperationScope) -> Vec<OperationState> {
             label: None,
         }),
     ]
-}
-
-fn deferred_scope(scope: OperationScope) -> DeferredScope {
-    DeferredScope {
-        scope,
-        step_id: "step".to_owned(),
-        source_entry_id: "source".to_owned(),
-        poll: 0,
-        configuration: lane_configuration(),
-        stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-    }
-}
-
-fn summary_generation() -> SummaryGenerationScope {
-    SummaryGenerationScope {
-        task: summary_task(),
-        summary_context: summary_context(),
-    }
 }
 
 /// The captured model reads each state leaf's configuration; leaves without
@@ -492,6 +456,7 @@ fn slice_not_implemented_reports_the_operation_it_names() {
 // rebuild's leaf coverage.
 
 use crate::harness::agent_harness::AgentLane;
+use crate::harness::agent_harness::LaneSnapshot;
 use crate::harness::agent_harness::WatchHandle;
 use crate::harness::runtime::lane::operation_state_with_scope;
 use crate::harness::runtime::test_support::recording_watch_installer;
@@ -527,27 +492,90 @@ fn assistant_wire(content: &serde_json::Value, stop_reason: &str, deferred: bool
     serde_json::from_value(wire).expect("assistant wire")
 }
 
+/// The pending partial wire the streaming captures reduce, zero usage
+/// pending over empty content.
+fn pending_partial_wire() -> pi_ai::types::AssistantMessage {
+    serde_json::from_value(json!({
+        "content": [],
+        "api": "anthropic-messages",
+        "provider": "test",
+        "model": "model",
+        "usage": zero_usage_wire(),
+        "stopReason": "pending",
+        "timestamp": 1,
+    }))
+    .expect("the partial wire")
+}
+
+/// The three-frame append list the streaming captures store, the start,
+/// text-start, and first delta the projection reduces.
+fn frame_append_writes(
+    address: &crate::harness::session::values::ValueList<
+        pi_ai::utils::assistant_message_frame::AssistantMessageFrame,
+    >,
+    partial: &pi_ai::types::AssistantMessage,
+) -> Vec<crate::harness::session::values::Write> {
+    vec![
+        crate::harness::session::values::append_list_write(
+            address,
+            pi_ai::utils::assistant_message_frame::AssistantMessageFrame::Start {
+                partial: partial.clone(),
+            },
+        )
+        .expect("frame append"),
+        crate::harness::session::values::append_list_write(
+            address,
+            pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextStart {
+                content_index: 0,
+                content: pi_ai::types::TextContent {
+                    text: String::new(),
+                    text_signature: None,
+                },
+            },
+        )
+        .expect("frame append"),
+        crate::harness::session::values::append_list_write(
+            address,
+            pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextDelta {
+                content_index: 0,
+                delta: "a".to_owned(),
+            },
+        )
+        .expect("frame append"),
+    ]
+}
+
+/// The live operation's id, the extraction the capture fixtures read.
+fn live_operation_id(lane: &Lane) -> String {
+    lane.state()
+        .operation
+        .as_ref()
+        .map(|operation| operation.meta.operation_id.clone())
+        .expect("the live operation")
+}
+
+/// The watch opened and its first snapshot read, the capture tests' lens.
+async fn watch_snapshot(lane: &Lane) -> (Box<dyn WatchHandle<LaneSnapshot>>, LaneSnapshot) {
+    let watch = AgentLane::watch(lane, &background_context())
+        .await
+        .expect("watch serves");
+    let snapshot = WatchHandle::<LaneSnapshot>::snapshot(&*watch);
+    (watch, snapshot)
+}
+
 #[tokio::test]
 async fn watch_captures_the_lane_snapshot_over_the_durable_values() {
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
     let prompt_tip = lane.state().tip_id.expect("the accepted tip");
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the live operation");
+    let operation_id = live_operation_id(&lane);
     finish_operation(&lane).await;
     let appended =
         AgentLane::append_message(&lane, user_text_message("history"), &background_context())
             .await
             .expect("append serves");
 
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     assert_eq!(snapshot.lane, "main");
     let ids: Vec<&str> = snapshot.transcript.iter().map(Entry::id).collect();
     assert_eq!(
@@ -578,20 +606,7 @@ async fn watch_captures_the_lane_snapshot_over_the_durable_values() {
 #[tokio::test]
 async fn watch_reports_the_streaming_message_from_the_stored_frames() {
     let lane = capturing_lane(None).await;
-    AgentLane::accept(
-        &lane,
-        OperationRequest::Prompt {
-            operation_id: None,
-            prompt: Box::new(crate::harness::agent_harness::PromptMessagesPayload::Text {
-                prompt: "hello".to_owned(),
-                images: None,
-            }),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("accept serves")
-    .expect("the admission");
+    accept_prompt(&lane).await;
     patch_live_state(
         &lane,
         OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
@@ -606,64 +621,13 @@ async fn watch_reports_the_streaming_message_from_the_stored_frames() {
     )
     .await;
 
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the live operation");
-    let partial: pi_ai::types::AssistantMessage = serde_json::from_value(json!({
-        "content": [],
-        "api": "anthropic-messages",
-        "provider": "test",
-        "model": "model",
-        "usage": {
-            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
-        },
-        "stopReason": "pending",
-        "timestamp": 1,
-    }))
-    .expect("the partial wire");
+    let operation_id = live_operation_id(&lane);
+    let partial = pending_partial_wire();
     let address =
         crate::harness::session::values::pending_assistant_frames(&operation_id, "response");
-    commit_writes(
-        lane.session(),
-        vec![
-            crate::harness::session::values::append_list_write(
-                &address,
-                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::Start {
-                    partial: partial.clone(),
-                },
-            )
-            .expect("frame append"),
-            crate::harness::session::values::append_list_write(
-                &address,
-                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextStart {
-                    content_index: 0,
-                    content: pi_ai::types::TextContent {
-                        text: String::new(),
-                        text_signature: None,
-                    },
-                },
-            )
-            .expect("frame append"),
-            crate::harness::session::values::append_list_write(
-                &address,
-                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextDelta {
-                    content_index: 0,
-                    delta: "a".to_owned(),
-                },
-            )
-            .expect("frame append"),
-        ],
-    )
-    .await;
+    commit_writes(lane.session(), frame_append_writes(&address, &partial)).await;
 
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     let streaming = snapshot
         .operation
         .as_ref()
@@ -694,22 +658,12 @@ async fn watch_reports_the_deferred_view_from_the_source_entry() {
     patch_live_state(
         &lane,
         OperationState::DeferredSuspended(DeferredSuspendedOperation {
-            deferred: DeferredScope {
-                scope: operation_scope(),
-                step_id: "step".to_owned(),
-                source_entry_id: source.clone(),
-                poll: 3,
-                configuration: lane_configuration(),
-                stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-            },
+            deferred: deferred_scope(operation_scope(), &source, 3),
         }),
     )
     .await;
 
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     let deferred = snapshot
         .operation
         .as_ref()
@@ -739,14 +693,7 @@ async fn watch_faults_when_the_deferred_source_lacks_its_handle() {
     patch_live_state(
         &lane,
         OperationState::DeferredSuspended(DeferredSuspendedOperation {
-            deferred: DeferredScope {
-                scope: operation_scope(),
-                step_id: "step".to_owned(),
-                source_entry_id: source,
-                poll: 0,
-                configuration: lane_configuration(),
-                stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-            },
+            deferred: deferred_scope(operation_scope(), &source, 0),
         }),
     )
     .await;
@@ -775,62 +722,39 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
     let lane = capturing_lane(None).await;
     // The batch's assistant entry commits while the lane is idle; the run
     // admits after.
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([
-                { "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} },
-                { "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": { "k": "block" } },
-            ]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry.clone(),
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: vec![
-                    serde_json::from_value(json!({
-                        "sourceIndex": 2,
-                        "resultEntryId": "result-3",
-                        "status": "planned",
-                    }))
-                    .expect("the planned call wire"),
-                    serde_json::from_value(json!({
-                        "sourceIndex": 0,
-                        "resultEntryId": "result-1",
-                        "status": "effect_pending",
-                        "replay": "safe",
-                    }))
-                    .expect("the effect-pending call wire"),
-                    serde_json::from_value(json!({
-                        "sourceIndex": 1,
-                        "resultEntryId": "result-2",
-                        "status": "outcome_ready",
-                        "terminate": false,
-                    }))
-                    .expect("the outcome-ready call wire"),
-                ],
-            },
-        }),
+        json!([
+            { "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} },
+            { "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": { "k": "block" } },
+        ]),
+        "toolUse",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 2,
+                "resultEntryId": "result-3",
+                "status": "planned",
+            }))
+            .expect("the planned call wire"),
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": "result-1",
+                "status": "effect_pending",
+                "replay": "safe",
+            }))
+            .expect("the effect-pending call wire"),
+            serde_json::from_value(json!({
+                "sourceIndex": 1,
+                "resultEntryId": "result-2",
+                "status": "outcome_ready",
+                "terminate": false,
+            }))
+            .expect("the outcome-ready call wire"),
+        ],
     )
     .await;
 
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the live operation");
+    let operation_id = live_operation_id(&lane);
     commit_writes(
         lane.session(),
         vec![
@@ -876,10 +800,7 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
     )
     .await;
 
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     let running_tools = &snapshot
         .operation
         .as_ref()
@@ -935,28 +856,12 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
     watch.unsubscribe();
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the three invariants share the fixture; one body keeps the fixture shape visible"
-)]
 #[tokio::test]
 async fn watch_faults_on_the_tools_batch_invariants() {
     // The invalid assistant entry.
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: "absent".to_owned(),
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: Vec::new(),
-            },
-        }),
-    )
-    .await;
+    patch_live_state(&lane, tools_batch_state("absent", Vec::new())).await;
     let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
         panic!("the invalid batch faults the capture");
     };
@@ -973,37 +878,19 @@ async fn watch_faults_on_the_tools_batch_invariants() {
 
     // The missing persisted arguments.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry,
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: vec![
-                    serde_json::from_value(json!({
-                        "sourceIndex": 0,
-                        "resultEntryId": "result-1",
-                        "status": "effect_pending",
-                        "replay": "safe",
-                    }))
-                    .expect("the effect-pending call wire"),
-                ],
-            },
-        }),
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": "result-1",
+                "status": "effect_pending",
+                "replay": "safe",
+            }))
+            .expect("the effect-pending call wire"),
+        ],
     )
     .await;
     let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
@@ -1022,37 +909,19 @@ async fn watch_faults_on_the_tools_batch_invariants() {
 
     // The missing staged result.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry,
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: vec![
-                    serde_json::from_value(json!({
-                        "sourceIndex": 0,
-                        "resultEntryId": "result-2",
-                        "status": "outcome_ready",
-                        "terminate": false,
-                    }))
-                    .expect("the outcome-ready call wire"),
-                ],
-            },
-        }),
+        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        "toolUse",
+        vec![
+            serde_json::from_value(json!({
+                "sourceIndex": 0,
+                "resultEntryId": "result-2",
+                "status": "outcome_ready",
+                "terminate": false,
+            }))
+            .expect("the outcome-ready call wire"),
+        ],
     )
     .await;
     let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
@@ -1072,20 +941,28 @@ async fn watch_faults_on_the_tools_batch_invariants() {
 
 /// The prompt admission the capture fixtures share.
 async fn accept_prompt(lane: &Lane) {
-    AgentLane::accept(
+    accept_text(lane, "hello").await;
+}
+
+/// The tools-batch rig: commits the assistant tool-call wire, admits the
+/// prompt, and patches the live batch; returns the batch's assistant entry
+/// id.
+async fn admitted_tools_batch(
+    lane: &Lane,
+    blocks: serde_json::Value,
+    stop_reason: &str,
+    calls: Vec<crate::harness::session::types::ToolCall>,
+) -> String {
+    let assistant_entry = AgentLane::append_message(
         lane,
-        OperationRequest::Prompt {
-            operation_id: None,
-            prompt: Box::new(crate::harness::agent_harness::PromptMessagesPayload::Text {
-                prompt: "hello".to_owned(),
-                images: None,
-            }),
-        },
+        assistant_wire(&blocks, stop_reason, false),
         &background_context(),
     )
     .await
-    .expect("accept serves")
-    .expect("the admission");
+    .expect("append serves");
+    accept_prompt(lane).await;
+    patch_live_state(lane, tools_batch_state(&assistant_entry, calls)).await;
+    assistant_entry
 }
 
 #[tokio::test]
@@ -1105,10 +982,7 @@ async fn watch_reports_the_retry_views() {
         }),
     )
     .await;
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     let retry = snapshot
         .operation
         .as_ref()
@@ -1134,10 +1008,7 @@ async fn watch_reports_the_retry_views() {
         }),
     )
     .await;
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     let retry = snapshot
         .operation
         .as_ref()
@@ -1178,22 +1049,6 @@ fn the_state_scope_rebuild_carries_every_leaf() {
     }
 }
 
-/// The deferred-effect-pending leaf the deferred+streaming capture drives.
-fn deferred_effect_pending(source_entry_id: &str, response_entry_id: &str) -> OperationState {
-    OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
-        scope: DeferredScope {
-            scope: operation_scope(),
-            step_id: "step".to_owned(),
-            source_entry_id: source_entry_id.to_owned(),
-            poll: 1,
-            configuration: lane_configuration(),
-            stream_options: crate::harness::types::AgentHarnessStreamOptions::default(),
-        },
-        response_entry_id: response_entry_id.to_owned(),
-        usage_id: "usage".to_owned(),
-    })
-}
-
 #[tokio::test]
 async fn watch_reports_the_deferred_and_streaming_views_together() {
     let lane = capturing_lane(None).await;
@@ -1205,62 +1060,16 @@ async fn watch_reports_the_deferred_and_streaming_views_together() {
     .await
     .expect("append serves");
     accept_prompt(&lane).await;
-    patch_live_state(&lane, deferred_effect_pending(&source, "response")).await;
+    patch_live_state(&lane, deferred_effect_pending(&source, "response", 1)).await;
 
-    let partial: pi_ai::types::AssistantMessage = serde_json::from_value(json!({
-        "content": [],
-        "api": "anthropic-messages",
-        "provider": "test",
-        "model": "model",
-        "usage": zero_usage_wire(),
-        "stopReason": "pending",
-        "timestamp": 1,
-    }))
-    .expect("the partial wire");
+    let partial = pending_partial_wire();
     let address = crate::harness::session::values::pending_assistant_frames(
-        &lane
-            .state()
-            .operation
-            .as_ref()
-            .map(|operation| operation.meta.operation_id.clone())
-            .expect("the operation"),
+        &live_operation_id(&lane),
         "response",
     );
-    commit_writes(
-        lane.session(),
-        vec![
-            crate::harness::session::values::append_list_write(
-                &address,
-                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::Start { partial },
-            )
-            .expect("frame append"),
-            crate::harness::session::values::append_list_write(
-                &address,
-                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextStart {
-                    content_index: 0,
-                    content: pi_ai::types::TextContent {
-                        text: String::new(),
-                        text_signature: None,
-                    },
-                },
-            )
-            .expect("frame append"),
-            crate::harness::session::values::append_list_write(
-                &address,
-                pi_ai::utils::assistant_message_frame::AssistantMessageFrame::TextDelta {
-                    content_index: 0,
-                    delta: "a".to_owned(),
-                },
-            )
-            .expect("frame append"),
-        ],
-    )
-    .await;
+    commit_writes(lane.session(), frame_append_writes(&address, &partial)).await;
 
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     let operation = snapshot.operation.as_ref().expect("the operation view");
     assert_eq!(
         operation.deferred.as_ref().expect("the deferred view").poll,
@@ -1296,10 +1105,7 @@ async fn watch_reports_the_aborting_operation_status() {
     )
     .await;
 
-    let watch = AgentLane::watch(&lane, &background_context())
-        .await
-        .expect("watch serves");
-    let snapshot = WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch);
+    let (watch, snapshot) = watch_snapshot(&lane).await;
     assert_eq!(
         snapshot
             .operation
@@ -1318,12 +1124,7 @@ async fn watch_faults_on_the_last_result_invariants() {
     // The missing record.
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the live operation");
+    let operation_id = live_operation_id(&lane);
     finish_operation(&lane).await;
     commit_writes(
         lane.session(),
@@ -1349,12 +1150,7 @@ async fn watch_faults_on_the_last_result_invariants() {
     // The malformed record.
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the live operation");
+    let operation_id = live_operation_id(&lane);
     finish_operation(&lane).await;
     commit_writes(
         lane.session(),
@@ -1396,50 +1192,21 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
         }))
         .expect("the call wire")
     };
-    let batch = |assistant_entry_id: &str, calls: Vec<crate::harness::session::types::ToolCall>| {
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry_id.to_owned(),
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls,
-            },
-        })
-    };
 
     // A text block where the call's source index names a tool call.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "text", "text": "not a call" }]),
-            "stop",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        batch(
-            &assistant_entry,
-            vec![call(0, "result-1", "effect_pending")],
-        ),
+        json!([{ "type": "text", "text": "not a call" }]),
+        "stop",
+        vec![call(0, "result-1", "effect_pending")],
     )
     .await;
     commit_writes(
         lane.session(),
         vec![raw_write(
             &crate::harness::session::values::operation_tool_args(
-                &lane
-                    .state()
-                    .operation
-                    .as_ref()
-                    .map(|operation| operation.meta.operation_id.clone())
-                    .expect("the operation"),
+                &live_operation_id(&lane),
                 "turn",
                 0,
             )
@@ -1464,32 +1231,14 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
 
     // The malformed persisted arguments.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the operation");
-    patch_live_state(
-        &lane,
-        batch(
-            &assistant_entry,
-            vec![call(0, "result-1", "effect_pending")],
-        ),
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-1", "effect_pending")],
     )
     .await;
+    let operation_id = live_operation_id(&lane);
     commit_writes(
         lane.session(),
         vec![raw_write(
@@ -1512,32 +1261,14 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
 
     // The malformed checkpoint.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    let operation_id = lane
-        .state()
-        .operation
-        .as_ref()
-        .map(|operation| operation.meta.operation_id.clone())
-        .expect("the operation");
-    patch_live_state(
-        &lane,
-        batch(
-            &assistant_entry,
-            vec![call(0, "result-1", "effect_pending")],
-        ),
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-1", "effect_pending")],
     )
     .await;
+    let operation_id = live_operation_id(&lane);
     commit_writes(
         lane.session(),
         vec![
@@ -1570,21 +1301,11 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
 
     // The mismatched staged result.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        batch(&assistant_entry, vec![call(0, "result-2", "outcome_ready")]),
+        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        "toolUse",
+        vec![call(0, "result-2", "outcome_ready")],
     )
     .await;
     commit_writes(
@@ -1642,7 +1363,7 @@ async fn the_recording_watch_replays_its_snapshot_and_drains_its_listener() {
         .expect("the resnapshot");
     assert_eq!(
         resnapshotted,
-        WatchHandle::<crate::harness::agent_harness::LaneSnapshot>::snapshot(&*watch),
+        WatchHandle::<LaneSnapshot>::snapshot(&*watch),
         "the resnapshot replays the captured snapshot",
     );
     watch.unsubscribe();
@@ -1778,29 +1499,11 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
 
     // The malformed staged payload.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry,
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: vec![call()],
-            },
-        }),
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call()],
     )
     .await;
     commit_writes(
@@ -1827,29 +1530,11 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
 
     // The custom staged payload.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry,
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: vec![call()],
-            },
-        }),
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call()],
     )
     .await;
     commit_writes(
@@ -1882,29 +1567,11 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
 
     // The non-toolResult staged message.
     let lane = capturing_lane(None).await;
-    let assistant_entry = AgentLane::append_message(
+    admitted_tools_batch(
         &lane,
-        assistant_wire(
-            &json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-            "toolUse",
-            false,
-        ),
-        &background_context(),
-    )
-    .await
-    .expect("append serves");
-    accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::Tools(ToolsOperation {
-            scope: operation_scope(),
-            batch: ToolBatch {
-                assistant_entry_id: assistant_entry,
-                configuration: lane_configuration(),
-                turn_id: "turn".to_owned(),
-                calls: vec![call()],
-            },
-        }),
+        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        "toolUse",
+        vec![call()],
     )
     .await;
     commit_writes(

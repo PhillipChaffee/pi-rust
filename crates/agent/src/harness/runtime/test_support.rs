@@ -59,6 +59,9 @@ use crate::harness::session::memory::MemoryStorageOptions;
 use crate::harness::session::session::StorageBackedSession;
 use crate::harness::session::session::StorageBackedSessionOptions;
 use crate::harness::session::types::CommitResult;
+use crate::harness::session::types::CompactionReason;
+use crate::harness::session::types::DeferredEffectPendingOperation;
+use crate::harness::session::types::DeferredScope;
 use crate::harness::session::types::Entry;
 use crate::harness::session::types::EntryScan;
 use crate::harness::session::types::EntryStructure;
@@ -68,12 +71,20 @@ use crate::harness::session::types::LaneConfiguration;
 use crate::harness::session::types::ModelIdentity;
 use crate::harness::session::types::OperationResultRecord;
 use crate::harness::session::types::OperationScope;
+use crate::harness::session::types::OperationState;
+use crate::harness::session::types::ResultBoundary;
 use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionError;
 use crate::harness::session::types::SessionMetadata;
 use crate::harness::session::types::SessionStats;
 use crate::harness::session::types::Storage;
 use crate::harness::session::types::StorageBranchScan;
+use crate::harness::session::types::SummaryContext;
+use crate::harness::session::types::SummaryGenerationScope;
+use crate::harness::session::types::SummaryTask;
+use crate::harness::session::types::ToolBatch;
+use crate::harness::session::types::ToolCall;
+use crate::harness::session::types::ToolsOperation;
 use crate::harness::session::types::UsageRow;
 use crate::harness::session::types::UsageScan;
 use crate::harness::session::values::ListAddress;
@@ -218,12 +229,10 @@ pub(super) fn operation_scope() -> OperationScope {
 /// The starting leaf the seeded operations carry, upstream's
 /// `{ at: "starting", ... }` fixtures.
 #[must_use]
-pub(super) fn starting_run_state() -> crate::harness::session::types::OperationState {
-    crate::harness::session::types::OperationState::Starting(
-        crate::harness::session::types::StartingOperation {
-            scope: operation_scope(),
-        },
-    )
+pub(super) fn starting_run_state() -> OperationState {
+    OperationState::Starting(crate::harness::session::types::StartingOperation {
+        scope: operation_scope(),
+    })
 }
 
 /// The generation inputs the model-carrying leaves carry, upstream's
@@ -498,10 +507,7 @@ pub(super) fn live_operation_id(lane: &Lane) -> String {
 ///
 /// # Panics
 /// The live operation's absence or the patch's failure.
-pub(super) async fn patch_live_state(
-    lane: &Lane,
-    next_state: crate::harness::session::types::OperationState,
-) {
+pub(super) async fn patch_live_state(lane: &Lane, next_state: OperationState) {
     let live = lane.state().operation.expect("the live operation");
     let operation_id = live.meta.operation_id.clone();
     let meta = live.meta;
@@ -996,4 +1002,83 @@ pub(super) fn bus_watch_installer(
             boxed
         },
     )
+}
+
+/// The structural task the summary leaves carry, upstream's `summaryTask`
+/// fixture with the boundary's reason.
+#[must_use]
+pub(super) fn summary_task(boundary: ResultBoundary) -> SummaryTask {
+    let reason = match &boundary {
+        ResultBoundary::Finish => Some(CompactionReason::Manual),
+        ResultBoundary::ResumeCheckpoint { .. } => Some(CompactionReason::Threshold),
+        ResultBoundary::CommitNavigation { .. } => None,
+    };
+    SummaryTask {
+        task_id: "task".to_owned(),
+        reason,
+        custom_instructions: None,
+        boundary,
+    }
+}
+
+/// The summary generation inputs the summary leaves carry, upstream's
+/// `summaryGeneration` fixture.
+#[must_use]
+pub(super) fn summary_generation() -> SummaryGenerationScope {
+    SummaryGenerationScope {
+        task: summary_task(ResultBoundary::Finish),
+        summary_context: SummaryContext {
+            result_entry_id: "summary".to_owned(),
+            configuration: lane_configuration(),
+            stream_options: AgentHarnessStreamOptions::default(),
+            retry_policy: generation_context().retry_policy,
+        },
+    }
+}
+
+/// The deferred scope the deferred leaves carry, upstream's `deferredScope`
+/// fixture.
+#[must_use]
+pub(super) fn deferred_scope(
+    scope: OperationScope,
+    source_entry_id: &str,
+    poll: u64,
+) -> DeferredScope {
+    DeferredScope {
+        scope,
+        step_id: "step".to_owned(),
+        source_entry_id: source_entry_id.to_owned(),
+        poll,
+        configuration: lane_configuration(),
+        stream_options: AgentHarnessStreamOptions::default(),
+    }
+}
+
+/// The deferred-effect-pending leaf the deferred-phase fixtures drive.
+#[must_use]
+pub(super) fn deferred_effect_pending(
+    source_entry_id: &str,
+    response_entry_id: &str,
+    poll: u64,
+) -> OperationState {
+    OperationState::DeferredEffectPending(DeferredEffectPendingOperation {
+        scope: deferred_scope(operation_scope(), source_entry_id, poll),
+        response_entry_id: response_entry_id.to_owned(),
+        usage_id: "usage".to_owned(),
+    })
+}
+
+/// The tools leaf the batch captures drive, upstream's
+/// `{ ...runScope(), at: "tools", batch }` fixture.
+#[must_use]
+pub(super) fn tools_batch_state(assistant_entry_id: &str, calls: Vec<ToolCall>) -> OperationState {
+    OperationState::Tools(ToolsOperation {
+        scope: operation_scope(),
+        batch: ToolBatch {
+            assistant_entry_id: assistant_entry_id.to_owned(),
+            configuration: lane_configuration(),
+            turn_id: "turn".to_owned(),
+            calls,
+        },
+    })
 }
