@@ -776,6 +776,12 @@ impl FileSystem for NodeExecutionEnv {
             if let Err(error) = written {
                 return Err(to_file_error(&error, Some(resolved)));
             }
+            // Tokio's File buffers; upstream's appendFile resolves only
+            // after the bytes are in the file, and the atomic publication
+            // reads the staged content back between appends.
+            if let Err(error) = file.flush().await {
+                return Err(to_file_error(&error, Some(resolved)));
+            }
             if fired_abort_signal(ctx).is_some() {
                 return Err(aborted_file_error(Some(resolved)));
             }
