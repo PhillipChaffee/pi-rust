@@ -30,7 +30,6 @@ use pi_ai::types::{
 use pi_ai::utils::assistant_message_frame::event_type_name;
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use serde_json::Value as JsonValue;
-use tokio_util::sync::CancellationToken;
 
 use crate::agent_loop::{event_partial, stream_reasoning};
 use crate::harness::context::{Context, get_telemetry_context};
@@ -254,19 +253,6 @@ impl std::error::Error for AssistantStreamError {
 /// cancels the token when the signal aborts and exits when the token is
 /// cancelled first, so a request that finishes before the signal aborts
 /// leaves the parked task to the drive pass's end.
-fn request_signal(context: &Context) -> Option<CancellationToken> {
-    let signal = context.abort_signal()?;
-    let token = CancellationToken::new();
-    let linked = token.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = signal.wait() => linked.cancel(),
-            () = linked.cancelled() => {},
-        }
-    });
-    Some(token)
-}
-
 /// Build the provider request options from the curated snapshot,
 /// upstream's `createRequestOptions`.
 fn create_request_options(
@@ -278,7 +264,7 @@ fn create_request_options(
     SimpleStreamOptions {
         transport_options: TransportOptions {
             http_client: None,
-            signal: request_signal(context),
+            signal: crate::harness::context::request_signal(context),
             on_payload: config.before_payload.clone().map(|hook| {
                 let context = context.clone();
                 OnPayload::new(move |payload, model| {

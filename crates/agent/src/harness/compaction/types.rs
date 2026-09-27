@@ -2,12 +2,13 @@
 //! `src/harness/compaction/compaction.ts` and
 //! `compaction/branch-summarization.ts`.
 //!
-//! The map's harness-foundations child carries the type surface its
-//! signatures and hook payloads reference (`CompactionSettings`,
-//! `CompactionPreparation`, `CompactResult`, the branch-summary pair, and
-//! `FileOperations`); the compaction child owns the module's logic and the
-//! rest of `utils.ts` (recorded on that ticket). The types ride the ported
-//! suites elsewhere; this module has no upstream unit file of its own.
+//! The map's harness-foundations child carried the type surface the hook
+//! payloads and harness options reference ([`CompactionSettings`],
+//! [`CompactionPreparation`], [`CompactResult`], the branch-summary pair,
+//! and [`FileOperations`]); the compaction child carried the module's
+//! logic and the rest of `utils.ts`. [`CompactionDetails`] — the entry's
+//! `details` wire shape — lives here too, the one data shape the compaction
+//! child contributes to this module.
 
 use std::collections::BTreeSet;
 
@@ -136,4 +137,18 @@ pub struct BranchPreparation {
     pub file_ops: FileOperations,
     /// Estimated token count for selected messages.
     pub total_tokens: i64,
+}
+
+/// The file-operation details a generated compaction entry stores,
+/// upstream's `CompactionDetails` in `compaction/compaction.ts` — the
+/// `details` object on the entry's wire shape.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionDetails {
+    /// Files read in the compacted history, sorted, serialized as
+    /// `readFiles`.
+    pub read_files: Vec<String>,
+    /// Files modified in the compacted history, sorted, serialized as
+    /// `modifiedFiles`.
+    pub modified_files: Vec<String>,
 }
