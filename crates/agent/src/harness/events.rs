@@ -1,10 +1,10 @@
 //! The passive harness event bus with isolated handler failures, ported
 //! from upstream `src/harness/events.ts`.
 //!
-//! Delivery serializes through one ordered tail: `emit_batch` binds the
-//! recipients at emit time, clones each event per listener, and appends
-//! one contiguous batch to the tail; each emitted batch resolves when its
-//! delivery completes. Handler failures isolate: the listener's failure
+//! Delivery serializes through one ordered tail: `emit_batch` binds each
+//! event's recipients at emit time, clones each event per listener, and
+//! appends one contiguous batch to the tail; each emitted batch resolves
+//! when its delivery completes. Handler failures isolate: the listener's failure
 //! converts into a `handler_error` event delivered to the remaining
 //! recipients without reporting further failures. Upstream's promise-chain
 //! tail restates as a drain-now task over a job queue — one drainer at a
@@ -74,16 +74,24 @@ type BusListener = Arc<
 
 /// The job types the ordered tail carries.
 enum BusJob {
-    /// One contiguous batch: bound events, bound recipients, and the
-    /// completion signal.
+    /// One contiguous batch of bound events plus the completion signal.
     Deliver {
-        batch: Vec<(HarnessEvent, Context)>,
-        recipients: Vec<BusListener>,
+        bound: Vec<BoundEvent>,
         done: oneshot::Sender<()>,
     },
     /// A closure that awaits at its position in the tail — the resnapshot
     /// boundary's vehicle.
     Barrier(Box<dyn FnOnce() -> BoxedFuture<'static, ()> + Send>),
+}
+
+/// One event bound at emit time to the recipients it delivers to,
+/// upstream's `emitBatch`'s `{ payload, recipients }` entry: the
+/// recipients are the listeners registered for this event's type plus the
+/// watch listeners, so a batch delivers each event to its own audience.
+struct BoundEvent {
+    payload: HarnessEvent,
+    context: Context,
+    recipients: Vec<BusListener>,
 }
 
 struct BusCore {
@@ -135,17 +143,32 @@ impl BusCore {
                         }
                     };
                     match job {
-                        BusJob::Deliver {
-                            batch,
-                            recipients,
-                            done,
-                        } => {
-                            for (event, context) in &batch {
-                                deliver(&core, event, &recipients, true, context).await;
-                            }
+                        BusJob::Deliver { bound, done } => {
+                            // The batch runs on its own task so a panicking
+                            // listener resolves it instead of killing the
+                            // drainer — the unwound task's latch would wedge
+                            // every later emit, where upstream's
+                            // `delivery.catch(() => {})` keeps the tail
+                            // alive across any delivery failure.
+                            let delivery_core = Arc::clone(&core);
+                            let delivery = tokio::spawn(async move {
+                                for BoundEvent {
+                                    payload,
+                                    context,
+                                    recipients,
+                                } in &bound
+                                {
+                                    deliver(&delivery_core, payload, recipients, true, context)
+                                        .await;
+                                }
+                            });
+                            let _ = delivery.await;
                             let _ = done.send(());
                         }
-                        BusJob::Barrier(barrier) => barrier().await,
+                        BusJob::Barrier(barrier) => {
+                            let run = tokio::spawn(async move { barrier().await });
+                            let _ = run.await;
+                        }
                     }
                 }
             });
@@ -208,49 +231,22 @@ impl HarnessEventBus {
         if self.closed_error().is_some() || events.is_empty() {
             return Box::pin(async {});
         }
+        let bound: Vec<BoundEvent> = events
+            .into_iter()
+            .map(|(payload, context)| {
+                let recipients = snapshot_recipients(&self.core, &payload);
+                BoundEvent {
+                    payload,
+                    context,
+                    recipients,
+                }
+            })
+            .collect();
         let (done, receiver) = oneshot::channel();
-        let recipients = self.snapshot_recipients_union(&events);
-        BusCore::push_job(
-            &self.core,
-            BusJob::Deliver {
-                batch: events,
-                recipients,
-                done,
-            },
-        );
+        BusCore::push_job(&self.core, BusJob::Deliver { bound, done });
         Box::pin(async move {
             let _ = receiver.await;
         })
-    }
-
-    fn snapshot_recipients_union(&self, events: &[(HarnessEvent, Context)]) -> Vec<BusListener> {
-        let core = self
-            .core
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut union: Vec<BusListener> = Vec::new();
-        for (event, _) in events {
-            if let Some(list) = core.listeners.get(&event.payload.event_type()) {
-                for listener in list {
-                    if !union
-                        .iter()
-                        .any(|registered| Arc::ptr_eq(registered, listener))
-                    {
-                        union.push(Arc::clone(listener));
-                    }
-                }
-            }
-        }
-        for listener in &core.watch_listeners {
-            if !union
-                .iter()
-                .any(|registered| Arc::ptr_eq(registered, listener))
-            {
-                union.push(Arc::clone(listener));
-            }
-        }
-        drop(core);
-        union
     }
 
     /// Subscribes one listener to an event type, upstream's `on`.
@@ -793,8 +789,24 @@ impl<T: Send + Sync + 'static> BufferedEventWatcher<T> {
                 let Some(listener) = listener else {
                     continue;
                 };
-                if let Err(error) = listener(&event, &context).await {
-                    on_error(error.to_string(), event, context);
+                // The call runs on its own task so a panicking listener
+                // resolves instead of killing the drainer, upstream's
+                // enqueue `.catch` keeping the tail alive and routing the
+                // failure to onError.
+                let call = tokio::spawn({
+                    let listener = Arc::clone(&listener);
+                    let event = event.clone();
+                    let context = context.clone();
+                    async move { listener(&event, &context).await }
+                });
+                match call.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => on_error(error.to_string(), event, context),
+                    Err(join) => on_error(
+                        crate::harness::runtime::types::panicked_task_error(join).to_string(),
+                        event,
+                        context,
+                    ),
                 }
             }
         });

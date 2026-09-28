@@ -1,32 +1,26 @@
 //! The runtime boundary suite: behavior upstream exercises from other
 //! layers (the harness lane surface, the drive procedures, the storage
-//! contract) bound here where the runtime child owns the seams — the staged
-//! seam raises, the drive spawn's failure path, the mismatch shape, the
-//! durable lane record's wire round-trip, the inbox admission split, and
-//! the captured-model projection over the state leaves.
+//! contract) bound here where the runtime child owns the seams — the real
+//! compaction and summarized-navigation admissions and the drive spawn's
+//! settle path, the mismatch shape, the durable lane record's wire
+//! round-trip, the inbox admission split, and the captured-model projection
+//! over the state leaves.
 
 #![expect(
     clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(
     clippy::panic,
-    reason = "the tests pin outcomes; a violated expectation panics the test by design"
+    reason = "the tests pin outcomes; unexpected results and violated expectations panic the test by design"
 )]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 
-use crate::harness::agent_harness::DriveOptions;
-use crate::harness::agent_harness::NavigateOptions;
-use crate::harness::agent_harness::OperationRequest;
+use crate::harness::agent_harness::{DriveOptions, NavigateOptions, OperationRequest};
 use crate::harness::context::background_context;
 use crate::harness::result::HarnessError;
 use crate::harness::runtime::lane::Lane;
-use crate::harness::runtime::lane::captured_model;
-use crate::harness::runtime::lane::durable_lane_state;
-use crate::harness::runtime::lane::select_accepted_inbox;
+use crate::harness::runtime::lane::{captured_model, durable_lane_state, select_accepted_inbox};
 use crate::harness::runtime::test_support::ControlledStorage;
 use crate::harness::runtime::test_support::accept_text;
 use crate::harness::runtime::test_support::assistant_wire_value;
@@ -48,11 +42,9 @@ use crate::harness::runtime::test_support::summary_generation;
 use crate::harness::runtime::test_support::summary_task;
 use crate::harness::runtime::test_support::tools_batch_state;
 use crate::harness::runtime::test_support::unused_watch_installer;
-use crate::harness::runtime::test_support::user_text_message;
-use crate::harness::runtime::test_support::zero_usage_wire;
+use crate::harness::runtime::test_support::{user_text_message, zero_usage_wire};
 use crate::harness::runtime::types::SliceNotImplemented;
-use crate::harness::session::memory::MemoryStorage;
-use crate::harness::session::memory::MemoryStorageOptions;
+use crate::harness::session::memory::{MemoryStorage, MemoryStorageOptions};
 use crate::harness::session::types::AssistantEffectPendingOperation;
 use crate::harness::session::types::AssistantReadyOperation;
 use crate::harness::session::types::AssistantRetryWaitOperation;
@@ -72,53 +64,326 @@ use crate::harness::session::types::RetryWait;
 use crate::harness::session::types::SummaryDecidingOperation;
 use crate::harness::session::types::SummaryEffectPendingOperation;
 use crate::harness::session::types::SummaryReadyOperation;
-use crate::harness::session::types::SummaryRetryWaitOperation;
-use crate::harness::session::types::ToolBatch;
-use crate::harness::session::types::ToolsOperation;
+use crate::harness::session::types::{SummaryRetryWaitOperation, ToolBatch, ToolsOperation};
 use crate::types::QueueMode;
 
-/// A configured `main` lane over a seeded session, the fixture the seam
-/// tests admit through; `Some(operation_id)` seeds an admitted starting
-/// operation for the drive-fault path.
+/// A configured `main` lane over a seeded session, the fixture the
+/// mismatch test admits through; `Some(operation_id)` seeds an admitted
+/// starting operation.
 async fn seam_lane(operation_id: Option<&str>) -> Lane {
     let session = memory_session_with_seed(operation_id).await;
-    restored_lane(session, noop_emit_batch(), unused_watch_installer()).await
+    restored_lane(
+        session,
+        noop_emit_batch(),
+        unused_watch_installer("boundary"),
+    )
+    .await
 }
 
-/// The staged seam error the result carries, unwrapped.
-fn slice_error_of(error: &crate::harness::runtime::types::LaneError) -> SliceNotImplemented {
-    error
-        .downcast_ref::<SliceNotImplemented>()
-        .expect("the staged seam raises SliceNotImplemented")
-        .clone()
+// The real-admission and spawn-settle suite: the compaction and
+// summarized-navigation admissions commit their durable writes and events,
+// and a freshly installed pass spawns the procedure loop through the faux
+// provider.
+
+use crate::harness::agent_harness::{DriveOutcome, HarnessEvent, HarnessEventPayload};
+use crate::harness::session::commit::insert_entry;
+use crate::harness::session::session::StorageBackedSessionOptions;
+use crate::harness::session::testing::InstrumentedStorage;
+use crate::harness::session::types::CompactionReason;
+use crate::harness::session::types::MessageEntry;
+use crate::harness::session::types::NewEntry;
+use crate::harness::session::types::OperationIntent;
+use crate::harness::session::types::{OperationKind, OperationMeta, SessionReader, TerminalStatus};
+use crate::harness::session::values::{Write, set_value_write};
+use pi_ai::providers::faux::FauxAssistantMessageOptions;
+use pi_ai::providers::faux::FauxProviderHandle;
+use pi_ai::providers::faux::{RegisterFauxProviderOptions, faux_assistant_message, faux_provider};
+
+/// The event collector the admission and drive flips capture through,
+/// upstream's `(batch) => { events.push(...batch); }` fixture collector.
+fn collecting_emit_batch(
+    events: Arc<Mutex<Vec<HarnessEvent>>>,
+) -> crate::harness::runtime::lane::EmitBatch {
+    Arc::new(
+        move |batch: Vec<HarnessEvent>, _context: crate::harness::context::Context| {
+            let events = Arc::clone(&events);
+            Box::pin(async move {
+                events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(batch);
+                Ok(())
+            })
+        },
+    )
 }
 
-/// `accept` on a compaction request raises the staged seam; the raise
-/// happens before any session work.
+/// The count of one payload's shape in the collected events.
+fn event_count(
+    events: &Arc<Mutex<Vec<HarnessEvent>>>,
+    shape: fn(&HarnessEventPayload) -> bool,
+) -> usize {
+    crate::harness::runtime::test_support::lock(events)
+        .iter()
+        .filter(|event| shape(&event.payload))
+        .count()
+}
+
+/// The message entry's write one seed commits, upstream's
+/// `{ kind: "entry", entry: { id, parentId, type: "message", message } }`
+/// literals.
+fn message_entry_write(id: &str, parent_id: Option<&str>, message: AgentMessage) -> Write {
+    Write::Entry(Box::new(insert_entry(NewEntry::Message {
+        id: id.to_owned(),
+        parent_id: parent_id.map(str::to_owned),
+        body: Box::new(MessageEntry {
+            message,
+            terminate: None,
+        }),
+    })))
+}
+
+/// The admission fixture the compaction and navigation flips drive: the
+/// seeded `main` lane over an instrumented memory backend, the caller's
+/// extra writes committed before the restore reads, and the accepted
+/// events collected.
+async fn admission_lane(
+    extra: Vec<Write>,
+) -> (
+    Lane,
+    Arc<StorageBackedSession>,
+    Arc<InstrumentedStorage>,
+    Arc<Mutex<Vec<HarnessEvent>>>,
+) {
+    let storage = Arc::new(InstrumentedStorage::new(Arc::new(MemoryStorage::new(
+        MemoryStorageOptions::default(),
+    ))));
+    let session = Arc::new(StorageBackedSession::new(
+        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
+        storage.clone(),
+        StorageBackedSessionOptions::default(),
+    ));
+    let mut writes =
+        crate::harness::runtime::test_support::main_lane_seed_writes(&lane_configuration())
+            .expect("seed writes");
+    writes.extend(extra);
+    commit_writes(&session, writes).await;
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let lane = restored_lane(
+        session.clone(),
+        collecting_emit_batch(Arc::clone(&events)),
+        unused_watch_installer("boundary"),
+    )
+    .await;
+    (lane, session, storage, events)
+}
+
+/// The drive fixture the compact and fresh-install flips run through: the
+/// seeded `main` lane over a memory backend with the lane configuration
+/// carrying the faux identity, the faux provider registered into the
+/// lane's catalog, and the caller's extra writes committed before the
+/// restore reads.
+async fn driven_lane(
+    extra: impl FnOnce(&crate::harness::session::types::LaneConfiguration) -> Vec<Write>,
+) -> (Lane, Arc<StorageBackedSession>, FauxProviderHandle) {
+    let faux = faux_provider(RegisterFauxProviderOptions::default());
+    let model = faux.first_model();
+    let configuration = crate::harness::session::types::LaneConfiguration {
+        model: crate::harness::session::types::ModelIdentity {
+            provider: model.provider.0.clone(),
+            model_id: model.id.clone(),
+        },
+        ..lane_configuration()
+    };
+    let session = Arc::new(StorageBackedSession::new(
+        crate::harness::runtime::test_support::runtime_session_metadata(next_session_id()),
+        Arc::new(MemoryStorage::new(MemoryStorageOptions::default())),
+        StorageBackedSessionOptions::default(),
+    ));
+    let mut writes = crate::harness::runtime::test_support::main_lane_seed_writes(&configuration)
+        .expect("seed writes");
+    writes.extend(extra(&configuration));
+    commit_writes(&session, writes).await;
+    let lane = restored_lane(
+        session.clone(),
+        noop_emit_batch(),
+        unused_watch_installer("boundary"),
+    )
+    .await;
+    lane.models().set_provider(Arc::new(faux.provider.clone()));
+    (lane, session, faux)
+}
+
+/// Upstream `it` under "runtime atomic run acceptance" (`accept.test.ts`):
+/// accepts standalone compaction with durable preparation and no
+/// execution.
 #[tokio::test]
-async fn accept_compaction_raises_the_staged_seam() {
-    let lane = seam_lane(None).await;
-    let error = lane
+async fn accepts_standalone_compaction_with_durable_preparation_and_no_execution() {
+    let (lane, session, storage, events) = admission_lane(Vec::new()).await;
+    AgentLane::append_message(&lane, user_text_message("history"), &background_context())
+        .await
+        .expect("append serves");
+    storage.clear_commit_attempts();
+
+    let admission = lane
         .accept_impl(
             OperationRequest::Compaction {
-                operation_id: None,
-                custom_instructions: None,
+                operation_id: Some("compaction".to_owned()),
+                custom_instructions: Some("focus".to_owned()),
             },
             &background_context(),
         )
         .await
-        .expect_err("the staged seam raises");
-    assert_eq!(slice_error_of(&error).operation, "compaction");
+        .expect("accept serves")
+        .expect("the admission");
+    assert_eq!(admission.operation_id, "compaction");
+    assert_eq!(admission.kind, OperationKind::Compaction);
+
+    let operation = lane.state().operation.expect("the accepted compaction");
+    let OperationState::SummaryDeciding(deciding) = &operation.state else {
+        panic!("expected accepted compaction: {:?}", operation.state.at());
+    };
+    assert_eq!(deciding.task.reason, Some(CompactionReason::Manual));
+    assert_eq!(deciding.task.custom_instructions.as_deref(), Some("focus"));
+    assert_eq!(deciding.task.boundary, ResultBoundary::Finish);
+    let stored = session
+        .get_value(
+            &crate::harness::session::values::operation_preparation(
+                "compaction",
+                &deciding.task.task_id,
+            )
+            .address,
+            &background_context(),
+        )
+        .await
+        .expect("the preparation read")
+        .expect("the stored preparation");
+    assert_eq!(stored.value.get("kind"), Some(&json!("compaction")));
+    assert_eq!(
+        storage.get_commit_attempts().len(),
+        1,
+        "one admission commit"
+    );
+    assert_eq!(
+        event_count(&events, |payload| matches!(
+            payload,
+            HarnessEventPayload::CompactionStart { .. }
+        )),
+        1,
+        "the admission published one compaction_start",
+    );
+    assert!(lane.active_drive().is_none(), "no pass installed");
 }
 
-/// A summarized navigation raises the staged seam; the plain path does not.
+/// Upstream `it.each([false, true])` under "runtime atomic run acceptance"
+/// (`accept.test.ts`): accepts summarized navigation atomically — the
+/// summarized row lands `summary.deciding` with the branch-summary
+/// preparation over the source's content, the direct row lands
+/// `navigation.ready_to_commit`; both keep the tip and commit once.
 #[tokio::test]
-async fn accept_navigation_summarize_raises_the_staged_seam() {
-    let lane = seam_lane(None).await;
+async fn accepts_summarized_navigation_atomically() {
+    for (summarize, operation_id) in [(true, "summarized"), (false, "direct")] {
+        let (lane, session, storage, events) = admission_lane(vec![
+            message_entry_write("root", None, user_text_message("root")),
+            message_entry_write("source", Some("root"), user_text_message("source")),
+            message_entry_write("target", Some("root"), user_text_message("target")),
+            set_value_write(
+                &crate::harness::session::values::branch_tip("main"),
+                Some("source".to_owned()),
+            )
+            .expect("the tip write"),
+        ])
+        .await;
+        storage.clear_commit_attempts();
+
+        lane.accept_impl(
+            OperationRequest::Navigation {
+                operation_id: Some(operation_id.to_owned()),
+                target_id: Some("target".to_owned()),
+                options: Some(NavigateOptions {
+                    summarize: Some(summarize),
+                    label: Some("chosen".to_owned()),
+                    custom_instructions: Some("focus".to_owned()),
+                }),
+            },
+            &background_context(),
+        )
+        .await
+        .expect("accept serves")
+        .expect("the admission");
+
+        let operation = lane.state().operation.expect("the accepted navigation");
+        assert_eq!(operation.meta.operation_id, operation_id);
+        assert_eq!(
+            lane.state().tip_id.as_deref(),
+            Some("source"),
+            "the tip stays"
+        );
+        if summarize {
+            let OperationState::SummaryDeciding(deciding) = &operation.state else {
+                panic!("expected summary decision: {:?}", operation.state.at());
+            };
+            assert_eq!(
+                deciding.task.boundary,
+                ResultBoundary::CommitNavigation {
+                    target_id: "target".to_owned(),
+                    label: Some("chosen".to_owned()),
+                },
+            );
+            assert_eq!(
+                deciding.task.reason, None,
+                "the navigation task carries no compaction reason",
+            );
+            let stored = session
+                .get_value(
+                    &crate::harness::session::values::operation_preparation(
+                        operation_id,
+                        &deciding.task.task_id,
+                    )
+                    .address,
+                    &background_context(),
+                )
+                .await
+                .expect("the preparation read")
+                .expect("the stored preparation");
+            assert_eq!(stored.value.get("kind"), Some(&json!("branch_summary")));
+            assert_eq!(
+                stored.value.pointer("/messages/0/content"),
+                Some(&json!("source")),
+                "the preparation carries the source's message",
+            );
+        } else {
+            assert_eq!(operation.state.at(), "navigation.ready_to_commit");
+        }
+        assert_eq!(
+            storage.get_commit_attempts().len(),
+            1,
+            "one admission commit"
+        );
+        assert_eq!(
+            event_count(&events, |payload| matches!(
+                payload,
+                HarnessEventPayload::NavigationStart { .. }
+            )),
+            1,
+            "the admission published one navigation_start",
+        );
+        assert!(lane.active_drive().is_none(), "no pass installed");
+    }
+}
+
+/// The summarized branch's root guards reject without writing, upstream's
+/// "Summarized navigation requires non-root source and target entries"
+/// invariants over a root source and a root target.
+#[tokio::test]
+async fn rejects_summarized_navigation_from_root_entries_without_writing() {
+    // The root source tip.
+    let (lane, _session, storage, _events) = admission_lane(Vec::new()).await;
+    storage.clear_commit_attempts();
     let error = lane
         .accept_impl(
             OperationRequest::Navigation {
-                operation_id: None,
+                operation_id: Some("summarized".to_owned()),
                 target_id: Some("target".to_owned()),
                 options: Some(NavigateOptions {
                     summarize: Some(true),
@@ -129,27 +394,144 @@ async fn accept_navigation_summarize_raises_the_staged_seam() {
             &background_context(),
         )
         .await
-        .expect_err("the staged seam raises");
-    assert_eq!(slice_error_of(&error).operation, "summarized navigation");
-}
+        .expect("accept serves")
+        .expect_err("the root source rejects");
+    match error {
+        HarnessError::InvalidNavigation {
+            reason, message, ..
+        } => {
+            assert_eq!(reason, "source_root");
+            assert_eq!(
+                message,
+                "Summarized navigation requires non-root source and target entries"
+            );
+        }
+        other => panic!("the root source: {other:?}"),
+    }
+    assert!(
+        storage.get_commit_attempts().is_empty(),
+        "the root source rejected without writing",
+    );
 
-/// The compact surface collapses into the same staged seam raise.
-#[tokio::test]
-async fn compact_impl_carries_the_staged_seam_error() {
-    let lane = seam_lane(None).await;
-    let error = lane
-        .compact_impl(None, &background_context())
+    // The root target.
+    let (lane, _session, storage, _events) = admission_lane(Vec::new()).await;
+    AgentLane::append_message(&lane, user_text_message("head"), &background_context())
         .await
-        .expect_err("the staged seam raises");
-    assert_eq!(slice_error_of(&error).operation, "compaction");
+        .expect("append serves");
+    storage.clear_commit_attempts();
+    let error = lane
+        .accept_impl(
+            OperationRequest::Navigation {
+                operation_id: Some("summarized".to_owned()),
+                target_id: None,
+                options: Some(NavigateOptions {
+                    summarize: Some(true),
+                    label: None,
+                    custom_instructions: None,
+                }),
+            },
+            &background_context(),
+        )
+        .await
+        .expect("accept serves")
+        .expect_err("the root target rejects");
+    match error {
+        HarnessError::InvalidNavigation { reason, .. } => {
+            assert_eq!(reason, "target_root");
+        }
+        other => panic!("the root target: {other:?}"),
+    }
+    assert!(
+        storage.get_commit_attempts().is_empty(),
+        "the guards rejected without writing",
+    );
 }
 
-/// A freshly installed drive pass faults with the staged seam (the drive
-/// child owns the procedure loop) and clears its owner, mirroring the real
-/// spawn handler's failure path.
+/// Upstream `it` under "runtime public drive" (`drive-public.test.ts`):
+/// composes standalone compaction acceptance with drive — the summary runs
+/// through the faux provider and the compaction settles completed.
 #[tokio::test]
-async fn drive_impl_faults_a_fresh_install_with_the_staged_seam() {
-    let lane = seam_lane(Some("operation")).await;
+async fn compact_composes_standalone_compaction_acceptance_with_drive() {
+    let (lane, _session, faux) = driven_lane(|_configuration| Vec::new()).await;
+    AgentLane::append_message(&lane, user_text_message("history"), &background_context())
+        .await
+        .expect("append serves");
+    faux.set_responses([
+        faux_assistant_message("summary", FauxAssistantMessageOptions::default()).into(),
+    ]);
+
+    let outcome = lane
+        .compact(None, &background_context())
+        .await
+        .expect("compact serves")
+        .expect("the compaction settles");
+    assert_eq!(outcome.compaction.kind, OperationKind::Compaction);
+    assert_eq!(outcome.compaction.status, TerminalStatus::Completed);
+    assert!(
+        outcome.run.is_none(),
+        "the empty lane queues no follow-up run",
+    );
+    assert_eq!(
+        faux.state().call_count(),
+        1,
+        "the summary ran through the faux provider",
+    );
+    assert!(
+        lane.active_drive().is_none(),
+        "the settled pass cleared its owner",
+    );
+    assert!(
+        lane.state().operation.is_none(),
+        "the completed compaction cleared its operation",
+    );
+}
+
+/// The freshly installed pass spawns the procedure loop detached, the
+/// seeded run drives through the faux provider, and the success handler
+/// clears the pass's owner — the staged-seam test's install and clear
+/// statements against the real spawn.
+#[tokio::test]
+async fn drive_spawns_the_procedure_loop_on_a_fresh_install() {
+    let (lane, _session, faux) = driven_lane(|_configuration| {
+        vec![
+            message_entry_write("prompt-1", None, user_text_message("question")),
+            set_value_write(
+                &crate::harness::session::values::branch_tip("main"),
+                Some("prompt-1".to_owned()),
+            )
+            .expect("the tip write"),
+            set_value_write(
+                &crate::harness::session::values::operation_meta("operation"),
+                OperationMeta {
+                    operation_id: "operation".to_owned(),
+                    lane: "main".to_owned(),
+                    source_tip_id: None,
+                    started_at: 1,
+                    intent: OperationIntent::Run {
+                        prompt_entry_ids: vec!["prompt-1".to_owned()],
+                    },
+                },
+            )
+            .expect("the meta write"),
+            set_value_write(
+                &crate::harness::session::values::operation_state("operation"),
+                crate::harness::runtime::test_support::starting_run_state(),
+            )
+            .expect("the state write"),
+            crate::harness::runtime::test_support::lane_state_write(
+                "main",
+                Some("operation"),
+                None,
+                Vec::new(),
+            )
+            .expect("the lane write"),
+        ]
+    })
+    .await;
+    faux.set_responses([
+        faux_assistant_message("answer", FauxAssistantMessageOptions::default()).into(),
+    ]);
+
     let driven = lane
         .drive_impl(
             DriveOptions {
@@ -159,12 +541,19 @@ async fn drive_impl_faults_a_fresh_install_with_the_staged_seam() {
             },
             &background_context(),
         )
-        .await;
-    let error = driven.expect_err("the fresh install faults with the staged seam");
-    assert_eq!(slice_error_of(&error).operation, "drive operation");
+        .await
+        .expect("drive serves")
+        .expect("the drive settles");
+    match driven {
+        DriveOutcome::Settled { outcome } => {
+            assert_eq!(outcome.kind, OperationKind::Run);
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+        }
+        other @ DriveOutcome::Waiting { .. } => panic!("the fresh install drove: {other:?}"),
+    }
     assert!(
         lane.active_drive().is_none(),
-        "the failed pass cleared its owner"
+        "the settled pass cleared its owner",
     );
 }
 
@@ -455,17 +844,148 @@ fn slice_not_implemented_reports_the_operation_it_names() {
 // fixtures — the arms `captureLaneSnapshot` reads — and the scope
 // rebuild's leaf coverage.
 
-use crate::harness::agent_harness::AgentLane;
-use crate::harness::agent_harness::LaneSnapshot;
-use crate::harness::agent_harness::WatchHandle;
+use crate::harness::agent_harness::{AgentLane, LaneSnapshot, WatchHandle};
 use crate::harness::runtime::lane::operation_state_with_scope;
 use crate::harness::runtime::test_support::recording_watch_installer;
-use crate::harness::session::types::Entry;
-use crate::harness::session::types::Storage;
+use crate::harness::session::types::{Entry, Storage};
 use crate::types::AgentMessage;
 
 /// The capturing fixture: the seam lane over a recording watch, the watch
 /// surface the capture tests drive.
+/// Installs the streaming fixture's effect-pending assistant leaf, the
+/// stored-frames views' seeded run.
+///
+/// # Panics
+/// The patch's failure.
+/// One tool-call block wire, the batch blocks' `{ type: "toolCall" }`
+/// literals.
+fn call_block(id: &str, name: &str, arguments: serde_json::Value) -> serde_json::Value {
+    let mut call = serde_json::Map::new();
+    call.insert("type".to_owned(), json!("toolCall"));
+    call.insert("id".to_owned(), json!(id));
+    call.insert("name".to_owned(), json!(name));
+    call.insert("arguments".to_owned(), arguments);
+    serde_json::Value::Array(vec![serde_json::Value::Object(call)])
+}
+
+/// Admits the single-call batch, the staged-result probes' seeded run:
+/// one `call-1`/`tool-1` tool call with empty arguments.
+///
+/// # Panics
+/// The append's failure.
+async fn admitted_single_call(lane: &Lane) {
+    admitted_tools_batch(
+        lane,
+        call_block("call-1", "tool-1", json!({})),
+        "toolUse",
+        vec![
+            serde_json::from_value::<crate::harness::session::types::ToolCall>(json!({
+                "sourceIndex": 0,
+                "resultEntryId": "result-1",
+                "status": "outcome_ready",
+                "terminate": false,
+            }))
+            .expect("the call wire"),
+        ],
+    )
+    .await;
+}
+
+async fn install_effect_pending_assistant(lane: &Lane) {
+    patch_live_state(
+        lane,
+        OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
+            scope: operation_scope(),
+            generation_context: generation_context(),
+            attempt: 1,
+            response_entry_id: "response".to_owned(),
+            usage_id: "usage".to_owned(),
+            intended_output_limit: 100,
+            context_window: 1_000,
+        }),
+    )
+    .await;
+}
+
+/// Installs the retry-wait leaf the retry views read, the deadline
+/// fixtures' seeded run.
+///
+/// # Panics
+/// The patch's failure.
+async fn install_retry_wait_leaf(lane: &Lane) {
+    patch_live_state(
+        lane,
+        OperationState::AssistantRetryWait(AssistantRetryWaitOperation {
+            scope: operation_scope(),
+            generation_context: generation_context(),
+            retry_wait: RetryWait {
+                next_attempt: 2,
+                not_before: 10,
+                error_message: "boom".to_owned(),
+            },
+        }),
+    )
+    .await;
+}
+
+/// The staged tool-result pending-entry write, the running-tools views'
+/// seeded outcome; a serialization failure panics the test by design.
+fn staged_tool_result_write(
+    entry_id: &str,
+    call_id: &str,
+    tool_name: &str,
+    text: &str,
+    is_error: bool,
+    timestamp: i64,
+) -> Write {
+    set_value_write(
+        &crate::harness::session::values::pending_entry(entry_id),
+        crate::harness::session::types::PendingEntry::Message {
+            payload: Box::new(
+                serde_json::from_value(json!({
+                    "role": "toolResult",
+                    "toolCallId": call_id,
+                    "toolName": tool_name,
+                    "content": [{ "type": "text", "text": text }],
+                    "isError": is_error,
+                    "timestamp": timestamp,
+                }))
+                .expect("the tool result wire"),
+            ),
+        },
+    )
+    .expect("staged write")
+}
+
+/// Writes the turn-0 tool-args raw payload, the invariant probes' seeded
+/// corruption; a serialization failure panics the test by design.
+async fn write_tool_args(lane: &Lane, value: serde_json::Value) {
+    commit_writes(
+        lane.session(),
+        vec![raw_write(
+            &crate::harness::session::values::operation_tool_args(
+                &live_operation_id(lane),
+                "turn",
+                0,
+            )
+            .address,
+            value,
+        )],
+    )
+    .await;
+}
+
+/// The closed reason one watch carries, the invariant probes' read; a
+/// serving watch panics the test by design.
+async fn watch_closed_reason(lane: &Lane, why: &str) -> String {
+    let Err(crate::harness::agent_harness::LaneOperationError::Closed(reason)) =
+        AgentLane::watch(lane, &background_context()).await
+    else {
+        panic!("{why}");
+    };
+    reason.to_string()
+}
+
 async fn capturing_lane(operation_id: Option<&str>) -> Lane {
     let session = memory_session_with_seed(operation_id).await;
     restored_lane(
@@ -514,7 +1034,7 @@ fn frame_append_writes(
         pi_ai::utils::assistant_message_frame::AssistantMessageFrame,
     >,
     partial: &pi_ai::types::AssistantMessage,
-) -> Vec<crate::harness::session::values::Write> {
+) -> Vec<Write> {
     vec![
         crate::harness::session::values::append_list_write(
             address,
@@ -607,19 +1127,7 @@ async fn watch_captures_the_lane_snapshot_over_the_durable_values() {
 async fn watch_reports_the_streaming_message_from_the_stored_frames() {
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
-            scope: operation_scope(),
-            generation_context: generation_context(),
-            attempt: 1,
-            response_entry_id: "response".to_owned(),
-            usage_id: "usage".to_owned(),
-            intended_output_limit: 100,
-            context_window: 1_000,
-        }),
-    )
-    .await;
+    install_effect_pending_assistant(&lane).await;
 
     let operation_id = live_operation_id(&lane);
     let partial = pending_partial_wire();
@@ -698,24 +1206,16 @@ async fn watch_faults_when_the_deferred_source_lacks_its_handle() {
     )
     .await;
 
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the handle-less source faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Deferred source is missing its assistant handle"),
-                "the capture faults with the deferred invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the handle-less source faults the capture").await;
+    assert!(
+        reason.contains("Deferred source is missing its assistant handle"),
+        "the capture faults with the deferred invariant: {reason}"
+    );
 }
 
 #[expect(
     clippy::too_many_lines,
-    reason = "the batch's two phases and their durable reads are one continuous capture"
+    reason = "the case drives the running and settled calls' capture arms"
 )]
 #[tokio::test]
 async fn watch_reports_the_tools_batch_running_and_settled_calls() {
@@ -763,7 +1263,7 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
                     .address,
                 json!({ "k": "persisted" }),
             ),
-            crate::harness::session::values::set_value_write(
+            set_value_write(
                 &crate::harness::session::values::pending_tool_output(&operation_id, "result-1"),
                 crate::harness::session::values::ToolOutputPayload {
                     content: vec![crate::types::AgentToolContent::Text(
@@ -779,23 +1279,7 @@ async fn watch_reports_the_tools_batch_running_and_settled_calls() {
                 },
             )
             .expect("checkpoint write"),
-            crate::harness::session::values::set_value_write(
-                &crate::harness::session::values::pending_entry("result-2"),
-                crate::harness::session::types::PendingEntry::Message {
-                    payload: Box::new(
-                        serde_json::from_value(json!({
-                            "role": "toolResult",
-                            "toolCallId": "call-2",
-                            "toolName": "tool-2",
-                            "content": [{ "type": "text", "text": "done-2" }],
-                            "isError": false,
-                            "timestamp": 2,
-                        }))
-                        .expect("the tool result wire"),
-                    ),
-                },
-            )
-            .expect("staged write"),
+            staged_tool_result_write("result-2", "call-2", "tool-2", "done-2", false, 2),
         ],
     )
     .await;
@@ -862,25 +1346,17 @@ async fn watch_faults_on_the_tools_batch_invariants() {
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
     patch_live_state(&lane, tools_batch_state("absent", Vec::new())).await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the invalid batch faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Tool batch assistant entry is invalid"),
-                "the invalid batch names its invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the invalid batch faults the capture").await;
+    assert!(
+        reason.contains("Tool batch assistant entry is invalid"),
+        "the invalid batch names its invariant: {reason}"
+    );
 
     // The missing persisted arguments.
     let lane = capturing_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![
             serde_json::from_value(json!({
@@ -893,25 +1369,17 @@ async fn watch_faults_on_the_tools_batch_invariants() {
         ],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the arg-less call faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Tool call call-1 is missing persisted arguments"),
-                "the arg-less call names its invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the arg-less call faults the capture").await;
+    assert!(
+        reason.contains("Tool call call-1 is missing persisted arguments"),
+        "the arg-less call names its invariant: {reason}"
+    );
 
     // The missing staged result.
     let lane = capturing_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        call_block("call-2", "tool-2", json!({})),
         "toolUse",
         vec![
             serde_json::from_value(json!({
@@ -924,19 +1392,11 @@ async fn watch_faults_on_the_tools_batch_invariants() {
         ],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the staged-less call faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Tool call result-2 is missing its staged result"),
-                "the staged-less call names its invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the staged-less call faults the capture").await;
+    assert!(
+        reason.contains("Tool call result-2 is missing its staged result"),
+        "the staged-less call names its invariant: {reason}"
+    );
 }
 
 /// The prompt admission the capture fixtures share.
@@ -969,19 +1429,7 @@ async fn admitted_tools_batch(
 async fn watch_reports_the_retry_views() {
     let lane = capturing_lane(None).await;
     accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::AssistantRetryWait(AssistantRetryWaitOperation {
-            scope: operation_scope(),
-            generation_context: generation_context(),
-            retry_wait: RetryWait {
-                next_attempt: 2,
-                not_before: 10,
-                error_message: "boom".to_owned(),
-            },
-        }),
-    )
-    .await;
+    install_retry_wait_leaf(&lane).await;
     let (watch, snapshot) = watch_snapshot(&lane).await;
     let retry = snapshot
         .operation
@@ -1133,19 +1581,11 @@ async fn watch_faults_on_the_last_result_invariants() {
         )],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the missing record faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains(&format!("Lane \"main\" is missing result {operation_id}")),
-                "the missing record names its invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the missing record faults the capture").await;
+    assert!(
+        reason.contains(&format!("Lane \"main\" is missing result {operation_id}")),
+        "the missing record names its invariant: {reason}"
+    );
 
     // The malformed record.
     let lane = capturing_lane(None).await;
@@ -1160,26 +1600,16 @@ async fn watch_faults_on_the_last_result_invariants() {
         )],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the malformed record faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason.to_string().contains("Operation result is malformed"),
-                "the malformed record names its parse failure: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the malformed record faults the capture").await;
+    assert!(
+        reason.contains("Operation result is malformed"),
+        "the malformed record names its parse failure: {reason}"
+    );
 }
 
 /// The remaining tools-batch parse invariants: the non-tool-call source
 /// block, the malformed args, the malformed checkpoint, the malformed and
 /// non-message and mismatched staged results.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the parse invariants share the fixture; one body keeps the fixture shape visible"
-)]
 #[tokio::test]
 async fn watch_faults_on_the_tools_batch_parse_invariants() {
     let call = |source_index: u64, result_entry_id: &str, status: &str| {
@@ -1202,68 +1632,34 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
         vec![call(0, "result-1", "effect_pending")],
     )
     .await;
-    commit_writes(
-        lane.session(),
-        vec![raw_write(
-            &crate::harness::session::values::operation_tool_args(
-                &live_operation_id(&lane),
-                "turn",
-                0,
-            )
-            .address,
-            json!({}),
-        )],
-    )
-    .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the text block faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("does not name a tool-call block"),
-                "the text block names its invariant: {reason}",
-            );
-        }
-    }
+    write_tool_args(&lane, json!({})).await;
+    let reason = watch_closed_reason(&lane, "the text block faults the capture").await;
+    assert!(
+        reason.contains("does not name a tool-call block"),
+        "the text block names its invariant: {reason}"
+    );
 
     // The malformed persisted arguments.
     let lane = capturing_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![call(0, "result-1", "effect_pending")],
     )
     .await;
-    let operation_id = live_operation_id(&lane);
-    commit_writes(
-        lane.session(),
-        vec![raw_write(
-            &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0).address,
-            json!(42),
-        )],
-    )
-    .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the malformed args fault the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason.to_string().contains("Tool arguments are malformed"),
-                "the malformed args name their parse failure: {reason}",
-            );
-        }
-    }
+    write_tool_args(&lane, json!(42)).await;
+    let reason = watch_closed_reason(&lane, "the malformed args fault the capture").await;
+    assert!(
+        reason.contains("Tool arguments are malformed"),
+        "the malformed args name their parse failure: {reason}"
+    );
 
     // The malformed checkpoint.
     let lane = capturing_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![call(0, "result-1", "effect_pending")],
     )
@@ -1285,65 +1681,39 @@ async fn watch_faults_on_the_tools_batch_parse_invariants() {
         ],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the malformed checkpoint faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Pending tool output is malformed"),
-                "the malformed checkpoint names its parse failure: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the malformed checkpoint faults the capture").await;
+    assert!(
+        reason.contains("Pending tool output is malformed"),
+        "the malformed checkpoint names its parse failure: {reason}"
+    );
 
     // The mismatched staged result.
     let lane = capturing_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        call_block("call-2", "tool-2", json!({})),
         "toolUse",
         vec![call(0, "result-2", "outcome_ready")],
     )
     .await;
     commit_writes(
         lane.session(),
-        vec![
-            crate::harness::session::values::set_value_write(
-                &crate::harness::session::values::pending_entry("result-2"),
-                crate::harness::session::types::PendingEntry::Message {
-                    payload: Box::new(
-                        serde_json::from_value(json!({
-                            "role": "toolResult",
-                            "toolCallId": "other-call",
-                            "toolName": "tool-2",
-                            "content": [{ "type": "text", "text": "done" }],
-                            "isError": false,
-                            "timestamp": 2,
-                        }))
-                        .expect("the tool result wire"),
-                    ),
-                },
-            )
-            .expect("staged write"),
-        ],
+        vec![staged_tool_result_write(
+            "result-2",
+            "other-call",
+            "tool-2",
+            "done",
+            false,
+            2,
+        )],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the mismatched staged result faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Tool call result-2 has a mismatched staged result"),
-                "the mismatched staged result names its invariant: {reason}",
-            );
-        }
-    }
+    let reason =
+        watch_closed_reason(&lane, "the mismatched staged result faults the capture").await;
+    assert!(
+        reason.contains("Tool call result-2 has a mismatched staged result"),
+        "the mismatched staged result names its invariant: {reason}"
+    );
 }
 
 /// The watch handle's start and resnapshot surfaces the capture fixture
@@ -1470,23 +1840,10 @@ async fn the_runtime_config_converts_messages() {
 
 /// The staged result's parse invariants: the malformed payload, the custom
 /// entry, and the non-toolResult message the staged arm rejects.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the three parse invariants share the fixture; one body keeps the fixture shape visible"
-)]
 #[tokio::test]
 async fn watch_faults_on_the_staged_result_parse_invariants() {
-    let call = || {
-        serde_json::from_value::<crate::harness::session::types::ToolCall>(json!({
-            "sourceIndex": 0,
-            "resultEntryId": "result-1",
-            "status": "outcome_ready",
-            "terminate": false,
-        }))
-        .expect("the call wire")
-    };
     let staged_for = |payload: serde_json::Value| {
-        crate::harness::session::values::set_value_write(
+        set_value_write(
             &crate::harness::session::values::pending_entry("result-1"),
             crate::harness::session::types::PendingEntry::Message {
                 payload: Box::new(
@@ -1499,13 +1856,7 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
 
     // The malformed staged payload.
     let lane = capturing_lane(None).await;
-    admitted_tools_batch(
-        &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-        "toolUse",
-        vec![call()],
-    )
-    .await;
+    admitted_single_call(&lane).await;
     commit_writes(
         lane.session(),
         vec![raw_write(
@@ -1514,33 +1865,19 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
         )],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the malformed staged result faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Pending entry payload is malformed"),
-                "the malformed staged result names its parse failure: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the malformed staged result faults the capture").await;
+    assert!(
+        reason.contains("Pending entry payload is malformed"),
+        "the malformed staged result names its parse failure: {reason}"
+    );
 
     // The custom staged payload.
     let lane = capturing_lane(None).await;
-    admitted_tools_batch(
-        &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-        "toolUse",
-        vec![call()],
-    )
-    .await;
+    admitted_single_call(&lane).await;
     commit_writes(
         lane.session(),
         vec![
-            crate::harness::session::values::set_value_write(
+            set_value_write(
                 &crate::harness::session::values::pending_entry("result-1"),
                 crate::harness::session::types::PendingEntry::Custom {
                     custom_type: "note".to_owned(),
@@ -1551,29 +1888,15 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
         ],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the custom staged result faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Tool call result-1 is missing its staged result"),
-                "the custom staged result names its invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(&lane, "the custom staged result faults the capture").await;
+    assert!(
+        reason.contains("Tool call result-1 is missing its staged result"),
+        "the custom staged result names its invariant: {reason}"
+    );
 
     // The non-toolResult staged message.
     let lane = capturing_lane(None).await;
-    admitted_tools_batch(
-        &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
-        "toolUse",
-        vec![call()],
-    )
-    .await;
+    admitted_single_call(&lane).await;
     commit_writes(
         lane.session(),
         vec![staged_for(json!({
@@ -1583,19 +1906,15 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
         }))],
     )
     .await;
-    let Err(error) = AgentLane::watch(&lane, &background_context()).await else {
-        panic!("the non-toolResult staged message faults the capture");
-    };
-    match error {
-        crate::harness::agent_harness::LaneOperationError::Closed(reason) => {
-            assert!(
-                reason
-                    .to_string()
-                    .contains("Tool call result-1 is missing its staged result"),
-                "the non-toolResult staged message names its invariant: {reason}",
-            );
-        }
-    }
+    let reason = watch_closed_reason(
+        &lane,
+        "the non-toolResult staged message faults the capture",
+    )
+    .await;
+    assert!(
+        reason.contains("Tool call result-1 is missing its staged result"),
+        "the non-toolResult staged message names its invariant: {reason}"
+    );
 }
 
 // The capture's storage-error arms and the faulted flag: the reads fault
@@ -1604,8 +1923,7 @@ async fn watch_faults_on_the_staged_result_parse_invariants() {
 
 use crate::harness::runtime::test_support::gate_next_read;
 use crate::harness::runtime::test_support::next_session_id;
-use crate::harness::runtime::test_support::runtime_session;
-use crate::harness::runtime::test_support::seed_main_lane_values;
+use crate::harness::runtime::test_support::{runtime_session, seed_main_lane_values};
 use crate::harness::session::session::StorageBackedSession;
 
 /// The capturing lane over the controlled backend, the read-failure rig's
@@ -1724,19 +2042,7 @@ async fn watch_faults_on_the_operation_leaf_read_failures() {
     let (lane, _session, storage) = controlled_capture_lane(None).await;
     accept_prompt(&lane).await;
     let operation_id = live_operation_id(&lane);
-    patch_live_state(
-        &lane,
-        OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
-            scope: operation_scope(),
-            generation_context: generation_context(),
-            attempt: 1,
-            response_entry_id: "response".to_owned(),
-            usage_id: "usage".to_owned(),
-            intended_output_limit: 100,
-            context_window: 1_000,
-        }),
-    )
-    .await;
+    install_effect_pending_assistant(&lane).await;
     arm_read_failure(&storage, &format!("{operation_id}:response"));
     let message = watch_fault(&lane).await;
     assert!(
@@ -1799,7 +2105,7 @@ async fn watch_faults_on_the_tools_batch_read_failures() {
     let (lane, _session, storage) = controlled_capture_lane(None).await;
     let assistant_entry = admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![call(0, "result-1", "effect_pending")],
     )
@@ -1815,7 +2121,7 @@ async fn watch_faults_on_the_tools_batch_read_failures() {
     let (lane, _session, storage) = controlled_capture_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![call(0, "result-1", "effect_pending")],
     )
@@ -1829,7 +2135,7 @@ async fn watch_faults_on_the_tools_batch_read_failures() {
     let (lane, _session, storage) = controlled_capture_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![call(0, "result-1", "effect_pending")],
     )
@@ -1854,7 +2160,7 @@ async fn watch_faults_on_the_tools_batch_read_failures() {
     let (lane, _session, storage) = controlled_capture_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        call_block("call-2", "tool-2", json!({})),
         "toolUse",
         vec![call(0, "result-2", "outcome_ready")],
     )
@@ -1867,13 +2173,13 @@ async fn watch_faults_on_the_tools_batch_read_failures() {
     );
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the case drives the remaining capture shapes' read arms"
+)]
 /// The capture's success-shape arms the error suites leave: the
 /// checkpoint-less running call, the settled call's persisted args, the
 /// non-assistant batch entry, and the absent deferred source.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the four shapes share the fixture rig; one body keeps the shape visible"
-)]
 #[tokio::test]
 async fn watch_reports_the_remaining_capture_shapes() {
     // The effect-pending call without its checkpoint: the running tool
@@ -1881,7 +2187,7 @@ async fn watch_reports_the_remaining_capture_shapes() {
     let (lane, _session, _storage) = controlled_capture_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-1", "name": "tool-1", "arguments": {} }]),
+        call_block("call-1", "tool-1", json!({})),
         "toolUse",
         vec![
             serde_json::from_value(json!({
@@ -1894,15 +2200,7 @@ async fn watch_reports_the_remaining_capture_shapes() {
         ],
     )
     .await;
-    let operation_id = live_operation_id(&lane);
-    commit_writes(
-        lane.session(),
-        vec![raw_write(
-            &crate::harness::session::values::operation_tool_args(&operation_id, "turn", 0).address,
-            json!({ "k": "persisted" }),
-        )],
-    )
-    .await;
+    write_tool_args(&lane, json!({ "k": "persisted" })).await;
     let (_watch, snapshot) = watch_snapshot(&lane).await;
     match &snapshot
         .operation
@@ -1925,7 +2223,7 @@ async fn watch_reports_the_remaining_capture_shapes() {
     let (lane, _session, _storage) = controlled_capture_lane(None).await;
     admitted_tools_batch(
         &lane,
-        json!([{ "type": "toolCall", "id": "call-2", "name": "tool-2", "arguments": {} }]),
+        call_block("call-2", "tool-2", json!({})),
         "toolUse",
         vec![
             serde_json::from_value(json!({
@@ -1947,23 +2245,7 @@ async fn watch_reports_the_remaining_capture_shapes() {
                     .address,
                 json!({ "k": "persisted" }),
             ),
-            crate::harness::session::values::set_value_write(
-                &crate::harness::session::values::pending_entry("result-2"),
-                crate::harness::session::types::PendingEntry::Message {
-                    payload: Box::new(
-                        serde_json::from_value(json!({
-                            "role": "toolResult",
-                            "toolCallId": "call-2",
-                            "toolName": "tool-2",
-                            "content": [{ "type": "text", "text": "done" }],
-                            "isError": false,
-                            "timestamp": 2,
-                        }))
-                        .expect("the tool result wire"),
-                    ),
-                },
-            )
-            .expect("staged write"),
+            staged_tool_result_write("result-2", "call-2", "tool-2", "done", false, 2),
         ],
     )
     .await;
@@ -2028,19 +2310,7 @@ async fn watch_reports_the_remaining_capture_shapes() {
 async fn watch_faults_on_the_streaming_reduce_failure() {
     let (lane, _session, _storage) = controlled_capture_lane(None).await;
     accept_prompt(&lane).await;
-    patch_live_state(
-        &lane,
-        OperationState::AssistantEffectPending(AssistantEffectPendingOperation {
-            scope: operation_scope(),
-            generation_context: generation_context(),
-            attempt: 1,
-            response_entry_id: "response".to_owned(),
-            usage_id: "usage".to_owned(),
-            intended_output_limit: 100,
-            context_window: 1_000,
-        }),
-    )
-    .await;
+    install_effect_pending_assistant(&lane).await;
     let operation_id = live_operation_id(&lane);
     let address =
         crate::harness::session::values::pending_assistant_frames(&operation_id, "response");

@@ -13,8 +13,7 @@
 )]
 
 use super::*;
-use crate::harness::runtime::test_support::assistant_wire_value;
-use crate::harness::runtime::test_support::compaction_entry_body;
+use crate::harness::runtime::test_support::{assistant_wire_value, compaction_entry_body};
 use crate::harness::session::types::ModelIdentity;
 use crate::types::ThinkingLevel;
 
@@ -825,10 +824,7 @@ fn settles_run_end_into_the_record_and_the_tip() {
     let record = snapshot.last_result.as_ref().expect("the settled record");
     assert_eq!(record.operation_id, "run");
     assert_eq!(record.kind, OperationKind::Run);
-    assert_eq!(
-        record.status,
-        crate::harness::session::types::TerminalStatus::Completed
-    );
+    assert_eq!(record.status, TerminalStatus::Completed);
     assert_eq!(record.error, None);
     assert_eq!(record.from_tip_id.as_deref(), Some("start-tip"));
     assert_eq!(record.tip_id.as_deref(), Some("end-tip"));
@@ -850,10 +846,7 @@ fn settles_run_end_into_the_record_and_the_tip() {
         }),
     );
     let record = failed.last_result.as_ref().expect("the failed record");
-    assert_eq!(
-        record.status,
-        crate::harness::session::types::TerminalStatus::Failed
-    );
+    assert_eq!(record.status, TerminalStatus::Failed);
     assert_eq!(
         record.error,
         Some(operation_error("provider_error")),
@@ -916,10 +909,7 @@ fn settles_compaction_end_into_the_record() {
     let record = snapshot.last_result.as_ref().expect("the settled record");
     assert_eq!(record.operation_id, "compact");
     assert_eq!(record.kind, OperationKind::Compaction);
-    assert_eq!(
-        record.status,
-        crate::harness::session::types::TerminalStatus::Completed
-    );
+    assert_eq!(record.status, TerminalStatus::Completed);
     assert_eq!(
         record.from_tip_id, None,
         "the record carries the operation's tip"
@@ -1046,10 +1036,7 @@ fn carries_the_aborted_and_failed_compaction_end_statuses() {
         }),
     );
     let record = aborted.last_result.as_ref().expect("the aborted record");
-    assert_eq!(
-        record.status,
-        crate::harness::session::types::TerminalStatus::Aborted,
-    );
+    assert_eq!(record.status, TerminalStatus::Aborted,);
 
     let mut failed = empty_snapshot();
     failed.operation = Some(run_operation("compact", OperationKind::Compaction));
@@ -1069,10 +1056,7 @@ fn carries_the_aborted_and_failed_compaction_end_statuses() {
         }),
     );
     let record = failed.last_result.as_ref().expect("the failed record");
-    assert_eq!(
-        record.status,
-        crate::harness::session::types::TerminalStatus::Failed,
-    );
+    assert_eq!(record.status, TerminalStatus::Failed,);
     assert_eq!(
         record.error.as_ref().map(|error| error.code.as_str()),
         Some("model_error"),
@@ -1097,7 +1081,7 @@ fn carries_the_aborted_run_end_status() {
     let record = snapshot.last_result.as_ref().expect("the aborted record");
     assert_eq!(
         record.status,
-        crate::harness::session::types::TerminalStatus::Aborted,
+        TerminalStatus::Aborted,
         "the aborted run carries its status",
     );
 }
@@ -1139,7 +1123,7 @@ fn carries_the_declined_compaction_end_status() {
     let record = snapshot.last_result.as_ref().expect("the declined record");
     assert_eq!(
         record.status,
-        crate::harness::session::types::TerminalStatus::Declined,
+        TerminalStatus::Declined,
         "the declined compaction carries its status",
     );
 }

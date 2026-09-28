@@ -8,6 +8,7 @@
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::HarnessEventPayload;
 use crate::harness::agent_harness::LaneQueuedItem;
+use crate::harness::agent_harness::lane_scoped_event;
 use crate::harness::context::Context;
 use crate::harness::runtime::lane::Lane;
 use crate::harness::runtime::types::ContinueOperationResult;
@@ -65,32 +66,35 @@ pub fn entry_lifecycle_events(entry: Entry, lane: &str, run_id: Option<&str>) ->
     let message_events = match &entry {
         Entry::Message { body, id, .. } => {
             let run_id = run_id.map(str::to_owned);
-            let message_start = HarnessEvent::lane_scoped(
+            let message_start = lane_scoped_event(
                 lane,
                 false,
+                "message_start",
                 HarnessEventPayload::MessageStart {
                     run_id: run_id.clone(),
                     message: body.message.clone(),
                 },
-            )
-            .unwrap_or_else(|error| unreachable!("message_start is lane-scoped: {error}"));
-            let message_end = HarnessEvent::lane_scoped(
+            );
+            let message_end = lane_scoped_event(
                 lane,
                 false,
+                "message_end",
                 HarnessEventPayload::MessageEnd {
                     run_id,
                     message: body.message.clone(),
                     entry_id: Some(id.clone()),
                 },
-            )
-            .unwrap_or_else(|error| unreachable!("message_end is lane-scoped: {error}"));
+            );
             vec![message_start, message_end]
         }
         Entry::Compaction { .. } | Entry::BranchSummary { .. } | Entry::Custom { .. } => Vec::new(),
     };
-    let entry_added =
-        HarnessEvent::lane_scoped(lane, false, HarnessEventPayload::EntryAdded { entry })
-            .unwrap_or_else(|error| unreachable!("entry_added is lane-scoped: {error}"));
+    let entry_added = lane_scoped_event(
+        lane,
+        false,
+        "entry_added",
+        HarnessEventPayload::EntryAdded { entry },
+    );
     let mut events = message_events;
     events.push(entry_added);
     events

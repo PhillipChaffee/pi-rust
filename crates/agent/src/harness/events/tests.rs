@@ -11,6 +11,10 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
+#![expect(
+    clippy::panic,
+    reason = "the boundary tests pin outcomes; a violated expectation panics the test by design"
+)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +41,12 @@ fn lane_event(run_id: &str) -> HarnessEvent {
 
 type Recorded = Arc<Mutex<Vec<HarnessEvent>>>;
 
+/// The plain bus over the background context, the per-case
+/// `new HarnessEventBus()` fixtures.
+fn bus_fixture() -> (HarnessEventBus, pi_chord::context::Context) {
+    (HarnessEventBus::new(), background_context())
+}
+
 fn listener(sink: Recorded) -> crate::harness::agent_harness::EventListener {
     Arc::new(move |event: &HarnessEvent, _context| {
         let sink = Arc::clone(&sink);
@@ -60,8 +70,7 @@ fn handler_errors_of(event: &HarnessEvent) -> Option<String> {
 
 #[tokio::test]
 async fn subscriptions_receive_delivered_events_and_unsubscribe() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let received: Recorded = Arc::new(Mutex::new(Vec::new()));
     let subscription = bus
         .on(HarnessEventType::RunStart, listener(Arc::clone(&received)))
@@ -103,6 +112,51 @@ async fn listener_failures_isolate_into_handler_errors() {
     assert_eq!(
         handler_errors.lock().expect("handler error lock").clone(),
         vec!["listener failed".to_owned()]
+    );
+}
+
+/// A panicking listener unwinds its own delivery task, not the drainer:
+/// the next emit still delivers, upstream's `delivery.catch(() => {})`
+/// keeping the tail alive across any failure.
+#[tokio::test]
+async fn a_panicking_listener_leaves_the_drainer_healthy() {
+    let (bus, context) = bus_fixture();
+    let delivered: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&delivered);
+    bus.on(
+        HarnessEventType::RunStart,
+        Arc::new(move |event: &HarnessEvent, _context| {
+            let sink = Arc::clone(&sink);
+            let owned = event.clone();
+            Box::pin(async move {
+                sink.lock().expect("delivery lock").push(owned);
+                Ok(())
+            })
+        }),
+    )
+    .expect("subscribe the healthy listener");
+    let exploding: crate::harness::agent_harness::EventListener =
+        Arc::new(|_event, _context| Box::pin(async { panic!("the listener explodes") }));
+    bus.on(HarnessEventType::RunStart, exploding)
+        .expect("subscribe the exploding listener");
+
+    bus.emit(lane_event("first"), &context).await;
+    bus.emit(lane_event("second"), &context).await;
+
+    let received = delivered
+        .lock()
+        .expect("delivery lock")
+        .clone()
+        .iter()
+        .map(|event| match &event.payload {
+            HarnessEventPayload::RunStart { run_id, .. } => run_id.clone(),
+            other => panic!("unexpected payload: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        received,
+        vec!["first", "second"],
+        "the drainer delivered the later emit after the unwind"
     );
 }
 
@@ -156,8 +210,7 @@ fn watcher_start(
 /// unsubscribes.
 #[tokio::test]
 async fn watch_from_snapshot_captures_and_resnapshots() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let captured: Arc<Mutex<u64>> = Arc::new(Mutex::new(7));
     let capture_source = Arc::clone(&captured);
     let watcher = bus
@@ -299,8 +352,7 @@ async fn emit_batch_skips_delivery_on_a_closed_bus_or_an_empty_batch() {
 /// spawning a second one, on the watcher tail and the bus tail alike.
 #[tokio::test]
 async fn pushes_while_a_tail_is_draining_reuse_the_running_drainer() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let watcher = bus
         .watch(0, Arc::new(|_event: &HarnessEvent| true), None)
         .expect("watch");
@@ -330,8 +382,7 @@ async fn pushes_while_a_tail_is_draining_reuse_the_running_drainer() {
 /// deliver under the new epoch.
 #[tokio::test]
 async fn a_stale_epoch_event_is_dropped_when_a_resnapshot_bumps_the_epoch() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let entered = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(Notify::new());
     let resnapshot_started = Arc::new(AtomicBool::new(false));
@@ -394,8 +445,7 @@ async fn a_stale_epoch_event_is_dropped_when_a_resnapshot_bumps_the_epoch() {
 /// type; the `handler_error` delivery does not recurse.
 #[tokio::test]
 async fn a_watch_listener_failure_becomes_a_handler_error_on_the_bus() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let watcher = bus
         .watch(0, Arc::new(|_event: &HarnessEvent| true), None)
         .expect("watch");
@@ -526,8 +576,7 @@ async fn a_failed_capture_unsubscribes_the_watcher() {
 /// direct boundary mark replay.
 #[tokio::test]
 async fn an_unmarked_capture_reports_the_violation_and_replays_the_held_events() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let entered = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(Notify::new());
     let capture: ResnapshotCapture<u64> = {
@@ -581,8 +630,7 @@ async fn an_unmarked_capture_reports_the_violation_and_replays_the_held_events()
 /// audience when no `handler_error` listeners are registered.
 #[tokio::test]
 async fn a_bus_listener_failure_reaches_the_watcher_audience() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let watcher = bus
         .watch(0, Arc::new(|_event: &HarnessEvent| true), None)
         .expect("watch");
@@ -628,8 +676,7 @@ async fn a_bus_listener_failure_reaches_the_watcher_audience() {
 /// after the boundary and reports the capture's own error.
 #[tokio::test]
 async fn a_marking_capture_that_fails_replays_and_reports() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let entered = Arc::new(AtomicBool::new(false));
     let started = Arc::new(Notify::new());
     let marked = Arc::new(Notify::new());
@@ -689,8 +736,7 @@ async fn a_marking_capture_that_fails_replays_and_reports() {
 /// A second resnapshot while one is in progress reports busy.
 #[tokio::test]
 async fn a_second_resnapshot_while_one_is_in_progress_reports_busy() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let entered = Arc::new(AtomicBool::new(false));
     let gate = Arc::new(Notify::new());
     let capture: ResnapshotCapture<u64> = {
@@ -732,8 +778,7 @@ async fn a_second_resnapshot_while_one_is_in_progress_reports_busy() {
 /// no-op.
 #[tokio::test]
 async fn the_resnapshot_choreography_drops_then_holds_then_replays() {
-    let bus = HarnessEventBus::new();
-    let context = background_context();
+    let (bus, context) = bus_fixture();
     let entered = Arc::new(AtomicBool::new(false));
     let started = Arc::new(Notify::new());
     let marked = Arc::new(Notify::new());

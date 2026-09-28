@@ -21,54 +21,39 @@
     reason = "the boundary tests pin outcomes; a violated expectation panics the test by design"
 )]
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pi_ai::models::create_models;
 use pi_ai::utils::assistant_message_frame::AssistantMessageFrame;
 use serde_json::json;
 
-use crate::harness::agent_harness::DriveOptions;
-use crate::harness::agent_harness::DriveOutcome;
-use crate::harness::agent_harness::DriveWaitReason;
-use crate::harness::context::background_context;
-use crate::harness::context::with_abort_signal;
+use crate::harness::agent_harness::{DriveOptions, DriveOutcome, DriveWaitReason};
+use crate::harness::context::{background_context, with_abort_signal};
 use crate::harness::hooks::HookRegistry;
-use crate::harness::runtime::lane::EmitBatch;
-use crate::harness::runtime::lane::Lane;
-use crate::harness::runtime::progress::ProgressChannel;
-use crate::harness::runtime::progress::open_frame_progress;
-use crate::harness::runtime::progress::open_tool_progress;
+use crate::harness::runtime::lane::{EmitBatch, Lane};
+use crate::harness::runtime::progress::{ProgressChannel, open_frame_progress, open_tool_progress};
 use crate::harness::runtime::test_support::ControlledStorage;
 use crate::harness::runtime::test_support::commit_writes;
 use crate::harness::runtime::test_support::deferred_effect_pending;
-use crate::harness::runtime::test_support::lane_configuration;
-use crate::harness::runtime::test_support::operation_scope;
-use crate::harness::runtime::test_support::tools_batch_state;
 use crate::harness::runtime::test_support::{gate_next_commit, generation_context};
+use crate::harness::runtime::test_support::{
+    lane_configuration, operation_scope, tools_batch_state,
+};
 use crate::harness::runtime::test_support::{noop_emit_batch, noop_hook_reporter};
 use crate::harness::runtime::test_support::{passthrough_fault_handler, patch_live_state};
 use crate::harness::runtime::test_support::{runtime_config, unused_watch_installer};
-use crate::harness::runtime::types::Drive;
-use crate::harness::runtime::types::LaneState;
-use crate::harness::runtime::types::LiveOperation;
-use crate::harness::runtime::types::lane_error;
-use crate::harness::session::memory::MemoryStorage;
-use crate::harness::session::memory::MemoryStorageOptions;
+use crate::harness::runtime::types::{Drive, LaneState, LiveOperation, lane_error};
+use crate::harness::session::memory::{MemoryStorage, MemoryStorageOptions};
 use crate::harness::session::types::AssistantEffectPendingOperation;
 use crate::harness::session::types::CheckpointData;
 use crate::harness::session::types::CheckpointOperation;
 use crate::harness::session::types::Continuation;
-use crate::harness::session::types::OperationIntent;
-use crate::harness::session::types::OperationMeta;
-use crate::harness::session::types::OperationState;
-use crate::harness::session::types::SessionError;
+use crate::harness::session::types::{
+    OperationIntent, OperationMeta, OperationState, SessionError,
+};
 use crate::harness::session::values as stored_values;
-use crate::harness::session::values::StoredValue;
-use crate::harness::session::values::delete_value_write;
-use crate::harness::session::values::set_value_write;
-use crate::types::AgentToolContent;
-use crate::types::AgentToolResult;
+use crate::harness::session::values::{StoredValue, delete_value_write, set_value_write};
+use crate::types::{AgentToolContent, AgentToolResult};
 use pi_ai::types::TextContent;
 
 fn next_session_id() -> String {
@@ -153,7 +138,7 @@ async fn create_fixture(state: OperationState) -> ProgressFixture {
         projection,
         passthrough_fault_handler(),
         emit_batch,
-        unused_watch_installer(),
+        unused_watch_installer("progress"),
         Arc::new(runtime_config),
     );
     let writes = vec![
@@ -274,7 +259,7 @@ async fn strips_invocation_cancellation_from_pass_context_and_owns_policy_and_ga
     assert_eq!(drive.operation_id, "operation");
     assert!(drive.context.abort_signal().is_none());
     assert!(drive.wait_for_retry);
-    assert_eq!(drive.deferred_permits, 1);
+    assert_eq!(drive.deferred_permits.load(Ordering::SeqCst), 1);
 
     let closed = lane_error(SessionError::Message("closed".to_owned()));
     drive.close_gate(closed);
@@ -313,6 +298,46 @@ async fn enqueues_assistant_frames_in_order_seals_admission_and_drops_late_write
     assert_eq!(
         serde_json::Value::Array(read_pending_frames(&fixture).await),
         serde_json::to_value(&frames).expect("frames wire"),
+    );
+}
+
+/// The chain continues past a vanished predecessor: the vanished writer's
+/// dropped sender releases its successor's wait, upstream's
+/// `.catch(() => {})` keeping the tail alive across any failure, so the
+/// successor still commits after the vanished write.
+#[tokio::test]
+async fn a_chain_continues_past_a_vanished_predecessor() {
+    let response_entry_id = "response";
+    let fixture = create_fixture(assistant_effect_pending(response_entry_id)).await;
+    let vanishing = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&vanishing);
+    let progress = open_progress::<AssistantMessageFrame>(
+        &fixture.lane,
+        &fixture.drive,
+        Arc::new(|frame: &AssistantMessageFrame| {
+            Ok(stored_values::append_list_write(
+                &stored_values::pending_assistant_frames("operation", "response"),
+                frame.clone(),
+            )
+            .expect("frame write"))
+        }),
+        Arc::new(move |_state: &LaneState| -> bool {
+            assert_ne!(
+                counter.fetch_add(1, Ordering::SeqCst),
+                0,
+                "the first writer vanishes",
+            );
+            true
+        }),
+    );
+    progress.write(frame_delta(0, "lost"));
+    progress.write(frame_delta(0, "kept"));
+    progress.drain().await.expect("drain");
+
+    assert_eq!(
+        serde_json::Value::Array(read_pending_frames(&fixture).await),
+        serde_json::to_value(&[frame_delta(0, "kept")]).expect("frames wire"),
+        "only the surviving write committed",
     );
 }
 

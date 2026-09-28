@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::types::{
     Api, AssistantBlock, AssistantMessage, AssistantMessageEvent, CacheRetention, Context,
-    DeferredHandle, ImageContent, Message, Modality, Model, ModelCost, ProviderId,
+    DeferredHandle, DeferredRequest, ImageContent, Message, Modality, Model, ModelCost, ProviderId,
     SimpleStreamOptions, StopReason, StreamOptions, TextContent, ThinkingContent, ToolCall,
     ToolResultMessage, UserBlock, UserContent,
 };
@@ -1039,11 +1039,18 @@ impl FauxCore {
                 return Ok(());
             };
 
-            if stream_options
+            // The request's deferred flag routes truthy only, upstream's
+            // `if (streamOptions?.deferred)`: `false` opts OUT of deferred
+            // handling while `true` and the windowed object opt in, so an
+            // `Enabled(false)` request must stream its step normally.
+            let wants_deferred = stream_options
                 .as_ref()
                 .and_then(|options| options.deferred.as_ref())
-                .is_some()
-            {
+                .is_some_and(|request| match request {
+                    DeferredRequest::Enabled(enabled) => *enabled,
+                    DeferredRequest::Windowed { .. } => true,
+                });
+            if wants_deferred {
                 let mut handle = DeferredHandle {
                     provider: model.provider.0.clone(),
                     model_id: model.id.clone(),

@@ -23,40 +23,30 @@
 
 #![expect(
     clippy::expect_used,
-    reason = "the tests pin outcomes; an unexpected result panics the test by design"
-)]
-#![expect(
     clippy::panic,
-    reason = "the tests pin outcomes; a violated expectation panics the test by design"
+    reason = "the tests pin outcomes; unexpected results and violated expectations panic the test by design"
 )]
 
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::MutexGuard;
-use std::sync::PoisonError;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pi_ai::models::create_models;
-use pi_ai::providers::faux::RegisterFauxProviderOptions;
-use pi_ai::providers::faux::faux_provider;
-use pi_ai::types::BoxedFuture;
-use pi_ai::types::Message;
+use pi_ai::providers::faux::FauxAssistantMessageOptions;
+use pi_ai::providers::faux::FauxProviderHandle;
+use pi_ai::providers::faux::{RegisterFauxProviderOptions, faux_assistant_message, faux_provider};
+use pi_ai::types::{BoxedFuture, Message};
 use serde_json::json;
 
 use crate::harness::agent_harness::AgentLane;
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::HarnessEventPayload;
 use crate::harness::agent_harness::LaneOperationError;
-use crate::harness::agent_harness::OperationRequest;
-use crate::harness::agent_harness::PromptMessagesPayload;
-use crate::harness::agent_harness::QueueMessage;
-use crate::harness::context::background_context;
+use crate::harness::agent_harness::{OperationRequest, PromptMessagesPayload, QueueMessage};
+use crate::harness::context::{Context, background_context};
 use crate::harness::hooks::HookRegistry;
 use crate::harness::result::HarnessClosed;
-use crate::harness::runtime::lane::EmitBatch;
-use crate::harness::runtime::lane::Lane;
+use crate::harness::runtime::lane::AbortResult;
+use crate::harness::runtime::lane::{EmitBatch, Lane};
 use crate::harness::runtime::restore::restore_lane;
 use crate::harness::runtime::test_support::ControlledStorage;
 use crate::harness::runtime::test_support::accept_text;
@@ -74,37 +64,28 @@ use crate::harness::runtime::test_support::memory_session_with_seed;
 use crate::harness::runtime::test_support::noop_emit_batch;
 use crate::harness::runtime::test_support::noop_hook_reporter;
 use crate::harness::runtime::test_support::operation_scope;
+use crate::harness::runtime::test_support::parking_idle_callback;
 use crate::harness::runtime::test_support::passthrough_fault_handler;
 use crate::harness::runtime::test_support::patch_live_state;
 use crate::harness::runtime::test_support::recording_watch_installer;
 use crate::harness::runtime::test_support::restored_lane_with_config;
 use crate::harness::runtime::test_support::runtime_config;
 use crate::harness::runtime::test_support::runtime_session;
-use crate::harness::runtime::test_support::user_blocks_message;
-use crate::harness::runtime::test_support::user_text_message;
+use crate::harness::runtime::test_support::{stored_value, user_blocks_message, user_text_message};
 use crate::harness::runtime::types::Config;
 use crate::harness::runtime::types::ContinueOperationResult;
 use crate::harness::runtime::types::LaneCommand;
-use crate::harness::runtime::types::LaneError;
-use crate::harness::runtime::types::LanePatch;
-use crate::harness::runtime::types::LiveOperation;
-use crate::harness::runtime::types::OperationCommand;
-use crate::harness::session::memory::MemoryStorage;
-use crate::harness::session::memory::MemoryStorageOptions;
+use crate::harness::runtime::types::{LaneError, LanePatch, LiveOperation, OperationCommand};
+use crate::harness::session::memory::{MemoryStorage, MemoryStorageOptions};
 use crate::harness::session::session::StorageBackedSession;
 use crate::harness::session::types::Control;
 use crate::harness::session::types::InboxItem;
 use crate::harness::session::types::InboxItemKind;
 use crate::harness::session::types::LaneConfiguration;
-use crate::harness::session::types::ModelIdentity;
-use crate::harness::session::types::OperationScope;
-use crate::harness::session::types::Session;
-use crate::harness::session::types::SessionReader;
+use crate::harness::session::types::{ModelIdentity, OperationScope, Session, SessionReader};
 use crate::harness::session::values as stored_values;
 use crate::harness::session::values::set_value_write;
-use crate::types::AgentMessage;
-use crate::types::QueueMode;
-use crate::types::ThinkingLevel;
+use crate::types::{AgentMessage, QueueMode, ThinkingLevel};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -122,6 +103,8 @@ fn next_session_id() -> String {
 struct LaneFixture {
     lane: Lane,
     model: pi_ai::types::Model,
+    /// The faux handle the driven runs script their responses through.
+    faux: FauxProviderHandle,
     session: Arc<StorageBackedSession>,
     storage: Arc<ControlledStorage>,
 }
@@ -176,6 +159,7 @@ async fn lane_seeded_with_config(
     LaneFixture {
         lane,
         model,
+        faux,
         session,
         storage,
     }
@@ -220,14 +204,155 @@ fn set_thinking_level(
     })
 }
 
+/// The drive options one observation carries, upstream's
+/// `lane.drive({ operationId }, context)` calls' default options.
+fn drive_options(operation_id: impl Into<String>) -> DriveOptions {
+    DriveOptions {
+        operation_id: operation_id.into(),
+        wait_for_retry: None,
+        poll_deferred: None,
+    }
+}
+
+/// Spawns one drive observation over the lane, upstream's
+/// `const waiting = lane.drive(...)` promise assignments.
+fn spawn_drive(
+    lane: Lane,
+    operation_id: &str,
+    context: &Context,
+) -> tokio::task::JoinHandle<Result<DriveResult, LaneOperationError>> {
+    let operation_id = operation_id.to_owned();
+    let context = context.clone();
+    tokio::spawn(async move { lane.drive(drive_options(operation_id), &context).await })
+}
+
+/// Builds one drive pass for the operation, upstream's `new Drive(...)`
+/// fixture handles.
+fn drive_pass_for(operation_id: &str) -> Arc<Drive> {
+    Arc::new(Drive::new(
+        &drive_options(operation_id.to_owned()),
+        &background_context(),
+    ))
+}
+
+/// Drives the admitted operation and unwraps the settled outcome, the
+/// skill/template surfaces' pass; an unexpected failure panics the test
+/// by design.
+async fn drive_serves(fixture: &LaneFixture, operation_id: &str) -> DriveOutcome {
+    fixture
+        .lane
+        .drive(
+            drive_options(operation_id.to_owned()),
+            &background_context(),
+        )
+        .await
+        .expect("drive serves")
+        .expect("the drive settles")
+}
+
+/// The single text block of the user message at the entry index, the
+/// prompt-surface scans' unwrap; a non-text entry panics the test by
+/// design.
+fn user_entry_text(entries: &[crate::harness::session::types::Entry], index: usize) -> &str {
+    let crate::harness::session::types::Entry::Message { body, .. } = &entries[index] else {
+        panic!("the entry: {:?}", entries[index]);
+    };
+    let AgentMessage::Standard(Message::User(user)) = &body.message else {
+        panic!("the user message: {:?}", body.message);
+    };
+    match &user.content {
+        pi_ai::types::UserContent::Blocks(blocks) => {
+            let [pi_ai::types::UserBlock::Text(text)] = blocks.as_slice() else {
+                panic!("the single text block: {blocks:?}")
+            };
+            &text.text
+        }
+        other @ pi_ai::types::UserContent::Text(_) => panic!("the text content: {other:?}"),
+    }
+}
+
+/// The idle callback that returns immediately, upstream's
+/// `() => Promise.resolve()` callbacks.
+fn noop_callback() -> crate::harness::agent_harness::IdleCallback {
+    Arc::new(|_context| Box::pin(std::future::ready(())))
+}
+
+/// Spawns one `run_when_idle` claim over the callback, upstream's
+/// `const waiting = lane.runWhenIdle(callback)` promise assignments.
+fn spawn_idle_claim(
+    fixture: &LaneFixture,
+    callback: crate::harness::agent_harness::IdleCallback,
+) -> tokio::task::JoinHandle<Result<(), LaneOperationError>> {
+    let lane = fixture.lane.clone();
+    tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
+}
+
+/// Spawns one `wait_for_idle` observation over the fixture's lane,
+/// upstream's `const waiting = lane.waitForIdle()` promise assignments.
+fn spawn_wait_for_idle(
+    fixture: &LaneFixture,
+) -> tokio::task::JoinHandle<Result<(), LaneOperationError>> {
+    let lane = fixture.lane.clone();
+    tokio::spawn(async move { lane.wait_for_idle(&background_context()).await })
+}
+
+/// Admits the run, parks the abort's commit behind the next commit's
+/// gate, and spawns the abort, the abort-race preludes; returns the
+/// release and the abort handle.
+async fn parked_abort(
+    fixture: &LaneFixture,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<AbortResult, LaneOperationError>>,
+) {
+    accepted_operation(fixture).await;
+    let (started, release) = gate_next_commit(&fixture.storage);
+    let aborted = spawn_abort(fixture);
+    started.await.expect("the abort's commit parked");
+    (release, aborted)
+}
+
+/// Spawns the operation's finish, the settle-under races' finish handle.
+fn spawn_finish(fixture: &LaneFixture) -> tokio::task::JoinHandle<()> {
+    let lane = fixture.lane.clone();
+    tokio::spawn(async move { finish_operation(&lane).await })
+}
+
+/// Spawns one abort request over the fixture's lane, upstream's
+/// `const finishing = lane.abort()` promise assignments.
+fn spawn_abort(
+    fixture: &LaneFixture,
+) -> tokio::task::JoinHandle<Result<AbortResult, LaneOperationError>> {
+    let lane = fixture.lane.clone();
+    tokio::spawn(async move { lane.abort(&background_context()).await })
+}
+
+/// Spawns one seal over the fixture's lane, upstream's
+/// `const sealed = lane.seal(...)` promise assignments.
+fn spawn_seal(fixture: &LaneFixture, closed: LaneError) -> tokio::task::JoinHandle<()> {
+    let lane = fixture.lane.clone();
+    tokio::spawn(async move { lane.seal(closed).await })
+}
+
+/// Reads the pending-entry payload a queued steer stored, upstream's
+/// `session.getValue(storedValues.pendingEntry(...))` reads.
+async fn pending_entry_value(
+    fixture: &LaneFixture,
+    entry_id: &str,
+) -> crate::harness::session::values::StoredValue {
+    stored_value(
+        &fixture.session,
+        &stored_values::pending_entry(entry_id).address,
+        &background_context(),
+    )
+    .await
+}
+
 #[tokio::test]
 async fn reads_and_replaces_configuration_from_owned_state() {
     let fixture = create_lane().await;
     let active_tool_names = vec!["read".to_owned()];
-    let identity = ModelIdentity {
-        provider: fixture.model.provider.0.clone(),
-        model_id: fixture.model.id.clone(),
-    };
+    let identity = faux_model_identity(&fixture);
 
     fixture
         .lane
@@ -272,15 +397,12 @@ async fn reads_and_replaces_configuration_from_owned_state() {
         active_tool_names,
         "getActiveTools"
     );
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_config("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read config")
-        .expect("stored config");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_config("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored.value,
         serde_json::to_value(LaneConfiguration {
@@ -298,10 +420,7 @@ async fn derives_queued_configuration_updates_from_the_latest_committed_state() 
     let fixture = create_lane().await;
     let (started, release) = gate_next_commit(&fixture.storage);
 
-    let identity = ModelIdentity {
-        provider: fixture.model.provider.0.clone(),
-        model_id: fixture.model.id.clone(),
-    };
+    let identity = faux_model_identity(&fixture);
     let model_update = {
         let lane = fixture.lane.clone();
         let identity = identity.clone();
@@ -543,15 +662,12 @@ async fn preserves_committed_memory_when_synchronous_event_publication_fails() {
         ThinkingLevel::High,
         "the committed memory published"
     );
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_config("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read config")
-        .expect("stored config");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_config("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored
             .value
@@ -627,15 +743,12 @@ async fn publishes_memory_only_after_the_durable_commit_succeeds() {
         ThinkingLevel::High,
         "memory published after the commit"
     );
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_config("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read config")
-        .expect("stored config");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_config("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored.value.get("thinkingLevel"),
         Some(&serde_json::json!("high"))
@@ -662,15 +775,12 @@ async fn preserves_memory_when_the_durable_commit_fails() {
         ThinkingLevel::Off,
         "memory stays at the last committed state"
     );
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_config("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read config")
-        .expect("stored config");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_config("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored.value.get("thinkingLevel"),
         Some(&serde_json::json!("off"))
@@ -813,15 +923,12 @@ async fn diverts_ordinary_work_but_settles_against_latest_cancelled_control() {
     }];
     assert_eq!(settled, expected_inbox);
     assert_eq!(fixture.lane.state().inbox, expected_inbox);
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_state("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read lane state")
-        .expect("stored lane state");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_state("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored.value.get("inbox"),
         Some(&serde_json::to_value(&expected_inbox).expect("inbox wire")),
@@ -964,15 +1071,7 @@ async fn enqueue_images_on_a_text_prompt_builds_the_blocks_content() {
         .await
         .expect("enqueue serves")
         .expect("the queue result");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::pending_entry(&entry_id).address,
-            &background_context(),
-        )
-        .await
-        .expect("read pending")
-        .expect("stored pending");
+    let stored = pending_entry_value(&fixture, &entry_id).await;
     assert_eq!(
         stored.value.get("payload").expect("payload").get("content"),
         Some(&json!([
@@ -1114,14 +1213,7 @@ async fn drive_on_a_foreign_operation_reports_the_mismatch() {
     let fixture = create_lane().await;
     let result = fixture
         .lane
-        .drive(
-            DriveOptions {
-                operation_id: "absent".to_owned(),
-                wait_for_retry: None,
-                poll_deferred: None,
-            },
-            &background_context(),
-        )
+        .drive(drive_options("absent"), &background_context())
         .await
         .expect("drive serves");
     let error = result.expect_err("a foreign operation rejects");
@@ -1221,28 +1313,8 @@ async fn run_when_idle_claims_the_owner_until_the_callback_releases() {
     let fixture = create_lane().await;
     let (callback_started, started) = deferred();
     let (release, release_rx) = deferred();
-    let started_cell = Arc::new(Mutex::new(Some(callback_started)));
-    let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-    let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-        let started_cell = Arc::clone(&started_cell);
-        let release_cell = Arc::clone(&release_cell);
-        Box::pin(async move {
-            let sender = lock(&started_cell).take();
-            if let Some(sender) = sender {
-                let _ = sender.send(());
-            }
-            // The guard must drop before the await: a std MutexGuard is
-            // not Send, and the callback's future is.
-            let receiver = lock(&release_cell).take();
-            if let Some(receiver) = receiver {
-                let _ = receiver.await;
-            }
-        })
-    });
-    let idle = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-    };
+    let callback = parking_idle_callback(callback_started, release_rx);
+    let idle = spawn_idle_claim(&fixture, callback);
     started.await.expect("the callback started");
     let blocked = {
         let lane = fixture.lane.clone();
@@ -1273,13 +1345,10 @@ async fn run_when_idle_claims_the_owner_until_the_callback_releases() {
 // The runtime-surface additions: the flows the ported suite binds to the
 // landed trait surface, minus the drive child's procedure loop.
 
-use crate::harness::agent_harness::DriveOptions;
-use crate::harness::agent_harness::DriveOutcome;
+use crate::harness::agent_harness::{DriveOptions, DriveOutcome, DriveResult, RunOutcome};
 use crate::harness::runtime::types::Drive;
 use crate::harness::session::types::OperationKind;
-use crate::harness::session::types::OperationResultRecord;
-use crate::harness::session::types::PendingEntry;
-use crate::harness::session::types::TerminalStatus;
+use crate::harness::session::types::{OperationResultRecord, PendingEntry, TerminalStatus};
 
 fn settled_record(operation_id: &str, tip_id: Option<&str>) -> OperationResultRecord {
     OperationResultRecord {
@@ -1403,14 +1472,7 @@ async fn drive_returns_the_settled_record_of_a_finished_operation() {
 
     let driven = fixture
         .lane
-        .drive(
-            DriveOptions {
-                operation_id: "settled".to_owned(),
-                wait_for_retry: None,
-                poll_deferred: None,
-            },
-            &background_context(),
-        )
+        .drive(drive_options("settled"), &background_context())
         .await
         .expect("drive serves")
         .expect("the settled claim");
@@ -1428,14 +1490,7 @@ async fn drive_joins_a_settled_active_pass() {
     let fixture = create_lane().await;
     let operation_id = accepted_operation(&fixture).await;
     let joined = operation_id.clone();
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: operation_id.clone(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for(&operation_id);
     drive.settle(DriveOutcome::Settled {
         outcome: settled_record(&operation_id, None),
     });
@@ -1467,14 +1522,7 @@ async fn drive_joins_a_settled_active_pass() {
 async fn drive_joins_a_failed_active_pass() {
     let fixture = create_lane().await;
     let operation_id = accepted_operation(&fixture).await;
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: operation_id.clone(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for(&operation_id);
     let failure = commit_failure("boom");
     drive.fail(Arc::clone(&failure));
     fixture.lane.set_active_drive(Some(drive));
@@ -1506,14 +1554,7 @@ async fn drive_joins_a_failed_active_pass() {
 async fn drive_reports_an_occupied_line() {
     let fixture = create_lane().await;
     let operation_id = accepted_operation(&fixture).await;
-    let rival = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "rival".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let rival = drive_pass_for("rival");
     let failure = commit_failure("rival failed");
     rival.fail(Arc::clone(&failure));
     fixture.lane.set_active_drive(Some(rival));
@@ -1545,35 +1586,11 @@ async fn drive_reports_an_occupied_line() {
 async fn drive_reports_the_context_abort_during_the_pass() {
     let fixture = create_lane().await;
     let operation_id = accepted_operation(&fixture).await;
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: operation_id.clone(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for(&operation_id);
     fixture.lane.set_active_drive(Some(Arc::clone(&drive)));
 
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move {
-            lane.drive(
-                DriveOptions {
-                    operation_id,
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &context,
-            )
-            .await
-        })
-    };
+    let (context, controller) = cancelled_caller();
+    let waiting = spawn_drive(fixture.lane.clone(), &operation_id, &context);
     tokio::task::yield_now().await;
     controller.abort_without_reason();
     let error = waiting
@@ -1616,15 +1633,12 @@ async fn request_abort_marks_the_operation_cancel_requested() {
         ),
         "the durable state flipped to cancel_requested"
     );
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::operation_state(&operation_id).address,
-            &background_context(),
-        )
-        .await
-        .expect("read state")
-        .expect("stored state");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::operation_state(&operation_id).address,
+        &background_context(),
+    )
+    .await;
     assert!(
         stored.value.to_string().contains("cancel_requested"),
         "the durable state flipped to cancel_requested",
@@ -1748,14 +1762,7 @@ async fn request_abort_reports_the_mismatch() {
 async fn request_abort_signals_the_installed_gate() {
     let fixture = create_lane().await;
     let operation_id = accepted_operation(&fixture).await;
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: operation_id.clone(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for(&operation_id);
     fixture.lane.set_active_drive(Some(Arc::clone(&drive)));
 
     fixture
@@ -1777,10 +1784,7 @@ async fn request_abort_signals_the_installed_gate() {
 #[tokio::test]
 async fn inspect_execution_reports_the_lane_view() {
     let fixture = create_lane().await;
-    let identity = ModelIdentity {
-        provider: fixture.model.provider.0.clone(),
-        model_id: fixture.model.id.clone(),
-    };
+    let identity = faux_model_identity(&fixture);
     fixture
         .lane
         .set_model(identity.clone(), &background_context())
@@ -1838,41 +1842,98 @@ async fn inspect_execution_reports_the_lane_view() {
     );
 }
 
+/// Registers the fixture's faux model into the lane's configuration, the/// The faux model's identity, upstream's
+/// `{ provider: "faux", modelId: "faux-1" }` literal.
+fn faux_model_identity(fixture: &LaneFixture) -> ModelIdentity {
+    ModelIdentity {
+        provider: fixture.model.provider.0.clone(),
+        model_id: fixture.model.id.clone(),
+    }
+}
+
+/// The cancelled caller's context and controller, upstream's
+/// `withCancel(BACKGROUND_CONTEXT)` pairs; the case aborts at its own point.
+fn cancelled_caller() -> (Context, pi_chord::context::AbortController) {
+    let (_, controller) = pi_chord::context::with_cancel(&background_context());
+    let context = crate::harness::context::with_abort_signal(
+        controller.signal().clone(),
+        &background_context(),
+    );
+    (context, controller)
+}
+
+/// The configured model the driven runs resolve and the faux provider
+/// serves.
+async fn adopt_faux_model(fixture: &LaneFixture) {
+    fixture
+        .lane
+        .set_model(faux_model_identity(fixture), &background_context())
+        .await
+        .expect("set model serves");
+}
+
+/// The settled run the driven prompts return, the completed record's kind
+/// and status pins.
+fn assert_settled_run(outcome: RunOutcome) -> OperationResultRecord {
+    match outcome {
+        RunOutcome::Settled(record) => {
+            assert_eq!(record.kind, OperationKind::Run);
+            assert_eq!(record.status, TerminalStatus::Completed);
+            record
+        }
+        RunOutcome::Suspended(suspended) => panic!("the settled run: {suspended:?}"),
+    }
+}
+
 #[tokio::test]
-async fn prompt_text_faults_at_the_staged_drive_seam() {
+async fn prompt_text_drives_the_accepted_run_to_a_settled_outcome() {
     let fixture = create_lane().await;
-    let error = fixture
+    adopt_faux_model(&fixture).await;
+    fixture.faux.set_responses([faux_assistant_message(
+        "answer",
+        FauxAssistantMessageOptions::default(),
+    )
+    .into()]);
+
+    let outcome = fixture
         .lane
         .prompt_text("hello", None, &background_context())
         .await
-        .expect_err("the staged drive seam faults the run");
-    match error {
-        LaneOperationError::Closed(reason) => {
-            assert_eq!(
-                reason.to_string(),
-                "drive operation is not implemented until its later AgentHarness slice",
-                "the staged drive seam faults the accepted run",
-            );
-        }
-    }
+        .expect("the prompt serves")
+        .expect("the run settles");
+    let record = assert_settled_run(outcome);
+    assert_eq!(
+        fixture.lane.state().tip_id.as_deref(),
+        record.tip_id.as_deref(),
+        "the settled tip rode the record",
+    );
+    assert!(
+        fixture.lane.active_drive().is_none(),
+        "the settled pass cleared its owner",
+    );
 }
 
 #[tokio::test]
 async fn prompt_messages_accepts_prebuilt_payloads() {
     let fixture = create_lane().await;
+    adopt_faux_model(&fixture).await;
+    fixture.faux.set_responses([
+        faux_assistant_message("one", FauxAssistantMessageOptions::default()).into(),
+        faux_assistant_message("two", FauxAssistantMessageOptions::default()).into(),
+    ]);
+
     let single = fixture
         .lane
         .prompt_messages(
             PromptMessagesPayload::Message(Box::new(user_text_message("hello"))),
             &background_context(),
         )
-        .await;
-    assert!(
-        single.is_err(),
-        "the prebuilt message runs to the staged drive seam",
-    );
-    // The faulted run's operation stays admitted; the next prompt is busy.
-    let busy = fixture
+        .await
+        .expect("prompt serves")
+        .expect("the run settles");
+    assert_settled_run(single);
+
+    let listed = fixture
         .lane
         .prompt_messages(
             PromptMessagesPayload::Messages(vec![
@@ -1882,33 +1943,36 @@ async fn prompt_messages_accepts_prebuilt_payloads() {
             &background_context(),
         )
         .await
-        .expect("prompt serves");
-    assert_eq!(
-        busy.expect_err("the busy lane rejects").tag(),
-        "LaneBusy",
-        "the message list runs against the still-admitted operation",
-    );
+        .expect("prompt serves")
+        .expect("the run settles");
+    assert_settled_run(listed);
 }
 
 #[tokio::test]
 async fn prompt_text_builds_blocks_from_images() {
     let fixture = create_lane().await;
-    let error = fixture
+    adopt_faux_model(&fixture).await;
+    fixture.faux.set_responses([faux_assistant_message(
+        "answer",
+        FauxAssistantMessageOptions::default(),
+    )
+    .into()]);
+
+    let outcome = fixture
         .lane
         .prompt_text(
             "hello",
             Some(vec![image_content("first")]),
             &background_context(),
         )
-        .await;
-    assert!(
-        error.is_err(),
-        "the image prompt runs to the staged drive seam"
-    );
+        .await
+        .expect("the prompt serves")
+        .expect("the run settles");
+    assert_settled_run(outcome);
     let entries = AgentLane::find_entries(&fixture.lane, None, &background_context())
         .await
         .expect("the scan");
-    match &entries[0] {
+    match &entries[1] {
         crate::harness::session::types::Entry::Message { body, .. } => match &body.message {
             AgentMessage::Standard(Message::User(user)) => match &user.content {
                 pi_ai::types::UserContent::Blocks(blocks) => {
@@ -1936,8 +2000,8 @@ async fn skill_reports_unknown_skills() {
     assert_eq!(error.tag(), "UnknownSkill");
 }
 
-/// The seeded lane over one resource-configured runtime, the staged-seam
-/// invocation tests' fixture.
+/// The seeded lane over one resource-configured runtime, the invocation
+/// tests' fixture.
 async fn seeded_lane_with_config(config: Config) -> Lane {
     let configuration = lane_configuration();
     let session = memory_session_with_seed(None).await;
@@ -1948,6 +2012,24 @@ async fn seeded_lane_with_config(config: Config) -> Lane {
         Arc::new(move || config.clone()),
     )
     .await
+}
+
+/// Registers the faux provider into the lane's own catalog and adopts its
+/// model, the driven invocations the seeded lane resolves.
+async fn drive_through_faux(lane: &Lane, responses: &[pi_ai::types::AssistantMessage]) {
+    let faux = faux_provider(RegisterFauxProviderOptions::default());
+    lane.models().set_provider(Arc::new(faux.provider.clone()));
+    let model = faux.first_model();
+    lane.set_model(
+        ModelIdentity {
+            provider: model.provider.0.clone(),
+            model_id: model.id.clone(),
+        },
+        &background_context(),
+    )
+    .await
+    .expect("set model serves");
+    faux.set_responses(responses.iter().cloned().map(Into::into));
 }
 
 #[tokio::test]
@@ -1961,33 +2043,28 @@ async fn skill_formats_a_known_invocation() {
         disable_model_invocation: None,
     }];
     let lane = seeded_lane_with_config(config).await;
-    let result = lane
+    drive_through_faux(
+        &lane,
+        &[faux_assistant_message(
+            "answer",
+            FauxAssistantMessageOptions::default(),
+        )],
+    )
+    .await;
+    let outcome = lane
         .skill("greet", Some("be kind".to_owned()), &background_context())
-        .await;
-    assert!(
-        result.is_err(),
-        "the known skill runs to the staged drive seam"
-    );
+        .await
+        .expect("skill serves")
+        .expect("the run settles");
+    assert_settled_run(outcome);
     let entries = AgentLane::find_entries(&lane, None, &background_context())
         .await
         .expect("the scan");
-    match &entries[0] {
-        crate::harness::session::types::Entry::Message { body, .. } => match &body.message {
-            AgentMessage::Standard(Message::User(user)) => match &user.content {
-                pi_ai::types::UserContent::Text(text) => {
-                    assert!(
-                        text.contains("Hello!") && text.contains("be kind"),
-                        "the invocation carries the skill and the instructions: {text}",
-                    );
-                }
-                other @ pi_ai::types::UserContent::Blocks(_) => {
-                    panic!("the blocks content: {other:?}")
-                }
-            },
-            other => panic!("the user message: {other:?}"),
-        },
-        other => panic!("the entry: {other:?}"),
-    }
+    let text = user_entry_text(&entries, 1);
+    assert!(
+        text.contains("Hello!") && text.contains("be kind"),
+        "the invocation carries the skill and the instructions: {text}",
+    );
 }
 
 #[tokio::test]
@@ -2011,77 +2088,71 @@ async fn prompt_from_template_formats_known_templates() {
         content: "Args: $1?".to_owned(),
     }];
     let lane = seeded_lane_with_config(config).await;
-    let result = lane
+    drive_through_faux(
+        &lane,
+        &[faux_assistant_message(
+            "answer",
+            FauxAssistantMessageOptions::default(),
+        )],
+    )
+    .await;
+    let outcome = lane
         .prompt_from_template(
             "greet",
             Some(vec!["world".to_owned()]),
             &background_context(),
         )
-        .await;
-    assert!(
-        result.is_err(),
-        "the known template runs to the staged drive seam"
-    );
+        .await
+        .expect("template serves")
+        .expect("the run settles");
+    assert_settled_run(outcome);
     let entries = AgentLane::find_entries(&lane, None, &background_context())
         .await
         .expect("the scan");
-    match &entries[0] {
-        crate::harness::session::types::Entry::Message { body, .. } => match &body.message {
-            AgentMessage::Standard(Message::User(user)) => match &user.content {
-                pi_ai::types::UserContent::Text(text) => {
-                    assert_eq!(
-                        text, "Args: world?",
-                        "the invocation carries the formatted args: {text}",
-                    );
-                }
-                other @ pi_ai::types::UserContent::Blocks(_) => {
-                    panic!("the blocks content: {other:?}")
-                }
-            },
-            other => panic!("the user message: {other:?}"),
-        },
-        other => panic!("the entry: {other:?}"),
-    }
+    let text = user_entry_text(&entries, 1);
+    assert_eq!(
+        text, "Args: world?",
+        "the invocation carries the formatted args: {text}",
+    );
 }
 
 #[tokio::test]
-async fn resume_drives_the_active_operation_to_the_staged_seam() {
+async fn resume_drives_the_active_operation_to_a_settled_outcome() {
     let fixture = create_lane().await;
+    adopt_faux_model(&fixture).await;
+    fixture.faux.set_responses([faux_assistant_message(
+        "answer",
+        FauxAssistantMessageOptions::default(),
+    )
+    .into()]);
     accepted_operation(&fixture).await;
-    let error = fixture
+
+    let outcome = fixture
         .lane
         .resume(&background_context())
         .await
-        .expect_err("the staged drive seam faults the resume");
-    match error {
-        LaneOperationError::Closed(reason) => {
-            assert_eq!(
-                reason.to_string(),
-                "drive operation is not implemented until its later AgentHarness slice",
-                "the staged drive seam faults the resume",
-            );
-        }
-    }
+        .expect("resume serves")
+        .expect("the run settles");
+    assert_settled_run(outcome);
+    assert!(
+        fixture.lane.active_drive().is_none(),
+        "the settled pass cleared its owner",
+    );
 }
 
 #[tokio::test]
-async fn abort_requests_cancellation_then_faults_at_the_staged_seam() {
+async fn abort_requests_cancellation_then_settles_the_aborted_run() {
     let fixture = create_lane().await;
-    let _operation_id = accepted_operation(&fixture).await;
-    let error = fixture
+    let operation_id = accepted_operation(&fixture).await;
+    // The request and the drive split, upstream's abort composing both: the
+    // flip assertion reads the leaf between them.
+    let requested = fixture
         .lane
-        .abort(&background_context())
+        .request_abort(&operation_id, &background_context())
         .await
-        .expect_err("the staged drive seam faults the abort");
-    match error {
-        LaneOperationError::Closed(reason) => {
-            assert_eq!(
-                reason.to_string(),
-                "drive operation is not implemented until its later AgentHarness slice",
-                "the staged drive seam faults the cancelled drive",
-            );
-        }
-    }
+        .expect("abort serves")
+        .expect("the request");
+    assert!(requested.newly_requested, "the request flips cancellation");
     let state = fixture.lane.state().operation.expect("the operation").state;
     assert!(
         matches!(
@@ -2090,6 +2161,22 @@ async fn abort_requests_cancellation_then_faults_at_the_staged_seam() {
                 if matches!(leaf.scope.control, Control::CancelRequested { .. })
         ),
         "the durable state flipped to cancel_requested"
+    );
+
+    let aborted = fixture
+        .lane
+        .abort(&background_context())
+        .await
+        .expect("abort serves")
+        .expect("the abort settles");
+    assert_eq!(aborted.operation_id, operation_id);
+    assert!(
+        aborted.steer.is_empty() && aborted.follow_up.is_empty(),
+        "the run carried no abortable input",
+    );
+    assert!(
+        fixture.lane.state().operation.is_none(),
+        "the aborted operation cleared",
     );
 }
 
@@ -2107,15 +2194,7 @@ async fn steer_queues_a_stopped_assistant_message() {
         .await
         .expect("steer serves")
         .expect("the steer");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::pending_entry(&entry_id).address,
-            &background_context(),
-        )
-        .await
-        .expect("read pending")
-        .expect("stored pending");
+    let stored = pending_entry_value(&fixture, &entry_id).await;
     assert_eq!(
         stored.value.get("payload").expect("payload"),
         &serde_json::to_value(&assistant).expect("assistant wire"),
@@ -2158,15 +2237,7 @@ async fn steer_merges_images_into_a_prebuilt_user_message() {
         .await
         .expect("steer serves")
         .expect("the steer");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::pending_entry(&entry_id).address,
-            &background_context(),
-        )
-        .await
-        .expect("read pending")
-        .expect("stored pending");
+    let stored = pending_entry_value(&fixture, &entry_id).await;
     assert_eq!(
         stored.value.get("payload").expect("payload").get("content"),
         Some(&json!([
@@ -2330,10 +2401,7 @@ async fn find_entries_scan_from_the_tip_and_get_result_reads_records() {
 async fn wait_for_idle_wakes_on_state_changes_until_the_lane_idles() {
     let fixture = create_lane().await;
     accepted_operation(&fixture).await;
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.wait_for_idle(&background_context()).await })
-    };
+    let waiting = spawn_wait_for_idle(&fixture);
     tokio::task::yield_now().await;
     assert!(
         !waiting.is_finished(),
@@ -2368,11 +2436,7 @@ async fn wait_for_idle_wakes_on_state_changes_until_the_lane_idles() {
 async fn wait_for_idle_aborts_with_the_context_reason() {
     let fixture = create_lane().await;
     accepted_operation(&fixture).await;
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
+    let (context, controller) = cancelled_caller();
     let waiting = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.wait_for_idle(&context).await })
@@ -2396,11 +2460,7 @@ async fn wait_for_idle_aborts_with_the_context_reason() {
     // A caller-supplied abort reason rides the wait's rejection.
     let fixture = create_lane().await;
     accepted_operation(&fixture).await;
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
+    let (context, controller) = cancelled_caller();
     let waiting = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.wait_for_idle(&context).await })
@@ -2422,12 +2482,8 @@ async fn wait_for_idle_aborts_with_the_context_reason() {
 async fn run_when_idle_waits_for_the_operation_to_finish() {
     let fixture = create_lane().await;
     accepted_operation(&fixture).await;
-    let callback: crate::harness::agent_harness::IdleCallback =
-        Arc::new(|_context| Box::pin(std::future::ready(())));
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-    };
+    let callback = noop_callback();
+    let waiting = spawn_idle_claim(&fixture, callback);
     tokio::task::yield_now().await;
     assert!(
         !waiting.is_finished(),
@@ -2450,13 +2506,8 @@ async fn run_when_idle_waits_for_the_operation_to_finish() {
 async fn run_when_idle_aborts_while_waiting() {
     let fixture = create_lane().await;
     accepted_operation(&fixture).await;
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
-    let callback: crate::harness::agent_harness::IdleCallback =
-        Arc::new(|_context| Box::pin(std::future::ready(())));
+    let (context, controller) = cancelled_caller();
+    let callback = noop_callback();
     let waiting = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.run_when_idle(callback, &context).await })
@@ -2479,35 +2530,11 @@ async fn commands_abort_while_waiting_for_the_idle_owner() {
     let fixture = create_lane().await;
     let (callback_started, started) = deferred();
     let (release, release_rx) = deferred();
-    let started_cell = Arc::new(Mutex::new(Some(callback_started)));
-    let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-    let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-        let started_cell = Arc::clone(&started_cell);
-        let release_cell = Arc::clone(&release_cell);
-        Box::pin(async move {
-            let sender = lock(&started_cell).take();
-            if let Some(sender) = sender {
-                let _ = sender.send(());
-            }
-            // The guard must drop before the await: a std MutexGuard is
-            // not Send, and the callback's future is.
-            let receiver = lock(&release_cell).take();
-            if let Some(receiver) = receiver {
-                let _ = receiver.await;
-            }
-        })
-    });
-    let idle = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-    };
+    let callback = parking_idle_callback(callback_started, release_rx);
+    let idle = spawn_idle_claim(&fixture, callback);
     started.await.expect("the callback claimed the idle slot");
 
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
+    let (context, controller) = cancelled_caller();
     let blocked = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.set_thinking_level(ThinkingLevel::High, &context).await })
@@ -2535,21 +2562,39 @@ async fn commands_abort_while_waiting_for_the_idle_owner() {
 }
 
 #[tokio::test]
-async fn compact_and_navigate_raise_the_staged_seams_through_the_trait() {
+async fn compact_composes_acceptance_with_drive_and_navigate_rejects_an_unknown_target() {
     let fixture = create_lane().await;
-    let error = fixture
+    adopt_faux_model(&fixture).await;
+    fixture.faux.set_responses([faux_assistant_message(
+        "summary",
+        FauxAssistantMessageOptions::default(),
+    )
+    .into()]);
+    AgentLane::append_message(
+        &fixture.lane,
+        user_text_message("history"),
+        &background_context(),
+    )
+    .await
+    .expect("append serves");
+
+    let outcome = fixture
         .lane
         .compact(None, &background_context())
         .await
-        .expect_err("the staged compaction seam faults the compact");
-    match error {
-        LaneOperationError::Closed(reason) => {
-            assert_eq!(
-                reason.to_string(),
-                "compaction is not implemented until its later AgentHarness slice",
-            );
-        }
-    }
+        .expect("compact serves")
+        .expect("the compaction settles");
+    assert_eq!(outcome.compaction.kind, OperationKind::Compaction);
+    assert_eq!(outcome.compaction.status, TerminalStatus::Completed);
+    assert!(
+        outcome.run.is_none(),
+        "the empty lane queues no follow-up run",
+    );
+    assert_eq!(
+        fixture.faux.state().call_count(),
+        1,
+        "the summary ran through the faux provider",
+    );
 
     let error = fixture
         .lane
@@ -2619,21 +2664,21 @@ async fn navigation_admits_against_a_known_target_and_validates_its_shapes() {
         "UnknownTarget",
     );
 
-    // A known non-tip target admits; the operation starts and the staged
-    // drive seam faults the navigation.
-    let error = fixture
+    // A known non-tip target admits; the real drive settles the navigation
+    // and moves the tip.
+    let admitted = fixture
         .lane
-        .navigate_tree(Some(first.clone()), None, &background_context())
+        .accept(
+            OperationRequest::Navigation {
+                operation_id: Some("navigation".to_owned()),
+                target_id: Some(first.clone()),
+                options: None,
+            },
+            &background_context(),
+        )
         .await
-        .expect_err("the staged drive seam faults the navigation");
-    match error {
-        LaneOperationError::Closed(reason) => {
-            assert_eq!(
-                reason.to_string(),
-                "drive operation is not implemented until its later AgentHarness slice",
-            );
-        }
-    }
+        .expect("accept serves")
+        .expect("the admission");
     let operation = fixture.lane.state().operation.expect("the navigation");
     match &operation.state {
         crate::harness::session::types::OperationState::NavigationReadyToCommit(leaf) => {
@@ -2642,6 +2687,25 @@ async fn navigation_admits_against_a_known_target_and_validates_its_shapes() {
         }
         other => panic!("the navigation state: {other:?}"),
     }
+    let driven = drive_serves(&fixture, &admitted.operation_id).await;
+    match driven {
+        DriveOutcome::Settled { outcome } => {
+            assert_eq!(outcome.kind, OperationKind::Navigation);
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+            assert_eq!(outcome.tip_id.as_deref(), Some(first.as_str()));
+            assert_eq!(outcome.from_tip_id.as_deref(), Some(second.as_str()));
+        }
+        other @ DriveOutcome::Waiting { .. } => panic!("the navigation drive: {other:?}"),
+    }
+    assert!(
+        fixture.lane.state().operation.is_none(),
+        "the completed navigation cleared its operation",
+    );
+    assert_eq!(
+        fixture.lane.state().tip_id.as_deref(),
+        Some(first.as_str()),
+        "the tip moved to the target",
+    );
 }
 
 #[tokio::test]
@@ -2668,14 +2732,7 @@ async fn sealed_lanes_reject_their_surfaces_with_the_collapsed_closed_error() {
     for rejection in [
         fixture
             .lane
-            .drive(
-                DriveOptions {
-                    operation_id: "any".to_owned(),
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &background_context(),
-            )
+            .drive(drive_options("any"), &background_context())
             .await
             .expect("drive serves")
             .expect_err("the sealed drive rejects"),
@@ -2812,19 +2869,9 @@ async fn wait_for_idle_joins_the_installed_drive_pass() {
     // The pass settles while the wait holds it; the owner then clears the
     // pass, the real procedure's post-settlement cleanup, and the wait idles.
     let fixture = create_lane().await;
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "drive".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for("drive");
     fixture.lane.set_active_drive(Some(Arc::clone(&drive)));
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.wait_for_idle(&background_context()).await })
-    };
+    let waiting = spawn_wait_for_idle(&fixture);
     tokio::task::yield_now().await;
     drive.settle(DriveOutcome::Settled {
         outcome: settled_record("drive", None),
@@ -2836,19 +2883,9 @@ async fn wait_for_idle_joins_the_installed_drive_pass() {
         .expect("the settled pass freed the wait");
 
     // A failed pass frees the wait the same way.
-    let failed = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "drive".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let failed = drive_pass_for("drive");
     fixture.lane.set_active_drive(Some(Arc::clone(&failed)));
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.wait_for_idle(&background_context()).await })
-    };
+    let waiting = spawn_wait_for_idle(&fixture);
     tokio::task::yield_now().await;
     failed.fail(commit_failure("boom"));
     fixture.lane.set_active_drive(None);
@@ -2861,21 +2898,10 @@ async fn wait_for_idle_joins_the_installed_drive_pass() {
 #[tokio::test]
 async fn run_when_idle_joins_the_installed_drive_pass() {
     let fixture = create_lane().await;
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "drive".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for("drive");
     fixture.lane.set_active_drive(Some(Arc::clone(&drive)));
-    let callback: crate::harness::agent_harness::IdleCallback =
-        Arc::new(|_context| Box::pin(std::future::ready(())));
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-    };
+    let callback = noop_callback();
+    let waiting = spawn_idle_claim(&fixture, callback);
     tokio::task::yield_now().await;
     drive.settle(DriveOutcome::Settled {
         outcome: settled_record("drive", None),
@@ -3306,15 +3332,7 @@ async fn follow_up_names_its_queue_in_the_rejections() {
         .await
         .expect("followUp serves")
         .expect("the follow-up");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::pending_entry(&entry_id).address,
-            &background_context(),
-        )
-        .await
-        .expect("read pending")
-        .expect("stored pending");
+    let stored = pending_entry_value(&fixture, &entry_id).await;
     assert_eq!(
         stored.value.get("payload").expect("payload").get("content"),
         Some(&json!([{ "type": "image", "mimeType": "image/png", "data": "first" }])),
@@ -3410,14 +3428,7 @@ async fn drive_faults_on_a_malformed_settled_record() {
     let message = closed_message(
         fixture
             .lane
-            .drive(
-                DriveOptions {
-                    operation_id: "broken".to_owned(),
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &background_context(),
-            )
+            .drive(drive_options("broken"), &background_context())
             .await
             .expect_err("the malformed record faults the drive"),
     );
@@ -3433,14 +3444,7 @@ async fn drive_reports_the_mismatch_against_the_live_operation() {
     accepted_operation(&fixture).await;
     let error = fixture
         .lane
-        .drive(
-            DriveOptions {
-                operation_id: "foreign".to_owned(),
-                wait_for_retry: None,
-                poll_deferred: None,
-            },
-            &background_context(),
-        )
+        .drive(drive_options("foreign"), &background_context())
         .await
         .expect("drive serves")
         .expect_err("the foreign id rejects");
@@ -3563,15 +3567,19 @@ async fn navigation_reports_its_kind_through_the_inspection() {
         .append_message(user_text_message("head"), &background_context())
         .await
         .expect("append serves");
-    let error = fixture
+    let admitted = fixture
         .lane
-        .navigate_tree(Some(first), None, &background_context())
+        .accept(
+            OperationRequest::Navigation {
+                operation_id: None,
+                target_id: Some(first.clone()),
+                options: None,
+            },
+            &background_context(),
+        )
         .await
-        .expect_err("the staged drive seam faults the navigation");
-    assert_eq!(
-        closed_message(error),
-        "drive operation is not implemented until its later AgentHarness slice",
-    );
+        .expect("accept serves")
+        .expect("the admission");
     let info = fixture
         .lane
         .inspect_execution(&background_context())
@@ -3582,6 +3590,15 @@ async fn navigation_reports_its_kind_through_the_inspection() {
         OperationKind::Navigation,
         "the navigation's kind rides the inspection",
     );
+
+    let driven = drive_serves(&fixture, &admitted.operation_id).await;
+    match driven {
+        DriveOutcome::Settled { outcome } => {
+            assert_eq!(outcome.kind, OperationKind::Navigation);
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+        }
+        other @ DriveOutcome::Waiting { .. } => panic!("the navigation drive: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -3622,37 +3639,12 @@ async fn seal_closes_the_installed_drive_and_waits_out_the_idle_owner() {
     let fixture = create_lane().await;
     let (callback_started, started) = deferred();
     let (release, release_rx) = deferred();
-    let started_cell = Arc::new(Mutex::new(Some(callback_started)));
-    let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-    let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-        let started_cell = Arc::clone(&started_cell);
-        let release_cell = Arc::clone(&release_cell);
-        Box::pin(async move {
-            let sender = lock(&started_cell).take();
-            if let Some(sender) = sender {
-                let _ = sender.send(());
-            }
-            let receiver = lock(&release_cell).take();
-            if let Some(receiver) = receiver {
-                let _ = receiver.await;
-            }
-        })
-    });
-    let idle = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-    };
+    let callback = parking_idle_callback(callback_started, release_rx);
+    let idle = spawn_idle_claim(&fixture, callback);
     started.await.expect("the callback claimed the idle slot");
     // The drive installs while the idle callback holds the lane; the seal
     // closes both.
-    let drive = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "drive".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let drive = drive_pass_for("drive");
     fixture.lane.set_active_drive(Some(Arc::clone(&drive)));
 
     let sealed = {
@@ -3797,14 +3789,7 @@ async fn fault_sealed_lanes_reject_every_surface_at_the_open_asserts() {
     expect_fault_sealed(
         fixture
             .lane
-            .drive(
-                DriveOptions {
-                    operation_id: "any".to_owned(),
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &background_context(),
-            )
+            .drive(drive_options("any"), &background_context())
             .await,
     );
     expect_fault_sealed(
@@ -3860,8 +3845,7 @@ async fn fault_sealed_lanes_reject_every_surface_at_the_open_asserts() {
     assert_eq!(usage_error.tag(), "Closed");
     assert_eq!(usage_error.message(), "harness faulted");
     expect_fault_sealed(fixture.lane.wait_for_idle(&background_context()).await);
-    let idle: crate::harness::agent_harness::IdleCallback =
-        Arc::new(|_context| Box::pin(std::future::ready(())));
+    let idle = noop_callback();
     expect_fault_sealed(
         fixture
             .lane
@@ -3925,20 +3909,13 @@ async fn work_queued_open_fault_seals_through_the_callback_asserts() {
     parked.await.expect("the line parked");
 
     let leveled = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
-    let aborted = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.abort(&background_context()).await })
-    };
+    let aborted = spawn_abort(&fixture);
     let resumed = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.resume(&background_context()).await })
     };
-    let idle_wait = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.wait_for_idle(&background_context()).await })
-    };
-    let idle: crate::harness::agent_harness::IdleCallback =
-        Arc::new(|_context| Box::pin(std::future::ready(())));
+    let idle_wait = spawn_wait_for_idle(&fixture);
+    let idle = noop_callback();
     let idle_claim = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.run_when_idle(idle, &background_context()).await })
@@ -4020,22 +3997,25 @@ async fn gated_idle_claim(
     tokio::task::JoinHandle<Result<(), LaneOperationError>>,
 ) {
     let (release, release_rx) = deferred();
-    let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-    let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-        let release_cell = Arc::clone(&release_cell);
-        Box::pin(async move {
-            let receiver = lock(&release_cell).take();
-            if let Some(receiver) = receiver {
-                let _ = receiver.await;
-            }
-        })
-    });
-    let idle = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-    };
+    let callback = crate::harness::runtime::test_support::release_idle_callback(release_rx);
+    let idle = spawn_idle_claim(fixture, callback);
     tokio::task::yield_now().await;
     tokio::task::yield_now().await;
+    (release, idle)
+}
+
+/// Spawns the idle claim whose callback parks on the release gate, the
+/// sequencing fixtures' claim; the release opens the parked callback.
+/// Returns `(release, idle)`.
+fn release_gated_idle_claim(
+    fixture: &LaneFixture,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<Result<(), LaneOperationError>>,
+) {
+    let (release, release_rx) = deferred();
+    let callback = crate::harness::runtime::test_support::release_idle_callback(release_rx);
+    let idle = spawn_idle_claim(fixture, callback);
     (release, idle)
 }
 
@@ -4054,10 +4034,7 @@ async fn the_command_waiting_out_the_idle_owner_faults_when_sealed() {
     );
 
     let closed: LaneError = Arc::new(HarnessClosed);
-    let sealed = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.seal(closed).await })
-    };
+    let sealed = spawn_seal(&fixture, closed);
     tokio::task::yield_now().await;
     let _ = release.send(());
     sealed.await.expect("seal join");
@@ -4084,26 +4061,7 @@ async fn the_idle_blocked_command_requeues_after_the_owner_releases() {
     let (parked, release) = park_mutation_line(&fixture.session);
     parked.await.expect("the line parked");
 
-    let (callback_release, idle) = {
-        // The claim command queues behind the parked job; the callback's
-        // own park gate opens after the claim.
-        let (release, release_rx) = deferred();
-        let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-        let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-            let release_cell = Arc::clone(&release_cell);
-            Box::pin(async move {
-                let receiver = lock(&release_cell).take();
-                if let Some(receiver) = receiver {
-                    let _ = receiver.await;
-                }
-            })
-        });
-        let idle = {
-            let lane = fixture.lane.clone();
-            tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-        };
-        (release, idle)
-    };
+    let (callback_release, idle) = release_gated_idle_claim(&fixture);
     let blocked = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
     tokio::task::yield_now().await;
 
@@ -4206,14 +4164,7 @@ async fn the_drive_claim_read_failure_faults_the_harness() {
     let message = closed_message(
         fixture
             .lane
-            .drive(
-                DriveOptions {
-                    operation_id: "absent".to_owned(),
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &background_context(),
-            )
+            .drive(drive_options("absent"), &background_context())
             .await
             .expect_err("the settled-record read faults the drive"),
     );
@@ -4355,15 +4306,12 @@ async fn the_cancel_queued_reads_fault_and_the_run_carries_the_operation() {
         .cancel_queued(&steer, &background_context())
         .await
         .expect("cancel serves");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_state("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read lane state")
-        .expect("stored lane state");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_state("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored.value.get("currentOperationId"),
         Some(&serde_json::to_value(&operation_id).expect("id wire")),
@@ -4521,10 +4469,7 @@ async fn the_abort_request_faults_when_the_lane_seals_under_it() {
     let (parked, release) = park_mutation_line(&fixture.session);
     parked.await.expect("the line parked");
 
-    let aborted = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.abort(&background_context()).await })
-    };
+    let aborted = spawn_abort(&fixture);
     // The second parked job holds the line again once the read ran; the
     // abort's request command queues behind it and the fault-seal lands
     // before its callback starts.
@@ -4556,14 +4501,8 @@ async fn the_abort_reports_the_inspected_operation_no_longer_active() {
     let (parked, release) = park_mutation_line(&fixture.session);
     parked.await.expect("the line parked");
 
-    let aborted = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.abort(&background_context()).await })
-    };
-    let finishing = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { finish_operation(&lane).await })
-    };
+    let aborted = spawn_abort(&fixture);
+    let finishing = spawn_finish(&fixture);
     tokio::task::yield_now().await;
 
     // The read captures the live id, the finish clears the operation, and
@@ -4586,18 +4525,8 @@ async fn the_abort_reports_the_inspected_operation_no_longer_active() {
 #[tokio::test]
 async fn the_aborted_operation_settling_under_the_abort_serves() {
     let fixture = create_lane().await;
-    accepted_operation(&fixture).await;
-    let (started, release) = gate_next_commit(&fixture.storage);
-
-    let aborted = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.abort(&background_context()).await })
-    };
-    started.await.expect("the abort's commit parked");
-    let finishing = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { finish_operation(&lane).await })
-    };
+    let (release, aborted) = parked_abort(&fixture).await;
+    let finishing = spawn_finish(&fixture);
     tokio::task::yield_now().await;
 
     let _ = release.send(());
@@ -4620,14 +4549,7 @@ async fn the_aborted_operation_settling_under_the_abort_serves() {
 #[tokio::test]
 async fn the_cancelled_operation_losing_its_lane_faults_the_abort() {
     let fixture = create_lane().await;
-    accepted_operation(&fixture).await;
-    let (started, release) = gate_next_commit(&fixture.storage);
-
-    let aborted = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.abort(&background_context()).await })
-    };
-    started.await.expect("the abort's commit parked");
+    let (release, aborted) = parked_abort(&fixture).await;
     let clearing = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { clear_operation_without_result(&lane).await })
@@ -4659,10 +4581,7 @@ async fn the_resume_settles_when_the_operation_settles_under_it() {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.resume(&background_context()).await })
     };
-    let finishing = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { finish_operation(&lane).await })
-    };
+    let finishing = spawn_finish(&fixture);
     tokio::task::yield_now().await;
 
     let _ = release.send(());
@@ -4670,7 +4589,7 @@ async fn the_resume_settles_when_the_operation_settles_under_it() {
     let resumed = resumed.await.expect("resume join").expect("resume serves");
     let outcome = resumed.expect("the settled resume serves");
     match outcome {
-        crate::harness::agent_harness::RunOutcome::Settled(record) => {
+        RunOutcome::Settled(record) => {
             assert_eq!(
                 record.operation_id,
                 fixture
@@ -4682,7 +4601,7 @@ async fn the_resume_settles_when_the_operation_settles_under_it() {
                 "the settled resume carried the settled record",
             );
         }
-        other @ crate::harness::agent_harness::RunOutcome::Suspended(_) => {
+        other @ RunOutcome::Suspended(_) => {
             panic!("the resume: {other:?}")
         }
     }
@@ -4730,24 +4649,7 @@ async fn the_idle_blocked_command_faults_when_sealed_under_it() {
     let (parked, release) = park_mutation_line(&fixture.session);
     parked.await.expect("the line parked");
 
-    let (callback_release, idle) = {
-        let (release, release_rx) = deferred();
-        let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-        let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-            let release_cell = Arc::clone(&release_cell);
-            Box::pin(async move {
-                let receiver = lock(&release_cell).take();
-                if let Some(receiver) = receiver {
-                    let _ = receiver.await;
-                }
-            })
-        });
-        let idle = {
-            let lane = fixture.lane.clone();
-            tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-        };
-        (release, idle)
-    };
+    let (callback_release, idle) = release_gated_idle_claim(&fixture);
     let blocked = tokio::spawn(set_thinking_level(&fixture.lane, ThinkingLevel::High, None));
     tokio::task::yield_now().await;
     let _ = release.send(()); // frees the line: the claim runs, the callback parks
@@ -4759,10 +4661,7 @@ async fn the_idle_blocked_command_faults_when_sealed_under_it() {
     );
 
     let closed: LaneError = Arc::new(HarnessClosed);
-    let sealed = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.seal(closed).await })
-    };
+    let sealed = spawn_seal(&fixture, closed);
     let _ = callback_release.send(());
     sealed.await.expect("seal join");
     idle.await
@@ -4787,29 +4686,8 @@ async fn the_idle_blocked_command_aborts_with_the_context_reason() {
     let (parked, release) = park_mutation_line(&fixture.session);
     parked.await.expect("the line parked");
 
-    let (callback_release, idle) = {
-        let (release, release_rx) = deferred();
-        let release_cell = Arc::new(Mutex::new(Some(release_rx)));
-        let callback: crate::harness::agent_harness::IdleCallback = Arc::new(move |_context| {
-            let release_cell = Arc::clone(&release_cell);
-            Box::pin(async move {
-                let receiver = lock(&release_cell).take();
-                if let Some(receiver) = receiver {
-                    let _ = receiver.await;
-                }
-            })
-        });
-        let idle = {
-            let lane = fixture.lane.clone();
-            tokio::spawn(async move { lane.run_when_idle(callback, &background_context()).await })
-        };
-        (release, idle)
-    };
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
+    let (callback_release, idle) = release_gated_idle_claim(&fixture);
+    let (context, controller) = cancelled_caller();
     let blocked = {
         let lane = fixture.lane.clone();
         tokio::spawn(async move { lane.set_thinking_level(ThinkingLevel::High, &context).await })
@@ -4879,15 +4757,7 @@ async fn the_enqueued_message_content_shapes() {
         .await
         .expect("steer serves")
         .expect("the steer");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::pending_entry(&image_only).address,
-            &background_context(),
-        )
-        .await
-        .expect("read pending")
-        .expect("stored pending");
+    let stored = pending_entry_value(&fixture, &image_only).await;
     assert_eq!(
         stored.value.get("payload").expect("payload").get("content"),
         Some(&json!([{ "type": "image", "mimeType": "image/png", "data": "first" }])),
@@ -4914,15 +4784,7 @@ async fn the_enqueued_message_content_shapes() {
         .await
         .expect("steer serves")
         .expect("the steer");
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::pending_entry(&merged).address,
-            &background_context(),
-        )
-        .await
-        .expect("read pending")
-        .expect("stored pending");
+    let stored = pending_entry_value(&fixture, &merged).await;
     assert_eq!(
         stored.value.get("payload").expect("payload").get("content"),
         Some(&json!([
@@ -5000,25 +4862,29 @@ async fn the_acceptance_message_shapes() {
     assert_eq!(error.tag(), "InvalidMessage");
 }
 
-/// The root navigation admits; the capture skips the target read.
+/// The root navigation admits; the capture skips the target read, and the
+/// drive empties the branch in one settled record.
 #[tokio::test]
 async fn the_root_navigation_admits() {
     let fixture = create_lane().await;
-    let _appended = fixture
+    let head = fixture
         .lane
         .append_message(user_text_message("head"), &background_context())
         .await
         .expect("append serves");
-    let error = fixture
+    let admitted = fixture
         .lane
-        .navigate_tree(None, None, &background_context())
+        .accept(
+            OperationRequest::Navigation {
+                operation_id: None,
+                target_id: None,
+                options: None,
+            },
+            &background_context(),
+        )
         .await
-        .expect_err("the admitted root navigation faults at the staged drive seam");
-    assert_eq!(
-        closed_message(error),
-        "drive operation is not implemented until its later AgentHarness slice",
-        "the root navigation admitted and drove to the staged seam",
-    );
+        .expect("accept serves")
+        .expect("the admission");
     let state = fixture.lane.state().operation.expect("the operation");
     assert!(
         matches!(
@@ -5028,6 +4894,29 @@ async fn the_root_navigation_admits() {
         ),
         "the root navigation's leaf carried no target",
     );
+
+    let driven = drive_serves(&fixture, &admitted.operation_id).await;
+    match driven {
+        DriveOutcome::Settled { outcome } => {
+            assert_eq!(outcome.kind, OperationKind::Navigation);
+            assert_eq!(outcome.status, TerminalStatus::Completed);
+            assert_eq!(
+                outcome.tip_id, None,
+                "the root navigation emptied the branch"
+            );
+            assert_eq!(outcome.from_tip_id.as_deref(), Some(head.as_str()));
+        }
+        other @ DriveOutcome::Waiting { .. } => panic!("the root navigation drive: {other:?}"),
+    }
+    assert!(
+        fixture.lane.state().operation.is_none(),
+        "the completed navigation cleared its operation",
+    );
+    assert_eq!(
+        fixture.lane.state().tip_id,
+        None,
+        "the root navigation emptied the branch",
+    );
 }
 
 /// The sealed request's drive reports the closed harness: the seal under
@@ -5035,13 +4924,7 @@ async fn the_root_navigation_admits() {
 #[tokio::test]
 async fn the_aborts_drive_reports_the_sealed_harness() {
     let fixture = create_lane().await;
-    accepted_operation(&fixture).await;
-    let (started, release) = gate_next_commit(&fixture.storage);
-    let aborted = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move { lane.abort(&background_context()).await })
-    };
-    started.await.expect("the abort's commit parked");
+    let (release, aborted) = parked_abort(&fixture).await;
     let closed: LaneError = Arc::new(HarnessClosed);
     fixture.lane.seal(closed).await;
     let _ = release.send(());
@@ -5293,35 +5176,22 @@ async fn the_namespace_scoped_arm_leaves_the_key_scoped_checks_open() {
     assert_eq!(entries.len(), 1, "the scan skipped the namespace arm");
 }
 /// The occupied claim's post-settle loop re-claims: the rival pass settles,
-/// the drive installs its own pass, and the staged seam faults it.
+/// the drive installs its own pass, and the spawned procedure loop drives
+/// the run to a settled outcome.
 #[tokio::test]
 async fn the_occupied_drive_reclaims_after_the_rival_pass_settles() {
     let fixture = create_lane().await;
+    adopt_faux_model(&fixture).await;
+    fixture.faux.set_responses([faux_assistant_message(
+        "answer",
+        FauxAssistantMessageOptions::default(),
+    )
+    .into()]);
     let operation_id = accepted_operation(&fixture).await;
-    let rival = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "rival".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let rival = drive_pass_for("rival");
     fixture.lane.set_active_drive(Some(Arc::clone(&rival)));
 
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move {
-            lane.drive(
-                DriveOptions {
-                    operation_id,
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &background_context(),
-            )
-            .await
-        })
-    };
+    let waiting = spawn_drive(fixture.lane.clone(), &operation_id, &background_context());
     tokio::task::yield_now().await;
     assert!(
         !waiting.is_finished(),
@@ -5332,15 +5202,21 @@ async fn the_occupied_drive_reclaims_after_the_rival_pass_settles() {
     rival.settle(DriveOutcome::Settled {
         outcome: settled_record("rival", None),
     });
-    let error = waiting
+    let settled = waiting
         .await
         .expect("drive join")
-        .expect_err("the re-claimed drive faults at the staged seam");
-    assert_eq!(
-        closed_message(error),
-        "drive operation is not implemented until its later AgentHarness slice",
-        "the re-claim installed its own pass and hit the staged seam",
-    );
+        .expect("the re-claim drove the run")
+        .expect("the re-claim settled");
+    match settled {
+        DriveOutcome::Settled { outcome } => {
+            assert_eq!(
+                outcome.status,
+                TerminalStatus::Completed,
+                "the re-claim installed its own pass and drove the run",
+            );
+        }
+        other @ DriveOutcome::Waiting { .. } => panic!("the re-claimed drive: {other:?}"),
+    }
 }
 
 /// The occupied claim's completion await races the context's abort; the
@@ -5349,35 +5225,11 @@ async fn the_occupied_drive_reclaims_after_the_rival_pass_settles() {
 async fn the_occupied_drive_reports_the_context_abort() {
     let fixture = create_lane().await;
     let operation_id = accepted_operation(&fixture).await;
-    let rival = Arc::new(Drive::new(
-        &DriveOptions {
-            operation_id: "rival".to_owned(),
-            wait_for_retry: None,
-            poll_deferred: None,
-        },
-        &background_context(),
-    ));
+    let rival = drive_pass_for("rival");
     fixture.lane.set_active_drive(Some(rival));
 
-    let (_, controller) = pi_chord::context::with_cancel(&background_context());
-    let context = crate::harness::context::with_abort_signal(
-        controller.signal().clone(),
-        &background_context(),
-    );
-    let waiting = {
-        let lane = fixture.lane.clone();
-        tokio::spawn(async move {
-            lane.drive(
-                DriveOptions {
-                    operation_id,
-                    wait_for_retry: None,
-                    poll_deferred: None,
-                },
-                &context,
-            )
-            .await
-        })
-    };
+    let (context, controller) = cancelled_caller();
+    let waiting = spawn_drive(fixture.lane.clone(), &operation_id, &context);
     tokio::task::yield_now().await;
     assert!(
         !waiting.is_finished(),
@@ -5435,15 +5287,12 @@ async fn the_settle_finish_patches_the_inbox() {
         fixture.lane.state().operation.is_none(),
         "the finish cleared"
     );
-    let stored = fixture
-        .session
-        .get_value(
-            &stored_values::lane_state("main").address,
-            &background_context(),
-        )
-        .await
-        .expect("read lane state")
-        .expect("stored lane state");
+    let stored = stored_value(
+        &fixture.session,
+        &stored_values::lane_state("main").address,
+        &background_context(),
+    )
+    .await;
     assert_eq!(
         stored.value.get("currentOperationId"),
         Some(&serde_json::Value::Null),

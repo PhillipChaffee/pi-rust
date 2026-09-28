@@ -64,31 +64,44 @@ fn handler(
     })
 }
 
+/// Registers one fixed-result handler, upstream's
+/// `registry.on(name, () => result)` rows with default options.
+fn register_fixed(
+    registry: &HookRegistry,
+    name: HookName,
+    result: HookResult,
+) -> crate::harness::agent_harness::Subscription {
+    registry
+        .on(
+            name,
+            handler(move |_event| result.clone()),
+            HookOptions::default(),
+        )
+        .expect("register")
+}
+
+/// The empty-prompt `BeforeRun` invocation, upstream's per-case
+/// `invocation({ kind: "before_run", prompt: [], resources })` literals.
+fn before_run_invocation() -> HookInvocation {
+    invocation(before_run_event())
+}
+
 /// `before_run` aggregates fail-open: injected messages accumulate across
 /// handlers, a failing handler reports but does not stop the rest.
 #[tokio::test]
 async fn before_run_aggregates_fail_open() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
+    let (_errors, registry) = error_capture_registry();
     let options = HookOptions {
         id: Some("second".to_owned()),
     };
-    registry
-        .on(
-            HookName::BeforeRun,
-            handler(|_event| {
-                HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
-                    messages: vec![injected_message()],
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register");
-    let event = HookEvent::BeforeRun {
-        prompt: vec![],
-        resources: crate::harness::agent_harness::Resources::default(),
-    };
-    let current = invocation(event.clone());
+    register_fixed(
+        &registry,
+        HookName::BeforeRun,
+        HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
+            messages: vec![injected_message()],
+        })),
+    );
+    let current = invocation(before_run_event());
     let (gate, _gate_control) = create_gate();
     let result = registry
         .run_with_gate(HookName::BeforeRun, current, &gate, &background_context())
@@ -104,7 +117,7 @@ async fn before_run_aggregates_fail_open() {
     let _ = options;
 }
 
-/// `run_with_gate` reports a closed gate rejection and a closed registry.
+/// A gate abort rejection carries its cancellation through the run error.
 #[tokio::test]
 async fn the_gate_rejection_maps_to_the_run_error() {
     let errors = Arc::new(Mutex::new(Vec::new()));
@@ -119,9 +132,7 @@ async fn the_gate_rejection_maps_to_the_run_error() {
     let error = registry
         .run_with_gate(
             HookName::BeforeDrive,
-            invocation(HookEvent::BeforeDrive {
-                operation: crate::harness::session::types::OperationKind::Run,
-            }),
+            invocation(before_drive_event()),
             &gate,
             &cancelled,
         )
@@ -129,7 +140,7 @@ async fn the_gate_rejection_maps_to_the_run_error() {
         .expect_err("an aborting gate refuses admission");
     assert!(matches!(
         error,
-        crate::harness::hooks::HookRunError::Aborted(_)
+        crate::harness::hooks::HookRunError::GateAborted(_)
     ));
     let _ = GateRejection::Closed;
 }
@@ -144,10 +155,7 @@ async fn a_closed_registry_refuses_every_run() {
     let error = registry
         .run_with_gate(
             HookName::BeforeRun,
-            invocation(HookEvent::BeforeRun {
-                prompt: vec![],
-                resources: crate::harness::agent_harness::Resources::default(),
-            }),
+            before_run_invocation(),
             &gate,
             &background_context(),
         )
@@ -233,6 +241,185 @@ fn settled_message() -> crate::harness::session::types::SettledAssistantMessage 
     .expect("settled assistant message")
 }
 
+/// The error-capturing registry, the reporter-asserting rows' fixture:
+/// the captured errors and the registry reporting into them.
+fn error_capture_registry() -> (Arc<Mutex<Vec<String>>>, HookRegistry) {
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
+    (errors, registry)
+}
+
+/// The plain registry whose reporter discards, upstream's per-case
+/// `new HookRegistry(() => {})` rows whose assertions never read the
+/// captured errors.
+fn empty_registry() -> HookRegistry {
+    HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))))
+}
+
+/// The `before_run` event the per-case suites fire, upstream's
+/// `{ kind: "before_run", prompt: [], resources }` literals.
+fn before_run_event() -> HookEvent {
+    HookEvent::BeforeRun {
+        prompt: vec![],
+        resources: crate::harness::agent_harness::Resources::default(),
+    }
+}
+
+/// The `before_run_end` event, upstream's `{ kind: "before_run_end",
+/// runId: "run", messages: [] }` literals.
+fn before_run_end_event() -> HookEvent {
+    HookEvent::BeforeRunEnd {
+        run_id: "run".to_owned(),
+        messages: vec![],
+    }
+}
+
+/// The `before_tool` event, upstream's `{ toolCallId: "call", toolName:
+/// "read", args: {} }` literals.
+fn before_tool_event() -> HookEvent {
+    HookEvent::BeforeTool {
+        tool_call_id: "call".to_owned(),
+        tool_name: "read".to_owned(),
+        args: BTreeMap::new(),
+    }
+}
+
+/// The `after_response` event, upstream's `{ status: 200, headers: null,
+/// message }` literals.
+fn after_response_event() -> HookEvent {
+    HookEvent::AfterResponse {
+        status: Some(200),
+        headers: None,
+        message: settled_message(),
+    }
+}
+
+/// The `before_compaction` event, upstream's `{ reason: "manual",
+/// preparation }` literals over the empty one-token preparation.
+fn before_compaction_event() -> HookEvent {
+    HookEvent::BeforeCompaction {
+        reason: crate::harness::session::types::CompactionReason::Manual,
+        preparation: crate::harness::compaction::types::CompactionPreparation {
+            messages_to_summarize: vec![],
+            turn_prefix_messages: vec![],
+            retained_tail: vec![],
+            is_split_turn: false,
+            tokens_before: 1,
+            previous_summary: None,
+            file_ops: crate::harness::compaction::types::FileOperations::default(),
+            settings: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
+        },
+        custom_instructions: None,
+    }
+}
+
+/// The `before_navigation` event, upstream's `{ targetId: "target",
+/// preparation }` literals.
+fn before_navigation_event() -> HookEvent {
+    HookEvent::BeforeNavigation {
+        target_id: "target".to_owned(),
+        preparation: branch_preparation(),
+        custom_instructions: None,
+    }
+}
+
+/// The `before_payload` event, upstream's `{ model, payload }` literals
+/// over the original payload.
+fn before_payload_event() -> HookEvent {
+    HookEvent::BeforePayload {
+        model: test_model(),
+        payload: serde_json::json!({ "original": true }),
+    }
+}
+
+/// The `before_drive` event, upstream's `{ operation: "run" }` literals.
+fn before_drive_event() -> HookEvent {
+    HookEvent::BeforeDrive {
+        operation: crate::harness::session::types::OperationKind::Run,
+    }
+}
+
+/// The fixed `before_compaction` result, upstream's `() => ({ decline })`
+/// and compaction rows.
+fn compaction_result(
+    decline: Option<bool>,
+    compaction: Option<crate::harness::compaction::types::CompactResult>,
+) -> HookResult {
+    HookResult::BeforeCompaction(Some(crate::harness::agent_harness::CompactionHookResult {
+        decline,
+        compaction,
+    }))
+}
+
+/// The fixed `before_navigation` result, upstream's `() => ({ decline,
+/// summary })` rows.
+fn navigation_result(
+    decline: Option<bool>,
+    summary: Option<crate::harness::compaction::types::BranchSummaryResult>,
+) -> HookResult {
+    HookResult::BeforeNavigation(Some(crate::harness::agent_harness::NavigationHookResult {
+        decline,
+        summary,
+    }))
+}
+
+/// Registers the fixed result, runs the name's aggregate, and unwraps the
+/// carried value, the register-then-run rows' settled read; a resultless
+/// aggregate panics the test by design.
+macro_rules! fixed_aggregate {
+    ($registry:expr, $name:ident, $event:expr, $variant:ident, $fixed:expr, $why:literal) => {{
+        register_fixed($registry, HookName::$name, $fixed);
+        let result = aggregate($registry, HookName::$name, $event).await;
+        match result {
+            HookResult::$variant(Some(result)) => result,
+            _ => panic!($why),
+        }
+    }};
+}
+
+/// The failing handler, upstream's throwing handler rows: one boxed-error
+/// failure with the given message.
+fn failing_handler(message: &'static str) -> crate::harness::agent_harness::HookHandler {
+    Arc::new(move |event: &HookInvocation, _context: &Context| {
+        let failure: crate::harness::agent_harness::HookFailure =
+            Box::<dyn std::error::Error + Send + Sync>::from(message);
+        let _ = event;
+        Box::pin(async move { Err::<HookResult, _>(failure) })
+    })
+}
+
+/// Registers one failing handler, the fail-closed rows' registration.
+fn register_failing(registry: &HookRegistry, name: HookName, message: &'static str) {
+    registry
+        .on(name, failing_handler(message), HookOptions::default())
+        .expect("register the failing handler");
+}
+
+/// Registers the fixed `before_tool` result, runs the aggregate, and
+/// unwraps the carried result, the tool-gate rows' settled read; a
+/// resultless aggregate panics the test by design.
+async fn before_tool_aggregate(
+    registry: &HookRegistry,
+    fixed: HookResult,
+    why: &'static str,
+) -> crate::harness::agent_harness::BeforeToolResult {
+    register_fixed(registry, HookName::BeforeTool, fixed);
+    let result = aggregate(registry, HookName::BeforeTool, before_tool_event()).await;
+    let HookResult::BeforeTool(Some(result)) = result else {
+        panic!("{why}");
+    };
+    result
+}
+
+/// Runs the name's aggregate over the background context, the
+/// register-then-run rows' settled read; an unexpected aggregate panics
+/// the test by design.
+async fn aggregate(registry: &HookRegistry, name: HookName, event: HookEvent) -> HookResult {
+    run(registry, name, event, &background_context())
+        .await
+        .expect("aggregate")
+}
+
 async fn run(
     registry: &HookRegistry,
     name: HookName,
@@ -248,21 +435,17 @@ async fn run(
 /// `transform_context` folds replacements across handlers fail-open.
 #[tokio::test]
 async fn transform_context_folds_replacements() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
-    registry
-        .on(
-            HookName::TransformContext,
-            handler(|_event| {
-                HookResult::TransformContext(Some(
-                    crate::harness::agent_harness::TransformContextResult {
-                        messages: Some(vec![user_message()]),
-                        system_prompt: Some("replacement".to_owned()),
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register");
+    let registry = empty_registry();
+    register_fixed(
+        &registry,
+        HookName::TransformContext,
+        HookResult::TransformContext(Some(
+            crate::harness::agent_harness::TransformContextResult {
+                messages: Some(vec![user_message()]),
+                system_prompt: Some("replacement".to_owned()),
+            },
+        )),
+    );
     let original = user_message();
     let result = run(
         &registry,
@@ -286,7 +469,7 @@ async fn transform_context_folds_replacements() {
 /// invokeAll overwrite.
 #[tokio::test]
 async fn before_run_end_keeps_the_last_follow_up() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     for follow_up in ["first", "second"] {
         registry
             .on(
@@ -300,17 +483,7 @@ async fn before_run_end_keeps_the_last_follow_up() {
             )
             .expect("register");
     }
-    let result = run(
-        &registry,
-        HookName::BeforeRunEnd,
-        HookEvent::BeforeRunEnd {
-            run_id: "run".to_owned(),
-            messages: vec![],
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeRunEnd, before_run_end_event()).await;
     let HookResult::BeforeRunEnd(Some(result)) = result else {
         panic!("the aggregate carries the follow-up");
     };
@@ -321,23 +494,17 @@ async fn before_run_end_keeps_the_last_follow_up() {
 /// derives the net patch against the original.
 #[tokio::test]
 async fn before_request_folds_stream_option_patches() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
-    registry
-        .on(
-            HookName::BeforeRequest,
-            handler(|_event| {
-                HookResult::BeforeRequest(Some(
-                    crate::harness::agent_harness::BeforeRequestResult {
-                        stream_options: AgentHarnessStreamOptionsPatch {
-                            timeout_ms: Some(Some(2_000)),
-                            ..AgentHarnessStreamOptionsPatch::default()
-                        },
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register");
+    let registry = empty_registry();
+    register_fixed(
+        &registry,
+        HookName::BeforeRequest,
+        HookResult::BeforeRequest(Some(crate::harness::agent_harness::BeforeRequestResult {
+            stream_options: AgentHarnessStreamOptionsPatch {
+                timeout_ms: Some(Some(2_000)),
+                ..AgentHarnessStreamOptionsPatch::default()
+            },
+        })),
+    );
     let original = AgentHarnessStreamOptions {
         timeout_ms: Some(1_000),
         ..AgentHarnessStreamOptions::default()
@@ -364,39 +531,24 @@ async fn before_request_folds_stream_option_patches() {
 /// `before_payload` hands the last replacement payload onward.
 #[tokio::test]
 async fn before_payload_replaces_the_payload() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
-    registry
-        .on(
-            HookName::BeforePayload,
-            handler(|_event| {
-                HookResult::BeforePayload(Some(crate::harness::agent_harness::PayloadResult {
-                    payload: serde_json::json!({ "replacement": true }),
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register");
-    let result = run(
+    let registry = empty_registry();
+    let result = fixed_aggregate!(
         &registry,
-        HookName::BeforePayload,
-        HookEvent::BeforePayload {
-            model: test_model(),
-            payload: serde_json::json!({ "original": true }),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
-    let HookResult::BeforePayload(Some(result)) = result else {
-        panic!("the aggregate carries the replacement payload");
-    };
+        BeforePayload,
+        before_payload_event(),
+        BeforePayload,
+        HookResult::BeforePayload(Some(crate::harness::agent_harness::PayloadResult {
+            payload: serde_json::json!({ "replacement": true }),
+        })),
+        "the aggregate carries the replacement payload"
+    );
     assert_eq!(result.payload, serde_json::json!({ "replacement": true }));
 }
 
 /// `after_response` carries the replacement settled message.
 #[tokio::test]
 async fn after_response_carries_the_replacement() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     registry
         .on(
             HookName::AfterResponse,
@@ -410,18 +562,7 @@ async fn after_response_carries_the_replacement() {
             HookOptions::default(),
         )
         .expect("register");
-    let result = run(
-        &registry,
-        HookName::AfterResponse,
-        HookEvent::AfterResponse {
-            status: Some(200),
-            headers: None,
-            message: settled_message(),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::AfterResponse, after_response_event()).await;
     let HookResult::AfterResponse(Some(result)) = result else {
         panic!("the aggregate carries the replacement");
     };
@@ -432,38 +573,19 @@ async fn after_response_carries_the_replacement() {
 /// breaks the loop; `run_tool_with_gate` carries the block through.
 #[tokio::test]
 async fn before_tool_blocks_the_call() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeTool,
-            handler(|_event| {
-                HookResult::BeforeTool(Some(crate::harness::agent_harness::BeforeToolResult {
-                    args: None,
-                    block: Some(crate::harness::agent_harness::ToolBlock {
-                        reason: "blocked by hook".to_owned(),
-                        terminate: None,
-                    }),
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register");
-    let result = run(
+    let (_errors, registry) = error_capture_registry();
+    let result = before_tool_aggregate(
         &registry,
-        HookName::BeforeTool,
-        HookEvent::BeforeTool {
-            tool_call_id: "call".to_owned(),
-            tool_name: "read".to_owned(),
-            args: BTreeMap::new(),
-        },
-        &background_context(),
+        HookResult::BeforeTool(Some(crate::harness::agent_harness::BeforeToolResult {
+            args: None,
+            block: Some(crate::harness::agent_harness::ToolBlock {
+                reason: "blocked by hook".to_owned(),
+                terminate: None,
+            }),
+        })),
+        "the aggregate carries the block",
     )
-    .await
-    .expect("aggregate");
-    let HookResult::BeforeTool(Some(result)) = result else {
-        panic!("the aggregate carries the block");
-    };
+    .await;
     let block = result.block.expect("blocked");
     assert_eq!(block.reason, "blocked by hook");
 }
@@ -472,38 +594,18 @@ async fn before_tool_blocks_the_call() {
 /// value per field.
 #[tokio::test]
 async fn after_tool_folds_result_patches() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
-    registry
-        .on(
-            HookName::AfterTool,
-            handler(|_event| {
-                HookResult::AfterTool(Some(crate::harness::agent_harness::AfterToolResult {
-                    is_error: Some(true),
-                    ..crate::harness::agent_harness::AfterToolResult::default()
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register");
-    let result = run(
+    let registry = empty_registry();
+    let result = fixed_aggregate!(
         &registry,
-        HookName::AfterTool,
-        HookEvent::AfterTool {
-            tool_call_id: "call".to_owned(),
-            tool_name: "read".to_owned(),
-            args: BTreeMap::new(),
-            content: vec![],
-            details: None,
-            is_error: false,
-            usage: None,
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
-    let HookResult::AfterTool(Some(result)) = result else {
-        panic!("the aggregate carries the patch");
-    };
+        AfterTool,
+        after_tool_event(),
+        AfterTool,
+        HookResult::AfterTool(Some(crate::harness::agent_harness::AfterToolResult {
+            is_error: Some(true),
+            ..crate::harness::agent_harness::AfterToolResult::default()
+        })),
+        "the aggregate carries the patch"
+    );
     assert_eq!(result.is_error, Some(true));
 }
 
@@ -511,63 +613,32 @@ async fn after_tool_folds_result_patches() {
 /// returning both decline and compaction reports and is skipped.
 #[tokio::test]
 async fn before_compaction_takes_the_first_decisive_result() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeCompaction,
-            handler(|_event| {
-                HookResult::BeforeCompaction(Some(
-                    crate::harness::agent_harness::CompactionHookResult {
-                        decline: Some(true),
-                        compaction: Some(crate::harness::compaction::types::CompactResult {
-                            summary: "summary".to_owned(),
-                            tokens_before: 1,
-                            usage: None,
-                            retained_tail: vec![],
-                            details: None,
-                        }),
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the malformed handler");
-    registry
-        .on(
-            HookName::BeforeCompaction,
-            handler(|_event| {
-                HookResult::BeforeCompaction(Some(
-                    crate::harness::agent_harness::CompactionHookResult {
-                        decline: Some(true),
-                        compaction: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the declining handler");
-    let result = run(
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
         &registry,
         HookName::BeforeCompaction,
-        HookEvent::BeforeCompaction {
-            reason: crate::harness::session::types::CompactionReason::Manual,
-            preparation: crate::harness::compaction::types::CompactionPreparation {
-                messages_to_summarize: vec![],
-                turn_prefix_messages: vec![],
-                retained_tail: vec![],
-                is_split_turn: false,
+        compaction_result(
+            Some(true),
+            Some(crate::harness::compaction::types::CompactResult {
+                summary: "summary".to_owned(),
                 tokens_before: 1,
-                previous_summary: None,
-                file_ops: crate::harness::compaction::types::FileOperations::default(),
-                settings: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-            },
-            custom_instructions: None,
-        },
-        &background_context(),
+                usage: None,
+                retained_tail: vec![],
+                details: None,
+            }),
+        ),
+    );
+    register_fixed(
+        &registry,
+        HookName::BeforeCompaction,
+        compaction_result(Some(true), None),
+    );
+    let result = aggregate(
+        &registry,
+        HookName::BeforeCompaction,
+        before_compaction_event(),
     )
-    .await
-    .expect("aggregate");
+    .await;
     let HookResult::BeforeCompaction(Some(result)) = result else {
         panic!("the decline reaches the aggregate");
     };
@@ -584,27 +655,12 @@ async fn before_compaction_takes_the_first_decisive_result() {
 /// `before_drive` runs fail-closed: a failing handler errors the drive.
 #[tokio::test]
 async fn before_drive_runs_fail_closed() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeDrive,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "drive handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
+    let (errors, registry) = error_capture_registry();
+    register_failing(&registry, HookName::BeforeDrive, "drive handler failed");
     let result = run(
         &registry,
         HookName::BeforeDrive,
-        HookEvent::BeforeDrive {
-            operation: crate::harness::session::types::OperationKind::Run,
-        },
+        before_drive_event(),
         &background_context(),
     )
     .await;
@@ -615,7 +671,7 @@ async fn before_drive_runs_fail_closed() {
 /// `before_drive` with only succeeding handlers settles the aggregate.
 #[tokio::test]
 async fn before_drive_succeeds_without_failures() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     registry
         .on(
             HookName::BeforeDrive,
@@ -626,9 +682,7 @@ async fn before_drive_succeeds_without_failures() {
     let result = run(
         &registry,
         HookName::BeforeDrive,
-        HookEvent::BeforeDrive {
-            operation: crate::harness::session::types::OperationKind::Run,
-        },
+        before_drive_event(),
         &background_context(),
     )
     .await
@@ -655,7 +709,7 @@ async fn a_closed_registry_refuses_registration() {
 /// The registry's first close error wins; later closes never override it.
 #[test]
 fn the_registry_keeps_its_first_close_error() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     registry.close("first".to_owned());
     registry.close("second".to_owned());
     let error = registry
@@ -672,18 +726,14 @@ fn the_registry_keeps_its_first_close_error() {
 /// error.
 #[tokio::test]
 async fn run_tool_with_gate_restates_the_gate_rejection() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let (gate, gate_control) = create_gate();
     let cancellation = tokio::sync::watch::channel(()).1;
     gate_control.begin_abort(cancellation);
     let error = registry
         .run_tool_with_gate(
             HookName::BeforeTool,
-            invocation(HookEvent::BeforeTool {
-                tool_call_id: "call".to_owned(),
-                tool_name: "read".to_owned(),
-                args: BTreeMap::new(),
-            }),
+            invocation(before_tool_event()),
             &gate,
             &background_context(),
         )
@@ -691,7 +741,7 @@ async fn run_tool_with_gate_restates_the_gate_rejection() {
         .expect_err("an aborting gate refuses admission");
     assert!(matches!(
         error,
-        crate::harness::hooks::HookRunError::Aborted(_)
+        crate::harness::hooks::HookRunError::GateAborted(_)
     ));
 }
 
@@ -699,46 +749,28 @@ async fn run_tool_with_gate_restates_the_gate_rejection() {
 /// handler, and the aggregate then sees only the survivors.
 #[tokio::test]
 async fn the_subscription_unregisters_one_handler() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     assert!(!registry.has(HookName::BeforeRun));
-    let first = registry
-        .on(
-            HookName::BeforeRun,
-            handler(|_event| {
-                HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
-                    messages: vec![injected_message()],
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the first handler");
-    let second = registry
-        .on(
-            HookName::BeforeRun,
-            handler(|_event| {
-                HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
-                    messages: vec![injected_message()],
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the second handler");
+    let first = register_fixed(
+        &registry,
+        HookName::BeforeRun,
+        HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
+            messages: vec![injected_message()],
+        })),
+    );
+    let second = register_fixed(
+        &registry,
+        HookName::BeforeRun,
+        HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
+            messages: vec![injected_message()],
+        })),
+    );
     assert!(registry.has(HookName::BeforeRun));
     first.unsubscribe();
     assert!(registry.has(HookName::BeforeRun));
     second.unsubscribe();
     assert!(!registry.has(HookName::BeforeRun));
-    let result = run(
-        &registry,
-        HookName::BeforeRun,
-        HookEvent::BeforeRun {
-            prompt: vec![],
-            resources: crate::harness::agent_harness::Resources::default(),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeRun, before_run_event()).await;
     let HookResult::BeforeRun(None) = result else {
         panic!("the unsubscribed handlers stop injecting");
     };
@@ -748,7 +780,7 @@ async fn the_subscription_unregisters_one_handler() {
 /// messages; the gate rejection and handler failure restate as run errors.
 #[test]
 fn the_registry_and_run_error_render_their_surfaces() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     assert!(format!("{registry:?}").contains("HookRegistry"));
     let closed = crate::harness::hooks::HookRunError::from(GateRejection::Closed(
         crate::harness::gate::GateClosedError("gate closed".to_owned()),
@@ -776,17 +808,14 @@ fn the_registry_and_run_error_render_their_surfaces() {
 /// before any handler runs; the abort reason restates on the run error.
 #[tokio::test]
 async fn a_cancelled_caller_context_aborts_the_admitted_run() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let (gate, _gate_control) = create_gate();
     let (cancelled, controller) = pi_chord::context::with_cancel(&background_context());
     controller.abort("cancelled");
     let error = registry
         .run_with_gate(
             HookName::BeforeRun,
-            invocation(HookEvent::BeforeRun {
-                prompt: vec![],
-                resources: crate::harness::agent_harness::Resources::default(),
-            }),
+            before_run_invocation(),
             &gate,
             &cancelled,
         )
@@ -805,10 +834,7 @@ async fn a_cancelled_caller_context_aborts_the_admitted_run() {
     let error = registry
         .run_with_gate(
             HookName::BeforeRun,
-            invocation(HookEvent::BeforeRun {
-                prompt: vec![],
-                resources: crate::harness::agent_harness::Resources::default(),
-            }),
+            before_run_invocation(),
             &gate,
             &reasonless,
         )
@@ -824,18 +850,14 @@ async fn a_cancelled_caller_context_aborts_the_admitted_run() {
 /// context is cancelled before admission.
 #[tokio::test]
 async fn a_cancelled_caller_context_aborts_the_tool_admission() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let (gate, _gate_control) = create_gate();
     let (cancelled, controller) = pi_chord::context::with_cancel(&background_context());
     controller.abort("cancelled");
     let error = registry
         .run_tool_with_gate(
             HookName::BeforeTool,
-            invocation(HookEvent::BeforeTool {
-                tool_call_id: "call".to_owned(),
-                tool_name: "read".to_owned(),
-                args: BTreeMap::new(),
-            }),
+            invocation(before_tool_event()),
             &gate,
             &cancelled,
         )
@@ -857,7 +879,7 @@ async fn run_tool_with_gate_runs_the_before_tool_aggregate() {
         TelemetryHandle::new(recorder.clone()),
         &background_context(),
     );
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let replaced_args = BTreeMap::from([("path".to_owned(), serde_json::json!("/tmp/replaced"))]);
     let expected_args = replaced_args.clone();
     registry
@@ -877,11 +899,7 @@ async fn run_tool_with_gate_runs_the_before_tool_aggregate() {
     let result = registry
         .run_tool_with_gate(
             HookName::BeforeTool,
-            invocation(HookEvent::BeforeTool {
-                tool_call_id: "call".to_owned(),
-                tool_name: "read".to_owned(),
-                args: BTreeMap::new(),
-            }),
+            invocation(before_tool_event()),
             &create_gate().0,
             &context,
         )
@@ -921,15 +939,12 @@ async fn run_tool_with_gate_runs_the_before_tool_aggregate() {
 /// `run_tool_with_gate` refuses every non-tool hook with a closed error.
 #[tokio::test]
 async fn run_tool_with_gate_refuses_non_tool_hooks() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let (gate, _gate_control) = create_gate();
     let error = registry
         .run_tool_with_gate(
             HookName::BeforeRun,
-            invocation(HookEvent::BeforeRun {
-                prompt: vec![],
-                resources: crate::harness::agent_harness::Resources::default(),
-            }),
+            before_run_invocation(),
             &gate,
             &background_context(),
         )
@@ -946,24 +961,20 @@ async fn run_tool_with_gate_refuses_non_tool_hooks() {
 /// the folded arguments into each next handler.
 #[tokio::test]
 async fn before_tool_folds_argument_replacements() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let seen_for_handler = Arc::clone(&seen);
-    registry
-        .on(
-            HookName::BeforeTool,
-            handler(|_event| {
-                HookResult::BeforeTool(Some(crate::harness::agent_harness::BeforeToolResult {
-                    args: Some(BTreeMap::from([(
-                        "path".to_owned(),
-                        serde_json::json!("/tmp/replaced"),
-                    )])),
-                    block: None,
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the replacing handler");
+    register_fixed(
+        &registry,
+        HookName::BeforeTool,
+        HookResult::BeforeTool(Some(crate::harness::agent_harness::BeforeToolResult {
+            args: Some(BTreeMap::from([(
+                "path".to_owned(),
+                serde_json::json!("/tmp/replaced"),
+            )])),
+            block: None,
+        })),
+    );
     registry
         .on(
             HookName::BeforeTool,
@@ -980,18 +991,7 @@ async fn before_tool_folds_argument_replacements() {
             HookOptions::default(),
         )
         .expect("register the observing handler");
-    let result = run(
-        &registry,
-        HookName::BeforeTool,
-        HookEvent::BeforeTool {
-            tool_call_id: "call".to_owned(),
-            tool_name: "read".to_owned(),
-            args: BTreeMap::new(),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeTool, before_tool_event()).await;
     let HookResult::BeforeTool(Some(result)) = result else {
         panic!("the aggregate carries the replacement arguments");
     };
@@ -1024,27 +1024,11 @@ async fn a_failing_before_tool_handler_blocks_the_call() {
         &background_context(),
     );
     let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeTool,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "tool hook failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
+    register_failing(&registry, HookName::BeforeTool, "tool hook failed");
     let result = registry
         .run_tool_with_gate(
             HookName::BeforeTool,
-            invocation(HookEvent::BeforeTool {
-                tool_call_id: "call".to_owned(),
-                tool_name: "read".to_owned(),
-                args: BTreeMap::new(),
-            }),
+            invocation(before_tool_event()),
             &create_gate().0,
             &context,
         )
@@ -1071,19 +1055,14 @@ async fn a_failing_before_tool_handler_blocks_the_call() {
 /// prompt, skips non-contributing handlers, and reports failures fail-open.
 #[tokio::test]
 async fn before_run_threads_injections_and_survives_failures() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeRun,
-            handler(|_event| {
-                HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
-                    messages: vec![injected_message()],
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the injecting handler");
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
+        &registry,
+        HookName::BeforeRun,
+        HookResult::BeforeRun(Some(crate::harness::agent_harness::BeforeRunResult {
+            messages: vec![injected_message()],
+        })),
+    );
     let observed_prompts = Arc::new(Mutex::new(Vec::new()));
     let observed_for_handler = Arc::clone(&observed_prompts);
     registry
@@ -1102,30 +1081,8 @@ async fn before_run_threads_injections_and_survives_failures() {
             HookOptions::default(),
         )
         .expect("register the observing handler");
-    registry
-        .on(
-            HookName::BeforeRun,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "run handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    let result = run(
-        &registry,
-        HookName::BeforeRun,
-        HookEvent::BeforeRun {
-            prompt: vec![],
-            resources: crate::harness::agent_harness::Resources::default(),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    register_failing(&registry, HookName::BeforeRun, "run handler failed");
+    let result = aggregate(&registry, HookName::BeforeRun, before_run_event()).await;
     let HookResult::BeforeRun(Some(result)) = result else {
         panic!("the aggregate carries the injections");
     };
@@ -1141,39 +1098,14 @@ async fn before_run_threads_injections_and_survives_failures() {
 /// no handler supplies one.
 #[tokio::test]
 async fn before_run_end_reports_failures_without_a_follow_up() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeRunEnd,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "run-end handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    registry
-        .on(
-            HookName::BeforeRunEnd,
-            handler(|_event| HookResult::BeforeRunEnd(None)),
-            HookOptions::default(),
-        )
-        .expect("register the empty handler");
-    let result = run(
+    let (errors, registry) = error_capture_registry();
+    register_failing(&registry, HookName::BeforeRunEnd, "run-end handler failed");
+    register_fixed(
         &registry,
         HookName::BeforeRunEnd,
-        HookEvent::BeforeRunEnd {
-            run_id: "run".to_owned(),
-            messages: vec![],
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+        HookResult::BeforeRunEnd(None),
+    );
+    let result = aggregate(&registry, HookName::BeforeRunEnd, before_run_end_event()).await;
     let HookResult::BeforeRunEnd(None) = result else {
         panic!("no handler supplies a follow-up");
     };
@@ -1184,56 +1116,37 @@ async fn before_run_end_reports_failures_without_a_follow_up() {
 /// only surfaces fields a handler actually replaced.
 #[tokio::test]
 async fn transform_context_reports_failures_and_keeps_the_last_replacement() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::TransformContext,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "transform handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    registry
-        .on(
-            HookName::TransformContext,
-            handler(|_event| HookResult::TransformContext(None)),
-            HookOptions::default(),
-        )
-        .expect("register the empty handler");
-    registry
-        .on(
-            HookName::TransformContext,
-            handler(|_event| {
-                HookResult::TransformContext(Some(
-                    crate::harness::agent_harness::TransformContextResult {
-                        messages: None,
-                        system_prompt: Some("replacement".to_owned()),
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the replacing handler");
-    registry
-        .on(
-            HookName::TransformContext,
-            handler(|_event| {
-                HookResult::TransformContext(Some(
-                    crate::harness::agent_harness::TransformContextResult {
-                        messages: Some(vec![replaced_message()]),
-                        system_prompt: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the messages-only handler");
+    let (errors, registry) = error_capture_registry();
+    register_failing(
+        &registry,
+        HookName::TransformContext,
+        "transform handler failed",
+    );
+    register_fixed(
+        &registry,
+        HookName::TransformContext,
+        HookResult::TransformContext(None),
+    );
+    register_fixed(
+        &registry,
+        HookName::TransformContext,
+        HookResult::TransformContext(Some(
+            crate::harness::agent_harness::TransformContextResult {
+                messages: None,
+                system_prompt: Some("replacement".to_owned()),
+            },
+        )),
+    );
+    register_fixed(
+        &registry,
+        HookName::TransformContext,
+        HookResult::TransformContext(Some(
+            crate::harness::agent_harness::TransformContextResult {
+                messages: Some(vec![replaced_message()]),
+                system_prompt: None,
+            },
+        )),
+    );
     let result = run(
         &registry,
         HookName::TransformContext,
@@ -1257,44 +1170,23 @@ async fn transform_context_reports_failures_and_keeps_the_last_replacement() {
 /// reports a patch when a handler contributed.
 #[tokio::test]
 async fn before_request_reports_failures_and_keeps_the_last_patch() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeRequest,
-            handler(|_event| HookResult::BeforeRequest(None)),
-            HookOptions::default(),
-        )
-        .expect("register the empty handler");
-    registry
-        .on(
-            HookName::BeforeRequest,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "request handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    registry
-        .on(
-            HookName::BeforeRequest,
-            handler(|_event| {
-                HookResult::BeforeRequest(Some(
-                    crate::harness::agent_harness::BeforeRequestResult {
-                        stream_options: AgentHarnessStreamOptionsPatch {
-                            timeout_ms: Some(Some(2_000)),
-                            ..AgentHarnessStreamOptionsPatch::default()
-                        },
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the patching handler");
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
+        &registry,
+        HookName::BeforeRequest,
+        HookResult::BeforeRequest(None),
+    );
+    register_failing(&registry, HookName::BeforeRequest, "request handler failed");
+    register_fixed(
+        &registry,
+        HookName::BeforeRequest,
+        HookResult::BeforeRequest(Some(crate::harness::agent_harness::BeforeRequestResult {
+            stream_options: AgentHarnessStreamOptionsPatch {
+                timeout_ms: Some(Some(2_000)),
+                ..AgentHarnessStreamOptionsPatch::default()
+            },
+        })),
+    );
     let result = run(
         &registry,
         HookName::BeforeRequest,
@@ -1322,53 +1214,23 @@ async fn before_request_reports_failures_and_keeps_the_last_patch() {
 /// payload onward.
 #[tokio::test]
 async fn before_payload_reports_failures_and_keeps_the_last_payload() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforePayload,
-            handler(|_event| HookResult::BeforePayload(None)),
-            HookOptions::default(),
-        )
-        .expect("register the empty handler");
-    registry
-        .on(
-            HookName::BeforePayload,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "payload handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    registry
-        .on(
-            HookName::BeforePayload,
-            handler(|_event| {
-                HookResult::BeforePayload(Some(crate::harness::agent_harness::PayloadResult {
-                    payload: serde_json::json!({ "replacement": true }),
-                }))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the replacing handler");
-    let result = run(
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
         &registry,
         HookName::BeforePayload,
-        HookEvent::BeforePayload {
-            model: test_model(),
-            payload: serde_json::json!({ "original": true }),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
-    let HookResult::BeforePayload(Some(result)) = result else {
-        panic!("the aggregate carries the replacement payload");
-    };
+        HookResult::BeforePayload(None),
+    );
+    register_failing(&registry, HookName::BeforePayload, "payload handler failed");
+    let result = fixed_aggregate!(
+        &registry,
+        BeforePayload,
+        before_payload_event(),
+        BeforePayload,
+        HookResult::BeforePayload(Some(crate::harness::agent_harness::PayloadResult {
+            payload: serde_json::json!({ "replacement": true }),
+        })),
+        "the aggregate carries the replacement payload"
+    );
     assert_eq!(result.payload, serde_json::json!({ "replacement": true }));
     assert!(!errors.lock().expect("report lock").is_empty());
 }
@@ -1377,8 +1239,7 @@ async fn before_payload_reports_failures_and_keeps_the_last_payload() {
 /// message.
 #[tokio::test]
 async fn after_response_reports_failures_and_keeps_the_last_replacement() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
+    let (errors, registry) = error_capture_registry();
     registry
         .on(
             HookName::AfterResponse,
@@ -1386,19 +1247,11 @@ async fn after_response_reports_failures_and_keeps_the_last_replacement() {
             HookOptions::default(),
         )
         .expect("register the empty handler");
-    registry
-        .on(
-            HookName::AfterResponse,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "response handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
+    register_failing(
+        &registry,
+        HookName::AfterResponse,
+        "response handler failed",
+    );
     registry
         .on(
             HookName::AfterResponse,
@@ -1423,18 +1276,7 @@ async fn after_response_reports_failures_and_keeps_the_last_replacement() {
             HookOptions::default(),
         )
         .expect("register the replacing handler");
-    let result = run(
-        &registry,
-        HookName::AfterResponse,
-        HookEvent::AfterResponse {
-            status: Some(200),
-            headers: None,
-            message: settled_message(),
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::AfterResponse, after_response_event()).await;
     let HookResult::AfterResponse(Some(result)) = result else {
         panic!("the aggregate carries the replacement");
     };
@@ -1446,7 +1288,7 @@ async fn after_response_reports_failures_and_keeps_the_last_replacement() {
 /// state into each next handler.
 #[tokio::test]
 async fn after_tool_folds_every_field_and_threads_the_state() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     registry
         .on(
             HookName::AfterTool,
@@ -1481,14 +1323,7 @@ async fn after_tool_folds_every_field_and_threads_the_state() {
             HookOptions::default(),
         )
         .expect("register the observing handler");
-    let result = run(
-        &registry,
-        HookName::AfterTool,
-        after_tool_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::AfterTool, after_tool_event()).await;
     let HookResult::AfterTool(Some(result)) = result else {
         panic!("the aggregate carries the patches");
     };
@@ -1521,29 +1356,9 @@ async fn after_tool_folds_every_field_and_threads_the_state() {
 /// when no handler patches a field.
 #[tokio::test]
 async fn after_tool_reports_failures_fail_open() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::AfterTool,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "tool handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    let result = run(
-        &registry,
-        HookName::AfterTool,
-        after_tool_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let (errors, registry) = error_capture_registry();
+    register_failing(&registry, HookName::AfterTool, "tool handler failed");
+    let result = aggregate(&registry, HookName::AfterTool, after_tool_event()).await;
     let HookResult::AfterTool(None) = result else {
         panic!("no patches means no aggregate");
     };
@@ -1553,34 +1368,15 @@ async fn after_tool_reports_failures_fail_open() {
 /// `after_tool` with no field patched reports no aggregate.
 #[tokio::test]
 async fn after_tool_without_patches_reports_none() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
-    registry
-        .on(
-            HookName::AfterTool,
-            handler(|_event| {
-                HookResult::AfterTool(Some(
-                    crate::harness::agent_harness::AfterToolResult::default(),
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the empty handler");
-    let result = run(
+    let registry = empty_registry();
+    register_fixed(
         &registry,
         HookName::AfterTool,
-        HookEvent::AfterTool {
-            tool_call_id: "call".to_owned(),
-            tool_name: "read".to_owned(),
-            args: BTreeMap::new(),
-            content: vec![],
-            details: None,
-            is_error: false,
-            usage: None,
-        },
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+        HookResult::AfterTool(Some(
+            crate::harness::agent_harness::AfterToolResult::default(),
+        )),
+    );
+    let result = aggregate(&registry, HookName::AfterTool, after_tool_event()).await;
     let HookResult::AfterTool(None) = result else {
         panic!("no patches means no aggregate");
     };
@@ -1591,48 +1387,23 @@ async fn after_tool_without_patches_reports_none() {
 /// decline-only verdict wins.
 #[tokio::test]
 async fn before_navigation_takes_the_first_decisive_result() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            handler(|_event| {
-                HookResult::BeforeNavigation(Some(
-                    crate::harness::agent_harness::NavigationHookResult {
-                        decline: Some(true),
-                        summary: Some(branch_summary()),
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the malformed handler");
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            handler(|_event| {
-                HookResult::BeforeNavigation(Some(
-                    crate::harness::agent_harness::NavigationHookResult {
-                        decline: Some(true),
-                        summary: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the declining handler");
-    let result = run(
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
         &registry,
         HookName::BeforeNavigation,
-        HookEvent::BeforeNavigation {
-            target_id: "target".to_owned(),
-            preparation: branch_preparation(),
-            custom_instructions: None,
-        },
-        &background_context(),
+        navigation_result(Some(true), Some(branch_summary())),
+    );
+    register_fixed(
+        &registry,
+        HookName::BeforeNavigation,
+        navigation_result(Some(true), None),
+    );
+    let result = aggregate(
+        &registry,
+        HookName::BeforeNavigation,
+        before_navigation_event(),
     )
-    .await
-    .expect("aggregate");
+    .await;
     let HookResult::BeforeNavigation(Some(result)) = result else {
         panic!("the decline reaches the aggregate");
     };
@@ -1651,61 +1422,28 @@ async fn before_navigation_takes_the_first_decisive_result() {
 /// reports handler failures without stopping the search.
 #[tokio::test]
 async fn before_navigation_accepts_a_summary_replacement() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            handler(|_event| {
-                HookResult::BeforeCompaction(Some(
-                    crate::harness::agent_harness::CompactionHookResult {
-                        decline: Some(true),
-                        compaction: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the wrong-variant handler");
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "navigation handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            handler(|_event| {
-                HookResult::BeforeNavigation(Some(
-                    crate::harness::agent_harness::NavigationHookResult {
-                        decline: None,
-                        summary: Some(branch_summary()),
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the summarizing handler");
-    let result = run(
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
         &registry,
         HookName::BeforeNavigation,
-        HookEvent::BeforeNavigation {
-            target_id: "target".to_owned(),
-            preparation: branch_preparation(),
-            custom_instructions: None,
-        },
-        &background_context(),
+        compaction_result(Some(true), None),
+    );
+    register_failing(
+        &registry,
+        HookName::BeforeNavigation,
+        "navigation handler failed",
+    );
+    register_fixed(
+        &registry,
+        HookName::BeforeNavigation,
+        navigation_result(None, Some(branch_summary())),
+    );
+    let result = aggregate(
+        &registry,
+        HookName::BeforeNavigation,
+        before_navigation_event(),
     )
-    .await
-    .expect("aggregate");
+    .await;
     let HookResult::BeforeNavigation(Some(result)) = result else {
         panic!("the summary reaches the aggregate");
     };
@@ -1722,40 +1460,23 @@ async fn before_navigation_accepts_a_summary_replacement() {
 /// `before_navigation` with no decisive handler reports no result.
 #[tokio::test]
 async fn before_navigation_without_a_decisive_result_reports_none() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            handler(|_event| {
-                HookResult::BeforeNavigation(Some(
-                    crate::harness::agent_harness::NavigationHookResult {
-                        decline: Some(false),
-                        summary: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the non-decisive handler");
-    registry
-        .on(
-            HookName::BeforeNavigation,
-            handler(|_event| HookResult::BeforeNavigation(None)),
-            HookOptions::default(),
-        )
-        .expect("register the empty handler");
-    let result = run(
+    let registry = empty_registry();
+    register_fixed(
         &registry,
         HookName::BeforeNavigation,
-        HookEvent::BeforeNavigation {
-            target_id: "target".to_owned(),
-            preparation: branch_preparation(),
-            custom_instructions: None,
-        },
-        &background_context(),
+        navigation_result(Some(false), None),
+    );
+    register_fixed(
+        &registry,
+        HookName::BeforeNavigation,
+        HookResult::BeforeNavigation(None),
+    );
+    let result = aggregate(
+        &registry,
+        HookName::BeforeNavigation,
+        before_navigation_event(),
     )
-    .await
-    .expect("aggregate");
+    .await;
     let HookResult::BeforeNavigation(None) = result else {
         panic!("no decisive result means no aggregate");
     };
@@ -1765,70 +1486,28 @@ async fn before_navigation_without_a_decisive_result_reports_none() {
 /// handlers until one is decisive; without one the aggregate reports none.
 #[tokio::test]
 async fn before_compaction_falls_through_non_decisive_results() {
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::clone(&errors)));
-    registry
-        .on(
-            HookName::BeforeCompaction,
-            handler(|_event| {
-                HookResult::BeforeNavigation(Some(
-                    crate::harness::agent_harness::NavigationHookResult {
-                        decline: Some(true),
-                        summary: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the wrong-variant handler");
-    registry
-        .on(
-            HookName::BeforeCompaction,
-            Arc::new(|_event: &HookInvocation, _context| {
-                Box::pin(async {
-                    Err(Box::<dyn std::error::Error + Send + Sync>::from(
-                        "compaction handler failed",
-                    ))
-                })
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the failing handler");
-    registry
-        .on(
-            HookName::BeforeCompaction,
-            handler(|_event| {
-                HookResult::BeforeCompaction(Some(
-                    crate::harness::agent_harness::CompactionHookResult {
-                        decline: Some(false),
-                        compaction: None,
-                    },
-                ))
-            }),
-            HookOptions::default(),
-        )
-        .expect("register the non-decisive handler");
-    let result = run(
+    let (errors, registry) = error_capture_registry();
+    register_fixed(
         &registry,
         HookName::BeforeCompaction,
-        HookEvent::BeforeCompaction {
-            reason: crate::harness::session::types::CompactionReason::Manual,
-            preparation: crate::harness::compaction::types::CompactionPreparation {
-                messages_to_summarize: vec![],
-                turn_prefix_messages: vec![],
-                retained_tail: vec![],
-                is_split_turn: false,
-                tokens_before: 1,
-                previous_summary: None,
-                file_ops: crate::harness::compaction::types::FileOperations::default(),
-                settings: crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS,
-            },
-            custom_instructions: None,
-        },
-        &background_context(),
+        navigation_result(Some(true), None),
+    );
+    register_failing(
+        &registry,
+        HookName::BeforeCompaction,
+        "compaction handler failed",
+    );
+    register_fixed(
+        &registry,
+        HookName::BeforeCompaction,
+        compaction_result(Some(false), None),
+    );
+    let result = aggregate(
+        &registry,
+        HookName::BeforeCompaction,
+        before_compaction_event(),
     )
-    .await
-    .expect("aggregate");
+    .await;
     let HookResult::BeforeCompaction(None) = result else {
         panic!("no decisive result means no aggregate");
     };
@@ -1839,7 +1518,7 @@ async fn before_compaction_falls_through_non_decisive_results() {
 /// different event variant than the hook name dispatches on.
 #[tokio::test]
 async fn a_mismatched_event_variant_short_circuits_the_aggregate() {
-    let registry = HookRegistry::new(reporting_handler_errors(Arc::new(Mutex::new(Vec::new()))));
+    let registry = empty_registry();
     let before_run_event = || HookEvent::BeforeRun {
         prompt: vec![],
         resources: crate::harness::agent_harness::Resources::default(),
@@ -1848,94 +1527,38 @@ async fn a_mismatched_event_variant_short_circuits_the_aggregate() {
         operation: crate::harness::session::types::OperationKind::Run,
     };
 
-    let result = run(
-        &registry,
-        HookName::BeforeRun,
-        before_drive_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeRun, before_drive_event()).await;
     assert!(matches!(result, HookResult::BeforeRun(None)));
 
-    let result = run(
-        &registry,
-        HookName::BeforeRunEnd,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeRunEnd, before_run_event()).await;
     assert!(matches!(result, HookResult::BeforeRunEnd(None)));
 
-    let result = run(
-        &registry,
-        HookName::TransformContext,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::TransformContext, before_run_event()).await;
     let HookResult::TransformContext(Some(result)) = result else {
         panic!("the transform aggregate always carries a result");
     };
     assert_eq!(result.messages, None);
     assert_eq!(result.system_prompt, None);
 
-    let result = run(
-        &registry,
-        HookName::BeforeRequest,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeRequest, before_run_event()).await;
     assert!(matches!(result, HookResult::BeforeRequest(None)));
 
-    let result = run(
-        &registry,
-        HookName::BeforePayload,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforePayload, before_run_event()).await;
     let HookResult::BeforePayload(Some(result)) = result else {
         panic!("the payload aggregate always carries a result");
     };
     assert_eq!(result.payload, serde_json::Value::Null);
 
-    let result = run(
-        &registry,
-        HookName::AfterResponse,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::AfterResponse, before_run_event()).await;
     let HookResult::AfterResponse(Some(result)) = result else {
         panic!("the response aggregate always carries a result");
     };
     assert_eq!(result.message, None);
 
-    let result = run(
-        &registry,
-        HookName::BeforeTool,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::BeforeTool, before_run_event()).await;
     assert!(matches!(result, HookResult::BeforeTool(None)));
 
-    let result = run(
-        &registry,
-        HookName::AfterTool,
-        before_run_event(),
-        &background_context(),
-    )
-    .await
-    .expect("aggregate");
+    let result = aggregate(&registry, HookName::AfterTool, before_run_event()).await;
     assert!(matches!(result, HookResult::AfterTool(None)));
 }
 

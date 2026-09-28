@@ -22,6 +22,78 @@
     reason = "the unused watch installer raises deliberately, upstream's `unusedWatch` throw"
 )]
 
+/// The pass-through `Provider` methods the observing wrappers share,
+/// upstream's `{ ...provider }` spreads: the wrapper embeds the delegated
+/// provider and expands this inside its `impl Provider`, overriding only
+/// the methods it instruments. Expanded at the use site so `$delegate`
+/// is the wrapper's embedded provider field.
+macro_rules! provider_pass_through {
+    ($delegate:ident) => {
+        fn id(&self) -> &str {
+            self.$delegate.id()
+        }
+
+        fn name(&self) -> &str {
+            self.$delegate.name()
+        }
+
+        fn auth(&self) -> &ProviderAuth {
+            self.$delegate.auth()
+        }
+
+        fn get_models(&self) -> Result<Vec<Model>, ProviderModelError> {
+            self.$delegate.get_models()
+        }
+
+        fn stream(
+            &self,
+            model: &Model,
+            context: &pi_ai::types::Context,
+            options: Option<&StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            self.$delegate.stream(model, context, options)
+        }
+    };
+}
+
+/// The pass-through `ProviderStreams` methods the deferred-stream wrappers
+/// share, upstream's `{ ...fixture.faux.provider }` spreads: the wrapper
+/// embeds the faux core and expands this inside its
+/// `impl ProviderStreams`, overriding only the methods it instruments.
+macro_rules! provider_streams_pass_through {
+    ($delegate:ident) => {
+        fn stream(
+            &self,
+            model: &Model,
+            context: &pi_ai::types::Context,
+            options: Option<&StreamOptions>,
+        ) -> AssistantMessageEventStream {
+            self.$delegate.stream(model, context, options)
+        }
+
+        fn stream_simple(
+            &self,
+            model: &Model,
+            context: &pi_ai::types::Context,
+            options: Option<&SimpleStreamOptions>,
+        ) -> AssistantMessageEventStream {
+            self.$delegate.stream_simple(model, context, options)
+        }
+
+        fn fetch_deferred(
+            &self,
+            model: &Model,
+            handle: &DeferredHandle,
+            options: Option<&DeferredFetchOptions>,
+        ) -> Option<AssistantMessageEventStream> {
+            self.$delegate.fetch_deferred(model, handle, options)
+        }
+    };
+}
+
+pub(crate) use provider_pass_through;
+pub(crate) use provider_streams_pass_through;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -34,30 +106,18 @@ use crate::harness::agent_harness::EventListener;
 use crate::harness::agent_harness::HarnessEvent;
 use crate::harness::agent_harness::LaneSnapshot;
 use crate::harness::agent_harness::OperationAdmission;
-use crate::harness::agent_harness::OperationRequest;
-use crate::harness::agent_harness::PromptMessagesPayload;
-use crate::harness::agent_harness::WatchHandle;
+use crate::harness::agent_harness::{OperationRequest, PromptMessagesPayload, WatchHandle};
 use crate::harness::compaction::types::DEFAULT_COMPACTION_SETTINGS;
-use crate::harness::context::Context;
-use crate::harness::context::background_context;
-use crate::harness::events::ListenerError;
-use crate::harness::events::ResnapshotCapture;
-use crate::harness::events::WatchFilter;
+use crate::harness::context::{Context, background_context};
+use crate::harness::events::{ListenerError, ResnapshotCapture, WatchFilter};
 use crate::harness::messages::convert_to_llm;
-use crate::harness::runtime::lane::ConfigProvider;
-use crate::harness::runtime::lane::EmitBatch;
-use crate::harness::runtime::lane::FaultHandler;
-use crate::harness::runtime::lane::Lane;
-use crate::harness::runtime::lane::WatchInstaller;
+use crate::harness::runtime::lane::{
+    ConfigProvider, EmitBatch, FaultHandler, Lane, WatchInstaller,
+};
 use crate::harness::runtime::restore::restore_lane;
-use crate::harness::runtime::types::Config;
-use crate::harness::runtime::types::Drive;
-use crate::harness::runtime::types::LaneError;
-use crate::harness::runtime::types::lane_error;
-use crate::harness::session::memory::MemoryStorage;
-use crate::harness::session::memory::MemoryStorageOptions;
-use crate::harness::session::session::StorageBackedSession;
-use crate::harness::session::session::StorageBackedSessionOptions;
+use crate::harness::runtime::types::{Config, Drive, LaneError, lane_error};
+use crate::harness::session::memory::{MemoryStorage, MemoryStorageOptions};
+use crate::harness::session::session::{StorageBackedSession, StorageBackedSessionOptions};
 use crate::harness::session::types::CommitResult;
 use crate::harness::session::types::CompactionReason;
 use crate::harness::session::types::DeferredEffectPendingOperation;
@@ -82,24 +142,13 @@ use crate::harness::session::types::StorageBranchScan;
 use crate::harness::session::types::SummaryContext;
 use crate::harness::session::types::SummaryGenerationScope;
 use crate::harness::session::types::SummaryTask;
-use crate::harness::session::types::ToolBatch;
-use crate::harness::session::types::ToolCall;
-use crate::harness::session::types::ToolsOperation;
-use crate::harness::session::types::UsageRow;
-use crate::harness::session::types::UsageScan;
+use crate::harness::session::types::{ToolBatch, ToolCall, ToolsOperation, UsageRow, UsageScan};
 use crate::harness::session::values::ListAddress;
 use crate::harness::session::values::ListElement;
 use crate::harness::session::values::ListReadOptions;
-use crate::harness::session::values::StoredValue;
-use crate::harness::session::values::ValueAddress;
-use crate::harness::session::values::Write;
-use crate::harness::session::values::set_value_write;
-use crate::harness::types::AgentHarnessResources;
-use crate::harness::types::AgentHarnessStreamOptions;
-use crate::types::AgentMessage;
-use crate::types::QueueMode;
-use crate::types::ThinkingLevel;
-use crate::types::ToolExecutionMode;
+use crate::harness::session::values::{StoredValue, ValueAddress, Write, set_value_write};
+use crate::harness::types::{AgentHarnessResources, AgentHarnessStreamOptions};
+use crate::types::{AgentMessage, QueueMode, ThinkingLevel, ToolExecutionMode};
 
 /// The lane configuration every fixture starts from, upstream's
 /// `configuration` constant.
@@ -174,11 +223,19 @@ pub(super) fn deferred() -> (
 
 /// The session id counter every runtime suite shares: one id per fixture
 /// session within the test process, the uniqueness the per-suite counters
-/// gave.
+/// gave. The prefix restates upstream's per-suite `` `${suite}-` `` id
+/// shape.
+#[must_use]
+pub(super) fn next_session_id_in(prefix: &str) -> String {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    format!("{prefix}-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
+}
+
+/// The runtime fixture suite's session id, [`next_session_id_in`] with the
+/// runtime-fixture prefix.
 #[must_use]
 pub(super) fn next_session_id() -> String {
-    static COUNTER: AtomicUsize = AtomicUsize::new(0);
-    format!("runtime-fixture-{}", COUNTER.fetch_add(1, Ordering::SeqCst))
+    next_session_id_in("runtime-fixture")
 }
 
 /// Locks one mutex, poisoned-lock recovery included, upstream's plain
@@ -187,12 +244,19 @@ pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Builds one plain user text message, upstream's `{ role: "user",
-/// content: text, timestamp: 1 }` literals.
+/// Builds one plain user text message, upstream's `user(content, timestamp
+/// = 1)` default.
 #[must_use]
 pub(super) fn user_text_message(text: &str) -> AgentMessage {
+    user_message(text, 1)
+}
+
+/// Builds one user text message at `timestamp`, upstream's
+/// `user(content, timestamp)` with its argument supplied.
+#[must_use]
+pub(super) fn user_message(text: &str, timestamp: i64) -> AgentMessage {
     AgentMessage::Standard(Message::User(UserMessage {
-        timestamp: 1,
+        timestamp,
         content: UserContent::Text(text.to_owned()),
     }))
 }
@@ -612,6 +676,81 @@ pub(super) async fn finish_operation(lane: &Lane) {
     .expect("the finish settles");
 }
 
+/// Reads one stored value and unwraps it, upstream's
+/// `const stored = await session.getValue(address)` reads: the returned
+/// struct carries the wire JSON under `value`.
+pub(super) async fn stored_value<S: Session + ?Sized>(
+    session: &Arc<S>,
+    address: &ValueAddress,
+    context: &Context,
+) -> StoredValue {
+    session
+        .get_value(address, context)
+        .await
+        .expect("the value reads")
+        .expect("the value is stored")
+}
+
+/// The event-pushing listener, upstream's `(event) => { events.push(event); }`
+/// rows: the listener clones the event into the shared sink.
+#[must_use]
+pub(super) fn recording_listener(sink: Arc<Mutex<Vec<HarnessEvent>>>) -> EventListener {
+    Arc::new(move |event: &HarnessEvent, _context| {
+        let sink = Arc::clone(&sink);
+        let event = event.clone();
+        Box::pin(async move {
+            lock(&sink).push(event);
+            Ok(())
+        })
+    })
+}
+
+/// The release-gated idle callback without a started gate, upstream's
+/// `runWhenIdle(async () => { await release.promise; })` fixtures.
+#[must_use]
+pub(super) fn release_idle_callback(
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> crate::harness::agent_harness::IdleCallback {
+    let release_cell = Arc::new(Mutex::new(Some(release)));
+    Arc::new(move |_context| {
+        let release_cell = Arc::clone(&release_cell);
+        Box::pin(async move {
+            let receiver = lock(&release_cell).take();
+            if let Some(receiver) = receiver {
+                let _ = receiver.await;
+            }
+        })
+    })
+}
+
+/// The parking idle callback, upstream's `runWhenIdle(async () => {
+/// started.resolve(); await release.promise; })`: the callback resolves
+/// the started gate on entry and parks on the release gate.
+#[must_use]
+pub(super) fn parking_idle_callback(
+    started: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> crate::harness::agent_harness::IdleCallback {
+    let started_cell = Arc::new(Mutex::new(Some(started)));
+    let release_cell = Arc::new(Mutex::new(Some(release)));
+    Arc::new(move |_context| {
+        let started_cell = Arc::clone(&started_cell);
+        let release_cell = Arc::clone(&release_cell);
+        Box::pin(async move {
+            let sender = lock(&started_cell).take();
+            if let Some(sender) = sender {
+                let _ = sender.send(());
+            }
+            // The guard must drop before the await: a std MutexGuard is
+            // not Send, and the callback's future is.
+            let receiver = lock(&release_cell).take();
+            if let Some(receiver) = receiver {
+                let _ = receiver.await;
+            }
+        })
+    })
+}
+
 /// The settle upstream's `setTimeout(resolve, 0)` await restates: yields
 /// until the bus delivery tail and the watchers' spawned drain tasks have
 /// flushed their work onto the current-thread runtime.
@@ -643,6 +782,33 @@ struct ReadFailureArm {
 /// subclasses: one hook ahead of the next commit, one one-shot commit
 /// failure, and the value-read counter the progress assertions read
 /// (upstream's `vi.spyOn(storage, "getValue")`).
+/// The plain scan forwards the memory-delegating fixtures share: each
+/// fixture wrapper embeds a `memory: Arc<MemoryStorage>` delegate and
+/// expands this inside its `impl Storage` for the scans every
+/// instrumented variant forwards untouched. Expanded at the use site so
+/// the delegate field's owner is the wrapper.
+macro_rules! memory_storage_tail {
+    () => {
+        fn scan_entries(
+            &self,
+            query: &EntryScan,
+            context: &Context,
+        ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
+            self.memory.scan_entries(query, context)
+        }
+
+        fn scan_usage(
+            &self,
+            query: &UsageScan,
+            context: &Context,
+        ) -> BoxedFuture<'_, Result<Vec<UsageRow>, SessionError>> {
+            self.memory.scan_usage(query, context)
+        }
+    };
+}
+
+pub(super) use memory_storage_tail;
+
 pub(super) struct ControlledStorage {
     memory: Arc<MemoryStorage>,
     before_next_commit: Mutex<Option<BeforeCommitFn>>,
@@ -874,21 +1040,7 @@ impl Storage for ControlledStorage {
         self.memory.scan_branch_structure(query, context)
     }
 
-    fn scan_entries(
-        &self,
-        query: &EntryScan,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        self.memory.scan_entries(query, context)
-    }
-
-    fn scan_usage(
-        &self,
-        query: &UsageScan,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<UsageRow>, SessionError>> {
-        self.memory.scan_usage(query, context)
-    }
+    memory_storage_tail!();
 
     fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
         let failure = lock(&self.stats_failure).take();
@@ -942,21 +1094,23 @@ pub(super) fn recording_watch_installer(initial: LaneSnapshot) -> WatchInstaller
         move |_filter: WatchFilter,
               _context: &Context,
               _resnapshot: ResnapshotCapture<LaneSnapshot>| {
-            Box::new(RecordingWatch {
+            Ok(Box::new(RecordingWatch {
                 snapshot: Mutex::new(initial.clone()),
-            })
+            }))
         },
     )
 }
 
-/// Builds the watch installer the progress fixture passes, upstream's
-/// `unusedWatch`: a watch these suites never call, which panics if a code
-/// path ever reaches it.
+/// Builds the watch installer the runtime fixtures pass, upstream's
+/// `unusedWatch`: a watch these suites never call, which panics with the
+/// suite's name if a code path ever reaches it.
 #[must_use]
-pub(super) fn unused_watch_installer() -> WatchInstaller {
+pub(super) fn unused_watch_installer(suite: &'static str) -> WatchInstaller {
     Arc::new(
-        |_filter: WatchFilter, _context: &Context, _resnapshot: ResnapshotCapture<LaneSnapshot>| {
-            panic!("watch is not used by progress tests")
+        move |_filter: WatchFilter,
+              _context: &Context,
+              _resnapshot: ResnapshotCapture<LaneSnapshot>| {
+            panic!("watch is not used by {suite} tests")
         },
     )
 }
@@ -1147,7 +1301,7 @@ pub(super) fn bus_watch_installer(
                 .expect("watch installs");
             let boxed: Box<dyn WatchHandle<LaneSnapshot>> =
                 Box::new(BusWatchHandle { inner: watcher });
-            boxed
+            Ok(boxed)
         },
     )
 }
