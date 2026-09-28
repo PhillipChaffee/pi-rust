@@ -69,10 +69,14 @@ pub fn create_fork_snapshot(
     let entries: BTreeMap<String, Entry> = entry_ids
         .iter()
         .map(|id| {
-            let entry = source_entries
-                .get(id)
-                .cloned()
-                .unwrap_or_else(|| unreachable_selected_entry(id));
+            #[expect(
+                clippy::option_if_let_else,
+                reason = "the closure-free match keeps the invariant arm a match arm instead of a coverage-counted closure"
+            )]
+            let entry = match source_entries.get(id) {
+                Some(entry) => entry.clone(),
+                None => unreachable_selected_entry(id),
+            };
             (id.clone(), entry)
         })
         .collect();

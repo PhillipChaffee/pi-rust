@@ -716,8 +716,13 @@ impl HookRegistry {
 /// The error one hook run reports, upstream's `runWithGate` rejections.
 #[derive(Debug)]
 pub enum HookRunError {
-    /// The gate refused admission for cancellation.
+    /// The admitted context aborted before any handler ran.
     Aborted(pi_chord::context::AbortReason),
+    /// The gate refused admission because an abort began, upstream's
+    /// `runWithGate` surfacing the thrown `AbortRequested`; the carried
+    /// cancellation settles when the abort work completes, which the drive
+    /// spine awaits before falling through.
+    GateAborted(crate::harness::gate::AbortRequested),
     /// The registry or gate closed.
     Closed(HarnessError),
     /// A fail-closed handler failed.
@@ -728,6 +733,7 @@ impl std::fmt::Display for HookRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Aborted(reason) => write!(f, "{reason}"),
+            Self::GateAborted(abort) => write!(f, "{abort}"),
             Self::Closed(error) => write!(f, "{error}"),
             Self::Handler(error) => write!(f, "{error}"),
         }
@@ -739,9 +745,7 @@ impl std::error::Error for HookRunError {}
 impl From<crate::harness::gate::GateRejection> for HookRunError {
     fn from(rejection: crate::harness::gate::GateRejection) -> Self {
         match rejection {
-            crate::harness::gate::GateRejection::AbortRequested(_) => {
-                Self::Aborted(pi_chord::context::AbortReason::Aborted)
-            }
+            crate::harness::gate::GateRejection::AbortRequested(abort) => Self::GateAborted(abort),
             crate::harness::gate::GateRejection::Closed(error) => {
                 Self::Closed(HarnessError::Closed { message: error.0 })
             }

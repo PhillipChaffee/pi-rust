@@ -1,13 +1,19 @@
 //! The progress channels an in-flight effect publishes through, ported from
 //! upstream `src/harness/runtime/progress.ts`.
 //!
-//! Upstream's channel chains each write's command onto `latest`, so
-//! `drain()` awaits the newest write and the lane's mutation line keeps the
-//! order. The port spawns each write's command on write and records the
-//! newest write's settlement in a watch channel — multi-consumer awaiting,
-//! which JS promises are by construction. Write failures stay retained in
-//! the settlement (upstream's `latest` rejection) and surface through
-//! `drain`.
+//! Upstream's `write` calls `lane.command` synchronously, so the mutation
+//! line enqueues in call order, and replaces `latest` with the newest
+//! write's promise, so `drain()` awaits the newest write. The port's
+//! enqueue happens when the write's task polls, which a multi-thread
+//! runtime schedules in any order, so each write's task first awaits its
+//! predecessor's settlement — the chain restores the call-order enqueue on
+//! every runtime flavor — and the newest write's settlement rides a watch
+//! channel, which serves `drain`'s newest-write await with the
+//! multi-consumer semantics JS promises have by construction. Write
+//! failures stay retained in the settlement (upstream's `latest`
+//! rejection) and surface through `drain`; a vanished predecessor's
+//! dropped sender releases the chain, upstream's `.catch(() => {})`
+//! keeping the tail alive across any failure.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, atomic::AtomicBool, atomic::Ordering};
 
@@ -163,11 +169,36 @@ fn open_progress<T: Send + Sync + 'static>(
         let still_owns = Arc::clone(&still_owns);
         let commit_write = Arc::clone(&commit_write);
         let (settlement_tx, settlement_rx) = tokio::sync::watch::channel(None);
-        {
+        // The predecessor's receiver and this write's own swap under one
+        // lock, so the chain follows the write call order — two rapid
+        // writes must not race the swap on a multi-thread runtime,
+        // upstream's synchronous read-then-assign of `latest`.
+        let previous = {
             let mut guard = lock_latest(&write_shared);
+            let previous = guard.take();
             *guard = Some(settlement_rx);
-        }
+            previous
+        };
         tokio::spawn(async move {
+            // The enqueue waits on the predecessor's settlement, so the
+            // mutation line sees the writes in call order on any runtime
+            // flavor, upstream's synchronous `lane.command` enqueue; a
+            // vanished predecessor's dropped sender releases the wait,
+            // upstream's `.catch(() => {})` keeping the tail alive across
+            // any failure.
+            if let Some(mut previous) = previous {
+                loop {
+                    {
+                        let settled = previous.borrow_and_update();
+                        if settled.is_some() {
+                            break;
+                        }
+                    }
+                    if previous.changed().await.is_err() {
+                        break;
+                    }
+                }
+            }
             let outcome = lane
                 .command(
                     move |state,

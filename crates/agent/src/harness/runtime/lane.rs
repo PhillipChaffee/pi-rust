@@ -27,11 +27,13 @@
 //!   restates as the delivery future's error: memory stays published and the
 //!   command rejects after the commit.
 //!
-//! Staged seams raise [`SliceNotImplemented`] until their owning children
-//! land: compaction and summarized-navigation preparation ride the
-//! compaction child, skill and prompt-template formatting ride the skills
-//! child, and the drive-pass procedure loop (`driveOperation`) rides the
-//! drive child — an installed pass faults deterministically until then.
+//! The drive-pass procedure loop (`driveOperation`) homes in
+//! [`crate::harness::runtime::drive`]: an installed pass spawns it
+//! detached, and the spawn's handlers clear the owner before settling or
+//! failing the pass's completion. Compaction and summarized-navigation
+//! admissions prepare through the drive child's structural serializers,
+//! and prompt, skill, and prompt-template admissions format through the
+//! skills child.
 //!
 //! Error-surface restatement: upstream lane methods reject with the thrown
 //! error object; the landed [`AgentLane`] trait collapses that surface —
@@ -108,6 +110,11 @@ use crate::harness::agent_harness::RunOutcome;
 use crate::harness::agent_harness::RunResult;
 use crate::harness::agent_harness::SuspendedRun;
 use crate::harness::agent_harness::WatchHandle;
+use crate::harness::agent_harness::global_event;
+use crate::harness::agent_harness::lane_scoped_event;
+use crate::harness::compaction::branch_summarization::prepare_branch_entries;
+use crate::harness::compaction::compaction::prepare_compaction;
+use crate::harness::compaction::types::BranchPreparation;
 use crate::harness::context::Context;
 use crate::harness::events::ListenerError;
 use crate::harness::events::ResnapshotBoundary as HarnessResnapshotBoundary;
@@ -117,6 +124,9 @@ use crate::harness::execution::tools::tool_result_from_message;
 use crate::harness::prompt_templates::format_prompt_template_invocation;
 use crate::harness::result::HarnessClosed;
 use crate::harness::result::HarnessError;
+use crate::harness::runtime::drive::drive_operation;
+use crate::harness::runtime::drive::structural::durable_branch_preparation;
+use crate::harness::runtime::drive::structural::durable_compaction_preparation;
 use crate::harness::runtime::progress::read_assistant_frames;
 use crate::harness::runtime::transcript::chain_entries;
 use crate::harness::runtime::transcript::committed_entry_events;
@@ -130,13 +140,14 @@ use crate::harness::runtime::types::LanePatch;
 use crate::harness::runtime::types::LaneState;
 use crate::harness::runtime::types::LiveOperation;
 use crate::harness::runtime::types::OperationCommand;
-use crate::harness::runtime::types::SliceNotImplemented;
 use crate::harness::runtime::types::any_payload;
 use crate::harness::runtime::types::from_arc;
 use crate::harness::runtime::types::lane_error;
+use crate::harness::runtime::types::panicked_task_error;
 use crate::harness::session::types::BranchScan;
 use crate::harness::session::types::BranchScanOrder;
 use crate::harness::session::types::CommitResult;
+use crate::harness::session::types::CompactionReason;
 use crate::harness::session::types::Control;
 use crate::harness::session::types::Entry;
 use crate::harness::session::types::EntryType;
@@ -152,6 +163,7 @@ use crate::harness::session::types::OperationResultRecord;
 use crate::harness::session::types::OperationScope;
 use crate::harness::session::types::OperationState;
 use crate::harness::session::types::PendingEntry;
+use crate::harness::session::types::ResultBoundary;
 use crate::harness::session::types::RunSettings;
 use crate::harness::session::types::Session;
 use crate::harness::session::types::SessionError;
@@ -159,6 +171,8 @@ use crate::harness::session::types::SessionMutationCallback;
 use crate::harness::session::types::SessionMutator;
 use crate::harness::session::types::SessionReader;
 use crate::harness::session::types::StartingOperation;
+use crate::harness::session::types::SummaryDecidingOperation;
+use crate::harness::session::types::SummaryTask;
 use crate::harness::session::types::UsageRow;
 use crate::harness::session::types::UsageWriteRow;
 use crate::harness::session::values::EntryWrite;
@@ -170,6 +184,7 @@ use crate::harness::session::values::delete_value_write;
 use crate::harness::session::values::lane_config;
 use crate::harness::session::values::lane_state;
 use crate::harness::session::values::operation_meta;
+use crate::harness::session::values::operation_preparation;
 use crate::harness::session::values::operation_result;
 use crate::harness::session::values::operation_state;
 use crate::harness::session::values::operation_tool_args;
@@ -197,13 +212,15 @@ pub type EmitBatch = Arc<
 ///
 /// The initial snapshot restates as the absence of one: the lane captures
 /// and sets it after the install, upstream's `{} as LaneSnapshot` +
-/// assignment.
+/// assignment. The error is the closed-bus rejection, upstream's
+/// `HarnessEventBus.watch` throwing `closedError` — a caller-visible error
+/// when a watch races the bus close.
 pub type WatchInstaller = Arc<
     dyn Fn(
             WatchFilter,
             &Context,
             ResnapshotCapture<LaneSnapshot>,
-        ) -> Box<dyn WatchHandle<LaneSnapshot>>
+        ) -> Result<Box<dyn WatchHandle<LaneSnapshot>>, LaneError>
         + Send
         + Sync,
 >;
@@ -369,12 +386,17 @@ fn pending_entry_write(entry_id: &str, pending: &PendingEntry) -> NewEntry {
     }
 }
 
-/// Builds one plain-text user message, upstream's prompt payloads'
-/// `{ type: "user", content: prompt }` construction.
+/// Builds one single-text-block user message, upstream's skill and
+/// prompt-template branches' `{ role: "user", content: [{ type: "text",
+/// text }] }` construction: the formatted text rides a blocks array, not
+/// a bare string.
 #[must_use]
-const fn user_text_message(text: String, timestamp: i64) -> AgentMessage {
+fn user_text_message(text: String, timestamp: i64) -> AgentMessage {
     AgentMessage::Standard(Message::User(UserMessage {
-        content: UserContent::Text(text),
+        content: UserContent::Blocks(vec![UserBlock::Text(TextContent {
+            text,
+            text_signature: None,
+        })]),
         timestamp,
     }))
 }
@@ -419,7 +441,9 @@ fn abort_reason_error(reason: Option<AbortReason>) -> LaneError {
     from_arc(Arc::new(SessionError::Message(message)))
 }
 
-const fn intent_kind_of(meta: &OperationMeta) -> OperationKind {
+/// The operation kind one operation intent maps to, upstream's
+/// `meta.intent.kind` reads.
+pub(crate) const fn intent_kind_of(meta: &OperationMeta) -> OperationKind {
     match meta.intent {
         crate::harness::session::types::OperationIntent::Run { .. } => OperationKind::Run,
         crate::harness::session::types::OperationIntent::Compaction { .. } => {
@@ -428,6 +452,39 @@ const fn intent_kind_of(meta: &OperationMeta) -> OperationKind {
         crate::harness::session::types::OperationIntent::Navigation { .. } => {
             OperationKind::Navigation
         }
+    }
+}
+
+/// The operation's durable write family, the admission commits'
+/// `{ meta, state, laneState }` value-set triple, upstream's
+/// per-admission value writes.
+fn operation_writes(
+    operation_id: &str,
+    lane_name: &str,
+    meta: OperationMeta,
+    state: OperationState,
+    inbox: &[InboxItem],
+    last_operation_id: Option<&str>,
+) -> Result<Vec<Write>, LaneError> {
+    Ok(vec![
+        set_value_write(&operation_meta(operation_id), meta).map_err(lane_error)?,
+        set_value_write(&operation_state(operation_id), state).map_err(lane_error)?,
+        set_value_write(
+            &lane_state(lane_name),
+            durable_lane_state(Some(operation_id), inbox, last_operation_id),
+        )
+        .map_err(lane_error)?,
+    ])
+}
+
+/// The busy rejection an admitted operation carries, upstream's
+/// `LaneBusy` throws over the live operation's id and kind.
+fn lane_busy_error(lane_name: &str, operation: &LiveOperation) -> HarnessError {
+    HarnessError::LaneBusy {
+        lane: lane_name.to_owned(),
+        operation_id: operation.meta.operation_id.clone(),
+        operation_kind: intent_kind_of(&operation.meta),
+        message: format!("Lane {} already has an active operation", quoted(lane_name)),
     }
 }
 
@@ -497,12 +554,12 @@ pub fn operation_state_with_scope(state: &OperationState, scope: OperationScope)
                 ..leaf.clone()
             },
         ),
-        OperationState::SummaryDeciding(leaf) => OperationState::SummaryDeciding(
-            crate::harness::session::types::SummaryDecidingOperation {
+        OperationState::SummaryDeciding(leaf) => {
+            OperationState::SummaryDeciding(SummaryDecidingOperation {
                 scope,
                 ..leaf.clone()
-            },
-        ),
+            })
+        }
         OperationState::SummaryReady(leaf) => {
             OperationState::SummaryReady(crate::harness::session::types::SummaryReadyOperation {
                 scope,
@@ -617,6 +674,24 @@ async fn wait_owner_or_change(
 }
 
 impl Lane {
+    /// The unexpected-class fault the acceptance classifiers raise,
+    /// upstream's catch-all `{ ...fault }` arm: the caller-class errors
+    /// pass through and anything else faults the harness; the family names
+    /// the procedure.
+    fn acceptance_fault_arm(
+        &self,
+        family: &str,
+        error: &HarnessError,
+        context: &Context,
+    ) -> LaneError {
+        self.fault(
+            from_arc(Arc::new(SessionError::Invariant(format!(
+                "{family} acceptance returned {}",
+                error.tag()
+            )))),
+            context,
+        )
+    }
     /// Builds one lane over its durable state, upstream's `constructor`.
     #[must_use]
     #[expect(
@@ -674,31 +749,39 @@ impl Lane {
         &self.inner.hooks
     }
 
+    /// The model registry, upstream's `models` field: the drive procedures
+    /// resolve the configured model and stream, complete, and cancel
+    /// deferred requests through it.
+    #[must_use]
+    pub fn models(&self) -> &Arc<pi_ai::models::Models> {
+        &self.inner.models
+    }
+
+    /// The event publisher for batches outside a commit, upstream's
+    /// `emitBatch` field: the drive procedures publish recovery and
+    /// progress event batches through it and await the delivery future.
+    #[must_use]
+    pub fn emit_batch(&self) -> &EmitBatch {
+        &self.inner.emit_batch
+    }
+
     /// The owned state projection, upstream's `state` property.
     #[must_use]
     pub fn state(&self) -> LaneState {
         lock_core(&self.inner).state.clone()
     }
 
-    /// The active drive pass, upstream's `activeDrive` — package-internal;
-    /// the deterministic procedure tests install exact owners directly.
+    /// The active drive pass, upstream's `activeDrive` — package-internal; the
+    /// drive spawn's handlers identity-check it and the deterministic
+    /// procedure tests install exact owners directly.
     #[must_use]
     pub fn active_drive(&self) -> Option<Arc<Drive>> {
         lock_core(&self.inner).active_drive.clone()
     }
 
-    /// Installs or clears the active drive pass; package-internal, the
-    /// procedure tests' direct-owner statement. The lib build sees no
-    /// caller (the lane's own drive path mutates the core under its lock)
-    /// until the drive child lands; the test builds reach it through the
-    /// progress and boundary suites.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the drive child's deterministic procedure tests install exact owners through this setter; until then only the runtime suites call it"
-        )
-    )]
+    /// Installs or clears the active drive pass; package-internal. The
+    /// drive spawn's owner clear routes through it, and the deterministic
+    /// procedure tests install exact owners through it.
     pub(crate) fn set_active_drive(&self, drive: Option<Arc<Drive>>) {
         lock_core(&self.inner).active_drive = drive;
     }
@@ -1393,15 +1476,7 @@ impl Lane {
                 Box::pin(async move {
                     if let Some(operation) = &state.operation {
                         return Ok(LaneCommand::Return {
-                            result: Err(HarnessError::LaneBusy {
-                                lane: lane_name.clone(),
-                                operation_id: operation.meta.operation_id.clone(),
-                                operation_kind: intent_kind_of(&operation.meta),
-                                message: format!(
-                                    "Lane {} already has an active operation",
-                                    quoted(&lane_name)
-                                ),
-                            }),
+                            result: Err(lane_busy_error(&lane_name, operation)),
                         });
                     }
                     let (selected_items, inbox) =
@@ -1521,28 +1596,14 @@ impl Lane {
                         set_value_write(&branch_tip(&lane_name), Some(parent_id.clone()))
                             .map_err(lane_error)?,
                     );
-                    writes.push(
-                        set_value_write(&operation_meta(&operation_id), meta.clone())
-                            .map_err(lane_error)?,
-                    );
-                    writes.push(
-                        set_value_write(
-                            &operation_state(&operation_id),
-                            next_operation_state.clone(),
-                        )
-                        .map_err(lane_error)?,
-                    );
-                    writes.push(
-                        set_value_write(
-                            &lane_state(&lane_name),
-                            durable_lane_state(
-                                Some(&operation_id),
-                                &inbox,
-                                state.last_operation_id.as_deref(),
-                            ),
-                        )
-                        .map_err(lane_error)?,
-                    );
+                    writes.extend(operation_writes(
+                        &operation_id,
+                        &lane_name,
+                        meta.clone(),
+                        next_operation_state.clone(),
+                        &inbox,
+                        state.last_operation_id.as_deref(),
+                    )?);
 
                     let events_lane = lane_name.clone();
                     let events_operation_id = operation_id.clone();
@@ -1604,13 +1665,15 @@ impl Lane {
         .await
     }
 
-    /// Admits a compaction operation, upstream's `acceptCompaction`. The
-    /// preparation computation rides the compaction child; the staged seam
-    /// raises until it lands.
+    /// Admits a compaction operation, upstream's `acceptCompaction`.
+    ///
+    /// The admission scans the compactable path, prepares through the
+    /// compaction child, and writes the durable preparation, the operation
+    /// meta and state, and the lane record in that order; the commit emits
+    /// one `CompactionStart` event.
     #[expect(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        reason = "mirrors upstream's async acceptCompaction; the lane's async method surface stays uniform"
+        clippy::too_many_lines,
+        reason = "the port mirrors upstream's single acceptCompaction method"
     )]
     async fn accept_compaction(
         &self,
@@ -1620,19 +1683,149 @@ impl Lane {
         acceptance_config: Config,
         context: &Context,
     ) -> Result<OperationAdmissionResult, LaneError> {
-        let _ = (
-            request,
-            operation_id,
-            started_at,
-            acceptance_config,
+        let OperationRequest::Compaction {
+            custom_instructions,
+            ..
+        } = request
+        else {
+            return Err(lane_error(SessionError::Invariant(
+                "accept_compaction takes compaction requests".to_owned(),
+            )));
+        };
+        let custom_instructions = custom_instructions.clone();
+        let task_id = self.inner.session.id_generator().next(Some(started_at));
+        let lane_name = self.inner.name.clone();
+
+        self.command::<OperationAdmissionResult, _>(
+            move |state, session, command_context| {
+                let lane_name = lane_name.clone();
+                let operation_id = operation_id.clone();
+                let custom_instructions = custom_instructions.clone();
+                let acceptance_config = acceptance_config.clone();
+                let task_id = task_id.clone();
+                Box::pin(async move {
+                    if let Some(operation) = &state.operation {
+                        return Ok(LaneCommand::Return {
+                            result: Err(lane_busy_error(&lane_name, operation)),
+                        });
+                    }
+                    let mut path: Vec<Entry> = Vec::new();
+                    if let Some(tip_id) = &state.tip_id {
+                        path = session
+                            .scan_branch(
+                                &crate::harness::session::types::StorageBranchScan {
+                                    start: tip_id.clone(),
+                                    stop_at_type: Some(EntryType::Compaction),
+                                    order: Some(BranchScanOrder::NewestFirst),
+                                    ..Default::default()
+                                },
+                                &command_context,
+                            )
+                            .await
+                            .map_err(lane_error)?;
+                        path.reverse();
+                    }
+                    let prepared = prepare_compaction(&path, acceptance_config.compaction)
+                        .map_err(lane_error)?;
+                    let Some(prepared) = prepared else {
+                        return Ok(LaneCommand::Return {
+                            result: Err(HarnessError::NothingToCompact {
+                                lane: lane_name.clone(),
+                                message: format!(
+                                    "Lane {} has nothing to compact",
+                                    quoted(&lane_name)
+                                ),
+                            }),
+                        });
+                    };
+                    let meta = OperationMeta {
+                        operation_id: operation_id.clone(),
+                        lane: lane_name.clone(),
+                        source_tip_id: state.tip_id.clone(),
+                        started_at,
+                        intent: crate::harness::session::types::OperationIntent::Compaction {
+                            custom_instructions: custom_instructions.clone(),
+                        },
+                    };
+                    let next_operation_state =
+                        OperationState::SummaryDeciding(SummaryDecidingOperation {
+                            scope: OperationScope {
+                                control: Control::Running,
+                                settings: captured_settings(&acceptance_config),
+                                latest_assistant_entry_id: None,
+                            },
+                            task: SummaryTask {
+                                task_id: task_id.clone(),
+                                reason: Some(CompactionReason::Manual),
+                                custom_instructions: custom_instructions.clone(),
+                                boundary: ResultBoundary::Finish,
+                            },
+                        });
+                    let mut writes: Vec<Write> = vec![
+                        set_value_write(
+                            &operation_preparation(&operation_id, &task_id),
+                            durable_compaction_preparation(prepared),
+                        )
+                        .map_err(lane_error)?,
+                    ];
+                    writes.extend(operation_writes(
+                        &operation_id,
+                        &lane_name,
+                        meta.clone(),
+                        next_operation_state.clone(),
+                        &state.inbox,
+                        state.last_operation_id.as_deref(),
+                    )?);
+                    let mut next = state.clone();
+                    next.operation = Some(LiveOperation {
+                        meta,
+                        state: next_operation_state,
+                    });
+                    let events_lane = lane_name.clone();
+                    let events_operation_id = operation_id.clone();
+                    Ok(LaneCommand::Commit {
+                        writes,
+                        next,
+                        materialize: Arc::new(move |_commit: &CommitResult| {
+                            Ok(OperationAdmission {
+                                operation_id: operation_id.clone(),
+                                kind: OperationKind::Compaction,
+                                started_at,
+                            })
+                        }),
+                        events: Some(Arc::new(move |_commit: &CommitResult| {
+                            vec![
+                                HarnessEvent::lane_scoped(
+                                    &events_lane,
+                                    false,
+                                    HarnessEventPayload::CompactionStart {
+                                        run_id: events_operation_id.clone(),
+                                        reason: CompactionReason::Manual,
+                                        started_at,
+                                    },
+                                )
+                                .unwrap_or_else(|error| {
+                                    unreachable!("compaction_start is lane-scoped: {error}")
+                                }),
+                            ]
+                        })),
+                    })
+                })
+            },
             context,
-        );
-        Err(Arc::new(SliceNotImplemented::new("compaction")))
+        )
+        .await
     }
 
-    /// Admits a navigation operation, upstream's `acceptNavigation`. The
-    /// summarized path's branch preparation rides the compaction child; the
-    /// staged seam raises before the retry loop until it lands.
+    /// Admits a navigation operation, upstream's `acceptNavigation`.
+    ///
+    /// The summarized branch observes the tip, reads the target, scans both
+    /// branches for the common ancestor, and prepares the abandoned branch
+    /// through the compaction child with no token budget; the command
+    /// retries the observation when the tip moved between the scan and the
+    /// commit. Both branches write the preparation (when summarized), the
+    /// operation meta and state, and the lane record, and emit one
+    /// `NavigationStart` event.
     #[expect(
         clippy::too_many_lines,
         reason = "the port mirrors upstream's single acceptNavigation method"
@@ -1655,159 +1848,270 @@ impl Lane {
         };
         let options = options.clone().unwrap_or_default();
         let summarize = options.summarize.unwrap_or(false);
-        if summarize {
-            return Err(lane_error(SliceNotImplemented::new(
-                "summarized navigation",
-            )));
-        }
         let target_id = target_id.clone();
         let options_label = options.label.clone();
         let options_custom_instructions = options.custom_instructions.clone();
+        let task_id = self.inner.session.id_generator().next(Some(started_at));
         let lane_name = self.inner.name.clone();
 
-        self.command::<OperationAdmissionResult, _>(
-            move |state, session, command_context| {
-                let lane_name = lane_name.clone();
-                let operation_id = operation_id.clone();
-                let target_id = target_id.clone();
-                let options_label = options_label.clone();
-                let options_custom_instructions = options_custom_instructions.clone();
-                let acceptance_config = acceptance_config.clone();
-                Box::pin(async move {
-                    if let Some(operation) = &state.operation {
-                        return Ok(LaneCommand::Return {
-                            result: Err(HarnessError::LaneBusy {
-                                lane: lane_name.clone(),
-                                operation_id: operation.meta.operation_id.clone(),
-                                operation_kind: intent_kind_of(&operation.meta),
-                                message: format!(
-                                    "Lane {} already has an active operation",
-                                    quoted(&lane_name)
-                                ),
-                            }),
-                        });
-                    }
-                    if target_id == state.tip_id {
-                        return Ok(LaneCommand::Return {
-                            result: Err(HarnessError::InvalidNavigation {
-                                lane: lane_name.clone(),
-                                reason: "current_tip".to_owned(),
-                                message: "Navigation target must differ from the current tip"
-                                    .to_owned(),
-                            }),
-                        });
-                    }
-                    if target_id.is_none() && options_label.is_some() {
-                        return Ok(LaneCommand::Return {
-                            result: Err(HarnessError::InvalidNavigation {
-                                lane: lane_name.clone(),
-                                reason: "root_label".to_owned(),
-                                message: "Root navigation cannot set a label".to_owned(),
-                            }),
-                        });
-                    }
-                    if let Some(target_id) = &target_id {
-                        let found = session
-                            .get_entries(vec![target_id.clone()], &command_context)
-                            .await
-                            .map_err(lane_error)?;
-                        if !found.contains_key(target_id) {
-                            return Ok(LaneCommand::Return {
-                                result: Err(HarnessError::UnknownTarget {
-                                    target_id: target_id.clone(),
-                                    message: format!("Unknown target: {target_id}"),
-                                }),
-                            });
-                        }
-                    }
+        loop {
+            let observed_tip_id = self.state().tip_id;
+            let mut preparation: Option<BranchPreparation> = None;
+            if summarize
+                && let Some(tip_entry_id) = &observed_tip_id
+                && let Some(target_entry_id) = &target_id
+            {
+                let target = self
+                    .inner
+                    .session
+                    .get_entries(vec![target_entry_id.clone()], context)
+                    .await
+                    .map_err(lane_error)?;
+                if target.contains_key(target_entry_id) {
+                    let (old_path, target_path) = tokio::try_join!(
+                        self.inner.session.scan_branch(
+                            &crate::harness::session::types::StorageBranchScan {
+                                start: tip_entry_id.clone(),
+                                order: Some(BranchScanOrder::NewestFirst),
+                                ..Default::default()
+                            },
+                            context,
+                        ),
+                        self.inner.session.scan_branch(
+                            &crate::harness::session::types::StorageBranchScan {
+                                start: target_entry_id.clone(),
+                                order: Some(BranchScanOrder::NewestFirst),
+                                ..Default::default()
+                            },
+                            context,
+                        ),
+                    )
+                    .map_err(lane_error)?;
+                    let old_ids: std::collections::BTreeSet<&str> =
+                        old_path.iter().map(Entry::id).collect();
+                    let common_ancestor_id = target_path
+                        .iter()
+                        .find(|entry| old_ids.contains(entry.id()))
+                        .map(|entry| entry.id().to_owned());
+                    // The ancestor's id sits in the old path's id set by
+                    // construction, so the position never misses.
+                    let cut = common_ancestor_id.map_or(old_path.len(), |ancestor_id| {
+                        old_path
+                            .iter()
+                            .position(|entry| entry.id() == ancestor_id)
+                            .unwrap_or(old_path.len())
+                    });
+                    let mut summarized_path = old_path[..cut].to_vec();
+                    summarized_path.reverse();
+                    preparation = Some(prepare_branch_entries(&summarized_path, 0));
+                }
+            }
 
-                    let meta = OperationMeta {
-                        operation_id: operation_id.clone(),
-                        lane: lane_name.clone(),
-                        source_tip_id: state.tip_id.clone(),
-                        started_at,
-                        intent: crate::harness::session::types::OperationIntent::Navigation {
-                            target_id: target_id.clone(),
-                            summarize: false,
-                            label: options_label.clone(),
-                            custom_instructions: options_custom_instructions.clone(),
-                        },
-                    };
-                    let next_operation_state =
-                        OperationState::NavigationReadyToCommit(NavigationReadyToCommitOperation {
-                            scope: OperationScope {
+            let accepted = self.command::<Option<OperationAdmissionResult>, _>(
+                {
+                    let lane_name = lane_name.clone();
+                    let operation_id = operation_id.clone();
+                    let target_id = target_id.clone();
+                    let options_label = options_label.clone();
+                    let options_custom_instructions = options_custom_instructions.clone();
+                    let acceptance_config = acceptance_config.clone();
+                    let task_id = task_id.clone();
+                    let observed_tip_id = observed_tip_id.clone();
+                    let preparation = preparation.clone();
+                    move |state, session, command_context| {
+                        let lane_name = lane_name.clone();
+                        let operation_id = operation_id.clone();
+                        let target_id = target_id.clone();
+                        let options_label = options_label.clone();
+                        let options_custom_instructions = options_custom_instructions.clone();
+                        let acceptance_config = acceptance_config.clone();
+                        let task_id = task_id.clone();
+                        let observed_tip_id = observed_tip_id.clone();
+                        let preparation = preparation.clone();
+                        Box::pin(async move {
+                            if let Some(operation) = &state.operation {
+                                return Ok(LaneCommand::Return {
+                                    result: Some(Err(lane_busy_error(&lane_name, operation))),
+                                });
+                            }
+                            if state.tip_id != observed_tip_id {
+                                return Ok(LaneCommand::Return { result: None });
+                            }
+                            if target_id == state.tip_id {
+                                return Ok(LaneCommand::Return {
+                                    result: Some(Err(HarnessError::InvalidNavigation {
+                                        lane: lane_name.clone(),
+                                        reason: "current_tip".to_owned(),
+                                        message: "Navigation target must differ from the current tip"
+                                            .to_owned(),
+                                    })),
+                                });
+                            }
+                            if target_id.is_none() && options_label.is_some() {
+                                return Ok(LaneCommand::Return {
+                                    result: Some(Err(HarnessError::InvalidNavigation {
+                                        lane: lane_name.clone(),
+                                        reason: "root_label".to_owned(),
+                                        message: "Root navigation cannot set a label".to_owned(),
+                                    })),
+                                });
+                            }
+                            if summarize && (state.tip_id.is_none() || target_id.is_none()) {
+                                return Ok(LaneCommand::Return {
+                                    result: Some(Err(HarnessError::InvalidNavigation {
+                                        lane: lane_name.clone(),
+                                        reason: if state.tip_id.is_none() {
+                                            "source_root".to_owned()
+                                        } else {
+                                            "target_root".to_owned()
+                                        },
+                                        message: "Summarized navigation requires non-root source and target entries"
+                                            .to_owned(),
+                                    })),
+                                });
+                            }
+                            if let Some(target_entry_id) = &target_id {
+                                let found = session
+                                    .get_entries(
+                                        vec![target_entry_id.clone()],
+                                        &command_context,
+                                    )
+                                    .await
+                                    .map_err(lane_error)?;
+                                if !found.contains_key(target_entry_id) {
+                                    return Ok(LaneCommand::Return {
+                                        result: Some(Err(HarnessError::UnknownTarget {
+                                            target_id: target_entry_id.clone(),
+                                            message: format!("Unknown target: {target_entry_id}"),
+                                        })),
+                                    });
+                                }
+                            }
+
+                            let meta = OperationMeta {
+                                operation_id: operation_id.clone(),
+                                lane: lane_name.clone(),
+                                source_tip_id: state.tip_id.clone(),
+                                started_at,
+                                intent:
+                                    crate::harness::session::types::OperationIntent::Navigation {
+                                        target_id: target_id.clone(),
+                                        summarize,
+                                        label: options_label.clone(),
+                                        custom_instructions: options_custom_instructions.clone(),
+                                    },
+                            };
+                            let scope = OperationScope {
                                 control: Control::Running,
                                 settings: captured_settings(&acceptance_config),
                                 latest_assistant_entry_id: None,
-                            },
-                            target_id: target_id.clone(),
-                            label: options_label.clone(),
-                        });
-                    let writes: Vec<Write> = vec![
-                        set_value_write(&operation_meta(&operation_id), meta.clone())
-                            .map_err(lane_error)?,
-                        set_value_write(
-                            &operation_state(&operation_id),
-                            next_operation_state.clone(),
-                        )
-                        .map_err(lane_error)?,
-                        set_value_write(
-                            &lane_state(&lane_name),
-                            durable_lane_state(
-                                Some(&operation_id),
-                                &state.inbox,
-                                state.last_operation_id.as_deref(),
-                            ),
-                        )
-                        .map_err(lane_error)?,
-                    ];
-                    let mut next = state.clone();
-                    next.operation = Some(LiveOperation {
-                        meta,
-                        state: next_operation_state,
-                    });
-                    let events_lane = lane_name.clone();
-                    let events_operation_id = operation_id.clone();
-                    let events_target = target_id.clone();
-                    Ok(LaneCommand::Commit {
-                        writes,
-                        next,
-                        materialize: Arc::new(move |_commit: &CommitResult| {
-                            Ok(OperationAdmission {
-                                operation_id: operation_id.clone(),
-                                kind: OperationKind::Navigation,
-                                started_at,
-                            })
-                        }),
-                        events: Some(Arc::new(move |_commit: &CommitResult| {
-                            vec![
-                                HarnessEvent::lane_scoped(
-                                    &events_lane,
-                                    false,
-                                    HarnessEventPayload::NavigationStart {
-                                        run_id: events_operation_id.clone(),
-                                        target_id: events_target.clone(),
-                                        started_at,
+                            };
+                            let mut writes: Vec<Write> = Vec::new();
+                            let next_operation_state = if summarize {
+                                if state.tip_id.is_none()
+                                    || target_id.is_none()
+                                    || preparation.is_none()
+                                {
+                                    return Err(lane_error(SessionError::Invariant(
+                                        "Validated summarized navigation is missing its preparation"
+                                            .to_owned(),
+                                    )));
+                                }
+                                let Some(summarized_target_id) = &target_id else {
+                                    unreachable!(
+                                        "validated summarized navigation carries its target"
+                                    )
+                                };
+                                let Some(prepared) = preparation else {
+                                    unreachable!(
+                                        "validated summarized navigation carries its preparation"
+                                    )
+                                };
+                                writes.push(
+                                    set_value_write(
+                                        &operation_preparation(&operation_id, &task_id),
+                                        durable_branch_preparation(prepared),
+                                    )
+                                    .map_err(lane_error)?,
+                                );
+                                OperationState::SummaryDeciding(SummaryDecidingOperation {
+                                    scope,
+                                    task: SummaryTask {
+                                        task_id: task_id.clone(),
+                                        reason: None,
+                                        custom_instructions: options_custom_instructions.clone(),
+                                        boundary: ResultBoundary::CommitNavigation {
+                                            target_id: summarized_target_id.clone(),
+                                            label: options_label.clone(),
+                                        },
+                                    },
+                                })
+                            } else {
+                                OperationState::NavigationReadyToCommit(
+                                    NavigationReadyToCommitOperation {
+                                        scope,
+                                        target_id: target_id.clone(),
+                                        label: options_label.clone(),
                                     },
                                 )
-                                .unwrap_or_else(|error| {
-                                    unreachable!("navigation_start is lane-scoped: {error}")
+                            };
+                            writes.extend(operation_writes(
+                                &operation_id,
+                                &lane_name,
+                                meta.clone(),
+                                next_operation_state.clone(),
+                                &state.inbox,
+                                state.last_operation_id.as_deref(),
+                            )?);
+                            let mut next = state.clone();
+                            next.operation = Some(LiveOperation {
+                                meta,
+                                state: next_operation_state,
+                            });
+                            let events_lane = lane_name.clone();
+                            let events_operation_id = operation_id.clone();
+                            let events_target = target_id.clone();
+                            Ok(LaneCommand::Commit {
+                                writes,
+                                next,
+                                materialize: Arc::new(move |_commit: &CommitResult| {
+                                    Some(Ok(OperationAdmission {
+                                        operation_id: operation_id.clone(),
+                                        kind: OperationKind::Navigation,
+                                        started_at,
+                                    }))
                                 }),
-                            ]
-                        })),
-                    })
-                })
-            },
-            context,
-        )
-        .await
+                                events: Some(Arc::new(move |_commit: &CommitResult| {
+                                    vec![lane_scoped_event(
+                                        &events_lane,
+                                        false,
+                                        "navigation_start",
+                                        HarnessEventPayload::NavigationStart {
+                                            run_id: events_operation_id.clone(),
+                                            target_id: events_target.clone(),
+                                            started_at,
+                                        },
+                                    )]
+                                })),
+                            })
+                        })
+                    }
+                },
+                context,
+            )
+            .await?;
+            if let Some(accepted) = accepted {
+                return Ok(accepted);
+            }
+        }
     }
 
     /// Drives the current operation, upstream's `drive`.
     ///
-    /// The claim loop installs one pass or joins an existing one; the
-    /// procedure loop (`driveOperation`) rides the drive child, so a freshly
-    /// installed pass faults with the staged raise until that child lands.
+    /// The claim loop installs one pass or joins an existing one; a fresh
+    /// install spawns the procedure loop (`driveOperation`) detached, and
+    /// the spawn's handlers clear the owner and settle or fail the pass's
+    /// completion one-shot before the awaiting caller observes it.
     ///
     /// # Errors
     /// The sealed error when the lane sealed with a fault; the drive's
@@ -1948,25 +2252,64 @@ impl Lane {
                 }
                 DriveClaim::Observe { drive, installed } => {
                     if installed {
-                        // The drive child owns the procedure loop; the staged
-                        // seam faults the pass deterministically, mirroring
-                        // the real spawn handler's failure path.
-                        let fault = self.fault(
-                            from_arc(Arc::new(SliceNotImplemented::new("drive operation"))),
-                            &drive.context,
-                        );
-                        {
-                            let mut core = lock_core(&self.inner);
-                            if core
-                                .active_drive
-                                .as_ref()
-                                .is_some_and(|active| Arc::ptr_eq(active, &drive))
-                            {
-                                core.active_drive = None;
-                                let () = core.state_change.send_modify(|version| *version += 1);
+                        // The pass runs detached, upstream's
+                        // `void driveOperation(...).then` settlement; the
+                        // handlers clear the owner and settle or fail the
+                        // pass's completion one-shot. The check-clear pair
+                        // holds no lock across the two setter calls, but no
+                        // install can interleave: installing requires an
+                        // empty owner, and this pass occupies it until the
+                        // clear lands.
+                        let lane = Arc::new(self.clone());
+                        let drive = Arc::clone(&drive);
+                        tokio::spawn(async move {
+                            // The join converts an unwind into the error the
+                            // fail handler processes, upstream's
+                            // `.then(settle, fail)` settling every throw —
+                            // expected or not — so a panicking pass cannot
+                            // leave the owner installed and the completion
+                            // pending.
+                            let pass = tokio::spawn({
+                                let lane = Arc::clone(&lane);
+                                let drive = Arc::clone(&drive);
+                                async move { drive_operation(&lane, &drive).await }
+                            });
+                            let result = match pass.await {
+                                Ok(result) => result,
+                                Err(join) => Err(panicked_task_error(join)),
+                            };
+                            match result {
+                                Ok(outcome) => {
+                                    if lane
+                                        .active_drive()
+                                        .is_some_and(|active| Arc::ptr_eq(&active, &drive))
+                                    {
+                                        lane.set_active_drive(None);
+                                        lane.inner.signal_state_change();
+                                    }
+                                    drive.settle(outcome);
+                                }
+                                Err(error) => {
+                                    // The sealed error wins over the fault,
+                                    // upstream's `closedError ?? onFault`
+                                    // read-ordered first; the fault handler
+                                    // is infallible, upstream's
+                                    // `catch (faultError)` erases.
+                                    let failure = lane
+                                        .inner
+                                        .sealed_error()
+                                        .unwrap_or_else(|| lane.fault(error, &drive.context));
+                                    if lane
+                                        .active_drive()
+                                        .is_some_and(|active| Arc::ptr_eq(&active, &drive))
+                                    {
+                                        lane.set_active_drive(None);
+                                        lane.inner.signal_state_change();
+                                    }
+                                    drive.fail(failure);
+                                }
                             }
-                        }
-                        drive.fail(fault);
+                        });
                     }
                     return match await_with_context(Box::pin(drive.completion()), context).await {
                         // The context's abort fires first, upstream's thrown
@@ -1983,8 +2326,8 @@ impl Lane {
     }
 
     /// Requests durable cancellation of one operation, upstream's
-    /// `requestOperationAbort` — the package-private primitive; public
-    /// exposure remains guarded until the drive child lands.
+    /// `requestOperationAbort` — the package-private primitive whose public
+    /// exposure upstream guards.
     ///
     /// # Errors
     /// The sealed error when the lane sealed with a fault; the request's
@@ -2364,13 +2707,7 @@ impl Lane {
                     | HarnessError::UnknownSkill { .. }
                     | HarnessError::UnknownTemplate { .. }
                     | HarnessError::Closed { .. } => Ok(Err(error)),
-                    _ => Err(self.fault(
-                        from_arc(Arc::new(SessionError::Invariant(format!(
-                            "Run acceptance returned {}",
-                            error.tag()
-                        )))),
-                        context,
-                    )),
+                    _ => Err(self.acceptance_fault_arm("Run acceptance", &error, context)),
                 };
             }
         };
@@ -2466,8 +2803,8 @@ impl Lane {
         .await
     }
 
-    /// Compacts the history, upstream's `compact`. The compaction acceptance
-    /// rides the compaction child; the staged seam raises until it lands.
+    /// Compacts the history, upstream's `compact`. The admission prepares the
+    /// durable compaction through the lane's compaction admission.
     ///
     /// # Errors
     /// The sealed error when the lane sealed with a fault.
@@ -2488,13 +2825,7 @@ impl Lane {
                     HarnessError::LaneBusy { .. }
                     | HarnessError::NothingToCompact { .. }
                     | HarnessError::Closed { .. } => Ok(Err(error)),
-                    _ => Err(self.fault(
-                        from_arc(Arc::new(SessionError::Invariant(format!(
-                            "Compaction acceptance returned {}",
-                            error.tag()
-                        )))),
-                        context,
-                    )),
+                    _ => Err(self.acceptance_fault_arm("Compaction acceptance", &error, context)),
                 };
             }
         };
@@ -2514,9 +2845,8 @@ impl Lane {
         }
     }
 
-    /// Navigates the tree, upstream's `navigateTree`. The summarized path's
-    /// preparation rides the compaction child; the staged seam raises until
-    /// it lands.
+    /// Navigates the tree, upstream's `navigateTree`. The admission prepares
+    /// the summarized branch through the lane's navigation admission.
     ///
     /// # Errors
     /// The sealed error when the lane sealed with a fault.
@@ -2540,13 +2870,7 @@ impl Lane {
                     | HarnessError::InvalidNavigation { .. }
                     | HarnessError::UnknownTarget { .. }
                     | HarnessError::Closed { .. } => Ok(Err(error)),
-                    _ => Err(self.fault(
-                        from_arc(Arc::new(SessionError::Invariant(format!(
-                            "Navigation acceptance returned {}",
-                            error.tag()
-                        )))),
-                        context,
-                    )),
+                    _ => Err(self.acceptance_fault_arm("Navigation acceptance", &error, context)),
                 };
             }
         };
@@ -2639,11 +2963,9 @@ impl Lane {
                         Ok(Ok(None))
                     }
                     HarnessError::Closed { .. } => Ok(Err(error)),
-                    _ => Err(self.fault(
-                        from_arc(Arc::new(SessionError::Invariant(format!(
-                            "Structural continuation acceptance returned {}",
-                            error.tag()
-                        )))),
+                    _ => Err(self.acceptance_fault_arm(
+                        "Structural continuation acceptance",
+                        &error,
                         context,
                     )),
                 };
@@ -3226,11 +3548,12 @@ impl Lane {
                         next: state,
                         materialize: Arc::new(move |_commit: &CommitResult| usage_id.clone()),
                         events: Some(Arc::new(move |commit: &CommitResult| {
-                            let seq = commit.seqs.first().copied().unwrap_or_else(|| {
-                                unreachable!("usage commit carries one sequence")
-                            });
-                            vec![
-                                HarnessEvent::global(HarnessEventPayload::Usage {
+                            let Some(seq) = commit.seqs.first().copied() else {
+                                unreachable!("usage commit carries one sequence");
+                            };
+                            vec![global_event(
+                                "usage",
+                                HarnessEventPayload::Usage {
                                     lane: events_lane.clone(),
                                     row: UsageRow {
                                         seq,
@@ -3241,9 +3564,8 @@ impl Lane {
                                         details: events_row.details.clone(),
                                     },
                                     totals: commit.stats.usage,
-                                })
-                                .unwrap_or_else(|error| unreachable!("usage is global: {error}")),
-                            ]
+                                },
+                            )]
                         })),
                     })
                 })
@@ -3558,7 +3880,7 @@ impl Lane {
                                 })
                             })
                         };
-                        let watcher = (lane.inner.install_watch)(filter, &watch_context, resnapshot);
+                        let watcher = (lane.inner.install_watch)(filter, &watch_context, resnapshot)?;
                         let snapshot = lane
                             .capture_lane_snapshot(&state, reader.as_ref(), &watch_context)
                             .await;

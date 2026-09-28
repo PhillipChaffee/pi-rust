@@ -1156,6 +1156,30 @@ impl HarnessEvent {
     }
 }
 
+/// Builds the lane-scoped event a runtime publisher emits, upstream's
+/// direct `new HarnessEvent({ lane, ... })` object: the constructor fails
+/// only for a payload whose event class is harness-global, which the
+/// call site pins statically, so the failure arm raises the invariant
+/// instead of threading a result through every publisher.
+pub(crate) fn lane_scoped_event(
+    lane_name: &str,
+    recovery: bool,
+    event: &'static str,
+    payload: HarnessEventPayload,
+) -> HarnessEvent {
+    HarnessEvent::lane_scoped(lane_name, recovery, payload)
+        .unwrap_or_else(|error| unreachable!("{event} is lane-scoped: {error}"))
+}
+
+/// Builds the harness-global event a runtime usage and lifecycle
+/// publisher emits, the mirror of [`lane_scoped_event`]: the constructor
+/// fails only for a lane-scoped payload, which the call site pins
+/// statically.
+pub(crate) fn global_event(event: &'static str, payload: HarnessEventPayload) -> HarnessEvent {
+    HarnessEvent::global(payload)
+        .unwrap_or_else(|error| unreachable!("{event} is harness-global: {error}"))
+}
+
 impl HarnessEventPayload {
     /// Whether the payload belongs to a lane, upstream's
     /// `LaneEventPayload` membership.

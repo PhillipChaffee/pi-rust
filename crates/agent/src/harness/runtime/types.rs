@@ -9,12 +9,15 @@
 //! rival, `waitForIdle`), where JS promises are multi-consumer by
 //! construction.
 //!
-//! The drive-pass procedure loop itself (`driveOperation`) rides the drive
-//! child; [`Drive`] carries its completion and gate surface so the lane can
-//! install and observe passes now.
+//! The drive-pass procedure loop (`driveOperation`) homes in
+//! [`crate::harness::runtime::drive`], which the lane spawns on a fresh
+//! install; [`Drive`] carries its completion, gate, and abort-cancellation
+//! surface so the lane can install, spawn, and observe passes.
 
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
 
 use pi_ai::utils::retry::RetryPolicy;
 use pi_chord::context::AbortController;
@@ -24,6 +27,7 @@ use crate::harness::agent_harness::DriveOptions;
 use crate::harness::agent_harness::DriveOutcome;
 use crate::harness::compaction::types::CompactionSettings;
 use crate::harness::context::without_abort_signal;
+use crate::harness::gate::Cancellation;
 use crate::harness::gate::Gate;
 use crate::harness::gate::GateControl;
 use crate::harness::session::types::InboxItem;
@@ -31,6 +35,7 @@ use crate::harness::session::types::LaneConfiguration;
 use crate::harness::session::types::OperationMeta;
 use crate::harness::session::types::OperationResultRecord;
 use crate::harness::session::types::OperationState;
+use crate::harness::session::types::SessionError;
 use crate::harness::session::values::Write;
 use crate::harness::types::AgentHarnessStreamOptions;
 use crate::harness::types::AgentHarnessTool;
@@ -47,6 +52,22 @@ pub type LaneError = Arc<dyn std::error::Error + Send + Sync>;
 #[must_use]
 pub fn lane_error(error: impl std::error::Error + Send + Sync + 'static) -> LaneError {
     Arc::new(error)
+}
+
+/// The lane error one unwound task carries, upstream's unexpected throw
+/// reaching the same fail handler: Rust-only — a panicking pass or tool job
+/// has no `Result` to reject, so its panic payload rides
+/// [`SessionError::Message`].
+pub(crate) fn panicked_task_error(join: tokio::task::JoinError) -> LaneError {
+    let payload = join.into_panic();
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no panic message".to_owned());
+    lane_error(SessionError::Message(format!(
+        "The task panicked: {detail}"
+    )))
 }
 
 /// Coerces one concrete error's `Arc` to the erased lane error, the
@@ -398,17 +419,28 @@ pub struct Drive {
     /// `waitForRetry`.
     pub wait_for_retry: bool,
     /// The deferred polls the pass may resolve, upstream's
-    /// `deferredPermits`.
-    pub deferred_permits: u32,
+    /// `deferredPermits`. An atomic counter because the poll intent's
+    /// materialization closure consumes it through the shared pass handle,
+    /// upstream's synchronous `drive.deferredPermits--`.
+    pub deferred_permits: AtomicU32,
     /// The pass's procedure-facing gate, upstream's `gate`.
     pub gate: Gate,
     /// The completion all awaiters share, upstream's `completion`.
     completion: tokio::sync::watch::Receiver<DriveCompletion>,
     completion_tx: tokio::sync::watch::Sender<DriveCompletion>,
+    /// The first-settlement latch [`Self::complete`] flips under one lock:
+    /// two racing settlements — the pass's own and a seal's fail — must
+    /// keep the first, upstream's promise one-shot.
+    completion_latch: Mutex<bool>,
     /// The pass's close signal, upstream's `closeSignal`.
     pub close_signal: pi_chord::context::AbortSignal,
     control: GateControl,
     close_controller: AbortController,
+    /// The cancellation an aborted wait hands back to the spine, upstream's
+    /// `AbortRequested.cancellation` as reached from a mid-wait abort:
+    /// [`Self::begin_abort`] stores a clone, and until then
+    /// [`Self::abort_cancellation`] answers with a pre-settled placeholder.
+    abort_cancellation: Mutex<Option<Cancellation>>,
 }
 
 impl std::fmt::Debug for Drive {
@@ -433,13 +465,15 @@ impl Drive {
             operation_id: options.operation_id.clone(),
             context: without_abort_signal(context),
             wait_for_retry: options.wait_for_retry.unwrap_or(false),
-            deferred_permits: u32::from(options.poll_deferred.unwrap_or(false)),
+            deferred_permits: AtomicU32::new(u32::from(options.poll_deferred.unwrap_or(false))),
             gate,
             completion,
             completion_tx,
+            completion_latch: Mutex::new(false),
             close_signal: close_controller.signal().clone(),
             control,
             close_controller,
+            abort_cancellation: Mutex::new(None),
         }
     }
 
@@ -456,10 +490,19 @@ impl Drive {
     }
 
     fn complete(&self, completion: DriveCompletion) {
-        let current = self.completion_tx.borrow().clone();
-        if matches!(current, DriveCompletion::Pending) {
-            let _ = self.completion_tx.send(completion);
+        // The latch check and flip hold one lock, upstream's promise
+        // settling exactly once: a `seal`'s fail racing the pass's settle
+        // cannot overwrite the first winner.
+        let mut settled = self
+            .completion_latch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *settled {
+            return;
         }
+        *settled = true;
+        drop(settled);
+        let _ = self.completion_tx.send(completion);
     }
 
     /// Resolves when the pass settles or fails, upstream's awaiting
@@ -489,8 +532,37 @@ impl Drive {
 
     /// Records the abort's cancellation on the gate, upstream's
     /// `beginAbort`.
-    pub fn begin_abort(&self, cancellation: crate::harness::gate::Cancellation) {
+    ///
+    /// The gate keeps the original for its admission state; the pass keeps
+    /// a clone so an aborted wait can hand the same future back to the
+    /// spine through [`Self::abort_cancellation`].
+    pub fn begin_abort(&self, cancellation: Cancellation) {
+        *self
+            .abort_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cancellation.clone());
         self.control.begin_abort(cancellation);
+    }
+
+    /// The cancellation receiver an aborted wait carries back to the spine
+    /// inside a [`crate::harness::gate::AbortRequested`], upstream's
+    /// `error.cancellation` as reached from a mid-wait abort — upstream's
+    /// abort path always awaits the gate's cancellation promise.
+    ///
+    /// The stored receiver settles when the abort work sends or its sender
+    /// drops; before any [`Self::begin_abort`], a pre-settled placeholder
+    /// (its sender already dropped) answers immediately.
+    #[must_use]
+    pub fn abort_cancellation(&self) -> Cancellation {
+        self.abort_cancellation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| {
+                let (sender, receiver) = tokio::sync::watch::channel(());
+                drop(sender);
+                receiver
+            })
     }
 
     /// Fires the gate's signal, upstream's `signalAbort`.
