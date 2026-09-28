@@ -2,3 +2,5 @@
 
 /lcov.info
 /mutants.out/
+opencode.json
+*.profraw
