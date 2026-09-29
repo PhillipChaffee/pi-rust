@@ -1,7 +1,9 @@
 //! Boundary tests for the harness hook registry.
 //!
-//! Upstream has no unit file for `hooks.ts` — the registry rides the
-//! runtime suites. These tests pin the aggregate semantics this slice
+//! The registry's unit cases ride upstream `test/harness/
+//! execution-primitives.test.ts`'s `HookRegistry` block, distributed
+//! across this suite with the gate and events suites the same file spans.
+//! These tests pin the aggregate semantics this slice
 //! restates: fail-open aggregation, fail-closed `before_drive`, the tool
 //! gate's abort contract, first-match structural hooks, and stream-options
 //! patch derivation.
@@ -15,12 +17,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use pi_chord::context::{Context, background_context};
-use pi_telemetry::{AttributeValue, InMemoryTelemetryContext, TelemetryHandle};
+use pi_telemetry::{AttributeValue, InMemoryTelemetryContext, SpanOptions, TelemetryHandle};
 
 use crate::harness::agent_harness::{
     HookEvent, HookInvocation, HookName, HookOptions, HookResult, StepKind,
 };
-use crate::harness::context::with_telemetry_context;
+use crate::harness::context::{
+    create_context_key, get_telemetry_context, with_context_value, with_telemetry_context,
+};
 use crate::harness::gate::{GateRejection, create_gate};
 use crate::harness::hooks::{
     HookRegistry, apply_stream_options_patch, create_stream_options_patch,
@@ -1797,4 +1801,364 @@ fn after_tool_event() -> HookEvent {
         is_error: false,
         usage: None,
     }
+}
+
+/// The pipeline call sink, upstream's per-case `calls` arrays.
+type Calls = Arc<Mutex<Vec<&'static str>>>;
+
+/// Registers the call-recording handler that appends its tag and settles,
+/// upstream's `() => { calls.push(tag) }` rows.
+fn record_call(calls: &Calls, tag: &'static str) -> crate::harness::agent_harness::HookHandler {
+    let calls = Arc::clone(calls);
+    Arc::new(move |_event: &HookInvocation, _context: &Context| {
+        let calls = Arc::clone(&calls);
+        Box::pin(async move {
+            calls.lock().expect("call lock").push(tag);
+            Ok(HookResult::BeforeDrive)
+        })
+    })
+}
+
+/// The parked first `before_drive` handler: appends `first:start`, flips
+/// `entered`, parks on `release`, appends `first:end`, upstream's
+/// `await release.promise` rows.
+fn parked_first_handler(
+    calls: &Calls,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> crate::harness::agent_harness::HookHandler {
+    let calls = Arc::clone(calls);
+    Arc::new(move |_event: &HookInvocation, _context: &Context| {
+        let calls = Arc::clone(&calls);
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        Box::pin(async move {
+            calls.lock().expect("call lock").push("first:start");
+            entered.notify_one();
+            release.notified().await;
+            calls.lock().expect("call lock").push("first:end");
+            Ok(HookResult::BeforeDrive)
+        })
+    })
+}
+
+/// A closed gate refuses admission before the pipeline starts: no handler
+/// runs, upstream's closed-gate half of "checks the effect gate
+/// immediately before the complete before_run pipeline".
+#[tokio::test]
+async fn a_closed_gate_refuses_admission_without_calling_handlers() {
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let registry = empty_registry();
+    registry
+        .on(
+            HookName::BeforeDrive,
+            record_call(&calls, "first"),
+            HookOptions::default(),
+        )
+        .expect("register the first handler");
+    let (gate, control) = create_gate();
+    control.close("closed".to_owned());
+    let error = registry
+        .run_with_gate(
+            HookName::BeforeDrive,
+            invocation(before_drive_event()),
+            &gate,
+            &background_context(),
+        )
+        .await
+        .expect_err("a closed gate refuses admission");
+    assert!(matches!(
+        error,
+        crate::harness::hooks::HookRunError::Closed(_)
+    ));
+    assert!(calls.lock().expect("call lock").is_empty());
+}
+
+/// A handler registered while the admitted pipeline is parked never joins
+/// it: the aggregate runs over the registration snapshot admission took,
+/// upstream's in-flight half of "checks the effect gate immediately
+/// before the complete before_run pipeline".
+#[tokio::test]
+async fn a_handler_registered_mid_run_never_joins_the_in_flight_pipeline() {
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(empty_registry());
+    registry
+        .on(
+            HookName::BeforeDrive,
+            parked_first_handler(&calls, Arc::clone(&entered), Arc::clone(&release)),
+            HookOptions::default(),
+        )
+        .expect("register the parked handler");
+    registry
+        .on(
+            HookName::BeforeDrive,
+            record_call(&calls, "second"),
+            HookOptions::default(),
+        )
+        .expect("register the second handler");
+    let (gate, _gate_control) = create_gate();
+    let run = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        async move {
+            registry
+                .run_with_gate(
+                    HookName::BeforeDrive,
+                    invocation(before_drive_event()),
+                    &gate,
+                    &background_context(),
+                )
+                .await
+        }
+    });
+    entered.notified().await;
+    registry
+        .on(
+            HookName::BeforeDrive,
+            record_call(&calls, "late"),
+            HookOptions::default(),
+        )
+        .expect("register the late handler");
+    release.notify_one();
+    let result = run
+        .await
+        .expect("the run joins")
+        .expect("the admitted pipeline completes");
+    assert!(matches!(result, HookResult::BeforeDrive));
+    assert_eq!(
+        *calls.lock().expect("call lock"),
+        ["first:start", "first:end", "second"]
+    );
+}
+
+/// The admitted handlers' context carries the gate's own abort signal:
+/// closing the gate after admission flips the signal the handler saw and
+/// carries the close reason, upstream's admitted half of "rejects
+/// pre-aborted invocations and combines admitted hook cancellation with
+/// the effect gate".
+#[tokio::test]
+async fn the_admitted_handlers_signal_flips_when_the_gate_closes() {
+    let registry = empty_registry();
+    let captured: Arc<Mutex<Option<pi_chord::context::AbortSignal>>> = Arc::new(Mutex::new(None));
+    registry
+        .on(
+            HookName::BeforeDrive,
+            {
+                let captured = Arc::clone(&captured);
+                Arc::new(move |_event: &HookInvocation, context: &Context| {
+                    let captured = Arc::clone(&captured);
+                    Box::pin(async move {
+                        *captured.lock().expect("signal lock") = context.abort_signal();
+                        Ok(HookResult::BeforeDrive)
+                    })
+                })
+            },
+            HookOptions::default(),
+        )
+        .expect("register the capturing handler");
+    let (gate, control) = create_gate();
+    let result = registry
+        .run_with_gate(
+            HookName::BeforeDrive,
+            invocation(before_drive_event()),
+            &gate,
+            &background_context(),
+        )
+        .await
+        .expect("the admitted run completes");
+    assert!(matches!(result, HookResult::BeforeDrive));
+    let signal = captured
+        .lock()
+        .expect("signal lock")
+        .clone()
+        .expect("the handler saw the gate's signal");
+    assert!(!signal.aborted());
+    control.close("gate closed".to_owned());
+    assert!(signal.aborted());
+    assert_eq!(
+        signal.reason(),
+        Some(pi_chord::context::AbortReason::Caller(
+            "gate closed".to_owned()
+        ))
+    );
+}
+
+/// An admitted pipeline completes as one gated effect: a mid-run abort
+/// flips the gate's signal but never un-admits the in-flight handlers,
+/// upstream's "admits the complete before_drive pipeline as one gated
+/// effect".
+#[tokio::test]
+async fn an_admitted_pipeline_survives_a_mid_run_gate_abort() {
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(empty_registry());
+    registry
+        .on(
+            HookName::BeforeDrive,
+            parked_first_handler(&calls, Arc::clone(&entered), Arc::clone(&release)),
+            HookOptions::default(),
+        )
+        .expect("register the parked handler");
+    registry
+        .on(
+            HookName::BeforeDrive,
+            record_call(&calls, "second"),
+            HookOptions::default(),
+        )
+        .expect("register the second handler");
+    let (gate, control) = create_gate();
+    let gate = Arc::new(gate);
+    let run = tokio::spawn({
+        let registry = Arc::clone(&registry);
+        let gate = Arc::clone(&gate);
+        async move {
+            registry
+                .run_with_gate(
+                    HookName::BeforeDrive,
+                    invocation(before_drive_event()),
+                    &gate,
+                    &background_context(),
+                )
+                .await
+        }
+    });
+    entered.notified().await;
+    control.begin_abort(tokio::sync::watch::channel(()).1);
+    control.signal_abort();
+    assert!(gate.signal().aborted());
+    release.notify_one();
+    let result = run
+        .await
+        .expect("the run joins")
+        .expect("the admitted pipeline completes");
+    assert!(matches!(result, HookResult::BeforeDrive));
+    assert_eq!(
+        *calls.lock().expect("call lock"),
+        ["first:start", "first:end", "second"]
+    );
+}
+
+/// Duplicate registration ids stay metadata — both registrations exist —
+/// and the first `before_drive` failure stops the later handlers and
+/// reports exactly once, upstream's "treats registration ids as optional
+/// metadata and fails before_drive closed".
+#[tokio::test]
+async fn duplicate_registration_ids_stay_metadata_and_fail_closed() {
+    let (errors, registry) = error_capture_registry();
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let duplicate = HookOptions {
+        id: Some("duplicate".to_owned()),
+    };
+    registry
+        .on(
+            HookName::BeforeDrive,
+            failing_handler("prerequisite failed"),
+            duplicate.clone(),
+        )
+        .expect("register the failing handler");
+    registry
+        .on(
+            HookName::BeforeDrive,
+            record_call(&calls, "later"),
+            duplicate,
+        )
+        .expect("register the later handler");
+    let result = run(
+        &registry,
+        HookName::BeforeDrive,
+        before_drive_event(),
+        &background_context(),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(calls.lock().expect("call lock").is_empty());
+    assert_eq!(
+        *errors.lock().expect("report lock"),
+        ["prerequisite failed".to_owned()]
+    );
+}
+
+/// `run_tool_with_gate` hands tool handlers the admitted context's values
+/// and nests their spans under the active hook span, which nests under
+/// the invocation span, upstream's "passes tool handlers a child context
+/// of the active hook span".
+#[tokio::test]
+async fn tool_handlers_nest_their_spans_under_the_hook_span() {
+    let recorder = InMemoryTelemetryContext::default();
+    let handle = TelemetryHandle::new(recorder.clone());
+    let key = create_context_key::<String>("hook.test.value");
+    let base = with_context_value(
+        &key,
+        "preserved".to_owned(),
+        &with_telemetry_context(handle.clone(), &background_context()),
+    );
+    let registry = Arc::new(empty_registry());
+    let received: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    registry
+        .on(
+            HookName::BeforeTool,
+            {
+                let received = Arc::clone(&received);
+                let key = key.clone();
+                Arc::new(move |_event: &HookInvocation, context: &Context| {
+                    let received = Arc::clone(&received);
+                    let key = key.clone();
+                    let telemetry = get_telemetry_context(context);
+                    Box::pin(async move {
+                        *received.lock().expect("value lock") = context.value(&key).cloned();
+                        let _ = telemetry
+                            .start_span(SpanOptions::new("handler.child"), |_span| async {
+                                Ok::<(), std::io::Error>(())
+                            })
+                            .await;
+                        Ok(HookResult::BeforeTool(None))
+                    })
+                })
+            },
+            HookOptions::default(),
+        )
+        .expect("register the handler");
+    let settled = handle
+        .start_span(SpanOptions::new("invocation"), move |invocation_span| {
+            let registry = Arc::clone(&registry);
+            async move {
+                let invocation_context =
+                    with_telemetry_context(invocation_span.telemetry_handle(), &base);
+                registry
+                    .run_tool_with_gate(
+                        HookName::BeforeTool,
+                        invocation(before_tool_event()),
+                        &create_gate().0,
+                        &invocation_context,
+                    )
+                    .await
+            }
+        })
+        .await
+        .expect("the tool aggregate settles");
+    let HookResult::BeforeTool(Some(settled)) = settled else {
+        panic!("the tool aggregate settles with its result");
+    };
+    assert_eq!(settled.args, None);
+    assert_eq!(settled.block, None);
+    assert_eq!(
+        received.lock().expect("value lock").as_deref(),
+        Some("preserved")
+    );
+    let spans = recorder.get_spans();
+    let span_named = |name: &str| {
+        spans
+            .iter()
+            .find(|span| span.name == name)
+            .expect(name)
+            .clone()
+    };
+    let invocation = span_named("invocation");
+    let hook = span_named("pi.harness.hook");
+    let child = span_named("handler.child");
+    assert_eq!(invocation.parent_id, None);
+    assert_eq!(hook.parent_id, Some(invocation.id));
+    assert_eq!(child.parent_id, Some(hook.id));
 }
