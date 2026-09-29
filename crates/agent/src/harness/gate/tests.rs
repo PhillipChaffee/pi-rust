@@ -1,7 +1,9 @@
 //! Boundary tests for the effect admission gate.
 //!
-//! Upstream has no unit file for `effect-gate.ts` — the gate rides the
-//! runtime suites. These tests pin the admission semantics this slice
+//! The gate's unit cases ride upstream `test/harness/
+//! execution-primitives.test.ts`'s `createGate` block, distributed across
+//! this suite with the hooks and events suites the same file spans. These
+//! tests pin the admission semantics this slice
 //! restates: an open gate admits everything, an aborting gate hands back
 //! the cancellation future, a closed gate reports its error, and the
 //! owner-facing controls are one-shot.

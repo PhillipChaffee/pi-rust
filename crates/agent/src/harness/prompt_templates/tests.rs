@@ -2,7 +2,9 @@
 //! binding the restated surfaces upstream's suite does not reach: the
 //! first-line description fallback edges, the case-sensitive `.md`
 //! selection, the substitution passes' ordering and clamping, and the
-//! quote parser's edges.
+//! quote parser's edges. The substitution formatter's second unit file,
+//! upstream `test/harness/resource-formatting.test.ts`, ports inside the
+//! substitution tests here and in the skills suite's invocation formatter.
 
 #![expect(
     clippy::expect_used,

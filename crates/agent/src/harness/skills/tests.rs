@@ -2,7 +2,10 @@
 //! restated surfaces upstream's suite does not reach: the ignore-file
 //! machinery (npm `ignore` parity on the Rust `ignore` crate), the
 //! first-`SKILL.md` early return, the silent skips, the metadata
-//! validation messages, and the invocation formatter's path shapes.
+//! validation messages, and the invocation formatter's path shapes. The
+//! formatter's second unit file, upstream
+//! `test/harness/resource-formatting.test.ts`, ports inside those
+//! formatter tests here and in the prompt-templates suite.
 
 #![expect(
     clippy::expect_used,

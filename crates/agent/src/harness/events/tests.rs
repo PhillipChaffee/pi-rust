@@ -1,7 +1,14 @@
 //! Boundary tests for the harness event bus and watcher.
 //!
-//! Upstream has no unit file for `events.ts` — the bus and the buffered
-//! watcher ride the runtime suites, which port with the runtime child.
+//! The bus and watcher's unit cases ride upstream `test/harness/
+//! execution-primitives.test.ts`'s `HarnessEventBus` block, distributed
+//! across this suite with the gate and hooks suites the same file spans.
+//! Two of its cases restate structurally in Rust and hold by construction:
+//! listener mutation isolation (each listener receives its own owned
+//! event) and per-batch emitting-context contiguity (each bound event
+//! carries the context its emitter gave it), so the exact cross-tail
+//! process order upstream pins on one JS microtask queue is not
+//! deterministically pinnable across the independent Rust drain tails.
 //! These tests pin the boundary semantics this slice restates: subscription
 //! delivery through the ordered tail, handler-failure isolation into
 //! `handler_error` events, the watcher's buffer-then-start contract, and
@@ -874,4 +881,60 @@ async fn an_unsubscribed_watcher_drops_pushes_and_reports_resnapshot_unavailable
         .await
         .expect_err("the watcher is unsubscribed");
     assert!(error.to_string().contains("unsubscribed"), "{error}");
+}
+
+/// Subscriptions and watchers bind when their batch emits: recipients
+/// registered while a batch is parked mid-delivery see nothing from it
+/// and receive the later events, upstream's "binds listeners and watchers
+/// when a batch is emitted".
+#[tokio::test]
+async fn late_recipients_bind_at_emit_and_see_only_later_events() {
+    let (bus, context) = bus_fixture();
+    let entered = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(Notify::new());
+    let blocking_sink: Recorded = Arc::new(Mutex::new(Vec::new()));
+    bus.on(
+        HarnessEventType::RunStart,
+        gating_listener(
+            Arc::clone(&blocking_sink),
+            "blocking",
+            Arc::clone(&entered),
+            Arc::clone(&gate),
+        ),
+    )
+    .expect("subscribe the parked listener");
+    let blocking = bus.emit(lane_event("blocking"), &context);
+    wait_until(&entered).await;
+    // The drainer is parked mid-delivery; this batch binds its recipients
+    // at emit, before the late registrations below.
+    let queued = bus.emit(lane_event("queued"), &context);
+    let late_sink: Recorded = Arc::new(Mutex::new(Vec::new()));
+    bus.on(HarnessEventType::RunStart, listener(Arc::clone(&late_sink)))
+        .expect("subscribe the late listener");
+    let late_watcher = bus
+        .watch(0_usize, Arc::new(|_event: &HarnessEvent| true), None)
+        .expect("watch");
+    let late_watcher_sink: Recorded = Arc::new(Mutex::new(Vec::new()));
+    WatchHandle::start(
+        late_watcher.as_ref(),
+        listener(Arc::clone(&late_watcher_sink)),
+    );
+    gate.notify_one();
+    blocking.await;
+    queued.await;
+    let ids = |sink: &Recorded| -> Vec<String> {
+        sink.lock()
+            .expect("received lock")
+            .iter()
+            .map(|event| run_id_of(event).to_owned())
+            .collect()
+    };
+    assert_eq!(ids(&blocking_sink), ["blocking", "queued"]);
+    assert!(late_sink.lock().expect("received lock").is_empty());
+    assert!(late_watcher_sink.lock().expect("received lock").is_empty());
+    bus.emit(lane_event("later"), &context).await;
+    wait_for_count(&late_sink, 1).await;
+    wait_for_count(&late_watcher_sink, 1).await;
+    assert_eq!(ids(&late_sink), ["later"]);
+    assert_eq!(ids(&late_watcher_sink), ["later"]);
 }
