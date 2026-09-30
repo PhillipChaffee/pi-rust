@@ -4,7 +4,9 @@
 //! Upstream serializes commits through a promise queue and joins `snapshot`
 //! and `close` onto the same tail; the port holds a FIFO lock across each
 //! apply (the JSONL backend's restatement), so admission order is poll order
-//! and the queue machinery is gone. Reads bypass the line, like upstream's
+//! and the queue machinery is gone — an admitted-but-unpolled commit can
+//! apply after a close's drain, where upstream's queue chain would hold the
+//! close for it. Reads bypass the line, like upstream's
 //! non-queued reads. Upstream's apply-time duplicate/parent validation is the
 //! DDL's own triggers (`RAISE(ABORT, ...)`); the port runs no TS-side
 //! preflight either, so a rejected commit carries the trigger's message.

@@ -673,7 +673,7 @@ impl SqliteSessionRepo {
         self.reserve_id(&metadata.base.id)?;
         let outcome: Result<(), SessionError> = async {
             let path = self.repository_path_for_metadata(metadata)?;
-            let db = self.database_factory.open_existing(&path)?;
+            let db: Arc<dyn SqliteDatabase> = Arc::from(self.database_factory.open_existing(&path)?);
             let body = (|| -> Result<(), SessionError> {
                 configure_writable_connection(db.as_ref())?;
                 metadata_from_session_row(
@@ -682,7 +682,15 @@ impl SqliteSessionRepo {
                     SQLITE_STORAGE_VERSION,
                 )?;
                 if self.uses_shared_database() {
-                    delete_session_rows(db.as_ref(), &metadata.base.id)?;
+                    // The shared container's row deletion is one transaction,
+                    // upstream's `db.transaction(() => { ...; deleteSessionRows(...) })`.
+                    let transaction_db = Arc::clone(&db);
+                    let transaction_id = metadata.base.id.clone();
+                    db.transaction(Box::new(move || {
+                        delete_session_rows(transaction_db.as_ref(), &transaction_id)?;
+                        Ok(SqliteTransactionOutcome::Committed(Box::new(())))
+                    }))
+                    .map_err(SessionError::from)?;
                 }
                 Ok(())
             })();
