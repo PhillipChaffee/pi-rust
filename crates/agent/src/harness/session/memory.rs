@@ -18,7 +18,6 @@
 //! admitted-operation set restates as a counter with a drain signal, the
 //! same `close`-waits-admitted-operations contract.
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -30,9 +29,8 @@ use crate::harness::session::facade;
 use crate::harness::session::in_memory_storage_state::InMemoryStorageState;
 use crate::harness::session::session::{StorageBackedSession, StorageBackedSessionOptions};
 use crate::harness::session::types::{
-    Branch, CommitResult, Entry, EntryQuery, EntryScan, EntryStructure, ForkOptions, IdGenerator,
-    Session, SessionCreateOptions, SessionError, SessionMetadata, SessionMutation,
-    SessionMutationCallback, SessionReader, SessionRepo, SessionStats, Storage, StorageBranchScan,
+    CommitResult, Entry, EntryScan, EntryStructure, ForkOptions,
+    Session, SessionCreateOptions, SessionError, SessionMetadata, SessionRepo, SessionStats, Storage, StorageBranchScan,
     UsageRow, UsageScan,
 };
 use crate::harness::session::values::{
@@ -76,16 +74,13 @@ pub(crate) fn default_now() -> NowFn {
     Arc::new(pi_ai::auth::resolve::now_ms)
 }
 
-/// The facade lifecycle, upstream's `"open" | "closing" | "closed"`.
-///
-/// Memory operations complete at the call, so the closing state is
-/// unobservable and collapses out; only open and closed remain.
+/// The memory lifecycle, upstream's `"open" | "closed"` for the storage:
+/// memory operations complete at the call, so the closing state is
+/// unobservable and collapses out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Lifecycle {
     /// Accepting operations.
     Open,
-    /// Closing; operations not yet admitted reject.
-    Closing,
     /// Closed.
     Closed,
 }
@@ -279,308 +274,6 @@ impl Storage for MemoryStorage {
     }
 }
 
-/// The facade's shared state: upstream's `MemorySessionFacade` fields, Arc'd
-/// so the admitted branch objects and mutation callbacks outlive the
-/// `Box<dyn Session>` handle they borrow from.
-struct FacadeInner {
-    session: Arc<StorageBackedSession>,
-    metadata: SessionMetadata,
-    id_generator: Arc<dyn IdGenerator>,
-    lifecycle: Arc<Mutex<Lifecycle>>,
-    gate: facade::AdmissionGate,
-    on_close: Arc<dyn Fn() + Send + Sync>,
-    close_cell: tokio::sync::OnceCell<()>,
-}
-
-/// The admitted-operation facade over one storage-backed session, upstream's
-/// `MemorySessionFacade`: every operation admits through the open-state
-/// gate and registers with the tracker, and close waits for the admitted
-/// operations before marking the session closed.
-struct MemorySessionFacade(Arc<FacadeInner>);
-
-impl MemorySessionFacade {
-    fn new(session: Arc<StorageBackedSession>, on_close: Arc<dyn Fn() + Send + Sync>) -> Self {
-        let lifecycle = Arc::new(Mutex::new(Lifecycle::Open));
-        let gate_is_open = Arc::clone(&lifecycle);
-        let gate = facade::AdmissionGate::new(
-            Arc::new(facade::AdmissionTracker::default()),
-            Arc::new(move || {
-                *gate_is_open.lock().unwrap_or_else(PoisonError::into_inner) == Lifecycle::Open
-            }),
-        );
-        Self(Arc::new(FacadeInner {
-            metadata: session.metadata().clone(),
-            id_generator: session.id_generator_arc(),
-            session,
-            lifecycle,
-            gate,
-            on_close,
-            close_cell: tokio::sync::OnceCell::new(),
-        }))
-    }
-
-    fn is_open(&self) -> bool {
-        self.0.gate.is_open()
-    }
-
-    fn wrap_branch(&self, branch: Box<dyn Branch>) -> Box<dyn Branch> {
-        facade::AdmittedBranch::new(branch, self.0.gate.clone())
-    }
-}
-
-impl SessionReader for MemorySessionFacade {
-    fn get_entries(
-        &self,
-        ids: Vec<String>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<BTreeMap<String, Entry>, SessionError>> {
-        self.0.gate.admit(self.0.session.get_entries(ids, context))
-    }
-
-    fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
-        self.0.gate.admit(self.0.session.get_stats(context))
-    }
-
-    fn get_value(
-        &self,
-        address: &ValueAddress,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<StoredValue>, SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.get_value(address, context))
-    }
-
-    fn scan_values(
-        &self,
-        prefix: &ValueAddress,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<StoredValue>, SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.scan_values(prefix, context))
-    }
-
-    fn read_list(
-        &self,
-        address: &ListAddress,
-        options: Option<ListReadOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.read_list(address, options, context))
-    }
-
-    fn scan_branch(
-        &self,
-        query: &StorageBranchScan,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.scan_branch(query, context))
-    }
-}
-
-impl Session for MemorySessionFacade {
-    fn metadata(&self) -> &SessionMetadata {
-        &self.0.metadata
-    }
-
-    fn id_generator(&self) -> &dyn IdGenerator {
-        &*self.0.id_generator
-    }
-
-    fn get_entry(
-        &self,
-        id: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
-        self.0.gate.admit(self.0.session.get_entry(id, context))
-    }
-
-    fn get_name(&self, context: &Context) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
-        self.0.gate.admit(self.0.session.get_name(context))
-    }
-
-    fn get_label(
-        &self,
-        target_id: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.get_label(target_id, context))
-    }
-
-    fn find_entries(
-        &self,
-        query: Option<&EntryQuery>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.find_entries(query, context))
-    }
-
-    fn find_entry(
-        &self,
-        query: Option<&EntryQuery>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
-        self.0.gate.admit(self.0.session.find_entry(query, context))
-    }
-
-    fn branch(
-        &self,
-        name: &str,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<Box<dyn Branch>>, SessionError>> {
-        let inner = self.0.clone();
-        let name = name.to_owned();
-        let context = context.clone();
-        Box::pin(async move {
-            let branch = inner
-                .gate
-                .admit(inner.session.branch(&name, &context))
-                .await?
-                .map(|branch| self.wrap_branch(branch));
-            Ok(branch)
-        })
-    }
-
-    fn create_branch(
-        &self,
-        name: &str,
-        at: Option<String>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Box<dyn Branch>, SessionError>> {
-        let inner = self.0.clone();
-        let name = name.to_owned();
-        let context = context.clone();
-        Box::pin(async move {
-            let branch = inner
-                .gate
-                .admit(inner.session.create_branch(&name, at, &context))
-                .await?;
-            Ok(self.wrap_branch(branch))
-        })
-    }
-
-    fn begin_mutation(
-        &self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Box<dyn SessionMutation>, SessionError>> {
-        let inner = self.0.clone();
-        let context = context.clone();
-        Box::pin(async move {
-            facade::begin_admitted_mutation(&inner.gate, &inner.session, &context).await
-        })
-    }
-
-    fn mutate(
-        &self,
-        mutation: SessionMutationCallback,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Box<dyn Any + Send>, SessionError>> {
-        Box::pin(facade::admitted_mutate(
-            &self.0.gate,
-            Arc::clone(&self.0.session),
-            mutation,
-            context.clone(),
-        ))
-    }
-
-    fn set_value(
-        &self,
-        address: &ValueAddress,
-        next: serde_json::Value,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.set_value(address, next, context))
-    }
-
-    fn delete_value(
-        &self,
-        address: &ValueAddress,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.delete_value(address, context))
-    }
-
-    fn append_list(
-        &self,
-        address: &ListAddress,
-        element: serde_json::Value,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.append_list(address, element, context))
-    }
-
-    fn delete_list(
-        &self,
-        address: &ListAddress,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.delete_list(address, context))
-    }
-
-    fn set_name(
-        &self,
-        name: Option<String>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.0.gate.admit(self.0.session.set_name(name, context))
-    }
-
-    fn set_label(
-        &self,
-        target_id: &str,
-        label: Option<String>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.0
-            .gate
-            .admit(self.0.session.set_label(target_id, label, context))
-    }
-
-    fn close(&self, _context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
-        // Upstream marks the facade closing synchronously in the close call;
-        // operations not admitted before it reject from here on.
-        if self.is_open() {
-            *self
-                .0
-                .lifecycle
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Closing;
-        }
-        let inner = self.0.clone();
-        Box::pin(async move {
-            inner
-                .close_cell
-                .get_or_init(|| async {
-                    inner.gate.drain().await;
-                    *inner
-                        .lifecycle
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Closed;
-                    (inner.on_close)();
-                })
-                .await;
-            Ok(())
-        })
-    }
-}
-
 /// The one repo record, upstream's `MemorySessionRecord`; the clone shares
 /// the storage and session handles, matching upstream's shared references.
 #[derive(Clone)]
@@ -655,11 +348,23 @@ impl MemorySessionRepo {
     }
 
     fn open_record(record: &MemorySessionRecord) -> Box<dyn Session> {
+        // The close flow runs the record's open flag flip, then the shared
+        // core marks the facade closed; upstream's memory close marks the
+        // facade closed before its on-close hook - the flip ordering is
+        // unobservable (the hook is infallible and nothing reads the
+        // lifecycle concurrently), and the port records the swap.
         let open = record.open.clone();
-        Box::new(MemorySessionFacade::new(
+        let on_close: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || open.store(false, Ordering::Release));
+        let core = facade::FacadeCore::new(
             record.session.clone(),
-            Arc::new(move || open.store(false, Ordering::Release)),
-        ))
+            record.metadata.clone(),
+            Arc::new(move |_context| {
+                (on_close.clone())();
+                Box::pin(std::future::ready(Ok(())))
+            }),
+        );
+        Box::new(facade::FacadeCore::clone(&core))
     }
 
     /// Build the record's session for one created or forked destination.

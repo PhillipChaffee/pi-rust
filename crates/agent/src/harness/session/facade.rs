@@ -16,8 +16,9 @@ use pi_ai::types::BoxedFuture;
 use crate::harness::context::Context;
 use crate::harness::session::session::StorageBackedSession;
 use crate::harness::session::types::{
-    Branch, BranchScan, CommitResult, Entry, Session, SessionError, SessionMutation,
-    SessionMutationCallback, SessionMutator, SessionReader, SessionStats, StorageBranchScan,
+    Branch, BranchScan, CommitResult, Entry, EntryQuery, IdGenerator, Session, SessionError,
+    SessionMetadata, SessionMutation, SessionMutationCallback, SessionMutator, SessionReader,
+    SessionStats, StorageBranchScan,
 };
 use crate::harness::session::values::{ListAddress, ListElement, StoredValue, ValueAddress};
 
@@ -386,4 +387,309 @@ pub fn admitted_mutate(
             )
             .await
     })))
+}
+
+/// The backend close flow one facade runs after the drain: the wrapped
+/// session's close plus whatever the backend owns (memory: the on-close
+/// hook; sqlite: the database close and the deregistration).
+pub type CloseFlow =
+    Arc<dyn Fn(&Context) -> BoxedFuture<'static, Result<(), SessionError>> + Send + Sync>;
+
+/// The shared facade lifecycle, upstream's `"open" | "closing" | "closed"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FacadeLifecycle {
+    /// Accepting operations.
+    Open,
+    /// Closing; operations not yet admitted reject.
+    Closing,
+    /// Closed.
+    Closed,
+}
+
+/// The facade's shared state over one storage-backed session, Arc'd so the
+/// admitted branch objects and mutation callbacks outlive the
+/// `Box<dyn Session>` handle they borrow from.
+///
+/// The backends' facades (`memory.ts`, sqlite-node's `session.ts`) carry the
+/// same fields and the same operation forwards; the port shares this core
+/// and the backends parameterize only their close flow. Cloning shares the
+/// state, upstream's object aliasing.
+#[derive(Clone)]
+pub struct FacadeCore {
+    session: Arc<StorageBackedSession>,
+    metadata: SessionMetadata,
+    id_generator: Arc<dyn IdGenerator>,
+    lifecycle: Arc<Mutex<FacadeLifecycle>>,
+    gate: AdmissionGate,
+    close_cell: tokio::sync::OnceCell<Result<(), SessionError>>,
+    /// The backend's close flow after the drain: the wrapped session's close
+    /// plus whatever the backend owns (memory: the on-close hook; sqlite:
+    /// the database close and the deregistration).
+    close_flow: CloseFlow,
+}
+
+impl std::fmt::Debug for FacadeCore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("FacadeCore").finish_non_exhaustive()
+    }
+}
+
+impl FacadeCore {
+    /// Builds the core over one storage-backed session and the backend's
+    /// close flow, upstream's facade constructors.
+    pub fn new(
+        session: Arc<StorageBackedSession>,
+        metadata: SessionMetadata,
+        close_flow: CloseFlow,
+    ) -> Arc<Self> {
+        let lifecycle = Arc::new(Mutex::new(FacadeLifecycle::Open));
+        let gate_is_open = Arc::clone(&lifecycle);
+        let gate = AdmissionGate::new(
+            Arc::new(AdmissionTracker::default()),
+            Arc::new(move || {
+                *gate_is_open.lock().unwrap_or_else(PoisonError::into_inner)
+                    == FacadeLifecycle::Open
+            }),
+        );
+        Arc::new(Self {
+            id_generator: session.id_generator_arc(),
+            session,
+            metadata,
+            lifecycle,
+            gate,
+            close_cell: tokio::sync::OnceCell::new(),
+            close_flow,
+        })
+    }
+
+    /// Whether the facade still admits operations.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        *self.lifecycle.lock().unwrap_or_else(PoisonError::into_inner) == FacadeLifecycle::Open
+    }
+
+    /// Marks the closing state synchronously, upstream's
+    /// `this.state = "closing"` inside the close call: operations not yet
+    /// admitted reject from the call onward, before the close future polls.
+    fn mark_closing(&self) {
+        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(PoisonError::into_inner);
+        if *lifecycle == FacadeLifecycle::Open {
+            *lifecycle = FacadeLifecycle::Closing;
+        }
+    }
+
+    async fn close_impl(&self, context: &Context) -> Result<(), SessionError> {
+        self.close_cell
+            .get_or_init(|| async {
+                self.gate.drain().await;
+                let flow = Arc::clone(&self.close_flow);
+                let context = context.clone();
+                let close_result = flow(&context).await;
+                *self.lifecycle.lock().unwrap_or_else(PoisonError::into_inner) =
+                    FacadeLifecycle::Closed;
+                close_result
+            })
+            .await
+            .clone()
+    }
+}
+
+impl SessionReader for FacadeCore {
+    fn get_entries(
+        &self,
+        ids: Vec<String>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<BTreeMap<String, Entry>, SessionError>> {
+        self.gate.admit(self.session.get_entries(ids, context))
+    }
+
+    fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
+        self.gate.admit(self.session.get_stats(context))
+    }
+
+    fn get_value(
+        &self,
+        address: &ValueAddress,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<StoredValue>, SessionError>> {
+        self.gate.admit(self.session.get_value(address, context))
+    }
+
+    fn scan_values(
+        &self,
+        prefix: &ValueAddress,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<StoredValue>, SessionError>> {
+        self.gate.admit(self.session.scan_values(prefix, context))
+    }
+
+    fn read_list(
+        &self,
+        address: &ListAddress,
+        options: Option<crate::harness::session::values::ListReadOptions>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
+        self.gate.admit(self.session.read_list(address, options, context))
+    }
+
+    fn scan_branch(
+        &self,
+        query: &StorageBranchScan,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
+        self.gate.admit(self.session.scan_branch(query, context))
+    }
+}
+
+impl Session for FacadeCore {
+    fn metadata(&self) -> &SessionMetadata {
+        &self.metadata
+    }
+
+    fn id_generator(&self) -> &dyn IdGenerator {
+        &*self.id_generator
+    }
+
+    fn get_entry(
+        &self,
+        id: &str,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
+        self.gate.admit(self.session.get_entry(id, context))
+    }
+
+    fn get_name(&self, context: &Context) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
+        self.gate.admit(self.session.get_name(context))
+    }
+
+    fn get_label(
+        &self,
+        target_id: &str,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
+        self.gate.admit(self.session.get_label(target_id, context))
+    }
+
+    fn find_entries(
+        &self,
+        query: Option<&EntryQuery>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
+        self.gate.admit(self.session.find_entries(query, context))
+    }
+
+    fn find_entry(
+        &self,
+        query: Option<&EntryQuery>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
+        self.gate.admit(self.session.find_entry(query, context))
+    }
+
+    fn branch(
+        &self,
+        name: &str,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Option<Box<dyn Branch>>, SessionError>> {
+        let gate = self.gate.clone();
+        let name = name.to_owned();
+        let context = context.clone();
+        Box::pin(async move {
+            let branch = gate.admit(self.session.branch(&name, &context)).await?;
+            Ok(branch.map(|branch| AdmittedBranch::new(branch, gate)))
+        })
+    }
+
+    fn create_branch(
+        &self,
+        name: &str,
+        at: Option<String>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn Branch>, SessionError>> {
+        let gate = self.gate.clone();
+        let name = name.to_owned();
+        let context = context.clone();
+        Box::pin(async move {
+            let branch = gate.admit(self.session.create_branch(&name, at, &context)).await?;
+            Ok(AdmittedBranch::new(branch, gate))
+        })
+    }
+
+    fn begin_mutation(
+        &self,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn SessionMutation>, SessionError>> {
+        let context = context.clone();
+        Box::pin(async move { begin_admitted_mutation(&self.gate, &self.session, &context).await })
+    }
+
+    fn mutate(
+        &self,
+        mutation: SessionMutationCallback,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<Box<dyn Any + Send>, SessionError>> {
+        Box::pin(admitted_mutate(
+            &self.gate,
+            Arc::clone(&self.session),
+            mutation,
+            context.clone(),
+        ))
+    }
+
+    fn set_value(
+        &self,
+        address: &ValueAddress,
+        next: serde_json::Value,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.gate.admit(self.session.set_value(address, next, context))
+    }
+
+    fn delete_value(
+        &self,
+        address: &ValueAddress,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.gate.admit(self.session.delete_value(address, context))
+    }
+
+    fn append_list(
+        &self,
+        address: &ListAddress,
+        element: serde_json::Value,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.gate.admit(self.session.append_list(address, element, context))
+    }
+
+    fn delete_list(
+        &self,
+        address: &ListAddress,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.gate.admit(self.session.delete_list(address, context))
+    }
+
+    fn set_name(
+        &self,
+        name: Option<String>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.gate.admit(self.session.set_name(name, context))
+    }
+
+    fn set_label(
+        &self,
+        target_id: &str,
+        label: Option<String>,
+        context: &Context,
+    ) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.gate.admit(self.session.set_label(target_id, label, context))
+    }
+
+    fn close(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
+        self.mark_closing();
+        let context = context.clone();
+        Box::pin(async move { self.close_impl(&context).await })
+    }
 }

@@ -977,7 +977,7 @@ impl SessionRepo for SqliteSessionRepo {
         let context = context.clone();
         Box::pin(async move {
             let session = self.create(options, &context).await?;
-            let boxed: Box<dyn Session> = Box::new(SqliteOpenSession::clone(&session));
+            let boxed: Box<dyn Session> = session.erased_session();
             Ok(boxed)
         })
     }
@@ -991,7 +991,7 @@ impl SessionRepo for SqliteSessionRepo {
         let context = context.clone();
         Box::pin(async move {
             let session = self.open(&typed, &context).await?;
-            let boxed: Box<dyn Session> = Box::new(SqliteOpenSession::clone(&session));
+            let boxed: Box<dyn Session> = session.erased_session();
             Ok(boxed)
         })
     }
@@ -1031,7 +1031,7 @@ impl SessionRepo for SqliteSessionRepo {
         let context = context.clone();
         Box::pin(async move {
             let session = self.fork(&typed, &options, &context).await?;
-            let boxed: Box<dyn Session> = Box::new(SqliteOpenSession::clone(&session));
+            let boxed: Box<dyn Session> = session.erased_session();
             Ok(boxed)
         })
     }
