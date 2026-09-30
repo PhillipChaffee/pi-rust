@@ -4,7 +4,6 @@
 //! errors, the erased-adapter surface, and the driver-seam behaviors.
 
 #![expect(clippy::expect_used, reason = "tests assert on results")]
-#![expect(clippy::panic, reason = "tests panic on failure")]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -898,7 +897,7 @@ async fn storage_contract_round_trips_a_full_session() {
         .expect("entries");
     // The scan reads in sequence order; the id-keyed map returns ids sorted.
     let mut from_get: Vec<Entry> = entries.into_values().collect();
-    from_get.sort_by_key(|entry| entry.seq());
+    from_get.sort_by_key(Entry::seq);
     assert_eq!(stored, from_get, "payload round-trips per variant");
     storage.close(&context).await.expect("close");
 }

@@ -11,11 +11,6 @@
 //!   renders `0` (the design's recorded rendering restatement).
 
 #![expect(clippy::expect_used, reason = "tests assert on results")]
-#![expect(clippy::panic, reason = "tests panic on failure")]
-#![expect(
-    clippy::unused_async,
-    reason = "upstream's suite is async end to end; the port keeps the tokio shape"
-)]
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -28,7 +23,7 @@ use pi_agent_core::harness::session::commit::{
 use pi_agent_core::harness::session::testing::conformance::user_message;
 use pi_agent_core::harness::session::types::{
     CommitResult, Entry, EntryCursor, EntryScan, EntryScanOrder, EntryType, MessageEntry, NewEntry,
-    Session, SessionStats, Storage, StorageBranchScan, UsageRow, UsageWriteRow,
+    SessionStats, Storage, StorageBranchScan, UsageRow, UsageWriteRow,
 };
 use pi_agent_core::harness::session::values::{
     ListAddress, ListCursor, ListReadOptions, Write, delete_value_write, entry_label, list,
@@ -158,6 +153,14 @@ fn o(row: &SqliteRow, column: &str) -> Option<String> {
 }
 
 /// Seeds one `entries` row directly, the suites' raw-SQL inserts.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the columns mirror the entries row one for one, upstream's raw SQL inserts"
+)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the payload reads naturally as a consumed value at the seed sites"
+)]
 fn seed_entry(
     db: &dyn SqliteDatabase,
     id: &str,
