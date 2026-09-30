@@ -1,5 +1,7 @@
 [workspace]
 # One crate per upstream TS package, per the map: crates/<pkg> mirrors packages/<pkg>.
+# The sqlite backend stays nested at crates/session-backends/sqlite-node, mirroring
+# upstream's packages/session-backends/sqlite-node (ADR 0003).
 members = [
     "crates/telemetry",
     "crates/ai",
@@ -9,6 +11,7 @@ members = [
     "crates/protocol",
     "crates/client",
     "crates/agent",
+    "crates/session-backends/sqlite-node",
 ]
 # Edition 2024's default resolver, made explicit so the workspace table is self-describing.
 resolver = "3"

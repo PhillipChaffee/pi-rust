@@ -26,13 +26,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use pi_ai::types::BoxedFuture;
 
 use crate::harness::context::Context;
+use crate::harness::session::facade;
 use crate::harness::session::in_memory_storage_state::InMemoryStorageState;
 use crate::harness::session::session::{StorageBackedSession, StorageBackedSessionOptions};
 use crate::harness::session::types::{
-    Branch, BranchScan, CommitResult, Entry, EntryQuery, EntryScan, EntryStructure, ForkOptions,
-    IdGenerator, Session, SessionCreateOptions, SessionError, SessionMetadata, SessionMutation,
-    SessionMutationCallback, SessionMutator, SessionReader, SessionRepo, SessionStats, Storage,
-    StorageBranchScan, UsageRow, UsageScan,
+    Branch, CommitResult, Entry, EntryQuery, EntryScan, EntryStructure, ForkOptions, IdGenerator,
+    Session, SessionCreateOptions, SessionError, SessionMetadata, SessionMutation,
+    SessionMutationCallback, SessionReader, SessionRepo, SessionStats, Storage, StorageBranchScan,
+    UsageRow, UsageScan,
 };
 use crate::harness::session::values::{
     ListAddress, ListElement, ListReadOptions, StoredValue, ValueAddress, Write,
@@ -278,65 +279,6 @@ impl Storage for MemoryStorage {
     }
 }
 
-/// The admitted-operation counter with its drain signal, upstream's
-/// `admitted` promise set on the memory facade: registration increments,
-/// settlement decrements, and close waits for the count to reach zero.
-#[derive(Debug, Default)]
-struct AdmissionTracker {
-    open: Mutex<usize>,
-    drained: tokio::sync::Notify,
-}
-
-impl AdmissionTracker {
-    fn register(self: &Arc<Self>) -> Arc<AdmissionSlot> {
-        *self.open.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-        Arc::new(AdmissionSlot {
-            tracker: self.clone(),
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn release(&self) {
-        let mut open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
-        *open -= 1;
-        if *open == 0 {
-            self.drained.notify_waiters();
-        }
-    }
-
-    /// Wait until every admitted operation has settled, upstream's
-    /// `Promise.allSettled([...this.admitted])`.
-    async fn drain(&self) {
-        loop {
-            if *self.open.lock().unwrap_or_else(PoisonError::into_inner) == 0 {
-                return;
-            }
-            self.drained.notified().await;
-        }
-    }
-}
-
-/// One admitted operation's slot; settlement decrements the tracker, and a
-/// dropped slot settles too so close never waits on an abandoned operation.
-struct AdmissionSlot {
-    tracker: Arc<AdmissionTracker>,
-    done: AtomicBool,
-}
-
-impl AdmissionSlot {
-    fn finish(&self) {
-        if !self.done.swap(true, Ordering::AcqRel) {
-            self.tracker.release();
-        }
-    }
-}
-
-impl Drop for AdmissionSlot {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
 /// The facade's shared state: upstream's `MemorySessionFacade` fields, Arc'd
 /// so the admitted branch objects and mutation callbacks outlive the
 /// `Box<dyn Session>` handle they borrow from.
@@ -344,8 +286,8 @@ struct FacadeInner {
     session: Arc<StorageBackedSession>,
     metadata: SessionMetadata,
     id_generator: Arc<dyn IdGenerator>,
-    lifecycle: Mutex<Lifecycle>,
-    tracker: Arc<AdmissionTracker>,
+    lifecycle: Arc<Mutex<Lifecycle>>,
+    gate: facade::AdmissionGate,
     on_close: Arc<dyn Fn() + Send + Sync>,
     close_cell: tokio::sync::OnceCell<()>,
 }
@@ -358,117 +300,31 @@ struct MemorySessionFacade(Arc<FacadeInner>);
 
 impl MemorySessionFacade {
     fn new(session: Arc<StorageBackedSession>, on_close: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let lifecycle = Arc::new(Mutex::new(Lifecycle::Open));
+        let gate_is_open = Arc::clone(&lifecycle);
+        let gate = facade::AdmissionGate::new(
+            Arc::new(facade::AdmissionTracker::default()),
+            Arc::new(move || {
+                *gate_is_open.lock().unwrap_or_else(PoisonError::into_inner) == Lifecycle::Open
+            }),
+        );
         Self(Arc::new(FacadeInner {
             metadata: session.metadata().clone(),
             id_generator: session.id_generator_arc(),
             session,
-            lifecycle: Mutex::new(Lifecycle::Open),
-            tracker: Arc::new(AdmissionTracker::default()),
+            lifecycle,
+            gate,
             on_close,
             close_cell: tokio::sync::OnceCell::new(),
         }))
     }
 
     fn is_open(&self) -> bool {
-        self.0.is_open()
-    }
-
-    fn closed_error() -> SessionError {
-        SessionError::Message("Session is closed".to_owned())
+        self.0.gate.is_open()
     }
 
     fn wrap_branch(&self, branch: Box<dyn Branch>) -> Box<dyn Branch> {
-        Box::new(AdmittedBranch {
-            branch,
-            inner: self.0.clone(),
-        })
-    }
-}
-
-/// The admitted-operation wrapper the facade's forwards share: the
-/// open-state gate, the tracker slot around the operation's settlement,
-/// upstream's `admit`.
-fn admit_operation<'a, T: 'a>(
-    inner: Arc<FacadeInner>,
-    operation: BoxedFuture<'a, Result<T, SessionError>>,
-) -> BoxedFuture<'a, Result<T, SessionError>> {
-    Box::pin(async move {
-        if !inner.is_open() {
-            return Err(SessionError::Message("Session is closed".to_owned()));
-        }
-        let slot = inner.tracker.register();
-        let outcome = operation.await;
-        slot.finish();
-        outcome
-    })
-}
-
-impl FacadeInner {
-    fn is_open(&self) -> bool {
-        *self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            == Lifecycle::Open
-    }
-}
-
-/// The branch surface admitted through the facade, upstream's
-/// `wrapBranch`.
-struct AdmittedBranch {
-    branch: Box<dyn Branch>,
-    inner: Arc<FacadeInner>,
-}
-
-impl Branch for AdmittedBranch {
-    fn name(&self) -> &str {
-        self.branch.name()
-    }
-
-    fn get_tip_id(
-        &self,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
-        admit_operation(self.inner.clone(), self.branch.get_tip_id(context))
-    }
-
-    fn find_entries(
-        &self,
-        query: Option<&BranchScan>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        admit_operation(self.inner.clone(), self.branch.find_entries(query, context))
-    }
-
-    fn find_entry(
-        &self,
-        query: Option<&BranchScan>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
-        admit_operation(self.inner.clone(), self.branch.find_entry(query, context))
-    }
-
-    fn append_message(
-        &self,
-        message: crate::types::AgentMessage,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, SessionError>> {
-        admit_operation(
-            self.inner.clone(),
-            self.branch.append_message(message, context),
-        )
-    }
-
-    fn append_custom_entry(
-        &self,
-        custom_type: &str,
-        data: Option<serde_json::Value>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<String, SessionError>> {
-        admit_operation(
-            self.inner.clone(),
-            self.branch.append_custom_entry(custom_type, data, context),
-        )
+        facade::AdmittedBranch::new(branch, self.0.gate.clone())
     }
 }
 
@@ -478,11 +334,11 @@ impl SessionReader for MemorySessionFacade {
         ids: Vec<String>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<BTreeMap<String, Entry>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.get_entries(ids, context))
+        self.0.gate.admit(self.0.session.get_entries(ids, context))
     }
 
     fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.get_stats(context))
+        self.0.gate.admit(self.0.session.get_stats(context))
     }
 
     fn get_value(
@@ -490,7 +346,9 @@ impl SessionReader for MemorySessionFacade {
         address: &ValueAddress,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Option<StoredValue>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.get_value(address, context))
+        self.0
+            .gate
+            .admit(self.0.session.get_value(address, context))
     }
 
     fn scan_values(
@@ -498,7 +356,9 @@ impl SessionReader for MemorySessionFacade {
         prefix: &ValueAddress,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<StoredValue>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.scan_values(prefix, context))
+        self.0
+            .gate
+            .admit(self.0.session.scan_values(prefix, context))
     }
 
     fn read_list(
@@ -507,10 +367,9 @@ impl SessionReader for MemorySessionFacade {
         options: Option<ListReadOptions>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
-        admit_operation(
-            self.0.clone(),
-            self.0.session.read_list(address, options, context),
-        )
+        self.0
+            .gate
+            .admit(self.0.session.read_list(address, options, context))
     }
 
     fn scan_branch(
@@ -518,93 +377,9 @@ impl SessionReader for MemorySessionFacade {
         query: &StorageBranchScan,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.scan_branch(query, context))
-    }
-}
-
-/// The granted mutation wrapped with the facade's admission slot, upstream's
-/// `beginMutation` return object.
-struct AdmittedMutation {
-    source: Box<dyn SessionMutation>,
-    slot: Option<Arc<AdmissionSlot>>,
-}
-
-impl SessionReader for AdmittedMutation {
-    fn get_entries(
-        &self,
-        ids: Vec<String>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<BTreeMap<String, Entry>, SessionError>> {
-        self.source.get_entries(ids, context)
-    }
-
-    fn get_stats(&self, context: &Context) -> BoxedFuture<'_, Result<SessionStats, SessionError>> {
-        self.source.get_stats(context)
-    }
-
-    fn get_value(
-        &self,
-        address: &ValueAddress,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Option<StoredValue>, SessionError>> {
-        self.source.get_value(address, context)
-    }
-
-    fn scan_values(
-        &self,
-        prefix: &ValueAddress,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<StoredValue>, SessionError>> {
-        self.source.scan_values(prefix, context)
-    }
-
-    fn read_list(
-        &self,
-        address: &ListAddress,
-        options: Option<ListReadOptions>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
-        self.source.read_list(address, options, context)
-    }
-
-    fn scan_branch(
-        &self,
-        query: &StorageBranchScan,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        self.source.scan_branch(query, context)
-    }
-}
-
-impl SessionMutator for AdmittedMutation {
-    fn commit(
-        &self,
-        writes: Vec<Write>,
-        context: &Context,
-    ) -> BoxedFuture<'_, Result<CommitResult, SessionError>> {
-        self.source.commit(writes, context)
-    }
-}
-
-impl SessionMutation for AdmittedMutation {
-    fn end(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
-        let slot = self.slot.clone();
-        let context = context.clone();
-        Box::pin(async move {
-            let ended = self.source.end(&context).await;
-            if let Some(slot) = &slot {
-                slot.finish();
-            }
-            ended
-        })
-    }
-}
-
-impl Drop for AdmittedMutation {
-    fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            slot.finish();
-        }
+        self.0
+            .gate
+            .admit(self.0.session.scan_branch(query, context))
     }
 }
 
@@ -622,11 +397,11 @@ impl Session for MemorySessionFacade {
         id: &str,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.get_entry(id, context))
+        self.0.gate.admit(self.0.session.get_entry(id, context))
     }
 
     fn get_name(&self, context: &Context) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.get_name(context))
+        self.0.gate.admit(self.0.session.get_name(context))
     }
 
     fn get_label(
@@ -634,7 +409,9 @@ impl Session for MemorySessionFacade {
         target_id: &str,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Option<String>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.get_label(target_id, context))
+        self.0
+            .gate
+            .admit(self.0.session.get_label(target_id, context))
     }
 
     fn find_entries(
@@ -642,7 +419,9 @@ impl Session for MemorySessionFacade {
         query: Option<&EntryQuery>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<Entry>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.find_entries(query, context))
+        self.0
+            .gate
+            .admit(self.0.session.find_entries(query, context))
     }
 
     fn find_entry(
@@ -650,7 +429,7 @@ impl Session for MemorySessionFacade {
         query: Option<&EntryQuery>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Option<Entry>, SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.find_entry(query, context))
+        self.0.gate.admit(self.0.session.find_entry(query, context))
     }
 
     fn branch(
@@ -662,7 +441,9 @@ impl Session for MemorySessionFacade {
         let name = name.to_owned();
         let context = context.clone();
         Box::pin(async move {
-            let branch = admit_operation(inner.clone(), inner.session.branch(&name, &context))
+            let branch = inner
+                .gate
+                .admit(inner.session.branch(&name, &context))
                 .await?
                 .map(|branch| self.wrap_branch(branch));
             Ok(branch)
@@ -679,11 +460,10 @@ impl Session for MemorySessionFacade {
         let name = name.to_owned();
         let context = context.clone();
         Box::pin(async move {
-            let branch = admit_operation(
-                inner.clone(),
-                inner.session.create_branch(&name, at, &context),
-            )
-            .await?;
+            let branch = inner
+                .gate
+                .admit(inner.session.create_branch(&name, at, &context))
+                .await?;
             Ok(self.wrap_branch(branch))
         })
     }
@@ -692,26 +472,10 @@ impl Session for MemorySessionFacade {
         &self,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Box<dyn SessionMutation>, SessionError>> {
+        let inner = self.0.clone();
         let context = context.clone();
         Box::pin(async move {
-            let slot = self.0.tracker.register();
-            let source = match self.0.session.begin_mutation(&context).await {
-                Ok(source) => source,
-                Err(error) => {
-                    slot.finish();
-                    return Err(error);
-                }
-            };
-            if !self.is_open() {
-                source.end(&context).await?;
-                slot.finish();
-                return Err(Self::closed_error());
-            }
-            let granted: Box<dyn SessionMutation> = Box::new(AdmittedMutation {
-                source,
-                slot: Some(slot),
-            });
-            Ok(granted)
+            facade::begin_admitted_mutation(&inner.gate, &inner.session, &context).await
         })
     }
 
@@ -720,31 +484,11 @@ impl Session for MemorySessionFacade {
         mutation: SessionMutationCallback,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Box<dyn Any + Send>, SessionError>> {
-        let inner = self.0.clone();
-        let context = context.clone();
-        Box::pin(admit_operation(
-            self.0.clone(),
-            Box::pin(async move {
-                let callback_inner = inner.clone();
-                inner
-                    .session
-                    .mutate(
-                        Box::new(
-                            move |mutator: &dyn SessionMutator, mutation_context: &Context| {
-                                // Upstream re-checks the facade's open state when
-                                // the callback body runs, so a callback queued
-                                // before close still rejects.
-                                let open = callback_inner.is_open();
-                                if !open {
-                                    return Box::pin(std::future::ready(Err(Self::closed_error())));
-                                }
-                                mutation(mutator, mutation_context)
-                            },
-                        ),
-                        &context,
-                    )
-                    .await
-            }),
+        Box::pin(facade::admitted_mutate(
+            &self.0.gate,
+            Arc::clone(&self.0.session),
+            mutation,
+            context.clone(),
         ))
     }
 
@@ -754,10 +498,9 @@ impl Session for MemorySessionFacade {
         next: serde_json::Value,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        admit_operation(
-            self.0.clone(),
-            self.0.session.set_value(address, next, context),
-        )
+        self.0
+            .gate
+            .admit(self.0.session.set_value(address, next, context))
     }
 
     fn delete_value(
@@ -765,10 +508,9 @@ impl Session for MemorySessionFacade {
         address: &ValueAddress,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        admit_operation(
-            self.0.clone(),
-            self.0.session.delete_value(address, context),
-        )
+        self.0
+            .gate
+            .admit(self.0.session.delete_value(address, context))
     }
 
     fn append_list(
@@ -777,10 +519,9 @@ impl Session for MemorySessionFacade {
         element: serde_json::Value,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        admit_operation(
-            self.0.clone(),
-            self.0.session.append_list(address, element, context),
-        )
+        self.0
+            .gate
+            .admit(self.0.session.append_list(address, element, context))
     }
 
     fn delete_list(
@@ -788,7 +529,9 @@ impl Session for MemorySessionFacade {
         address: &ListAddress,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.delete_list(address, context))
+        self.0
+            .gate
+            .admit(self.0.session.delete_list(address, context))
     }
 
     fn set_name(
@@ -796,7 +539,7 @@ impl Session for MemorySessionFacade {
         name: Option<String>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        admit_operation(self.0.clone(), self.0.session.set_name(name, context))
+        self.0.gate.admit(self.0.session.set_name(name, context))
     }
 
     fn set_label(
@@ -805,10 +548,9 @@ impl Session for MemorySessionFacade {
         label: Option<String>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        admit_operation(
-            self.0.clone(),
-            self.0.session.set_label(target_id, label, context),
-        )
+        self.0
+            .gate
+            .admit(self.0.session.set_label(target_id, label, context))
     }
 
     fn close(&self, _context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
@@ -826,7 +568,7 @@ impl Session for MemorySessionFacade {
             inner
                 .close_cell
                 .get_or_init(|| async {
-                    inner.tracker.drain().await;
+                    inner.gate.drain().await;
                     *inner
                         .lifecycle
                         .lock()

@@ -10,6 +10,7 @@
 
 pub mod commit;
 pub mod context;
+pub mod facade;
 pub mod fork;
 pub mod fork_policy;
 pub mod in_memory_storage_state;
