@@ -42,7 +42,7 @@ use pi_agent_core::harness::session::values::{
     ListAddress, ListElement, ListReadOptions, StoredValue, ValueAddress, Write,
 };
 use pi_agent_core::types::BoxedFuture;
-use pi_session_backend_sqlite_node::sqlite::types::SqliteDatabase;
+use pi_session_backend_sqlite_node::sqlite::types::{SqliteDatabase, SqliteDatabaseFactory};
 use pi_session_backend_sqlite_node::{
     SqliteStorage, SqliteStorageOptions, apply_initial_schema, create_rusqlite_factory,
 };
@@ -143,11 +143,12 @@ impl Storage for FixtureDisposeStorage {
     }
 
     fn close(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
-        let storage = Arc::clone(&self.storage);
+        // Calling the inner close runs its synchronous "closing" latch now,
+        // at the fixture's call; the future continues the queue drain.
+        let inner = self.storage.close(context);
         let db = Arc::clone(&self.db);
-        let context = context.clone();
         Box::pin(async move {
-            let storage_result = storage.close(&context).await;
+            let storage_result = inner.await;
             db.close()
                 .map_err(|error| SessionError::Message(error.to_string()))?;
             storage_result

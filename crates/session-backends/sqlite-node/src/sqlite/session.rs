@@ -9,11 +9,11 @@
 
 use std::sync::Arc;
 
+use crate::sqlite::session_row::SqliteSessionMetadata;
+use crate::sqlite::types::SqliteAdapterError;
 use pi_agent_core::harness::session::facade::FacadeCore;
 use pi_agent_core::harness::session::session::StorageBackedSession;
 use pi_agent_core::harness::session::types::{Session, SessionError};
-use crate::sqlite::session_row::SqliteSessionMetadata;
-use crate::sqlite::types::SqliteAdapterError;
 
 /// The facade options, upstream's `SqliteOpenSessionOptions`.
 #[derive(Clone)]
@@ -29,20 +29,27 @@ pub struct SqliteOpenSessionOptions {
 
 impl std::fmt::Debug for SqliteOpenSessionOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SqliteOpenSessionOptions").finish_non_exhaustive()
+        formatter
+            .debug_struct("SqliteOpenSessionOptions")
+            .finish_non_exhaustive()
     }
 }
 
 /// The SQLite open-session lifecycle wrapper, upstream's `SqliteOpenSession`.
 ///
 /// Cloning shares the facade state, upstream's object aliasing between the
-/// repository's registry and the caller's handle.
+/// repository's registry and the caller's handle. The shared
+/// [`FacadeCore`] erases the metadata to the base shape; the typed
+/// [`SqliteSessionMetadata`] rides alongside it, upstream's
+/// `Session<SqliteSessionMetadata>` parameter.
 #[derive(Clone)]
-pub struct SqliteOpenSession(Arc<FacadeCore>);
+pub struct SqliteOpenSession(Arc<FacadeCore>, SqliteSessionMetadata);
 
 impl std::fmt::Debug for SqliteOpenSession {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("SqliteOpenSession").finish_non_exhaustive()
+        formatter
+            .debug_struct("SqliteOpenSession")
+            .finish_non_exhaustive()
     }
 }
 
@@ -56,11 +63,13 @@ impl SqliteOpenSession {
         metadata: SqliteSessionMetadata,
         options: SqliteOpenSessionOptions,
     ) -> Self {
-        let close_database = options.close_database.clone();
-        let on_close = options.on_close.clone();
+        let SqliteOpenSessionOptions {
+            close_database,
+            on_close,
+        } = options;
         let core = FacadeCore::new(
             Arc::clone(&session),
-            metadata.base,
+            metadata.base.clone(),
             Arc::new(move |context| {
                 let session = Arc::clone(&session);
                 let close_database = Arc::clone(&close_database);
@@ -82,12 +91,23 @@ impl SqliteOpenSession {
                 })
             }),
         );
-        SqliteOpenSession(core)
+        Self(core, metadata)
+    }
+
+    /// The typed SQLite metadata, upstream's `session.metadata` property:
+    /// the `SqliteSessionMetadata` the typed lifecycle carries. The erased
+    /// [`Session::metadata`] (through the core) returns only the base
+    /// fields; the canonical container `path` rides only here, and the
+    /// repo-level tests pass this value across repositories (foreign fork
+    /// sources).
+    #[must_use]
+    pub const fn typed_metadata(&self) -> &SqliteSessionMetadata {
+        &self.1
     }
 
     /// The session id, the deregistration's removal key.
     pub(crate) fn session_id(&self) -> &str {
-        &self.0.metadata().id
+        &self.1.base.id
     }
 
     /// The erased session handle over the shared core, the repository's

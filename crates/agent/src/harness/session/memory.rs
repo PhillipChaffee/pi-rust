@@ -29,9 +29,9 @@ use crate::harness::session::facade;
 use crate::harness::session::in_memory_storage_state::InMemoryStorageState;
 use crate::harness::session::session::{StorageBackedSession, StorageBackedSessionOptions};
 use crate::harness::session::types::{
-    CommitResult, Entry, EntryScan, EntryStructure, ForkOptions,
-    Session, SessionCreateOptions, SessionError, SessionMetadata, SessionRepo, SessionStats, Storage, StorageBranchScan,
-    UsageRow, UsageScan,
+    CommitResult, Entry, EntryScan, EntryStructure, ForkOptions, Session, SessionCreateOptions,
+    SessionError, SessionMetadata, SessionRepo, SessionStats, Storage, StorageBranchScan, UsageRow,
+    UsageScan,
 };
 use crate::harness::session::values::{
     ListAddress, ListElement, ListReadOptions, StoredValue, ValueAddress, Write,

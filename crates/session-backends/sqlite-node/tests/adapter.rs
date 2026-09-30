@@ -20,7 +20,7 @@ use std::sync::Arc;
 use pi_session_backend_sqlite_node::create_rusqlite_factory;
 use pi_session_backend_sqlite_node::sqlite::types::{
     SqliteAdapterError, SqliteDatabase, SqliteDatabaseFactory, SqliteParams, SqliteRunResult,
-    SqliteStatement, SqliteTransactionOutcome, SqliteValue,
+    SqliteTransactionOutcome, SqliteValue,
 };
 
 use support::path_exists;
@@ -45,7 +45,8 @@ fn transaction_typed<T: Any + Send>(
 ) -> Result<T, SqliteAdapterError> {
     let outcome = db.transaction(Box::new(move || {
         callback().map(|value| {
-            SqliteTransactionOutcome::Committed(Box::new(value) as Box<dyn Any + Send>)
+            let committed: Box<dyn Any + Send> = Box::new(value);
+            SqliteTransactionOutcome::Committed(committed)
         })
     }))?;
     outcome.downcast::<T>().map_or_else(
@@ -215,7 +216,7 @@ async fn rejects_asynchronous_transaction_callbacks() {
             .run(&SqliteParams::Positional(vec![SqliteValue::Integer(42)]))?;
         Ok(SqliteTransactionOutcome::Asynchronous)
     }));
-    let error = rejected.err().expect("transaction rejected");
+    let error = rejected.expect_err("transaction rejected");
     assert!(
         error
             .message()

@@ -3,11 +3,15 @@
 //! upstream's tests build (transaction counting, gated opens, snapshot
 //! interception, close tracking).
 
+#![expect(
+    dead_code,
+    reason = "shared fixtures; each test binary uses the subset it needs"
+)]
 #![expect(clippy::expect_used, reason = "test fixtures assert on construction")]
 #![expect(clippy::panic, reason = "test fixtures panic on misuse")]
 #![expect(
-    clippy::significant_drop_tightening,
-    reason = "test doubles hold the seam lock across their forwarding bodies"
+    unreachable_pub,
+    reason = "the fixture module is compiled into every integration test binary as a private module"
 )]
 
 use std::future::Future;
@@ -15,14 +19,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pi_agent_core::harness::session::testing::ConformanceCase;
-use pi_agent_core::harness::session::types::CommitResult;
-use pi_agent_core::harness::session::types::SessionError;
+use pi_agent_core::harness::session::types::{CommitResult, SessionError};
 use pi_agent_core::types::BoxedFuture;
-use pi_session_backend_sqlite_node::sqlite::migrations::apply_initial_schema;
 use pi_session_backend_sqlite_node::sqlite::storage::NowFn;
 use pi_session_backend_sqlite_node::sqlite::types::{
     SqliteDatabase, SqliteDatabaseFactory, SqliteParams, SqliteRow, SqliteRunResult,
-    SqliteStatement, SqliteTransactionOutcome,
+    SqliteStatement,
 };
 use pi_session_backend_sqlite_node::{SqliteSessionRepoOptions, create_rusqlite_factory, sql};
 
@@ -121,10 +123,10 @@ pub fn insert_conformance_session_row(db: &dyn SqliteDatabase) {
 pub fn explain_query_plan(
     db: &dyn SqliteDatabase,
     query: &str,
-    params: SqliteParams,
+    params: &SqliteParams,
 ) -> Vec<String> {
     db.prepare(&format!("EXPLAIN QUERY PLAN {query}"))
-        .all(&params)
+        .all(params)
         .expect("explain query plan")
         .iter()
         .map(|row| row.string("detail").expect("detail"))
@@ -261,7 +263,7 @@ impl GatedOpenExistingFactory {
     ) {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let factory = Arc::new(GatedOpenExistingFactory {
+        let factory = Arc::new(Self {
             source: Box::new(create_rusqlite_factory()),
             gated: AtomicBool::new(false),
             entered_tx,
@@ -422,7 +424,7 @@ pub struct SnapshotBoundaryFactory {
 impl SnapshotBoundaryFactory {
     /// Builds the factory over the rusqlite factory.
     pub fn new(after_snapshot_established: Arc<dyn Fn() + Send + Sync>) -> Self {
-        SnapshotBoundaryFactory {
+        Self {
             source: Box::new(create_rusqlite_factory()),
             after_snapshot_established,
             read_only_open_count: AtomicUsize::new(0),
@@ -504,19 +506,18 @@ impl SqliteDatabase for CloseTrackingDatabase {
     ) -> Result<(), pi_session_backend_sqlite_node::sqlite::types::SqliteAdapterError> {
         self.close_attempts.fetch_add(1, Ordering::SeqCst);
         self.source.close()?;
-        match self
+        let injected = self
             .close_error
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            Some(error) => Err(
+            .take();
+        injected.map_or(Ok(()), |error| {
+            Err(
                 pi_session_backend_sqlite_node::sqlite::types::SqliteAdapterError::new(
                     error.to_string(),
                 ),
-            ),
-            None => Ok(()),
-        }
+            )
+        })
     }
 }
 
@@ -531,7 +532,7 @@ pub struct CloseTrackingFactory {
 impl CloseTrackingFactory {
     /// Builds the factory over the rusqlite factory.
     pub fn new() -> Self {
-        CloseTrackingFactory {
+        Self {
             source: Box::new(create_rusqlite_factory()),
             writable_connections: Mutex::new(Vec::new()),
         }

@@ -195,7 +195,6 @@ impl SqliteStorage {
     }
 
     async fn commit_impl(&self, writes: Vec<Write>) -> Result<CommitResult, SessionError> {
-        self.assert_open()?;
         let line = self.commit_line.lock().await;
         let result = self.apply_commit(writes);
         drop(line);
@@ -234,12 +233,11 @@ impl SqliteStorage {
     }
 
     async fn close_impl(&self) -> Result<(), SessionError> {
+        // The synchronous "closing" latch happened in the trait method; this
+        // body is the queue-tail drain that moves the state to "closed"
+        // (upstream's `.then(() => { this.state = "closed"; })`).
         self.close_cell
             .get_or_init(|| async {
-                *self
-                    .lifecycle
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Closing;
                 let line = self.commit_line.lock().await;
                 *self
                     .lifecycle
@@ -358,6 +356,14 @@ impl Storage for SqliteStorage {
         writes: Vec<Write>,
         _context: &Context,
     ) -> BoxedFuture<'_, Result<CommitResult, SessionError>> {
+        // Upstream admits the commit synchronously at the call
+        // (storage.ts:77-80): the open gate and the queue-tail join run
+        // before any await, so a commit called while open still applies once
+        // close has latched "closing". The apply itself never re-checks the
+        // state; the call-time gate is the only one.
+        if let Err(error) = self.assert_open() {
+            return Box::pin(ready(Err(error)));
+        }
         Box::pin(self.commit_impl(writes))
     }
 
@@ -457,6 +463,17 @@ impl Storage for SqliteStorage {
     }
 
     fn close(&self, _context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {
+        // Upstream's close is a plain method (storage.ts:202-209): the
+        // memoized-promise check and the "closing" latch run synchronously at
+        // the call, so reads and commits called afterwards reject while the
+        // queue drain is still pending; a repeat call is the memoized one and
+        // never regresses a completed close.
+        if self.close_cell.get().is_none() {
+            *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Lifecycle::Closing;
+        }
         Box::pin(self.close_impl())
     }
 }

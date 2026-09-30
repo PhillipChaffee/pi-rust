@@ -14,7 +14,12 @@ pi-ai = { path = "../../ai" }
 pi-agent-core = { path = "../../agent" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = { version = "1.0.145", features = ["preserve_order"] }
+# float_roundtrip: the persisted usage stats accumulate through a
+# JSON.parse/stringify round-trip; V8's JSON.parse is correctly rounded and
+# serde_json's default parser is not, so totals could drift by one ulp from
+# upstream's (storage-conformance "keeps stats equal to message count and
+# ledger totals" pins it).
+serde_json = { version = "1.0.145", features = ["preserve_order", "float_roundtrip"] }
 tokio = { version = "1.47", default-features = false, features = ["sync"] }
 base64 = "0.22"
 

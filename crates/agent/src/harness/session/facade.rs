@@ -465,14 +465,21 @@ impl FacadeCore {
     /// Whether the facade still admits operations.
     #[must_use]
     pub fn is_open(&self) -> bool {
-        *self.lifecycle.lock().unwrap_or_else(PoisonError::into_inner) == FacadeLifecycle::Open
+        *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            == FacadeLifecycle::Open
     }
 
     /// Marks the closing state synchronously, upstream's
     /// `this.state = "closing"` inside the close call: operations not yet
     /// admitted reject from the call onward, before the close future polls.
     fn mark_closing(&self) {
-        let mut lifecycle = self.lifecycle.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if *lifecycle == FacadeLifecycle::Open {
             *lifecycle = FacadeLifecycle::Closing;
         }
@@ -485,8 +492,10 @@ impl FacadeCore {
                 let flow = Arc::clone(&self.close_flow);
                 let context = context.clone();
                 let close_result = flow(&context).await;
-                *self.lifecycle.lock().unwrap_or_else(PoisonError::into_inner) =
-                    FacadeLifecycle::Closed;
+                *self
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = FacadeLifecycle::Closed;
                 close_result
             })
             .await
@@ -529,7 +538,8 @@ impl SessionReader for FacadeCore {
         options: Option<crate::harness::session::values::ListReadOptions>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<Vec<ListElement>, SessionError>> {
-        self.gate.admit(self.session.read_list(address, options, context))
+        self.gate
+            .admit(self.session.read_list(address, options, context))
     }
 
     fn scan_branch(
@@ -610,7 +620,9 @@ impl Session for FacadeCore {
         let name = name.to_owned();
         let context = context.clone();
         Box::pin(async move {
-            let branch = gate.admit(self.session.create_branch(&name, at, &context)).await?;
+            let branch = gate
+                .admit(self.session.create_branch(&name, at, &context))
+                .await?;
             Ok(AdmittedBranch::new(branch, gate))
         })
     }
@@ -642,7 +654,8 @@ impl Session for FacadeCore {
         next: serde_json::Value,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.gate.admit(self.session.set_value(address, next, context))
+        self.gate
+            .admit(self.session.set_value(address, next, context))
     }
 
     fn delete_value(
@@ -659,7 +672,8 @@ impl Session for FacadeCore {
         element: serde_json::Value,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.gate.admit(self.session.append_list(address, element, context))
+        self.gate
+            .admit(self.session.append_list(address, element, context))
     }
 
     fn delete_list(
@@ -684,7 +698,8 @@ impl Session for FacadeCore {
         label: Option<String>,
         context: &Context,
     ) -> BoxedFuture<'_, Result<(), SessionError>> {
-        self.gate.admit(self.session.set_label(target_id, label, context))
+        self.gate
+            .admit(self.session.set_label(target_id, label, context))
     }
 
     fn close(&self, context: &Context) -> BoxedFuture<'_, Result<(), SessionError>> {

@@ -50,7 +50,10 @@ impl SqliteStatement for RusqliteStatement {
             SqliteParams::Positional(values) => {
                 self.run_with(rusqlite::params_from_iter(values.iter()))
             }
-            SqliteParams::Named(map) => self.run_with(named_binding(map).as_slice()),
+            SqliteParams::Named(map) => {
+                let names = named_names(map);
+                self.run_with(named_pairs(&names, map).as_slice())
+            }
         }
     }
 
@@ -59,7 +62,10 @@ impl SqliteStatement for RusqliteStatement {
             SqliteParams::Positional(values) => {
                 self.get_with(rusqlite::params_from_iter(values.iter()))
             }
-            SqliteParams::Named(map) => self.get_with(named_binding(map).as_slice()),
+            SqliteParams::Named(map) => {
+                let names = named_names(map);
+                self.get_with(named_pairs(&names, map).as_slice())
+            }
         }
     }
 
@@ -68,7 +74,10 @@ impl SqliteStatement for RusqliteStatement {
             SqliteParams::Positional(values) => {
                 self.materialized(rusqlite::params_from_iter(values.iter()))
             }
-            SqliteParams::Named(map) => self.materialized(named_binding(map).as_slice()),
+            SqliteParams::Named(map) => {
+                let names = named_names(map);
+                self.materialized(named_pairs(&names, map).as_slice())
+            }
         }
     }
 
@@ -77,7 +86,10 @@ impl SqliteStatement for RusqliteStatement {
             SqliteParams::Positional(values) => {
                 self.materialized(rusqlite::params_from_iter(values.iter()))
             }
-            SqliteParams::Named(map) => self.materialized(named_binding(map).as_slice()),
+            SqliteParams::Named(map) => {
+                let names = named_names(map);
+                self.materialized(named_pairs(&names, map).as_slice())
+            }
         }
     }
 }
@@ -143,10 +155,34 @@ impl RusqliteStatement {
     }
 }
 
-/// The named-parameter slice rusqlite binds against `:name` markers, the
-/// `&[(S, T)]` shape of its sealed `Params` trait.
-fn named_binding(map: &BTreeMap<String, SqliteValue>) -> Vec<(&str, &dyn ToSql)> {
-    map.iter()
+/// The bind keys SQLite matches: node:sqlite matches object keys against the
+/// marker labels with or without their prefix (`allowBareNamedParameters`
+/// defaults to true); SQLite's `sqlite3_bind_parameter_index` matches only
+/// the prefixed label, so a bare key gains `:` and a prefixed key is used
+/// as-is. (Upstream also resolves bare keys against `@`/`$` markers; every
+/// query in this crate — verbatim upstream SQL — carries `:` markers only.)
+fn named_names(map: &BTreeMap<String, SqliteValue>) -> Vec<String> {
+    map.keys()
+        .map(|key| {
+            if key.starts_with(':') || key.starts_with('@') || key.starts_with('$') {
+                key.clone()
+            } else {
+                format!(":{key}")
+            }
+        })
+        .collect()
+}
+
+/// The named-parameter slice rusqlite binds, the `&[(S, T)]` shape of its
+/// sealed `Params` trait; the keys borrow `names`, which the caller keeps
+/// alive across the execution.
+fn named_pairs<'a>(
+    names: &'a [String],
+    map: &'a BTreeMap<String, SqliteValue>,
+) -> Vec<(&'a str, &'a dyn ToSql)> {
+    names
+        .iter()
+        .zip(map.values())
         .map(|(name, value)| {
             let value: &dyn ToSql = value;
             (name.as_str(), value)

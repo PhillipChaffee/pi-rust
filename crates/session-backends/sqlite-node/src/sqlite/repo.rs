@@ -956,8 +956,8 @@ impl SqliteSessionRepo {
             Arc::clone(&session),
             metadata,
             crate::sqlite::session::SqliteOpenSessionOptions {
-                on_close,
                 close_database,
+                on_close,
             },
         ));
         self.open_sessions
