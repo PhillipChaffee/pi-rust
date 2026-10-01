@@ -63,15 +63,17 @@ const ZERO_USAGE: Usage = Usage {
     },
 };
 
-fn usage(input: i64, output: i64) -> Usage {
+/// Upstream's distinct-field usage literal (storage.test.ts:508-515): the
+/// four counter fields differ so a decode swap between them cannot pass.
+const fn usage() -> Usage {
     Usage {
-        input: u64::try_from(input).unwrap_or(u64::MAX),
-        output: u64::try_from(output).unwrap_or(u64::MAX),
-        cache_read: u64::try_from(input + 1).unwrap_or(u64::MAX),
-        cache_write: u64::try_from(output + 1).unwrap_or(u64::MAX),
+        input: 1,
+        output: 2,
+        cache_read: 3,
+        cache_write: 4,
         cache_write_1h: None,
         reasoning: None,
-        total_tokens: u64::try_from(input + output).unwrap_or(u64::MAX),
+        total_tokens: 10,
         cost: UsageCost {
             input: 0.1,
             output: 0.2,
@@ -862,7 +864,7 @@ async fn uses_branch_entries_as_the_outer_scan_for_branch_structure_queries() {
 async fn scans_decoded_usage_rows_with_sequence_bounds() {
     with_storage(|storage, db| {
         Box::pin(async move {
-            let usage_json = serde_json::to_string(&usage(1, 2)).expect("usage json");
+            let usage_json = serde_json::to_string(&usage()).expect("usage json");
             for (id, seq, entry_id, adjustment, details) in [
                 ("u1", 1i64, Some("e1"), 0i64, None),
                 ("u2", 2, None, 1, Some(serde_json::json!({ "reason": "adjust" }))),
@@ -900,7 +902,7 @@ async fn scans_decoded_usage_rows_with_sequence_bounds() {
                 vec![UsageRow {
                     id: "u2".to_owned(),
                     seq: 2,
-                    usage: usage(1, 2),
+                    usage: usage(),
                     entry_id: None,
                     adjustment: true,
                     details: Some(serde_json::json!({ "reason": "adjust" })),
@@ -932,7 +934,7 @@ fn prepares_committed_writes_with_assigned_sequences_and_timestamp() {
             user_entry("entry", None, "hi"),
             Write::Usage(insert_usage(UsageWriteRow {
                 id: "usage".to_owned(),
-                usage: usage(1, 2),
+                usage: usage(),
                 entry_id: None,
                 adjustment: false,
                 details: None,
@@ -1042,7 +1044,7 @@ async fn gets_maintained_session_stats() {
                 db.as_ref(),
                 1,
                 2,
-                &serde_json::to_string(&usage(1, 2)).expect("usage json"),
+                &serde_json::to_string(&usage()).expect("usage json"),
                 3,
             );
 
@@ -1050,7 +1052,7 @@ async fn gets_maintained_session_stats() {
                 storage.get_stats(&context()).await.expect("stats"),
                 SessionStats {
                     message_count: 2,
-                    usage: usage(1, 2)
+                    usage: usage()
                 }
             );
             let next = storage
@@ -1067,7 +1069,7 @@ async fn gets_maintained_session_stats() {
                 next.stats,
                 SessionStats {
                     message_count: 2,
-                    usage: usage(1, 2)
+                    usage: usage()
                 }
             );
         })

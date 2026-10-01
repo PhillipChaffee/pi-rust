@@ -54,6 +54,12 @@ impl AdmissionTracker {
 
     /// Waits until every admitted operation has settled, upstream's
     /// `Promise.allSettled([...this.admitted])`.
+    ///
+    /// The check-then-notify loop is safe on the current-thread runtimes this
+    /// workspace builds (`#[tokio::test]` defaults and the agent loop's
+    /// single-threaded substrate): check and `Notified` creation sit inside
+    /// one poll, so no release can land between them. A multi-threaded
+    /// runtime would need `Notified::enable()` before the count check.
     pub async fn drain(&self) {
         loop {
             if *self.open.lock().unwrap_or_else(PoisonError::into_inner) == 0 {

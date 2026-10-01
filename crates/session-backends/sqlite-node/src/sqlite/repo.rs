@@ -715,8 +715,10 @@ impl SqliteSessionRepo {
                     SQLITE_STORAGE_VERSION,
                 )?;
                 if self.uses_shared_database() {
-                    // The shared container's row deletion is one transaction,
-                    // upstream's `db.transaction(() => { ...; deleteSessionRows(...) })`.
+                    // The shared container's row deletion is one transaction.
+                    // Scope delta, recorded: upstream's transaction also wraps
+                    // the version-gate read; the port reads the gate outside
+                    // it — unobservable under the single-writer contract.
                     let transaction_db = Arc::clone(&db);
                     let transaction_id = metadata.base.id.clone();
                     db.transaction(Box::new(move || {
@@ -921,6 +923,10 @@ impl SqliteSessionRepo {
                     .drain(..)
                     .collect();
                 let mut errors = Vec::new();
+                // Drain order delta, recorded: upstream's allSettled closes
+                // concurrently; the port closes sequentially — the error
+                // order follows the same insertion order and no session's
+                // close observes another's.
                 for session in sessions {
                     if let Err(error) = session.close(context).await {
                         errors.push(error);

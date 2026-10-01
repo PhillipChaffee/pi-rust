@@ -475,7 +475,10 @@ pub struct CloseTrackingDatabase {
     source: Box<dyn SqliteDatabase>,
     /// The close attempts the tests assert.
     pub close_attempts: AtomicUsize,
-    /// The error close reports, when injected.
+    /// The error close reports, when injected. Consumed on report (upstream
+    /// keeps its `closeError` set, so every close attempt fails); no test
+    /// here closes a failing connection twice, and a future one should carry
+    /// this delta into its assertions.
     pub close_error: Mutex<Option<SessionError>>,
 }
 

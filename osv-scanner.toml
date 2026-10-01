@@ -89,7 +89,6 @@ name = "pi-client"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/client/Cargo.toml"
 
-
 [[PackageOverrides]]
 name = "pi-session-backend-sqlite-node"
 license.override = ["MIT"]

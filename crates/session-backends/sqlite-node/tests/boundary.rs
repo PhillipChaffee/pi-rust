@@ -1276,7 +1276,7 @@ async fn a_failing_database_close_reports_from_the_delete_and_the_external_fork(
 }
 
 #[tokio::test]
-async fn a_failing_close_on_the_fork_external_source_reports_the_close_error() {
+async fn fork_external_source_reads_through_the_tracking_factory() {
     let directory = tempfile::tempdir().expect("tempdir");
     let factory = Arc::new(support::CloseTrackingFactory::new());
     let repo = SqliteSessionRepo::new(pi_session_backend_sqlite_node::SqliteSessionRepoOptions {
@@ -1291,11 +1291,9 @@ async fn a_failing_close_on_the_fork_external_source_reports_the_close_error() {
         .await
         .expect("create");
     source.close(&context).await.expect("close");
-    // The read-only opens pass through the tracking factory untracked
-    // (upstream's factory), so the fork's external close succeeds; instead
-    // inject the failure on the source's container close, which the fork
-    // does not touch - the fork succeeds. The close-error arm asserts
-    // through the delete path instead.
+    // Read-only opens pass through the tracking factory unwrapped, so the
+    // fork's external-source read runs and closes undisturbed; the close
+    // error arm is asserted by the delete test above.
     let forked = repo
         .fork(
             source.typed_metadata(),
@@ -1309,7 +1307,7 @@ async fn a_failing_close_on_the_fork_external_source_reports_the_close_error() {
 }
 
 #[tokio::test]
-async fn list_swallows_a_failing_per_file_close() {
+async fn list_reads_through_the_tracking_factory() {
     let directory = tempfile::tempdir().expect("tempdir");
     let factory = Arc::new(support::CloseTrackingFactory::new());
     let repo = SqliteSessionRepo::new(pi_session_backend_sqlite_node::SqliteSessionRepoOptions {
@@ -1324,9 +1322,9 @@ async fn list_swallows_a_failing_per_file_close() {
         .await
         .expect("create");
     session.close(&context).await.expect("close");
-    // The read-only opens pass through unwrapped, so discovery's closes are
-    // the tracked writable connections'... no: read-only opens bypass the
-    // tracking; the swallow is asserted by the corrupt-file case instead.
+    // Read-only discovery opens bypass the tracking factory, and the
+    // best-effort per-file swallow is pinned by the corrupt-file test; this
+    // asserts the readable session still lists through the tracked factory.
     let listed = repo.list(&context).expect("list");
     assert_eq!(listed.len(), 1);
     let _ = repo.close(&context).await;
