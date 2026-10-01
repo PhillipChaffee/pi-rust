@@ -11,6 +11,7 @@
 //!   renders `0` (the design's recorded rendering restatement).
 
 #![expect(clippy::expect_used, reason = "tests assert on results")]
+#![expect(clippy::panic, reason = "tests panic on the failure shape they pin")]
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -993,26 +994,37 @@ fn prepares_committed_writes_with_assigned_sequences_and_timestamp() {
     );
 }
 
+/// Seeds one `sessions` row, the suite's raw-SQL insert.
+fn seed_sessions_row(
+    db: &dyn SqliteDatabase,
+    created_at: i64,
+    message_count: i64,
+    usage_payload: &str,
+    next_seq: i64,
+) {
+    sql!(
+        "INSERT INTO sessions
+		(id, created_at, parent_session_id, storage_version, metadata, message_count, usage_payload, next_seq)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        SESSION_ID,
+        created_at,
+        None::<String>,
+        1i64,
+        None::<String>,
+        message_count,
+        usage_payload,
+        next_seq,
+    )
+    .run(db)
+    .map(|_| ())
+    .expect("seed session row");
+}
+
 #[tokio::test]
 async fn reads_and_advances_the_next_commit_sequence() {
     with_storage(|_storage, db| {
         Box::pin(async move {
-            sql!(
-                "INSERT INTO sessions
-				(id, created_at, parent_session_id, storage_version, metadata, message_count, usage_payload, next_seq)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                SESSION_ID,
-                1i64,
-                None::<String>,
-                1i64,
-                None::<String>,
-                0i64,
-                "{}",
-                7i64,
-            )
-            .run(db.as_ref())
-            .map(|_| ())
-            .expect("seed session");
+            seed_sessions_row(db.as_ref(), 1, 0, "{}", 7);
 
             assert_eq!(read_next_seq(db.as_ref(), SESSION_ID).expect("read"), 7);
             advance_next_seq(db.as_ref(), SESSION_ID, 10).expect("advance");
@@ -1026,35 +1038,38 @@ async fn reads_and_advances_the_next_commit_sequence() {
 async fn gets_maintained_session_stats() {
     with_storage(|storage, db| {
         Box::pin(async move {
-            sql!(
-                "INSERT INTO sessions
-				(id, created_at, parent_session_id, storage_version, metadata, message_count, usage_payload, next_seq)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                SESSION_ID,
-                1i64,
-                None::<String>,
-                1i64,
-                None::<String>,
-                2i64,
-                serde_json::to_string(&usage(1, 2)).expect("usage json"),
-                3i64,
-            )
-            .run(db.as_ref())
-            .map(|_| ())
-            .expect("seed session");
+            seed_sessions_row(
+                db.as_ref(),
+                1,
+                2,
+                &serde_json::to_string(&usage(1, 2)).expect("usage json"),
+                3,
+            );
 
             assert_eq!(
                 storage.get_stats(&context()).await.expect("stats"),
-                SessionStats { message_count: 2, usage: usage(1, 2) }
+                SessionStats {
+                    message_count: 2,
+                    usage: usage(1, 2)
+                }
             );
             let next = storage
                 .commit(
-                    vec![set_value_write(&session_name(), "after-history".to_owned()).expect("write")],
+                    vec![
+                        set_value_write(&session_name(), "after-history".to_owned())
+                            .expect("write"),
+                    ],
                     &context(),
                 )
                 .await
                 .expect("commit");
-            assert_eq!(next.stats, SessionStats { message_count: 2, usage: usage(1, 2) });
+            assert_eq!(
+                next.stats,
+                SessionStats {
+                    message_count: 2,
+                    usage: usage(1, 2)
+                }
+            );
         })
     })
     .await;

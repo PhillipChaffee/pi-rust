@@ -149,8 +149,11 @@ pub fn session_path(directory: &str, id: &str) -> String {
 /// The open-storage identity key, upstream's
 /// `JSON.stringify([path, sessionId])`.
 fn storage_identity(path: &str, session_id: &str) -> String {
-    serde_json::to_string(&(path, session_id))
-        .unwrap_or_else(|_| format!("[{path:?},{session_id:?}]"))
+    #[expect(
+        clippy::expect_used,
+        reason = "a two-element array of strings always serializes; there is no fallback shape to return"
+    )]
+    serde_json::to_string(&(path, session_id)).expect("storage identity serializes")
 }
 
 /// Removes one session's container plus its WAL/SHM sidecars, upstream's
@@ -448,24 +451,8 @@ impl SqliteSessionRepo {
         let reserved_file = AtomicBool::new(false);
         let initialized = AtomicBool::new(false);
         let outcome: Result<Arc<SqliteOpenSession>, SessionError> = async {
-            let parent = Path::new(&path)
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent).map_err(|error| io_error(&error))?;
-            if !self.uses_shared_database() {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .map_err(|error| io_error(&error))?;
-                reserved_file.store(true, Ordering::SeqCst);
-            }
-            let active_db: Arc<dyn SqliteDatabase> = Arc::from(self.database_factory.open(&path)?);
-            *failure_db.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(Arc::clone(&active_db));
-            configure_writable_connection(active_db.as_ref())?;
-            apply_initial_schema(active_db.as_ref())?;
+            self.reserve_destination(&path, &reserved_file)?;
+            let active_db = self.open_destination(&path, &failure_db)?;
             let canonical_path = std::fs::canonicalize(&path)
                 .map_err(|error| io_error(&error))?
                 .to_string_lossy()
@@ -512,6 +499,51 @@ impl SqliteSessionRepo {
             &reserved_file,
             &initialized,
         )
+    }
+
+    /// The destination directory + file reservation shared by `create` and
+    /// `fork`, upstream's mkdir + `wx` block.
+    ///
+    /// # Errors
+    /// A filesystem failure; `reserved_file` records the reservation for the
+    /// shared epilogue.
+    fn reserve_destination(
+        &self,
+        path: &str,
+        reserved_file: &AtomicBool,
+    ) -> Result<(), SessionError> {
+        let parent = Path::new(path)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|error| io_error(&error))?;
+        if !self.uses_shared_database() {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|error| io_error(&error))?;
+            reserved_file.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// The writable-open + schema block shared by `create` and `fork`,
+    /// upstream's open + configure + applyInitialSchema.
+    ///
+    /// # Errors
+    /// A filesystem or driver failure; `failure_db` records the connection
+    /// for the shared epilogue.
+    fn open_destination(
+        &self,
+        path: &str,
+        failure_db: &Mutex<Option<Arc<dyn SqliteDatabase>>>,
+    ) -> Result<Arc<dyn SqliteDatabase>, SessionError> {
+        let active_db: Arc<dyn SqliteDatabase> = Arc::from(self.database_factory.open(path)?);
+        *failure_db.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&active_db));
+        configure_writable_connection(active_db.as_ref())?;
+        apply_initial_schema(active_db.as_ref())?;
+        Ok(active_db)
     }
 
     /// The create/fork shared epilogue, upstream's catch + finally: a failed
@@ -673,7 +705,8 @@ impl SqliteSessionRepo {
         self.reserve_id(&metadata.base.id)?;
         let outcome: Result<(), SessionError> = async {
             let path = self.repository_path_for_metadata(metadata)?;
-            let db: Arc<dyn SqliteDatabase> = Arc::from(self.database_factory.open_existing(&path)?);
+            let db: Arc<dyn SqliteDatabase> =
+                Arc::from(self.database_factory.open_existing(&path)?);
             let body = (|| -> Result<(), SessionError> {
                 configure_writable_connection(db.as_ref())?;
                 metadata_from_session_row(

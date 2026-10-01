@@ -527,6 +527,8 @@ pub struct CloseTrackingFactory {
     source: Box<dyn SqliteDatabaseFactory>,
     /// The writable connections, in open order.
     pub writable_connections: Mutex<Vec<Arc<CloseTrackingDatabase>>>,
+    /// Injects a close error into the next connection opened.
+    fail_next_close: AtomicBool,
 }
 
 impl CloseTrackingFactory {
@@ -535,7 +537,13 @@ impl CloseTrackingFactory {
         Self {
             source: Box::new(create_rusqlite_factory()),
             writable_connections: Mutex::new(Vec::new()),
+            fail_next_close: AtomicBool::new(false),
         }
+    }
+
+    /// The next connection this factory opens reports one close failure.
+    pub fn fail_next_connection_close(&self) {
+        self.fail_next_close.store(true, Ordering::SeqCst);
     }
 
     /// The open-count shortcut the close-failure tests assert.
@@ -566,6 +574,36 @@ impl Default for CloseTrackingFactory {
     }
 }
 
+impl CloseTrackingFactory {
+    /// Opens through the source factory, tracks the connection, and honors
+    /// the next-close failure flag.
+    fn track(
+        &self,
+        connection: Result<
+            Box<dyn SqliteDatabase>,
+            pi_session_backend_sqlite_node::sqlite::types::SqliteAdapterError,
+        >,
+    ) -> Result<
+        Box<dyn SqliteDatabase>,
+        pi_session_backend_sqlite_node::sqlite::types::SqliteAdapterError,
+    > {
+        let connection = Arc::new(CloseTrackingDatabase {
+            source: connection?,
+            close_attempts: AtomicUsize::new(0),
+            close_error: Mutex::new(if self.fail_next_close.swap(false, Ordering::SeqCst) {
+                Some(SessionError::Message("close failed".to_owned()))
+            } else {
+                None
+            }),
+        });
+        self.writable_connections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Arc::clone(&connection));
+        Ok(Box::new(HandleTrackingDatabase { inner: connection }))
+    }
+}
+
 impl SqliteDatabaseFactory for CloseTrackingFactory {
     fn open(
         &self,
@@ -574,16 +612,7 @@ impl SqliteDatabaseFactory for CloseTrackingFactory {
         Box<dyn SqliteDatabase>,
         pi_session_backend_sqlite_node::sqlite::types::SqliteAdapterError,
     > {
-        let connection = Arc::new(CloseTrackingDatabase {
-            source: self.source.open(path)?,
-            close_attempts: AtomicUsize::new(0),
-            close_error: Mutex::new(None),
-        });
-        self.writable_connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Arc::clone(&connection));
-        Ok(Box::new(HandleTrackingDatabase { inner: connection }))
+        self.track(self.source.open(path))
     }
 
     fn open_existing(
@@ -593,16 +622,7 @@ impl SqliteDatabaseFactory for CloseTrackingFactory {
         Box<dyn SqliteDatabase>,
         pi_session_backend_sqlite_node::sqlite::types::SqliteAdapterError,
     > {
-        let connection = Arc::new(CloseTrackingDatabase {
-            source: self.source.open_existing(path)?,
-            close_attempts: AtomicUsize::new(0),
-            close_error: Mutex::new(None),
-        });
-        self.writable_connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(Arc::clone(&connection));
-        Ok(Box::new(HandleTrackingDatabase { inner: connection }))
+        self.track(self.source.open_existing(path))
     }
 
     fn open_read_only(
