@@ -165,7 +165,8 @@ impl StorageBackedSession {
 
     /// The id generator as a shared handle, for facades re-exporting it,
     /// upstream's `session.idGenerator` reference.
-    pub(crate) fn id_generator_arc(&self) -> Arc<dyn IdGenerator> {
+    #[must_use]
+    pub fn id_generator_arc(&self) -> Arc<dyn IdGenerator> {
         Arc::clone(&self.core.id_generator)
     }
 

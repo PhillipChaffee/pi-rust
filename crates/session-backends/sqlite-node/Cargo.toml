@@ -1,0 +1,31 @@
+[package]
+name = "pi-session-backend-sqlite-node"
+version = "0.1.0"
+edition = "2024"
+description = "SQLite session backend ported from @earendil-works/pi-session-backend-sqlite-node"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["sqlite", "session", "storage", "agent", "coding-agent"]
+categories = ["database", "development-tools"]
+
+[dependencies]
+pi-ai = { path = "../../ai" }
+pi-agent-core = { path = "../../agent" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+# float_roundtrip: the persisted usage stats accumulate through a
+# JSON.parse/stringify round-trip; V8's JSON.parse is correctly rounded and
+# serde_json's default parser is not, so totals could drift by one ulp from
+# upstream's (storage-conformance "keeps stats equal to message count and
+# ledger totals" pins it).
+serde_json = { version = "1.0.145", features = ["preserve_order", "float_roundtrip"] }
+tokio = { version = "1.47", default-features = false, features = ["sync"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt"] }
+tempfile = "3"
+
+[lints]
+workspace = true
