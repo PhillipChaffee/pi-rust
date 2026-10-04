@@ -29,4 +29,5 @@ pub use wire::{
     decode_service_control_call, parse_service_call, parse_service_catalogue,
     parse_service_provider_update, parse_service_subscription_snapshot,
     parse_wire_service_provider_update, parse_wire_service_subscription_snapshot,
+    service_call_to_json, snapshot_to_json, wire_snapshot_to_json, wire_update_to_json,
 };

@@ -548,7 +548,7 @@ pub enum ServiceProviderUpdate {
 /// One remote method invocation: which instance, which member, borrowed
 /// arguments. Upstream validates values at the parse boundary only and
 /// never clones them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceCall {
     /// The service to invoke on.
     pub service_id: String,

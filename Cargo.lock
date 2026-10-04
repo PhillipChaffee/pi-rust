@@ -2307,6 +2307,19 @@ name = "pi-rust"
 version = "0.1.0"
 
 [[package]]
+name = "pi-server"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-core",
+ "pi-chord",
+ "pi-protocol",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "pi-session-backend-sqlite-node"
 version = "0.1.0"
 dependencies = [
@@ -3621,6 +3634,7 @@ version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]

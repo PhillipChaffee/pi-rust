@@ -93,3 +93,8 @@ reason = "unpublished workspace crate; license declared in crates/client/Cargo.t
 name = "pi-session-backend-sqlite-node"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/session-backends/sqlite-node/Cargo.toml"
+
+[[PackageOverrides]]
+name = "pi-server"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/server/Cargo.toml"
