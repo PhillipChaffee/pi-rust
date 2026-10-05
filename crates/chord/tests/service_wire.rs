@@ -38,7 +38,7 @@ use pi_chord::services::wire::{
     parse_wire_service_subscription_snapshot, snapshot_to_json,
 };
 use pi_chord::types::{
-    JsonValue, ServiceCatalogueEntry, ServiceInstanceAddress, ServiceInstanceSnapshot,
+    JsonValue, ServiceCall, ServiceCatalogueEntry, ServiceInstanceAddress, ServiceInstanceSnapshot,
     ServiceMemberSnapshot, ServiceMode, ServiceProviderUpdate, ServiceSubscriptionSnapshot,
 };
 
@@ -1067,28 +1067,28 @@ fn parses_every_update_arm_and_guards_control_calls() {
 
     // The control call guards reject foreign services, instances, unknown
     // members, and mismatched arguments.
-    let call = pi_chord::types::ServiceCall {
+    let call = ServiceCall {
         service_id: "other".to_string(),
         member: "catalogue".to_string(),
         args: Vec::new(),
         instance: None,
     };
     assert!(decode_service_control_call(&call).is_none());
-    let call = pi_chord::types::ServiceCall {
+    let call = ServiceCall {
         service_id: pi_chord::services::wire::SERVICE_CONTROL_ID.to_string(),
         member: "catalogue".to_string(),
         args: Vec::new(),
         instance: Some(address),
     };
     assert!(decode_service_control_call(&call).is_none());
-    let call = pi_chord::types::ServiceCall {
+    let call = ServiceCall {
         service_id: pi_chord::services::wire::SERVICE_CONTROL_ID.to_string(),
         member: "unknown".to_string(),
         args: Vec::new(),
         instance: None,
     };
     assert!(decode_service_control_call(&call).is_none());
-    let call = pi_chord::types::ServiceCall {
+    let call = ServiceCall {
         service_id: pi_chord::services::wire::SERVICE_CONTROL_ID.to_string(),
         member: "catalogue".to_string(),
         args: vec![js("spurious")],
@@ -1476,4 +1476,98 @@ fn endpoint_keyed_subscriptions_render_addressed_snapshots() {
             .dispose()
             .unwrap_or_else(|e| panic!("dispose: {e}"));
     });
+}
+
+#[test]
+fn renders_wire_payloads_as_the_json_the_parsers_accept() {
+    let snapshot = WireServiceSubscriptionSnapshot {
+        service_id: "pi.models".to_string(),
+        mode: ServiceMode::Singleton,
+        instances: vec![WireServiceInstanceSnapshot {
+            instance: Some(ServiceInstanceAddress {
+                key: "k".to_string(),
+                generation: 2,
+            }),
+            members: vec![
+                WireServiceMemberSnapshot::Method {
+                    name: "complete".to_string(),
+                },
+                WireServiceMemberSnapshot::State {
+                    name: "state".to_string(),
+                    sequence: 3,
+                    ops: vec![WireOp::Set {
+                        path: PathRef::Inline(vec![key("revision")]),
+                        value: number(7),
+                    }],
+                },
+            ],
+        }],
+    };
+    // The crate-level render matches the test-local helper the client suite
+    // validated, byte for byte.
+    assert_eq!(
+        pi_chord::services::wire::wire_snapshot_to_json(&snapshot),
+        wire_snapshot_to_json(&snapshot)
+    );
+
+    let update = pi_chord::services::wire::WireServiceProviderUpdate::State {
+        instance: Some(ServiceInstanceAddress {
+            key: "k".to_string(),
+            generation: 1,
+        }),
+        member: "state".to_string(),
+        sequence: 4,
+        ops: vec![WireOp::Set {
+            path: PathRef::Inline(vec![key("revision")]),
+            value: number(8),
+        }],
+    };
+    assert_eq!(
+        pi_chord::services::wire::wire_update_to_json(&update),
+        wire_update_to_json(&update)
+    );
+    for update in [
+        pi_chord::services::wire::WireServiceProviderUpdate::Unavailable,
+        pi_chord::services::wire::WireServiceProviderUpdate::Spawned {
+            instance: WireServiceInstanceSnapshot {
+                instance: None,
+                members: vec![WireServiceMemberSnapshot::Method {
+                    name: "run".to_string(),
+                }],
+            },
+        },
+        pi_chord::services::wire::WireServiceProviderUpdate::Closed {
+            instance: ServiceInstanceAddress {
+                key: "k".to_string(),
+                generation: 1,
+            },
+        },
+    ] {
+        assert_eq!(
+            pi_chord::services::wire::wire_update_to_json(&update),
+            wire_update_to_json(&update)
+        );
+    }
+
+    // The service-call render parses back to the same call shape.
+    let rendered = pi_chord::services::wire::service_call_to_json(&ServiceCall {
+        service_id: "test.session".to_string(),
+        instance: Some(ServiceInstanceAddress {
+            key: "k".to_string(),
+            generation: 1,
+        }),
+        member: "run".to_string(),
+        args: vec![js("Hello")],
+    });
+    let parsed = parse_service_call(&rendered).unwrap_or_else(|e| panic!("call parses: {e}"));
+    assert_eq!(parsed.service_id, "test.session");
+    assert_eq!(parsed.member, "run");
+    assert_eq!(parsed.args, vec![js("Hello")]);
+    assert_eq!(
+        parsed.instance,
+        Some(ServiceInstanceAddress {
+            key: "k".to_string(),
+            generation: 1,
+        })
+    );
 }

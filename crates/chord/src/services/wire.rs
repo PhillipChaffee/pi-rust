@@ -798,6 +798,123 @@ fn instance_to_json(instance: &ServiceInstanceSnapshot) -> JsonValue {
     object(entries)
 }
 
+/// Renders a wire-form subscription snapshot as its JSON.
+///
+/// The restatement of upstream's structural identity: the object
+/// `ServiceStateEncoder.encodeSnapshot` returns is itself the wire payload,
+/// and the endpoint hands it to the protocol encoder unchanged.
+#[must_use]
+pub fn wire_snapshot_to_json(snapshot: &WireServiceSubscriptionSnapshot) -> JsonValue {
+    object(vec![
+        ("serviceId", JsonValue::Str(snapshot.service_id.clone())),
+        ("mode", JsonValue::Str(snapshot.mode.as_str().to_string())),
+        (
+            "instances",
+            JsonValue::Array(
+                snapshot
+                    .instances
+                    .iter()
+                    .map(wire_instance_to_json)
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn wire_instance_to_json(instance: &WireServiceInstanceSnapshot) -> JsonValue {
+    let mut entries = Vec::new();
+    if let Some(address) = &instance.instance {
+        entries.push(("instance", address_to_json(address)));
+    }
+    entries.push((
+        "members",
+        JsonValue::Array(
+            instance
+                .members
+                .iter()
+                .map(|member| match member {
+                    WireServiceMemberSnapshot::Method { name } => object(vec![
+                        ("name", JsonValue::Str(name.clone())),
+                        ("kind", JsonValue::Str("method".to_string())),
+                    ]),
+                    WireServiceMemberSnapshot::State {
+                        name,
+                        sequence,
+                        ops,
+                    } => object(vec![
+                        ("name", JsonValue::Str(name.clone())),
+                        ("kind", JsonValue::Str("state".to_string())),
+                        ("sequence", JsonValue::Number(JsonNumber::from(*sequence))),
+                        (
+                            "ops",
+                            JsonValue::Array(ops.iter().map(WireOp::to_json).collect()),
+                        ),
+                    ]),
+                })
+                .collect(),
+        ),
+    ));
+    object(entries)
+}
+
+/// Renders a wire-form provider update as its JSON, the same structural
+/// identity for the `service_update` payload.
+#[must_use]
+pub fn wire_update_to_json(update: &WireServiceProviderUpdate) -> JsonValue {
+    match update {
+        WireServiceProviderUpdate::State {
+            instance,
+            member,
+            sequence,
+            ops,
+        } => {
+            let mut entries = vec![
+                ("type", JsonValue::Str("state".to_string())),
+                ("member", JsonValue::Str(member.clone())),
+                ("sequence", JsonValue::Number(JsonNumber::from(*sequence))),
+                (
+                    "ops",
+                    JsonValue::Array(ops.iter().map(WireOp::to_json).collect()),
+                ),
+            ];
+            if let Some(address) = instance {
+                entries.push(("instance", address_to_json(address)));
+            }
+            object(entries)
+        }
+        WireServiceProviderUpdate::Unavailable => {
+            object(vec![("type", JsonValue::Str("unavailable".to_string()))])
+        }
+        WireServiceProviderUpdate::Replaced { snapshot } => object(vec![
+            ("type", JsonValue::Str("replaced".to_string())),
+            ("snapshot", wire_instance_to_json(snapshot)),
+        ]),
+        WireServiceProviderUpdate::Spawned { instance } => object(vec![
+            ("type", JsonValue::Str("spawned".to_string())),
+            ("instance", wire_instance_to_json(instance)),
+        ]),
+        WireServiceProviderUpdate::Closed { instance } => object(vec![
+            ("type", JsonValue::Str("closed".to_string())),
+            ("instance", address_to_json(instance)),
+        ]),
+    }
+}
+
+/// Renders one service call as the JSON the wire carries inside request
+/// envelopes, the same structural identity for `{serviceId, member, args}`.
+#[must_use]
+pub fn service_call_to_json(call: &ServiceCall) -> JsonValue {
+    let mut entries = vec![
+        ("serviceId", JsonValue::Str(call.service_id.clone())),
+        ("member", JsonValue::Str(call.member.clone())),
+        ("args", JsonValue::Array(call.args.clone())),
+    ];
+    if let Some(address) = &call.instance {
+        entries.push(("instance", address_to_json(address)));
+    }
+    object(entries)
+}
+
 fn address_to_json(address: &ServiceInstanceAddress) -> JsonValue {
     object(vec![
         ("key", JsonValue::Str(address.key.clone())),

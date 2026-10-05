@@ -1,0 +1,51 @@
+[package]
+name = "pi-server"
+version = "0.1.0"
+edition = "2024"
+description = "Transport-neutral server for remote pi sessions: listener SPI, versioned handshake, routed Session attachment, and Unix transports, ported from @earendil-works/pi-server"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["rpc", "server", "protocol", "unix-socket", "coding-agent"]
+categories = ["network-programming", "development-tools"]
+
+[dependencies]
+# Upstream routes service calls through `@earendil-works/chord` and sessions
+# through `@earendil-works/pi-agent-core`; the crate DAG mirrors both import
+# edges beside the wire edge to `pi-protocol`.
+pi-chord = { path = "../chord" }
+pi-protocol = { path = "../protocol" }
+pi-agent-core = { path = "../agent" }
+# sha2: the owned bind path the Unix listener derives from the public route
+# (upstream's `createHash("sha256")` over the path).
+sha2 = "0.10"
+# uuid: attachment ids and stale-socket scratch names (upstream's
+# `randomUUID`).
+uuid = { version = "1.26", features = ["v4"] }
+# tokio: the async substrate the stack decision pins. macros: the select!
+# combinator the Unix connection drivers ride; sync: the oneshot waiters and
+# command channels behind ordered writes and the promise restatements; net +
+# fs + io-util: the Unix-domain socket listener and its filesystem dance;
+# rt: the local tasks the listener and connection I/O run as; time: the
+# handshake and graceful-close timeouts.
+tokio = { version = "1.47", default-features = false, features = [
+  "rt",
+  "macros",
+  "sync",
+  "net",
+  "fs",
+  "io-util",
+  "time",
+] }
+
+[dev-dependencies]
+# macros: the test attribute macro; rt-multi-thread is not needed — the
+# server is single-threaded by construction and every test runs on the
+# current-thread runtime behind a LocalSet.
+tokio = { version = "1.47", features = ["macros"] }
+# tempdir fixtures for the real Unix-socket tests, matching upstream's
+# mkdtemp test style.
+tempfile = "3"
+
+[lints]
+workspace = true
