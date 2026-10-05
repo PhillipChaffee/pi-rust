@@ -12,6 +12,7 @@ members = [
     "crates/client",
     "crates/agent",
     "crates/server",
+    "crates/coding-agent",
     "crates/session-backends/sqlite-node",
 ]
 # Edition 2024's default resolver, made explicit so the workspace table is self-describing.

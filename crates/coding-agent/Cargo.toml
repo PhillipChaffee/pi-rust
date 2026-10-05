@@ -1,0 +1,30 @@
+[package]
+name = "pi-coding-agent"
+version = "0.1.0"
+edition = "2024"
+description = "The pi coding agent product layer: config paths, session manager, tools, and CLI, ported from @earendil-works/pi-coding-agent"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["coding-agent", "ai", "cli", "terminal", "llm"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+# The defaults module's `ThinkingLevel`, upstream's import from
+# `@earendil-works/pi-agent-core`. The remaining ADR 0003 runtime edges
+# (pi-ai, pi-tui, chord, pi-client, pi-protocol, pi-server) land with the
+# tickets that first consume them.
+pi-agent-core = { path = "../agent" }
+
+[dev-dependencies]
+# Scratch directories the session-cwd suites probe for existence.
+tempfile = "3"
+
+# Upstream's `pi` bin target; the name is provisional per the map's
+# packaging fog. The CLI grammar and mode dispatch land with their tickets.
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[lints]
+workspace = true
