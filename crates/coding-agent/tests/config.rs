@@ -21,7 +21,29 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{empty_env, env_with};
-use pi_coding_agent::config::{ENV_AGENT_DIR, ENV_SESSION_DIR, get_package_dir_with};
+use pi_coding_agent::config::{
+    ENV_AGENT_DIR, ENV_SESSION_DIR, get_agent_dir, get_agent_dir_with, get_package_dir,
+    get_package_dir_with,
+};
+
+#[test]
+fn the_pi_bin_target_runs_and_exits_cleanly() {
+    // the scaffold bin ships the provisional `pi` name; it exits 0 doing
+    // nothing until the CLI dispatch lands
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .status()
+        .expect("the pi bin target runs");
+
+    assert!(status.success());
+}
+
+#[test]
+fn the_process_wrappers_read_the_real_environment() {
+    // the plain getters are the process-env default over the injected
+    // variants; an environment carrying neither override makes them agree
+    assert_eq!(get_agent_dir(), get_agent_dir_with(&empty_env()));
+    assert_eq!(get_package_dir(), get_package_dir_with(&empty_env()));
+}
 
 #[test]
 fn package_dir_prefers_the_pi_package_dir_override() {
