@@ -98,3 +98,8 @@ reason = "unpublished workspace crate; license declared in crates/session-backen
 name = "pi-server"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/server/Cargo.toml"
+
+[[PackageOverrides]]
+name = "pi-coding-agent"
+license.override = ["MIT"]
+reason = "unpublished workspace crate; license declared in crates/coding-agent/Cargo.toml"

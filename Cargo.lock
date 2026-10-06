@@ -2287,6 +2287,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-coding-agent"
+version = "0.1.0"
+dependencies = [
+ "pi-agent-core",
+ "tempfile",
+]
+
+[[package]]
 name = "pi-evals"
 version = "0.1.0"
 dependencies = [
