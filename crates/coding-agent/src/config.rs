@@ -108,7 +108,7 @@ pub fn home_dir() -> String {
 /// The process working directory, upstream's `process.cwd()`. Degrades to
 /// the empty string when the platform cannot report one (Node throws); the
 /// only consumer is the resolver base below.
-fn process_cwd() -> String {
+pub(crate) fn process_cwd() -> String {
     std::env::current_dir()
         .unwrap_or_default()
         .to_string_lossy()
