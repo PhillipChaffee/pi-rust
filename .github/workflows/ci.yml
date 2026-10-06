@@ -74,12 +74,19 @@ jobs:
       # the coverage run below carries the other 3371 tests and this step
       # carries the 9 doctests — the libtest run's only unique content.
       - run: cargo test --doc --workspace
+      # The arboard clipboard adapter opens the platform clipboard at
+      # construction; the headless runner cannot open one, so the adapter's
+      # methods answer None upstream and their bodies never run. Xvfb gives
+      # the coverage run a real X server, which is what turns the clipboard
+      # belt's gate coverage from a platform residual into measured code.
+      - name: Install Xvfb
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
       # Gate AND report in one pass: llvm-cov writes the report before it
       # evaluates the fail-under switches (lines, regions, functions), so the
       # upload below can still run on a gate failure (measured: exit 1 with
       # lcov.info on disk).
       - name: Coverage gate (lines, regions, functions — 95 each)
-        run: cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info
+        run: xvfb-run -a cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.
