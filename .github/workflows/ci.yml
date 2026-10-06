@@ -194,7 +194,11 @@ jobs:
       - name: Dependency advisories (osv-scanner v2.5.1)
         run: osv-scanner scan -r .
       - name: License check (osv-scanner v2.5.1)
-        run: osv-scanner scan -r . --licenses="MIT,Apache-2.0,ISC,BSD-3-Clause,BSD-2-Clause,MPL-2.0,PSF-2.0,Unicode-3.0,Python-2.0,Unlicense,CC0-1.0,0BSD,Apache-1.1,BSD-3-Clause-Clear,LGPL-3.0-only,BlueOak-1.0.0,CC-BY-3.0,CDLA-Permissive-2.0,Zlib"
+        # BSL-1.0 rides arboard's Windows backend alone (clipboard-win,
+        # error-code); the map's Windows exclusion keeps it uncompiled on
+        # every gate platform, and the grant is the OSI-approved permissive
+        # Boost license both crates declare.
+        run: osv-scanner scan -r . --licenses="MIT,Apache-2.0,ISC,BSD-3-Clause,BSD-2-Clause,MPL-2.0,PSF-2.0,Unicode-3.0,Python-2.0,Unlicense,CC0-1.0,0BSD,Apache-1.1,BSD-3-Clause-Clear,LGPL-3.0-only,BlueOak-1.0.0,CC-BY-3.0,CDLA-Permissive-2.0,Zlib,BSL-1.0"
       - name: RustSec advisories (cargo-deny v0.20.2)
         run: cargo deny check advisories
       - name: License policy (cargo-deny v0.20.2)

@@ -74,12 +74,19 @@ async fn the_plain_entries_read_through_the_installed_override() {
     set_native_clipboard_override(Some(Arc::new(Mock)));
     assert_eq!(read_clipboard_text().await, Some("plain text".to_string()));
     // Writes consult the native clipboard off-linux only — the command
-    // writers carry linux writes, upstream's platform ladder — so the
-    // plain write asserts on the process platform and the injected seam
-    // pins the linux diagnosis deterministically.
-    if Platform::of_process() == Platform::Linux {
+    // writers carry linux writes, upstream's platform ladder. The plain
+    // entry answers deterministically on the headless runner (no writer
+    // can spawn without a display environment); a display-carrying linux
+    // box pins the ladder through the injected seam with an empty
+    // environment instead of racing the live tools.
+    if Platform::of_process() != Platform::Linux {
+        copy_to_clipboard("hello").await.expect("the mock writes");
+    } else if std::env::var_os("DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("TERMUX_VERSION").is_some()
+    {
         let env: EnvLookup = Box::new(|_key: &str| None);
-        let error = copy_to_clipboard_with(
+        copy_to_clipboard_with(
             "hello",
             &env,
             Platform::Linux,
@@ -87,12 +94,14 @@ async fn the_plain_entries_read_through_the_installed_override() {
         )
         .await
         .expect_err("an empty environment carries no writer");
+    } else {
+        let error = copy_to_clipboard("hello")
+            .await
+            .expect_err("a headless linux carries no writer");
         assert_eq!(
             error.0,
             "Clipboard unavailable: no Wayland or X11 display detected"
         );
-    } else {
-        copy_to_clipboard("hello").await.expect("the mock writes");
     }
     set_native_clipboard_override(None);
 }
