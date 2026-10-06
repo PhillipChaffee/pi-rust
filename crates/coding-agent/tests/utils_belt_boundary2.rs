@@ -20,7 +20,9 @@ use pi_coding_agent::utils::clipboard::{
     read_clipboard_text, set_native_clipboard_disabled, set_native_clipboard_override,
     set_osc52_sink,
 };
-use pi_coding_agent::utils::clipboard_command::{ClipboardCommandOptions, ClipboardCommandRunner};
+use pi_coding_agent::utils::clipboard_command::{
+    ClipboardCommandOptions, ClipboardCommandRunner, ProcessClipboardCommandRunner,
+};
 use pi_coding_agent::utils::clipboard_image::{
     base_mime_type, extension_for_image_mime_type, read_clipboard_image, read_clipboard_image_with,
 };
@@ -71,7 +73,27 @@ async fn the_plain_entries_read_through_the_installed_override() {
     }
     set_native_clipboard_override(Some(Arc::new(Mock)));
     assert_eq!(read_clipboard_text().await, Some("plain text".to_string()));
-    copy_to_clipboard("hello").await.expect("the mock writes");
+    // Writes consult the native clipboard off-linux only — the command
+    // writers carry linux writes, upstream's platform ladder — so the
+    // plain write asserts on the process platform and the injected seam
+    // pins the linux diagnosis deterministically.
+    if Platform::of_process() == Platform::Linux {
+        let env: EnvLookup = Box::new(|_key: &str| None);
+        let error = copy_to_clipboard_with(
+            "hello",
+            &env,
+            Platform::Linux,
+            &ProcessClipboardCommandRunner,
+        )
+        .await
+        .expect_err("an empty environment carries no writer");
+        assert_eq!(
+            error.0,
+            "Clipboard unavailable: no Wayland or X11 display detected"
+        );
+    } else {
+        copy_to_clipboard("hello").await.expect("the mock writes");
+    }
     set_native_clipboard_override(None);
 }
 
