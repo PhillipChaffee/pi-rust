@@ -31,7 +31,7 @@ use std::process::{Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-pub use crate::config::{default_env_lookup, EnvLookup};
+pub use crate::config::{EnvLookup, default_env_lookup};
 
 /// The command-result cache, upstream's module-global `commandResultCache`:
 /// results persist for the process lifetime until explicitly cleared.
@@ -79,11 +79,7 @@ fn env_var_name_prefix(value: &str) -> Option<&str> {
         }
         end = index + ch.len_utf8();
     }
-    if end == 0 {
-        None
-    } else {
-        Some(&value[..end])
-    }
+    if end == 0 { None } else { Some(&value[..end]) }
 }
 
 /// Merge a literal onto the parts, upstream's `appendLiteral`: adjacent
@@ -123,7 +119,9 @@ fn parse_config_value_template(config: &str) -> Vec<TemplatePart> {
                 index = dollar + 2;
             }
             Some('{') => {
-                let close = config[dollar + 2..].find('}').map(|close| dollar + 2 + close);
+                let close = config[dollar + 2..]
+                    .find('}')
+                    .map(|close| dollar + 2 + close);
                 let Some(close) = close else {
                     append_literal(&mut parts, "$");
                     index = dollar + 1;
@@ -131,7 +129,9 @@ fn parse_config_value_template(config: &str) -> Vec<TemplatePart> {
                 };
                 let name = &config[dollar + 2..close];
                 if is_env_var_name(name) {
-                    parts.push(TemplatePart::Env { name: name.to_string() });
+                    parts.push(TemplatePart::Env {
+                        name: name.to_string(),
+                    });
                 } else {
                     append_literal(&mut parts, &config[dollar..=close]);
                 }
@@ -140,7 +140,9 @@ fn parse_config_value_template(config: &str) -> Vec<TemplatePart> {
             _ => {
                 let name = env_var_name_prefix(&config[dollar + 1..]);
                 if let Some(name) = name {
-                    parts.push(TemplatePart::Env { name: name.to_string() });
+                    parts.push(TemplatePart::Env {
+                        name: name.to_string(),
+                    });
                     index = dollar + 1 + name.len();
                 } else {
                     append_literal(&mut parts, "$");
@@ -171,18 +173,19 @@ fn parse_config_value_reference(config: &str) -> ConfigValueReference {
 /// then `process.env`. A value that is present but empty falls through — the
 /// `||` chain treats `""` as missing — so an unset variable and a blank one
 /// resolve the same way.
-fn resolve_env_config_value(name: &str, env: Option<&BTreeMap<String, String>>, process_env: &EnvLookup) -> Option<String> {
+fn resolve_env_config_value(
+    name: &str,
+    env: Option<&BTreeMap<String, String>>,
+    process_env: &EnvLookup,
+) -> Option<String> {
     if let Some(env) = env
         && let Some(value) = env.get(name)
-            && !value.is_empty() {
-                return Some(value.clone());
-            }
-    let value = process_env(name)?;
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
+        && !value.is_empty()
+    {
+        return Some(value.clone());
     }
+    let value = process_env(name)?;
+    if value.is_empty() { None } else { Some(value) }
 }
 
 /// The distinct env variable names a template reads, upstream's
@@ -246,7 +249,10 @@ pub fn get_config_value_env_var_names(config: &str) -> Vec<String> {
 /// The env variables a config value reads that resolve to nothing, upstream's
 /// `getMissingConfigValueEnvVarNames`.
 #[must_use]
-pub fn get_missing_config_value_env_var_names(config: &str, env: Option<&BTreeMap<String, String>>) -> Vec<String> {
+pub fn get_missing_config_value_env_var_names(
+    config: &str,
+    env: Option<&BTreeMap<String, String>>,
+) -> Vec<String> {
     get_config_value_env_var_names(config)
         .into_iter()
         .filter(|name| resolve_env_config_value(name, env, &default_env_lookup()).is_none())
@@ -271,7 +277,10 @@ pub fn get_missing_config_value_env_var_names_with(
 /// `isCommandConfigValue`.
 #[must_use]
 pub fn is_command_config_value(config: &str) -> bool {
-    matches!(parse_config_value_reference(config), ConfigValueReference::Command { .. })
+    matches!(
+        parse_config_value_reference(config),
+        ConfigValueReference::Command { .. }
+    )
 }
 
 /// Whether every env variable the value reads resolves, upstream's
@@ -293,7 +302,10 @@ pub fn is_config_value_configured(config: &str, env: Option<&BTreeMap<String, St
 ///
 /// One unresolvable env segment voids the whole value (`None`).
 #[must_use]
-pub fn resolve_config_value(config: &str, env: Option<&BTreeMap<String, String>>) -> Option<String> {
+pub fn resolve_config_value(
+    config: &str,
+    env: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
     resolve_config_value_with(config, env, &default_env_lookup())
 }
 
@@ -369,7 +381,9 @@ fn execute_command_uncached(command_config: &str) -> Option<String> {
 /// The cached executor, upstream's `executeCommand`: successful and failed
 /// resolutions both cache, keyed on the full `!…` config text.
 fn execute_command_cached(command_config: &str) -> Option<String> {
-    let cache = COMMAND_RESULT_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = COMMAND_RESULT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(cached) = cache.get(command_config) {
         return cached.clone();
     }
@@ -385,7 +399,10 @@ fn execute_command_cached(command_config: &str) -> Option<String> {
 /// Resolve without consulting or filling the command cache, upstream's
 /// `resolveConfigValueUncached`.
 #[must_use]
-pub fn resolve_config_value_uncached(config: &str, env: Option<&BTreeMap<String, String>>) -> Option<String> {
+pub fn resolve_config_value_uncached(
+    config: &str,
+    env: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
     resolve_config_value_uncached_with(config, env, &default_env_lookup())
 }
 
@@ -420,16 +437,20 @@ pub fn resolve_config_value_or_throw(
     }
 
     match parse_config_value_reference(config) {
-        ConfigValueReference::Command { config } => {
-            Err(format!("Failed to resolve {description} from shell command: {}", &config[1..]))
-        }
+        ConfigValueReference::Command { config } => Err(format!(
+            "Failed to resolve {description} from shell command: {}",
+            &config[1..]
+        )),
         ConfigValueReference::Template { .. } => {
             let missing = get_missing_config_value_env_var_names(config, env);
             match missing.as_slice() {
-                [one] => Err(format!("Failed to resolve {description} from environment variable: {one}")),
-                many if many.len() > 1 => {
-                    Err(format!("Failed to resolve {description} from environment variables: {}", many.join(", ")))
-                }
+                [one] => Err(format!(
+                    "Failed to resolve {description} from environment variable: {one}"
+                )),
+                many if many.len() > 1 => Err(format!(
+                    "Failed to resolve {description} from environment variables: {}",
+                    many.join(", ")
+                )),
                 _ => Err(format!("Failed to resolve {description}")),
             }
         }
@@ -450,9 +471,10 @@ pub fn resolve_headers(
         // Upstream's `if (resolvedValue)` truthiness: a resolved empty string
         // drops the entry here, while the or-throw variant below keeps it.
         if let Some(resolved_value) = resolve_config_value(value, env)
-            && !resolved_value.is_empty() {
-                resolved.insert(key.clone(), resolved_value);
-            }
+            && !resolved_value.is_empty()
+        {
+            resolved.insert(key.clone(), resolved_value);
+        }
     }
     if resolved.is_empty() {
         None
@@ -476,13 +498,21 @@ pub fn resolve_headers_or_throw(
     };
     let mut resolved = BTreeMap::new();
     for (key, value) in headers {
-        let resolved_value = resolve_config_value_or_throw(value, &format!("{description} header \"{key}\""), env)?;
+        let resolved_value =
+            resolve_config_value_or_throw(value, &format!("{description} header \"{key}\""), env)?;
         resolved.insert(key.clone(), resolved_value);
     }
-    Ok(if resolved.is_empty() { None } else { Some(resolved) })
+    Ok(if resolved.is_empty() {
+        None
+    } else {
+        Some(resolved)
+    })
 }
 
 /// Clear the command-result cache, upstream's test-facing export.
 pub fn clear_config_value_cache() {
-    COMMAND_RESULT_CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    COMMAND_RESULT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
 }

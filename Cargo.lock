@@ -2646,7 +2646,6 @@ dependencies = [
  "pi-tui",
  "rand 0.9.5",
  "regex",
- "serde",
  "serde_json",
  "syntect",
  "tempfile",

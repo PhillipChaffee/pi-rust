@@ -14,8 +14,8 @@
 use crate::config::{APP_NAME, CONFIG_DIR_NAME};
 use crate::settings_manager::DefaultProjectTrust;
 use crate::trust_manager::{
-    get_project_trust_options, has_trust_requiring_project_resources, ProjectTrustOption, ProjectTrustStore,
-    ProjectTrustUpdate,
+    ProjectTrustOption, ProjectTrustStore, ProjectTrustUpdate, get_project_trust_options,
+    has_trust_requiring_project_resources,
 };
 
 /// The app mode, upstream's `AppMode`.
@@ -115,7 +115,9 @@ async fn select_project_trust_option(
             options.iter().map(|option| option.label.clone()).collect(),
         )
         .await;
-    options.into_iter().find(|option| Some(&option.label) == selected.as_ref())
+    options
+        .into_iter()
+        .find(|option| Some(&option.label) == selected.as_ref())
 }
 
 /// Save a prompt result's store updates, upstream's
@@ -148,7 +150,9 @@ fn save_project_trust_prompt_result(
 ///
 /// # Errors
 /// The store writes the prompt saves can fail with.
-pub async fn resolve_project_trusted(options: ResolveProjectTrustedOptions<'_>) -> Result<bool, crate::trust_manager::TrustError> {
+pub async fn resolve_project_trusted(
+    options: ResolveProjectTrustedOptions<'_>,
+) -> Result<bool, crate::trust_manager::TrustError> {
     if let Some(trust_override) = options.trust_override {
         return Ok(trust_override);
     }
@@ -164,7 +168,9 @@ pub async fn resolve_project_trusted(options: ResolveProjectTrustedOptions<'_>) 
             .await;
         for (extension_path, error) in errors {
             if let Some(report) = options.on_extension_error {
-                report(&format!("Extension \"{extension_path}\" project_trust error: {error}"));
+                report(&format!(
+                    "Extension \"{extension_path}\" project_trust error: {error}"
+                ));
             }
         }
         if let Some(outcome) = result {
@@ -181,7 +187,10 @@ pub async fn resolve_project_trusted(options: ResolveProjectTrustedOptions<'_>) 
         return Ok(decision.unwrap_or(false));
     }
 
-    match options.default_project_trust.unwrap_or(DefaultProjectTrust::Ask) {
+    match options
+        .default_project_trust
+        .unwrap_or(DefaultProjectTrust::Ask)
+    {
         DefaultProjectTrust::Always => return Ok(true),
         DefaultProjectTrust::Never => return Ok(false),
         DefaultProjectTrust::Ask => {}
@@ -191,7 +200,9 @@ pub async fn resolve_project_trusted(options: ResolveProjectTrustedOptions<'_>) 
         return Ok(false);
     }
 
-    let Some(selected) = select_project_trust_option(options.cwd, options.project_trust_context).await else {
+    let Some(selected) =
+        select_project_trust_option(options.cwd, options.project_trust_context).await
+    else {
         return Ok(false);
     };
     save_project_trust_prompt_result(options.trust_store, &selected)?;

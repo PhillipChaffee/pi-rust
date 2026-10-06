@@ -108,11 +108,7 @@ fn resolve_cwd_default(input: &str) -> String {
 /// ascent bound upstream's `dirname(currentDir) === currentDir` check.
 fn parent_dir(dir: &str) -> Option<String> {
     let parent = Path::new(dir).parent()?.to_string_lossy().into_owned();
-    if parent == dir {
-        None
-    } else {
-        Some(parent)
-    }
+    if parent == dir { None } else { Some(parent) }
 }
 
 /// The nearest recorded decision for a cwd, upstream's
@@ -208,10 +204,12 @@ fn read_trust_file(path: &str) -> Result<TrustFile, TrustError> {
         return Ok(TrustFile::new());
     }
     let content = std::fs::read_to_string(path).map_err(|error| trust_error(error.to_string()))?;
-    let parsed: Value =
-        serde_json::from_str(strip_bom(&content)).map_err(|error| trust_error(format!("Failed to read trust store {path}: {error}")))?;
+    let parsed: Value = serde_json::from_str(strip_bom(&content))
+        .map_err(|error| trust_error(format!("Failed to read trust store {path}: {error}")))?;
     let Value::Object(entries) = parsed else {
-        return Err(trust_error(format!("Invalid trust store {path}: expected an object")));
+        return Err(trust_error(format!(
+            "Invalid trust store {path}: expected an object"
+        )));
     };
     let mut data = TrustFile::new();
     for (key, value) in entries {
@@ -222,7 +220,7 @@ fn read_trust_file(path: &str) -> Result<TrustFile, TrustError> {
                 return Err(trust_error(format!(
                     "Invalid trust store {path}: value for {} must be true, false, or null",
                     serde_json::to_string(&key).unwrap_or_default()
-                )))
+                )));
             }
         };
         data.insert(key, decision);
@@ -241,7 +239,10 @@ fn write_trust_file(path: &str, data: &TrustFile) -> Result<(), TrustError> {
             (key.clone(), value)
         })
         .collect();
-    let content = format!("{}\n", serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string()));
+    let content = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string())
+    );
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent).map_err(|error| trust_error(error.to_string()))?;
     }
@@ -286,11 +287,18 @@ impl ProjectTrustStore {
     /// A malformed store file or a lock failure.
     pub fn get_entry(&self, cwd: &str) -> Result<Option<ProjectTrustStoreEntry>, TrustError> {
         let lock_dir = lock_dir_for(&self.trust_path);
-        std::fs::create_dir_all(Path::new(&self.trust_path).parent().unwrap_or_else(|| Path::new(".")))
-            .map_err(|error| trust_error(error.to_string()))?;
-        let guard = acquire_sync_retrying(&lock_dir).map_err(|error| trust_error(error.to_string()))?;
+        std::fs::create_dir_all(
+            Path::new(&self.trust_path)
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .map_err(|error| trust_error(error.to_string()))?;
+        let guard =
+            acquire_sync_retrying(&lock_dir).map_err(|error| trust_error(error.to_string()))?;
         let outcome = find_nearest_trust_entry(&read_trust_file(&self.trust_path)?, cwd);
-        guard.release().map_err(|error| trust_error(error.to_string()))?;
+        guard
+            .release()
+            .map_err(|error| trust_error(error.to_string()))?;
         Ok(outcome)
     }
 
@@ -311,9 +319,14 @@ impl ProjectTrustStore {
     /// A malformed store file, a lock failure, or a write failure.
     pub fn set_many(&self, decisions: &[ProjectTrustUpdate]) -> Result<(), TrustError> {
         let lock_dir = lock_dir_for(&self.trust_path);
-        std::fs::create_dir_all(Path::new(&self.trust_path).parent().unwrap_or_else(|| Path::new(".")))
-            .map_err(|error| trust_error(error.to_string()))?;
-        let guard = acquire_sync_retrying(&lock_dir).map_err(|error| trust_error(error.to_string()))?;
+        std::fs::create_dir_all(
+            Path::new(&self.trust_path)
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        )
+        .map_err(|error| trust_error(error.to_string()))?;
+        let guard =
+            acquire_sync_retrying(&lock_dir).map_err(|error| trust_error(error.to_string()))?;
         let outcome = (|| {
             let mut data = read_trust_file(&self.trust_path)?;
             for update in decisions {
@@ -329,7 +342,9 @@ impl ProjectTrustStore {
             }
             write_trust_file(&self.trust_path, &data)
         })();
-        guard.release().map_err(|error| trust_error(error.to_string()))?;
+        guard
+            .release()
+            .map_err(|error| trust_error(error.to_string()))?;
         outcome
     }
 }

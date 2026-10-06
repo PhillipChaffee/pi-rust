@@ -14,7 +14,7 @@
 //!   deferred to the type system.
 //! - The credential's unknown api-key fields upstream's spread preserves do
 //!   not survive a Rust round-trip: serde drops fields outside
-//!   [`ApiKeyCredential`](pi_ai::auth::types::ApiKeyCredential), whose type
+//!   [`ApiKeyCredential`], whose type
 //!   upstream carries no index signature for either.
 //! - The shared read state keyed on the file revision restates as one
 //!   process-wide slot: the first file-backed store takes it, later stores
@@ -50,12 +50,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::EnvLookup;
 use crate::file_lock::{
-    acquire_sync_retrying, lock_dir_for, release_with_hook, AsyncLockOptions, FileLock, FileLockGuard, LockError,
-    MkdirLock, OnCompromised,
+    AsyncLockOptions, FileLock, FileLockGuard, LockError, MkdirLock, OnCompromised,
+    acquire_sync_retrying, lock_dir_for, release_with_hook,
 };
 use crate::resolve_config_value::{is_command_config_value, resolve_config_value_with};
 use crate::utils::abort::race_with_abort_signal;
-use crate::utils::paths::{get_file_revision, normalize_path, PathInputOptions};
+use crate::utils::paths::{PathInputOptions, get_file_revision, normalize_path};
 use crate::utils::text::strip_bom;
 
 /// The contended-acquire deadline, upstream's `staleMs`.
@@ -163,7 +163,8 @@ fn parse_storage_data(content: Option<&str>) -> Result<AuthStorageData, AuthErro
     if content.is_empty() {
         return Ok(AuthStorageData::new());
     }
-    serde_json::from_str(strip_bom(content)).map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))
+    serde_json::from_str(strip_bom(content))
+        .map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))
 }
 
 /// Serialize the data the way upstream writes it: two-space pretty JSON.
@@ -181,7 +182,11 @@ fn entry_to_credential(provider_id: &str, value: &Value) -> Result<Option<Creden
     }
     serde_json::from_value(value.clone())
         .map(Some)
-        .map_err(|_| auth_error(format!("Invalid auth.json credential for provider \"{provider_id}\"")))
+        .map_err(|_| {
+            auth_error(format!(
+                "Invalid auth.json credential for provider \"{provider_id}\""
+            ))
+        })
 }
 
 /// One credential entry serialized for storage.
@@ -214,7 +219,11 @@ impl ReloadSlot {
         loop {
             let notified = self.ready.notified();
             tokio::pin!(notified);
-            let settled = self.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let settled = self
+                .result
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             if let Some(settled) = settled {
                 return settled;
             }
@@ -225,10 +234,19 @@ impl ReloadSlot {
     /// Depart one reader, upstream's finally: the last reader clears the
     /// current slot and arms the reload's cancellation.
     fn depart(slot: &Arc<Self>, read_state: &Mutex<ReadState>) {
-        if slot.readers.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+        if slot
+            .readers
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
             let should_clear = {
-                let mut state = read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let current_matches = state.reload.as_ref().is_some_and(|current| Arc::ptr_eq(current, slot));
+                let mut state = read_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let current_matches = state
+                    .reload
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, slot));
                 if current_matches {
                     state.reload = None;
                 }
@@ -259,7 +277,9 @@ static SHARED_AUTH_FILE_READ_STATE: LazyLock<Mutex<SharedReadStateSlot>> =
     LazyLock::new(|| Mutex::new(None));
 
 fn shared_read_state_for(auth_path: &str) -> Arc<Mutex<ReadState>> {
-    let mut shared = SHARED_AUTH_FILE_READ_STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut shared = SHARED_AUTH_FILE_READ_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((taken_path, state)) = shared.as_ref() {
         if taken_path == auth_path {
             return Arc::clone(state);
@@ -293,7 +313,10 @@ pub trait AuthStorageBackend: Send + Sync + 'static {
     ///
     /// # Errors
     /// A lock-acquisition, read, or write failure.
-    fn with_lock<T>(&self, f: impl FnOnce(Option<&str>) -> LockOutcome<T> + Send) -> Result<T, AuthError>;
+    fn with_lock<T>(
+        &self,
+        f: impl FnOnce(Option<&str>) -> LockOutcome<T> + Send,
+    ) -> Result<T, AuthError>;
 
     /// The asynchronous locked operation, upstream's `withLockAsync`.
     ///
@@ -302,7 +325,9 @@ pub trait AuthStorageBackend: Send + Sync + 'static {
     /// aborted-during-operation signal; or a compromised lock.
     fn with_lock_async<T>(
         &self,
-        f: impl FnOnce(Option<&str>) -> BoxedFuture<'static, Result<LockOutcome<T>, AuthError>> + Send + 'static,
+        f: impl FnOnce(Option<&str>) -> BoxedFuture<'static, Result<LockOutcome<T>, AuthError>>
+        + Send
+        + 'static,
         options: Option<&AuthOptions>,
     ) -> BoxedFuture<'static, Result<T, AuthError>>;
 }
@@ -328,10 +353,13 @@ async fn acquire_contended(
         match lock.lock(lock_dir, &options).await {
             Ok(guard) => {
                 if let Some(signal) = signal
-                    && signal.is_cancelled() {
-                        guard.release().map_err(|error| auth_error(error.to_string()))?;
-                        return Err(aborted());
-                    }
+                    && signal.is_cancelled()
+                {
+                    guard
+                        .release()
+                        .map_err(|error| auth_error(error.to_string()))?;
+                    return Err(aborted());
+                }
                 return Ok(guard);
             }
             Err(error) => {
@@ -343,7 +371,8 @@ async fn acquire_contended(
                 if !locked || remaining.is_zero() {
                     return Err(error);
                 }
-                let base_delay_ms = std::cmp::min(10 * 2u64.saturating_pow(retry), CONTENDED_MAX_DELAY_HALF_MS);
+                let base_delay_ms =
+                    std::cmp::min(10 * 2u64.saturating_pow(retry), CONTENDED_MAX_DELAY_HALF_MS);
                 retry += 1;
                 #[expect(
                     clippy::cast_precision_loss,
@@ -351,7 +380,8 @@ async fn acquire_contended(
                     clippy::cast_sign_loss,
                     reason = "the backoff math rides upstream's JS numbers: the base is at most 1000 and the product rounds into u64 range, and remaining is a positive duration"
                 )]
-                let jittered = ((base_delay_ms as f64) * (1.0 + rand::random::<f64>())).round() as u64;
+                let jittered =
+                    ((base_delay_ms as f64) * (1.0 + rand::random::<f64>())).round() as u64;
                 let delay_ms = remaining.as_millis().min(u128::from(u64::MAX));
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -417,19 +447,25 @@ impl FileAuthStorageBackend {
 }
 
 impl AuthStorageBackend for FileAuthStorageBackend {
-    fn with_lock<T>(&self, f: impl FnOnce(Option<&str>) -> LockOutcome<T> + Send) -> Result<T, AuthError> {
+    fn with_lock<T>(
+        &self,
+        f: impl FnOnce(Option<&str>) -> LockOutcome<T> + Send,
+    ) -> Result<T, AuthError> {
         ensure_parent_dir(&self.auth_path)?;
         ensure_file_exists(&self.auth_path)?;
 
-        let guard = acquire_sync_retrying(&self.lock_dir()).map_err(|error| auth_error(error.to_string()))?;
-        let outcome = {
+        let guard = acquire_sync_retrying(&self.lock_dir())
+            .map_err(|error| auth_error(error.to_string()))?;
+        // Upstream's finally releases on every path, so the body computes
+        // without early returns and the release tail always runs.
+        let outcome: Result<T, AuthError> = (|| {
             let current = std::fs::read_to_string(&self.auth_path).ok();
             let outcome = f(current.as_deref());
             if let Some(next) = &outcome.next {
                 write_auth_file(&self.auth_path, next)?;
             }
-            Ok::<T, AuthError>(outcome.result)
-        };
+            Ok(outcome.result)
+        })();
         // Upstream's finally: the release runs whatever happened, and its
         // error replaces the outcome the way a finally throw would.
         match guard.release() {
@@ -440,7 +476,9 @@ impl AuthStorageBackend for FileAuthStorageBackend {
 
     fn with_lock_async<T>(
         &self,
-        f: impl FnOnce(Option<&str>) -> BoxedFuture<'static, Result<LockOutcome<T>, AuthError>> + Send + 'static,
+        f: impl FnOnce(Option<&str>) -> BoxedFuture<'static, Result<LockOutcome<T>, AuthError>>
+        + Send
+        + 'static,
         options: Option<&AuthOptions>,
     ) -> BoxedFuture<'static, Result<T, AuthError>> {
         let signal = options.and_then(|options| options.signal.clone());
@@ -459,7 +497,9 @@ impl AuthStorageBackend for FileAuthStorageBackend {
             let hook: OnCompromised = {
                 let flag = Arc::clone(&compromised);
                 Arc::new(move |_error: &LockError| {
-                    let mut slot = flag.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut slot = flag
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if slot.is_none() {
                         *slot = Some(auth_error("Auth storage lock was compromised"));
                     }
@@ -477,7 +517,9 @@ impl AuthStorageBackend for FileAuthStorageBackend {
             };
 
             let guard = acquire_contended(&*lock, &lock_dir, signal.as_ref(), Some(hook)).await?;
-            let outcome = {
+            // Upstream's finally releases on every path, so the body computes
+            // without early returns and the release tail always runs.
+            let outcome: Result<T, AuthError> = async {
                 throw_if_compromised()?;
                 check_signal(signal.as_ref())?;
                 let current = std::fs::read_to_string(&auth_path).ok();
@@ -488,8 +530,9 @@ impl AuthStorageBackend for FileAuthStorageBackend {
                     write_auth_file(&auth_path, next)?;
                 }
                 throw_if_compromised()?;
-                Ok::<T, AuthError>(outcome.result)
-            };
+                Ok(outcome.result)
+            }
+            .await;
             // Upstream's finally: the release runs whatever happened, its
             // errors swallowed, the compromise hook still firing.
             release_with_hook(
@@ -522,23 +565,41 @@ pub struct InMemoryAuthStorageBackend {
 impl InMemoryAuthStorageBackend {
     /// Seed the value with serialized content, upstream's `withLock` seeding.
     fn seed(&self, next: String) {
-        *self.inner.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+        *self
+            .inner
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
     }
 }
 
 impl AuthStorageBackend for InMemoryAuthStorageBackend {
-    fn with_lock<T>(&self, f: impl FnOnce(Option<&str>) -> LockOutcome<T> + Send) -> Result<T, AuthError> {
-        let current = self.inner.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    fn with_lock<T>(
+        &self,
+        f: impl FnOnce(Option<&str>) -> LockOutcome<T> + Send,
+    ) -> Result<T, AuthError> {
+        let current = self
+            .inner
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let outcome = f(current.as_deref());
         if let Some(next) = outcome.next {
-            *self.inner.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+            *self
+                .inner
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
         }
         Ok(outcome.result)
     }
 
     fn with_lock_async<T>(
         &self,
-        f: impl FnOnce(Option<&str>) -> BoxedFuture<'static, Result<LockOutcome<T>, AuthError>> + Send + 'static,
+        f: impl FnOnce(Option<&str>) -> BoxedFuture<'static, Result<LockOutcome<T>, AuthError>>
+        + Send
+        + 'static,
         options: Option<&AuthOptions>,
     ) -> BoxedFuture<'static, Result<T, AuthError>> {
         let signal = options.and_then(|options| options.signal.clone());
@@ -553,11 +614,18 @@ impl AuthStorageBackend for InMemoryAuthStorageBackend {
                     // The queued operation's own signal check runs at the
                     // front of the queue, so a cancelled mutation never runs.
                     check_signal(signal.as_ref())?;
-                    let current = inner.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                    let current = inner
+                        .value
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
                     let outcome = f(current.as_deref()).await?;
                     check_signal(signal.as_ref())?;
                     if let Some(next) = outcome.next {
-                        *inner.value.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
+                        *inner
+                            .value
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(next);
                     }
                     Ok::<T, AuthError>(outcome.result)
                 },
@@ -674,7 +742,10 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
         };
         let revision = get_file_revision(auth_path);
         let matches = revision.is_some() && {
-            let state = self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self
+                .read_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             revision == state.revision
         };
         if !matches {
@@ -683,7 +754,10 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
     }
 
     fn update_read_state(&self, data: AuthStorageData, revision: Option<String>) {
-        let mut state = self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .read_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.data = data;
         state.revision = revision;
     }
@@ -702,13 +776,17 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
             }
         });
         if matches!(outcome, Ok(()))
-            && let Ok(data) = parse_storage_data(content.as_deref()) {
-                self.update_read_state(data, revision);
-            }
-            // Preserve the last valid in-memory snapshot.
+            && let Ok(data) = parse_storage_data(content.as_deref())
+        {
+            self.update_read_state(data, revision);
+        }
+        // Preserve the last valid in-memory snapshot.
     }
 
-    async fn reload_from_storage_async(&self, options: Option<&AuthOptions>) -> Result<AuthStorageData, AuthError> {
+    async fn reload_from_storage_async(
+        &self,
+        options: Option<&AuthOptions>,
+    ) -> Result<AuthStorageData, AuthError> {
         let read_state = Arc::clone(&self.read_state);
         let auth_path = self.auth_path.clone();
         self.storage
@@ -720,7 +798,9 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
                         let current_data = parse_storage_data(content.as_deref())?;
                         let revision = auth_path.as_deref().and_then(get_file_revision);
                         {
-                            let mut state = read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut state = read_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             state.data.clone_from(&current_data);
                             state.revision = revision;
                         }
@@ -738,7 +818,10 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
     /// The latest data, upstream's `readLatestData`: the in-memory backend
     /// reloads directly, the file backend short-circuits on a matching
     /// revision and otherwise joins the coalesced reload slot.
-    async fn read_latest_data(&self, options: Option<&AuthOptions>) -> Result<AuthStorageData, AuthError> {
+    async fn read_latest_data(
+        &self,
+        options: Option<&AuthOptions>,
+    ) -> Result<AuthStorageData, AuthError> {
         let signal = options.and_then(|options| options.signal.as_ref());
         check_signal(signal)?;
 
@@ -748,14 +831,22 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
                 Ok(data) => Ok(data),
                 // Upstream: without a signal, a failed reload resolves to the
                 // current snapshot; with one, the failure propagates.
-                Err(_) if signal.is_none() => Ok(self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).data.clone()),
+                Err(_) if signal.is_none() => Ok(self
+                    .read_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .data
+                    .clone()),
                 Err(error) => Err(error),
             };
         };
 
         let revision = get_file_revision(auth_path);
         if revision.is_some() {
-            let state = self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = self
+                .read_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if revision == state.revision {
                 return Ok(state.data.clone());
             }
@@ -764,7 +855,10 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
         // Join or start the coalesced reload, upstream's readLatestData slot
         // machinery.
         let slot = {
-            let mut state = self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .read_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.reload.is_none() {
                 let slot = Arc::new(ReloadSlot {
                     cancel: CancellationToken::new(),
@@ -785,18 +879,40 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
                 return Err(auth_error("reload slot vanished"));
             };
             let joined = Arc::clone(slot);
-            joined.readers.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            joined
+                .readers
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             drop(state);
             joined
         };
 
-        let settled = slot.settle().await;
+        // Upstream races the abort against the reload promise
+        // (raceWithAbortSignal): a signalled reader rejects promptly and
+        // departs, which arms the reload's cancellation when it is the last
+        // reader.
+        let settled = match signal {
+            Some(signal) => {
+                tokio::select! {
+                    () = signal.cancelled() => {
+                        ReloadSlot::depart(&slot, &self.read_state);
+                        return Err(aborted());
+                    }
+                    settled = slot.settle() => settled,
+                }
+            }
+            None => slot.settle().await,
+        };
         ReloadSlot::depart(&slot, &self.read_state);
 
         match (signal, settled) {
             (_, Ok(data)) => Ok(data),
             (Some(_), Err(message)) => Err(auth_error(message)),
-            (None, Err(_)) => Ok(self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).data.clone()),
+            (None, Err(_)) => Ok(self
+                .read_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .data
+                .clone()),
         }
     }
 
@@ -806,7 +922,11 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
     /// # Errors
     /// A reload failure when a signal is supplied, a malformed stored entry,
     /// or an aborted signal.
-    pub async fn read(&self, provider: &str, options: Option<&AuthOptions>) -> Result<Option<Credential>, AuthError> {
+    pub async fn read(
+        &self,
+        provider: &str,
+        options: Option<&AuthOptions>,
+    ) -> Result<Option<Credential>, AuthError> {
         let data = self.read_latest_data(options).await?;
         let credential = match data.get(provider) {
             Some(entry) => entry_to_credential(provider, entry)?,
@@ -833,7 +953,10 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
     ///
     /// # Errors
     /// A reload failure or an aborted signal.
-    pub async fn list(&self, options: Option<&AuthOptions>) -> Result<Vec<CredentialInfo>, AuthError> {
+    pub async fn list(
+        &self,
+        options: Option<&AuthOptions>,
+    ) -> Result<Vec<CredentialInfo>, AuthError> {
         let data = self.read_latest_data(options).await?;
         check_signal(options.and_then(|options| options.signal.as_ref()))?;
         Ok(data
@@ -863,7 +986,12 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
         options: Option<&AuthOptions>,
     ) -> Result<Option<Credential>, AuthError> {
         let bookkeeping = Arc::new(Mutex::new(ModifyBookkeeping {
-            latest: self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).data.clone(),
+            latest: self
+                .read_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .data
+                .clone(),
             revision: None,
         }));
         let provider = provider.to_string();
@@ -892,15 +1020,14 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
                                     None => None,
                                 };
                                 {
-                                    let mut bookkeeping =
-                                        bookkeeping.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    let mut bookkeeping = bookkeeping
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     bookkeeping.latest.clone_from(&current_data);
-                                    bookkeeping.revision = auth_path.as_deref().and_then(get_file_revision);
+                                    bookkeeping.revision =
+                                        auth_path.as_deref().and_then(get_file_revision);
                                 }
-                                Ok(LockOutcome {
-                                    result,
-                                    next: None,
-                                })
+                                Ok(LockOutcome { result, next: None })
                             }
                             Some(next) => {
                                 let mut merged = current_data;
@@ -923,7 +1050,9 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
             .await;
         // Upstream: the await's failure skips the updateReadState entirely.
         if result.is_ok() {
-            let bookkeeping = bookkeeping.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bookkeeping = bookkeeping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.update_read_state(bookkeeping.latest.clone(), bookkeeping.revision.clone());
         }
         result
@@ -933,8 +1062,18 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
     ///
     /// # Errors
     /// A storage failure or an aborted signal.
-    pub async fn delete(&self, provider: &str, options: Option<&AuthOptions>) -> Result<(), AuthError> {
-        let latest = Arc::new(Mutex::new(self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).data.clone()));
+    pub async fn delete(
+        &self,
+        provider: &str,
+        options: Option<&AuthOptions>,
+    ) -> Result<(), AuthError> {
+        let latest = Arc::new(Mutex::new(
+            self.read_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .data
+                .clone(),
+        ));
         let provider = provider.to_string();
         let latest_for_closure = Arc::clone(&latest);
         let result = self
@@ -946,7 +1085,10 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
                     Box::pin(async move {
                         let mut current_data = parse_storage_data(content.as_deref())?;
                         current_data.shift_remove(&provider);
-                        latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone_from(&current_data);
+                        latest
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clone_from(&current_data);
                         Ok(LockOutcome {
                             result: (),
                             next: Some(serialize_storage_data(&current_data)),
@@ -958,7 +1100,13 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
             .await;
         // Upstream: the await's failure skips the updateReadState entirely.
         if matches!(result, Ok(())) {
-            self.update_read_state(latest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(), None);
+            self.update_read_state(
+                latest
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                None,
+            );
         }
         result
     }
@@ -999,7 +1147,9 @@ impl<B: AuthStorageBackend> ReloadJob<B> {
                         let current_data = parse_storage_data(content.as_deref())?;
                         let revision = get_file_revision(&auth_path);
                         {
-                            let mut state = read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut state = read_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             state.data.clone_from(&current_data);
                             state.revision = revision;
                         }
@@ -1013,17 +1163,25 @@ impl<B: AuthStorageBackend> ReloadJob<B> {
             )
             .await;
 
-        *self.slot.result.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match result {
+        *self
+            .slot
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(match result {
             Ok(data) => Ok(data),
             Err(error) => Err(error.to_string()),
         });
         self.slot.ready.notify_waiters();
 
-        let mut state = self.read_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .read_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(current) = &state.reload
-            && Arc::ptr_eq(current, &self.slot) {
-                state.reload = None;
-            }
+            && Arc::ptr_eq(current, &self.slot)
+        {
+            state.reload = None;
+        }
     }
 }
 
@@ -1036,7 +1194,10 @@ impl<B: AuthStorageBackend> CredentialStore for AuthStorage<B> {
         Box::pin(Self::read(self, provider_id, options))
     }
 
-    fn list<'a>(&'a self, options: Option<&'a AuthOptions>) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
+    fn list<'a>(
+        &'a self,
+        options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
         Box::pin(Self::list(self, options))
     }
 
@@ -1093,8 +1254,8 @@ impl ReadOnlyAuthStorage {
     /// # Errors
     /// A `file://` path that does not convert to a local path.
     pub fn new_with_env(auth_path: &str, env: EnvLookup) -> Result<Self, AuthError> {
-        let normalized =
-            normalize_path(auth_path, &PathInputOptions::default()).map_err(|error| auth_error(error.to_string()))?;
+        let normalized = normalize_path(auth_path, &PathInputOptions::default())
+            .map_err(|error| auth_error(error.to_string()))?;
         Ok(Self {
             auth_path: normalized,
             env,
@@ -1106,26 +1267,35 @@ impl ReadOnlyAuthStorage {
     /// empty record; every entry must be a well-formed api-key or OAuth
     /// credential.
     fn load(&self) -> Result<AuthStorageData, AuthError> {
-        let cached = self.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let cached = self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(data) = cached {
             return Ok(data);
         }
         let loaded = self.read_and_validate()?;
-        *self.data.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(loaded.clone());
+        *self
+            .data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(loaded.clone());
         Ok(loaded)
     }
 
     fn read_and_validate(&self) -> Result<AuthStorageData, AuthError> {
         let content = std::fs::read_to_string(&self.auth_path)
             .map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))?;
-        let parsed: Value =
-            serde_json::from_str(strip_bom(&content)).map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))?;
+        let parsed: Value = serde_json::from_str(strip_bom(&content))
+            .map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))?;
         let Value::Object(entries) = parsed else {
             return Err(auth_error("Invalid auth.json: expected an object"));
         };
         for (provider_id, value) in &entries {
             if serde_json::from_value::<Credential>(value.clone()).is_err() {
-                return Err(auth_error(format!("Invalid auth.json credential for provider \"{provider_id}\"")));
+                return Err(auth_error(format!(
+                    "Invalid auth.json credential for provider \"{provider_id}\""
+                )));
             }
         }
         Ok(entries)
@@ -1165,7 +1335,10 @@ impl CredentialStore for ReadOnlyAuthStorage {
         })
     }
 
-    fn list<'a>(&'a self, options: Option<&'a AuthOptions>) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
+    fn list<'a>(
+        &'a self,
+        options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
         Box::pin(async move {
             check_signal(options.and_then(|options| options.signal.as_ref()))?;
             let data = self.load()?;
@@ -1189,7 +1362,11 @@ impl CredentialStore for ReadOnlyAuthStorage {
         _f: CredentialModifyFn,
         _options: Option<&'a AuthOptions>,
     ) -> BoxedFuture<'a, Result<Option<Credential>, AuthError>> {
-        Box::pin(async move { Err(auth_error("Read-only credential storage cannot modify auth.json")) })
+        Box::pin(async move {
+            Err(auth_error(
+                "Read-only credential storage cannot modify auth.json",
+            ))
+        })
     }
 
     fn delete<'a>(
@@ -1197,7 +1374,11 @@ impl CredentialStore for ReadOnlyAuthStorage {
         _provider_id: &'a str,
         _options: Option<&'a AuthOptions>,
     ) -> BoxedFuture<'a, Result<(), AuthError>> {
-        Box::pin(async move { Err(auth_error("Read-only credential storage cannot modify auth.json")) })
+        Box::pin(async move {
+            Err(auth_error(
+                "Read-only credential storage cannot modify auth.json",
+            ))
+        })
     }
 }
 

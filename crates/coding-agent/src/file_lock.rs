@@ -109,7 +109,9 @@ impl FileLockGuard {
     pub fn release(self) -> Result<(), LockError> {
         match std::fs::remove_dir(&self.lock_dir) {
             Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(LockError::Compromised),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(LockError::Compromised)
+            }
             Err(error) => Err(LockError::Io(error)),
         }
     }
@@ -135,19 +137,22 @@ pub fn lock_dir_for(target: &str) -> PathBuf {
 pub fn acquire_once(lock_dir: &Path, stale_ms: Option<u64>) -> Result<FileLockGuard, LockError> {
     for _ in 0..2 {
         match std::fs::create_dir(lock_dir) {
-            Ok(()) => return Ok(FileLockGuard { lock_dir: lock_dir.to_path_buf() }),
+            Ok(()) => {
+                return Ok(FileLockGuard {
+                    lock_dir: lock_dir.to_path_buf(),
+                });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = stale_ms
-                    .is_some_and(|window| {
-                        let mtime = std::fs::symlink_metadata(lock_dir)
-                            .and_then(|meta| meta.modified())
-                            .ok();
-                        mtime.is_some_and(|mtime| {
-                            SystemTime::now()
-                                .duration_since(mtime)
-                                .is_ok_and(|age| age >= Duration::from_millis(window))
-                        })
-                    });
+                let stale = stale_ms.is_some_and(|window| {
+                    let mtime = std::fs::symlink_metadata(lock_dir)
+                        .and_then(|meta| meta.modified())
+                        .ok();
+                    mtime.is_some_and(|mtime| {
+                        SystemTime::now()
+                            .duration_since(mtime)
+                            .is_ok_and(|age| age >= Duration::from_millis(window))
+                    })
+                });
                 if !stale {
                     return Err(LockError::Locked);
                 }
@@ -199,7 +204,10 @@ impl std::fmt::Debug for AsyncLockOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AsyncLockOptions")
             .field("signal", &self.signal)
-            .field("on_compromised", &self.on_compromised.as_ref().map(|_| "()"))
+            .field(
+                "on_compromised",
+                &self.on_compromised.as_ref().map(|_| "()"),
+            )
             .finish()
     }
 }
@@ -218,24 +226,27 @@ pub fn acquire(
     options: &AsyncLockOptions,
 ) -> Result<FileLockGuard, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(signal) = &options.signal
-        && signal.is_cancelled() {
-            return Err(Box::new(AbortError));
-        }
+        && signal.is_cancelled()
+    {
+        return Err(Box::new(AbortError));
+    }
     let guard = match acquire_once(lock_dir, Some(30_000)) {
         Ok(guard) => guard,
         Err(error) => {
             if let Some(signal) = &options.signal
-                && signal.is_cancelled() {
-                    return Err(Box::new(AbortError));
-                }
+                && signal.is_cancelled()
+            {
+                return Err(Box::new(AbortError));
+            }
             return Err(Box::new(error));
         }
     };
     if let Some(signal) = &options.signal
-        && signal.is_cancelled() {
-            let _ = guard.release();
-            return Err(Box::new(AbortError));
-        }
+        && signal.is_cancelled()
+    {
+        let _ = guard.release();
+        return Err(Box::new(AbortError));
+    }
     Ok(guard)
 }
 

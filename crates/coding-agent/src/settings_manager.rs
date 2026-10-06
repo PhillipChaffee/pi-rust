@@ -16,7 +16,7 @@
 //!   insertion order the saved files carry.
 //! - The write queue restates as synchronous persistence: upstream's queued
 //!   tasks serialize promise-chain writes over async fs, and the port's
-//!   writes are sync, so `save` persists inline and [`flush`] waits for
+//!   writes are sync, so `save` persists inline and `flush` waits for
 //!   nothing. The queue's error path is kept — a failed write records the
 //!   error and leaves the modified-field tracking intact, the retry the
 //!   catch-less chain implies.
@@ -42,9 +42,9 @@ use pi_tui::terminal_image::CapabilityOverrides;
 use pi_tui::tui::TuiMode;
 use serde_json::Value;
 
-use crate::config::{default_env_lookup, EnvLookup, CONFIG_DIR_NAME};
+use crate::config::{CONFIG_DIR_NAME, EnvLookup, default_env_lookup};
 use crate::file_lock::{acquire_sync_retrying, lock_dir_for};
-use crate::utils::paths::{normalize_path, resolve_path, PathInputOptions};
+use crate::utils::paths::{PathInputOptions, normalize_path, resolve_path};
 use crate::utils::text::strip_bom;
 
 /// The default HTTP idle timeout, upstream's
@@ -66,7 +66,10 @@ pub fn parse_http_idle_timeout_ms(value: &Value) -> Option<i64> {
         if trimmed.is_empty() {
             return None;
         }
-        return trimmed.parse::<f64>().ok().and_then(parse_finite_timeout_ms);
+        return trimmed
+            .parse::<f64>()
+            .ok()
+            .and_then(parse_finite_timeout_ms);
     }
     parse_finite_timeout_ms(value.as_f64()?)
 }
@@ -322,9 +325,7 @@ impl SettingsStorage for FileSettingsStorage {
         let mut release = None;
         let file_exists = Path::new(path).exists();
         if file_exists {
-            release = Some(
-                acquire_sync_retrying(&lock_dir).map_err(|error| error.to_string())?,
-            );
+            release = Some(acquire_sync_retrying(&lock_dir).map_err(|error| error.to_string())?);
         }
         let outcome = {
             let current = if file_exists {
@@ -335,13 +336,13 @@ impl SettingsStorage for FileSettingsStorage {
             let next = f(current.as_deref())?;
             if let Some(next) = next {
                 if let Some(parent) = Path::new(path).parent()
-                    && !parent.exists() {
-                        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                    }
+                    && !parent.exists()
+                {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
                 if release.is_none() {
-                    release = Some(
-                        acquire_sync_retrying(&lock_dir).map_err(|error| error.to_string())?,
-                    );
+                    release =
+                        Some(acquire_sync_retrying(&lock_dir).map_err(|error| error.to_string())?);
                 }
                 std::fs::write(path, next).map_err(|error| error.to_string())?;
             }
@@ -399,10 +400,7 @@ impl SettingsStorage for InMemorySettingsStorage {
 /// Deep-merge two JSON objects, upstream's `deepMergeObjects`: nested objects
 /// merge recursively, everything else — including arrays and `null` —
 /// replaces.
-fn deep_merge_objects(
-    base: &Settings,
-    overrides: &Settings,
-) -> Settings {
+fn deep_merge_objects(base: &Settings, overrides: &Settings) -> Settings {
     let mut result = base.clone();
     for (key, override_value) in overrides {
         let Some(base_value) = base.get(key) else {
@@ -472,7 +470,14 @@ fn migrate_settings(settings: &mut Settings) {
         let websockets = settings.get("websockets").and_then(Value::as_bool);
         settings.insert(
             "transport".to_string(),
-            Value::String(if websockets.unwrap_or(false) { "websocket" } else { "sse" }.to_string()),
+            Value::String(
+                if websockets.unwrap_or(false) {
+                    "websocket"
+                } else {
+                    "sse"
+                }
+                .to_string(),
+            ),
         );
         settings.shift_remove("websockets");
     }
@@ -485,9 +490,10 @@ fn migrate_settings(settings: &mut Settings) {
         if let Some(skills_settings) = skills_settings {
             let enable = skills_settings.get("enableSkillCommands").cloned();
             if let Some(enable) = enable
-                && !settings.contains_key("enableSkillCommands") {
-                    settings.insert("enableSkillCommands".to_string(), enable);
-                }
+                && !settings.contains_key("enableSkillCommands")
+            {
+                settings.insert("enableSkillCommands".to_string(), enable);
+            }
             let custom = skills_settings
                 .get("customDirectories")
                 .and_then(Value::as_array)
@@ -515,19 +521,19 @@ fn migrate_settings(settings: &mut Settings) {
                 .and_then(|provider| provider.get("maxRetryDelayMs"))
                 .is_some_and(|value| !value.is_null());
             if let Some(max_delay) = max_delay
-                && !provider_has_override {
-                    let mut next_provider = provider.cloned().unwrap_or_default();
-                    next_provider.insert(
-                        "maxRetryDelayMs".to_string(),
-                        serde_json::Number::from_f64(max_delay)
-                            .map_or(Value::Null, Value::Number),
-                    );
-                    let retry_object = settings.get_mut("retry").and_then(Value::as_object_mut);
-                    if let Some(retry_object) = retry_object {
-                        retry_object.insert("provider".to_string(), Value::Object(next_provider));
-                        retry_object.shift_remove("maxDelayMs");
-                    }
+                && !provider_has_override
+            {
+                let mut next_provider = provider.cloned().unwrap_or_default();
+                next_provider.insert(
+                    "maxRetryDelayMs".to_string(),
+                    serde_json::Number::from_f64(max_delay).map_or(Value::Null, Value::Number),
+                );
+                let retry_object = settings.get_mut("retry").and_then(Value::as_object_mut);
+                if let Some(retry_object) = retry_object {
+                    retry_object.insert("provider".to_string(), Value::Object(next_provider));
+                    retry_object.shift_remove("maxDelayMs");
                 }
+            }
         }
     }
 }
@@ -584,9 +590,22 @@ impl<S: SettingsStorage> std::fmt::Debug for SettingsManager<S> {
 pub type Settings = serde_json::Map<String, Value>;
 
 impl<S: SettingsStorage> SettingsManager<S> {
-    fn new(storage: Arc<S>, global: LoadedSettings, project: LoadedSettings, initial_errors: Vec<SettingsError>, project_trusted: bool, settings_paths: SettingsPaths) -> Self {
-        let LoadedSettings { settings: global_settings, error: global_load_error } = global;
-        let LoadedSettings { settings: project_settings, error: project_load_error } = project;
+    fn new(
+        storage: Arc<S>,
+        global: LoadedSettings,
+        project: LoadedSettings,
+        initial_errors: Vec<SettingsError>,
+        project_trusted: bool,
+        settings_paths: SettingsPaths,
+    ) -> Self {
+        let LoadedSettings {
+            settings: global_settings,
+            error: global_load_error,
+        } = global;
+        let LoadedSettings {
+            settings: project_settings,
+            error: project_load_error,
+        } = project;
         let settings = deep_merge_settings(&global_settings, &project_settings);
         Self {
             storage,
@@ -620,7 +639,8 @@ impl<S: SettingsStorage> SettingsManager<S> {
         let storage = Arc::new(storage);
         let project_trusted = options.project_trusted.unwrap_or(true);
         let global_load = Self::try_load_from_storage(&storage, SettingsScope::Global, true);
-        let project_load = Self::try_load_from_storage(&storage, SettingsScope::Project, project_trusted);
+        let project_load =
+            Self::try_load_from_storage(&storage, SettingsScope::Project, project_trusted);
         let mut initial_errors = Vec::new();
         if let Some(error) = &global_load.error {
             initial_errors.push(SettingsError {
@@ -636,10 +656,21 @@ impl<S: SettingsStorage> SettingsManager<S> {
                 message: error.clone(),
             });
         }
-        Self::new(storage, global_load, project_load, initial_errors, project_trusted, settings_paths)
+        Self::new(
+            storage,
+            global_load,
+            project_load,
+            initial_errors,
+            project_trusted,
+            settings_paths,
+        )
     }
 
-    fn load_from_storage(storage: &S, scope: SettingsScope, project_trusted: bool) -> Result<Settings, String> {
+    fn load_from_storage(
+        storage: &S,
+        scope: SettingsScope,
+        project_trusted: bool,
+    ) -> Result<Settings, String> {
         if scope == SettingsScope::Project && !project_trusted {
             return Ok(Settings::new());
         }
@@ -663,7 +694,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
         Ok(settings)
     }
 
-    fn try_load_from_storage(storage: &S, scope: SettingsScope, project_trusted: bool) -> LoadedSettings {
+    fn try_load_from_storage(
+        storage: &S,
+        scope: SettingsScope,
+        project_trusted: bool,
+    ) -> LoadedSettings {
         match Self::load_from_storage(storage, scope, project_trusted) {
             Ok(settings) => LoadedSettings {
                 settings,
@@ -715,7 +750,8 @@ impl<S: SettingsStorage> SettingsManager<S> {
             self.settings = deep_merge_settings(&self.global_settings, &self.project_settings);
             return;
         }
-        let project_load = Self::try_load_from_storage(&self.storage, SettingsScope::Project, trusted);
+        let project_load =
+            Self::try_load_from_storage(&self.storage, SettingsScope::Project, trusted);
         self.project_settings = project_load.settings;
         self.project_load_error = project_load.error.clone();
         if let Some(error) = project_load.error {
@@ -741,7 +777,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
         self.modified.clear();
         self.modified_project.clear();
 
-        let project_load = Self::try_load_from_storage(&self.storage, SettingsScope::Project, self.project_trusted);
+        let project_load = Self::try_load_from_storage(
+            &self.storage,
+            SettingsScope::Project,
+            self.project_trusted,
+        );
         if project_load.error.is_none() {
             self.project_settings = project_load.settings;
             self.project_load_error = None;
@@ -827,7 +867,9 @@ impl<S: SettingsStorage> SettingsManager<S> {
                     let in_memory_nested = value.and_then(Value::as_object);
                     let mut merged_nested = base_nested;
                     for nested_key in nested_modified {
-                        if let Some(nested_value) = in_memory_nested.and_then(|nested| nested.get(nested_key)) {
+                        if let Some(nested_value) =
+                            in_memory_nested.and_then(|nested| nested.get(nested_key))
+                        {
                             merged_nested.insert(nested_key.clone(), nested_value.clone());
                         }
                     }
@@ -920,18 +962,26 @@ impl<S: SettingsStorage> SettingsManager<S> {
     }
 
     fn merged_get_nested(&self, key: &str, nested_key: &str) -> Option<&Value> {
-        self.settings.get(key).and_then(|value| value.get(nested_key))
+        self.settings
+            .get(key)
+            .and_then(|value| value.get(nested_key))
     }
 
     /// The last-seen changelog version, upstream's `getLastChangelogVersion`.
     #[must_use]
     pub fn get_last_changelog_version(&self) -> Option<String> {
-        self.merged_get("lastChangelogVersion").and_then(Value::as_str).map(str::to_string)
+        self.merged_get("lastChangelogVersion")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Record the changelog version, upstream's `setLastChangelogVersion`.
     pub fn set_last_changelog_version(&mut self, version: &str) {
-        self.set_global("lastChangelogVersion", Value::String(version.to_string()), None);
+        self.set_global(
+            "lastChangelogVersion",
+            Value::String(version.to_string()),
+            None,
+        );
     }
 
     /// The session directory, upstream's `getSessionDir` — tilde-expanded
@@ -940,19 +990,26 @@ impl<S: SettingsStorage> SettingsManager<S> {
     pub fn get_session_dir(&self) -> Option<String> {
         self.merged_get("sessionDir")
             .and_then(Value::as_str)
-            .map(|session_dir| normalize_path(session_dir, &PathInputOptions::default()).unwrap_or_else(|_| session_dir.to_string()))
+            .map(|session_dir| {
+                normalize_path(session_dir, &PathInputOptions::default())
+                    .unwrap_or_else(|_| session_dir.to_string())
+            })
     }
 
     /// The default provider, upstream's `getDefaultProvider`.
     #[must_use]
     pub fn get_default_provider(&self) -> Option<String> {
-        self.merged_get("defaultProvider").and_then(Value::as_str).map(str::to_string)
+        self.merged_get("defaultProvider")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// The default model, upstream's `getDefaultModel`.
     #[must_use]
     pub fn get_default_model(&self) -> Option<String> {
-        self.merged_get("defaultModel").and_then(Value::as_str).map(str::to_string)
+        self.merged_get("defaultModel")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Set the default provider, upstream's `setDefaultProvider`.
@@ -981,7 +1038,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the steering mode, upstream's `setSteeringMode`.
     pub fn set_steering_mode(&mut self, mode: QueueMode) {
-        self.set_global("steeringMode", Value::String(mode.as_str().to_string()), None);
+        self.set_global(
+            "steeringMode",
+            Value::String(mode.as_str().to_string()),
+            None,
+        );
     }
 
     /// The follow-up mode, upstream's `getFollowUpMode`.
@@ -994,14 +1055,20 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the follow-up mode, upstream's `setFollowUpMode`.
     pub fn set_follow_up_mode(&mut self, mode: QueueMode) {
-        self.set_global("followUpMode", Value::String(mode.as_str().to_string()), None);
+        self.set_global(
+            "followUpMode",
+            Value::String(mode.as_str().to_string()),
+            None,
+        );
     }
 
     /// The raw theme setting, upstream's `getThemeSetting`: any non-string
     /// reads as unset.
     #[must_use]
     pub fn get_theme_setting(&self) -> Option<String> {
-        self.merged_get("theme").and_then(Value::as_str).map(str::to_string)
+        self.merged_get("theme")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// The fixed theme name, upstream's `getTheme`: slash-separated
@@ -1033,7 +1100,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// One model's thinking-level override, upstream's
     /// `getModelThinkingLevel`.
     #[must_use]
-    pub fn get_model_thinking_level(&self, provider: &str, model_id: &str) -> Option<ThinkingLevel> {
+    pub fn get_model_thinking_level(
+        &self,
+        provider: &str,
+        model_id: &str,
+    ) -> Option<ThinkingLevel> {
         let levels = self.merged_get("modelThinkingLevels")?;
         serde_json::from_value(levels.get(format!("{provider}/{model_id}")).cloned()?).ok()
     }
@@ -1050,9 +1121,18 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set one model's thinking-level override, upstream's
     /// `setModelThinkingLevel`.
-    pub fn set_model_thinking_level(&mut self, provider: &str, model_id: &str, level: ThinkingLevel) {
+    pub fn set_model_thinking_level(
+        &mut self,
+        provider: &str,
+        model_id: &str,
+        level: ThinkingLevel,
+    ) {
         let value = serde_json::to_value(level).unwrap_or(Value::Null);
-        self.set_global("modelThinkingLevels", value, Some(&format!("{provider}/{model_id}")));
+        self.set_global(
+            "modelThinkingLevels",
+            value,
+            Some(&format!("{provider}/{model_id}")),
+        );
     }
 
     /// Remove one model's thinking-level override, upstream's
@@ -1076,8 +1156,12 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The transport, upstream's `getTransport`.
     #[must_use]
     pub fn get_transport(&self) -> Transport {
-        serde_json::from_value(self.merged_get("transport").cloned().unwrap_or(Value::String("auto".to_string())))
-            .unwrap_or(Transport::Auto)
+        serde_json::from_value(
+            self.merged_get("transport")
+                .cloned()
+                .unwrap_or(Value::String("auto".to_string())),
+        )
+        .unwrap_or(Transport::Auto)
     }
 
     /// Set the transport, upstream's `setTransport`.
@@ -1104,15 +1188,19 @@ impl<S: SettingsStorage> SettingsManager<S> {
         field: &str,
         model: Option<&ModelKey>,
     ) -> Result<i64, String> {
+        // Upstream validates with a `!== undefined` gate ahead of the `??`
+        // chain, so a JSON `null` present in the file is invalid input, not
+        // an unset setting — dropping the key is the unset spelling.
         let compaction = self.merged_get("compaction");
         let ordinary = compaction.and_then(|compaction| compaction.get(field));
         if let Some(ordinary) = ordinary
-            && !ordinary.is_null() && !is_non_negative_safe_integer(ordinary) {
-                return Err(format!(
-                    "Invalid compaction.{field} setting: {}. Expected a non-negative safe integer.",
-                    js_string(ordinary)
-                ));
-            }
+            && !is_non_negative_safe_integer(ordinary)
+        {
+            return Err(format!(
+                "Invalid compaction.{field} setting: {}. Expected a non-negative safe integer.",
+                js_string(ordinary)
+            ));
+        }
 
         let model_key = model.map(ModelKey::key);
         let entry = model_key.as_deref().and_then(|model_key| {
@@ -1121,22 +1209,24 @@ impl<S: SettingsStorage> SettingsManager<S> {
                 .and_then(|overrides| overrides.get(model_key))
         });
         if let Some(entry) = entry
-            && !entry.is_null() && !is_mergeable_object(entry) {
-                return Err(format!(
-                    "Invalid compaction.modelOverrides[\"{}\"] setting: {}. Expected an object.",
-                    model_key.unwrap_or_default(),
-                    js_string(entry)
-                ));
-            }
+            && !is_mergeable_object(entry)
+        {
+            return Err(format!(
+                "Invalid compaction.modelOverrides[\"{}\"] setting: {}. Expected an object.",
+                model_key.unwrap_or_default(),
+                js_string(entry)
+            ));
+        }
         let override_value = entry.and_then(|entry| entry.get(field));
         if let Some(override_value) = override_value
-            && !override_value.is_null() && !is_non_negative_safe_integer(override_value) {
-                return Err(format!(
-                    "Invalid compaction.modelOverrides[\"{}\"].{field} setting: {}. Expected a non-negative safe integer.",
-                    model_key.unwrap_or_default(),
-                    js_string(override_value)
-                ));
-            }
+            && !is_non_negative_safe_integer(override_value)
+        {
+            return Err(format!(
+                "Invalid compaction.modelOverrides[\"{}\"].{field} setting: {}. Expected a non-negative safe integer.",
+                model_key.unwrap_or_default(),
+                js_string(override_value)
+            ));
+        }
         let resolved = override_value
             .and_then(Value::as_i64)
             .or_else(|| ordinary.and_then(Value::as_i64));
@@ -1161,7 +1251,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     ///
     /// # Errors
     /// The invalid-setting messages upstream throws.
-    pub fn get_compaction_keep_recent_tokens(&self, model: Option<&ModelKey>) -> Result<i64, String> {
+    pub fn get_compaction_keep_recent_tokens(
+        &self,
+        model: Option<&ModelKey>,
+    ) -> Result<i64, String> {
         self.get_compaction_token_setting("keepRecentTokens", model)
     }
 
@@ -1169,7 +1262,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     ///
     /// # Errors
     /// The invalid-setting messages upstream throws.
-    pub fn get_compaction_settings(&self, model: Option<&ModelKey>) -> Result<CompactionSettings, String> {
+    pub fn get_compaction_settings(
+        &self,
+        model: Option<&ModelKey>,
+    ) -> Result<CompactionSettings, String> {
         Ok(CompactionSettings {
             enabled: self.get_compaction_enabled(),
             reserve_tokens: self.get_compaction_reserve_tokens(model)?,
@@ -1258,7 +1354,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
             if let Some(timeout) = parse_http_idle_timeout_ms(value) {
                 return Ok(Some(timeout));
             }
-            return Err(format!("Invalid {setting_name} setting: {}", js_string(value)));
+            return Err(format!(
+                "Invalid {setting_name} setting: {}",
+                js_string(value)
+            ));
         }
         Ok(None)
     }
@@ -1283,8 +1382,7 @@ impl<S: SettingsStorage> SettingsManager<S> {
         }
         self.set_global(
             "httpIdleTimeoutMs",
-            serde_json::Number::from_f64(timeout_ms.floor())
-                .map_or(Value::Null, Value::Number),
+            serde_json::Number::from_f64(timeout_ms.floor()).map_or(Value::Null, Value::Number),
             None,
         );
         Ok(())
@@ -1337,9 +1435,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     #[must_use]
     pub fn get_external_editor_command_with(&self, env: &EnvLookup) -> String {
         if let Some(editor) = self.merged_get("externalEditor").and_then(Value::as_str)
-            && !editor.trim().is_empty() {
-                return editor.to_string();
-            }
+            && !editor.trim().is_empty()
+        {
+            return editor.to_string();
+        }
         if let Some(editor) = env("VISUAL").filter(|editor| !editor.is_empty()) {
             return editor;
         }
@@ -1359,7 +1458,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     pub fn get_shell_path(&self) -> Option<String> {
         self.merged_get("shellPath")
             .and_then(Value::as_str)
-            .map(|shell_path| normalize_path(shell_path, &PathInputOptions::default()).unwrap_or_else(|_| shell_path.to_string()))
+            .map(|shell_path| {
+                normalize_path(shell_path, &PathInputOptions::default())
+                    .unwrap_or_else(|_| shell_path.to_string())
+            })
     }
 
     /// Set the shell path, upstream's `setShellPath`.
@@ -1374,7 +1476,9 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// Whether startup is quiet, upstream's `getQuietStartup`.
     #[must_use]
     pub fn get_quiet_startup(&self) -> bool {
-        self.merged_get("quietStartup").and_then(Value::as_bool).unwrap_or(false)
+        self.merged_get("quietStartup")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// Set the quiet startup, upstream's `setQuietStartup`.
@@ -1386,7 +1490,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// read from the global scope only, invalid values reading as ask.
     #[must_use]
     pub fn get_default_project_trust(&self) -> DefaultProjectTrust {
-        match self.global_settings.get("defaultProjectTrust").and_then(Value::as_str) {
+        match self
+            .global_settings
+            .get("defaultProjectTrust")
+            .and_then(Value::as_str)
+        {
             Some("always") => DefaultProjectTrust::Always,
             Some("never") => DefaultProjectTrust::Never,
             _ => DefaultProjectTrust::Ask,
@@ -1405,7 +1513,9 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The shell command prefix, upstream's `getShellCommandPrefix`.
     #[must_use]
     pub fn get_shell_command_prefix(&self) -> Option<String> {
-        self.merged_get("shellCommandPrefix").and_then(Value::as_str).map(str::to_string)
+        self.merged_get("shellCommandPrefix")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Set the shell command prefix, upstream's `setShellCommandPrefix`.
@@ -1434,8 +1544,14 @@ impl<S: SettingsStorage> SettingsManager<S> {
     pub fn set_npm_command(&mut self, command: Option<&[String]>) {
         self.set_global(
             "npmCommand",
-            command
-                .map_or(Value::Null, |command| Value::Array(command.iter().map(|part| Value::String(part.clone())).collect())),
+            command.map_or(Value::Null, |command| {
+                Value::Array(
+                    command
+                        .iter()
+                        .map(|part| Value::String(part.clone()))
+                        .collect(),
+                )
+            }),
             None,
         );
     }
@@ -1470,20 +1586,29 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// Whether analytics share, upstream's `getEnableAnalytics`.
     #[must_use]
     pub fn get_enable_analytics(&self) -> bool {
-        self.merged_get("enableAnalytics").and_then(Value::as_bool).unwrap_or(false)
+        self.merged_get("enableAnalytics")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 
     /// The analytics tracking identifier, upstream's `getTrackingId`.
     #[must_use]
     pub fn get_tracking_id(&self) -> Option<String> {
-        self.merged_get("trackingId").and_then(Value::as_str).map(str::to_string)
+        self.merged_get("trackingId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     }
 
     /// Set the analytics opt-in, upstream's `setEnableAnalytics`: the first
     /// opt-in generates the tracking identifier.
     pub fn set_enable_analytics(&mut self, enabled: bool) {
         self.set_global("enableAnalytics", Value::Bool(enabled), None);
-        if enabled && self.global_settings.get("trackingId").is_none_or(Value::is_null) {
+        if enabled
+            && self
+                .global_settings
+                .get("trackingId")
+                .is_none_or(Value::is_null)
+        {
             let tracking_id = uuid::Uuid::new_v4().to_string();
             self.set_global("trackingId", Value::String(tracking_id), None);
         }
@@ -1493,7 +1618,8 @@ impl<S: SettingsStorage> SettingsManager<S> {
     #[must_use]
     pub fn get_packages(&self) -> Vec<Value> {
         self.merged_get("packages")
-            .and_then(Value::as_array).cloned()
+            .and_then(Value::as_array)
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -1520,7 +1646,16 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the extension paths, upstream's `setExtensionPaths`.
     pub fn set_extension_paths(&mut self, paths: &[String]) {
-        self.set_global("extensions", Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()), None);
+        self.set_global(
+            "extensions",
+            Value::Array(
+                paths
+                    .iter()
+                    .map(|path| Value::String(path.clone()))
+                    .collect(),
+            ),
+            None,
+        );
     }
 
     /// Set the project extension paths, upstream's
@@ -1532,7 +1667,12 @@ impl<S: SettingsStorage> SettingsManager<S> {
         self.update_project_settings("extensions", |settings| {
             settings.insert(
                 "extensions".to_string(),
-                Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()),
+                Value::Array(
+                    paths
+                        .iter()
+                        .map(|path| Value::String(path.clone()))
+                        .collect(),
+                ),
             );
         })
     }
@@ -1545,7 +1685,16 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the skill paths, upstream's `setSkillPaths`.
     pub fn set_skill_paths(&mut self, paths: &[String]) {
-        self.set_global("skills", Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()), None);
+        self.set_global(
+            "skills",
+            Value::Array(
+                paths
+                    .iter()
+                    .map(|path| Value::String(path.clone()))
+                    .collect(),
+            ),
+            None,
+        );
     }
 
     /// Set the project skill paths, upstream's `setProjectSkillPaths`.
@@ -1556,7 +1705,12 @@ impl<S: SettingsStorage> SettingsManager<S> {
         self.update_project_settings("skills", |settings| {
             settings.insert(
                 "skills".to_string(),
-                Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()),
+                Value::Array(
+                    paths
+                        .iter()
+                        .map(|path| Value::String(path.clone()))
+                        .collect(),
+                ),
             );
         })
     }
@@ -1569,7 +1723,16 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the prompt-template paths, upstream's `setPromptTemplatePaths`.
     pub fn set_prompt_template_paths(&mut self, paths: &[String]) {
-        self.set_global("prompts", Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()), None);
+        self.set_global(
+            "prompts",
+            Value::Array(
+                paths
+                    .iter()
+                    .map(|path| Value::String(path.clone()))
+                    .collect(),
+            ),
+            None,
+        );
     }
 
     /// Set the project prompt-template paths, upstream's
@@ -1581,7 +1744,12 @@ impl<S: SettingsStorage> SettingsManager<S> {
         self.update_project_settings("prompts", |settings| {
             settings.insert(
                 "prompts".to_string(),
-                Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()),
+                Value::Array(
+                    paths
+                        .iter()
+                        .map(|path| Value::String(path.clone()))
+                        .collect(),
+                ),
             );
         })
     }
@@ -1594,7 +1762,16 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the theme paths, upstream's `setThemePaths`.
     pub fn set_theme_paths(&mut self, paths: &[String]) {
-        self.set_global("themes", Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()), None);
+        self.set_global(
+            "themes",
+            Value::Array(
+                paths
+                    .iter()
+                    .map(|path| Value::String(path.clone()))
+                    .collect(),
+            ),
+            None,
+        );
     }
 
     /// Set the project theme paths, upstream's `setProjectThemePaths`.
@@ -1605,7 +1782,12 @@ impl<S: SettingsStorage> SettingsManager<S> {
         self.update_project_settings("themes", |settings| {
             settings.insert(
                 "themes".to_string(),
-                Value::Array(paths.iter().map(|path| Value::String(path.clone())).collect()),
+                Value::Array(
+                    paths
+                        .iter()
+                        .map(|path| Value::String(path.clone()))
+                        .collect(),
+                ),
             );
         })
     }
@@ -1628,7 +1810,9 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The thinking budgets, upstream's `getThinkingBudgets`.
     #[must_use]
     pub fn get_thinking_budgets(&self) -> Option<Settings> {
-        self.merged_get("thinkingBudgets").and_then(Value::as_object).cloned()
+        self.merged_get("thinkingBudgets")
+            .and_then(Value::as_object)
+            .cloned()
     }
 
     /// The terminal capability overrides, upstream's
@@ -1637,12 +1821,19 @@ impl<S: SettingsStorage> SettingsManager<S> {
     #[must_use]
     pub fn get_terminal_capability_overrides(&self) -> CapabilityOverrides {
         let terminal = self.merged_get("terminal");
-        let images = terminal.and_then(|terminal| terminal.get("images")).and_then(Value::as_str);
-        let images_override = match images {
-            Some("kitty") => Some(Some(pi_tui::terminal_image::ImageProtocol::Kitty)),
-            Some("iterm2") => Some(Some(pi_tui::terminal_image::ImageProtocol::Iterm2)),
-            Some("auto") | None => None,
-            _ => Some(None),
+        // Upstream spreads `{ images: null }` only when `images === false`;
+        // every other value — absent, "auto", or a string the protocol list
+        // does not name — omits the field, so the raw value must be read
+        // rather than its string projection.
+        let images_override = match terminal.and_then(|terminal| terminal.get("images")) {
+            Some(Value::String(protocol)) if protocol == "kitty" => {
+                Some(Some(pi_tui::terminal_image::ImageProtocol::Kitty))
+            }
+            Some(Value::String(protocol)) if protocol == "iterm2" => {
+                Some(Some(pi_tui::terminal_image::ImageProtocol::Iterm2))
+            }
+            Some(Value::Bool(false)) => Some(None),
+            _ => None,
         };
         let true_color = terminal
             .and_then(|terminal| terminal.get("trueColor"))
@@ -1673,7 +1864,9 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The inline image width in cells, upstream's `getImageWidthCells`.
     #[must_use]
     pub fn get_image_width_cells(&self) -> i64 {
-        let width = self.merged_get_nested("terminal", "imageWidthCells").and_then(Value::as_f64);
+        let width = self
+            .merged_get_nested("terminal", "imageWidthCells")
+            .and_then(Value::as_f64);
         match width {
             Some(width) if width.is_finite() => {
                 #[expect(
@@ -1734,7 +1927,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the terminal progress, upstream's `setShowTerminalProgress`.
     pub fn set_show_terminal_progress(&mut self, enabled: bool) {
-        self.set_global("terminal", Value::Bool(enabled), Some("showTerminalProgress"));
+        self.set_global(
+            "terminal",
+            Value::Bool(enabled),
+            Some("showTerminalProgress"),
+        );
     }
 
     /// The TUI mode, upstream's `getTuiMode`.
@@ -1758,7 +1955,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The fullscreen exit output, upstream's `getFullscreenExitOutput`.
     #[must_use]
     pub fn get_fullscreen_exit_output(&self) -> FullscreenExitOutput {
-        match self.merged_get("fullscreenExitOutput").and_then(Value::as_str) {
+        match self
+            .merged_get("fullscreenExitOutput")
+            .and_then(Value::as_str)
+        {
             Some("resume-hint") => FullscreenExitOutput::ResumeHint,
             _ => FullscreenExitOutput::Transcript,
         }
@@ -1770,13 +1970,20 @@ impl<S: SettingsStorage> SettingsManager<S> {
             FullscreenExitOutput::ResumeHint => "resume-hint",
             FullscreenExitOutput::Transcript => "transcript",
         };
-        self.set_global("fullscreenExitOutput", Value::String(value.to_string()), None);
+        self.set_global(
+            "fullscreenExitOutput",
+            Value::String(value.to_string()),
+            None,
+        );
     }
 
     /// The fullscreen scrollbar mode, upstream's `getFullscreenScrollbar`.
     #[must_use]
     pub fn get_fullscreen_scrollbar(&self) -> ScrollViewScrollbar {
-        match self.merged_get("fullscreenScrollbar").and_then(Value::as_str) {
+        match self
+            .merged_get("fullscreenScrollbar")
+            .and_then(Value::as_str)
+        {
             Some("always") => ScrollViewScrollbar::Always,
             Some("hidden") => ScrollViewScrollbar::Hidden,
             _ => ScrollViewScrollbar::Auto,
@@ -1790,7 +1997,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
             ScrollViewScrollbar::Hidden => "hidden",
             ScrollViewScrollbar::Auto => "auto",
         };
-        self.set_global("fullscreenScrollbar", Value::String(value.to_string()), None);
+        self.set_global(
+            "fullscreenScrollbar",
+            Value::String(value.to_string()),
+            None,
+        );
     }
 
     /// Whether selection copies, upstream's `getFullscreenCopyOnSelect`.
@@ -1835,15 +2046,22 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The enabled model patterns, upstream's `getEnabledModels`.
     #[must_use]
     pub fn get_enabled_models(&self) -> Option<Vec<String>> {
-        self.merged_get("enabledModels").map(|value| string_array(Some(value)))
+        self.merged_get("enabledModels")
+            .map(|value| string_array(Some(value)))
     }
 
     /// Set the enabled model patterns, upstream's `setEnabledModels`.
     pub fn set_enabled_models(&mut self, patterns: Option<&[String]>) {
         self.set_global(
             "enabledModels",
-            patterns
-                .map_or(Value::Null, |patterns| Value::Array(patterns.iter().map(|pattern| Value::String(pattern.clone())).collect())),
+            patterns.map_or(Value::Null, |patterns| {
+                Value::Array(
+                    patterns
+                        .iter()
+                        .map(|pattern| Value::String(pattern.clone()))
+                        .collect(),
+                )
+            }),
             None,
         );
     }
@@ -1851,15 +2069,22 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The initial built-in tool selection, upstream's `getDefaultTools`.
     #[must_use]
     pub fn get_default_tools(&self) -> Option<Vec<String>> {
-        self.merged_get("defaultTools").map(|value| string_array(Some(value)))
+        self.merged_get("defaultTools")
+            .map(|value| string_array(Some(value)))
     }
 
     /// Set the built-in tool selection, upstream's `setDefaultTools`.
     pub fn set_default_tools(&mut self, tools: Option<&[String]>) {
         self.set_global(
             "defaultTools",
-            tools
-                .map_or(Value::Null, |tools| Value::Array(tools.iter().map(|tool| Value::String(tool.clone())).collect())),
+            tools.map_or(Value::Null, |tools| {
+                Value::Array(
+                    tools
+                        .iter()
+                        .map(|tool| Value::String(tool.clone()))
+                        .collect(),
+                )
+            }),
             None,
         );
     }
@@ -1867,7 +2092,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The double-escape action, upstream's `getDoubleEscapeAction`.
     #[must_use]
     pub fn get_double_escape_action(&self) -> &str {
-        match self.merged_get("doubleEscapeAction").and_then(Value::as_str) {
+        match self
+            .merged_get("doubleEscapeAction")
+            .and_then(Value::as_str)
+        {
             Some("fork") => "fork",
             Some("none") => "none",
             _ => "tree",
@@ -1876,7 +2104,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the double-escape action, upstream's `setDoubleEscapeAction`.
     pub fn set_double_escape_action(&mut self, action: &str) {
-        self.set_global("doubleEscapeAction", Value::String(action.to_string()), None);
+        self.set_global(
+            "doubleEscapeAction",
+            Value::String(action.to_string()),
+            None,
+        );
     }
 
     /// The tree filter mode, upstream's `getTreeFilterMode`: invalid values
@@ -1908,7 +2140,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// injected environment lookup.
     #[must_use]
     pub fn get_show_hardware_cursor_with(&self, env: &EnvLookup) -> bool {
-        if let Some(enabled) = self.merged_get("showHardwareCursor").and_then(Value::as_bool) {
+        if let Some(enabled) = self
+            .merged_get("showHardwareCursor")
+            .and_then(Value::as_bool)
+        {
             return enabled;
         }
         env("PI_HARDWARE_CURSOR").is_some_and(|value| value == "1")
@@ -1935,7 +2170,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
             reason = "Math.floor restatement: the fraction drops the way upstream's floor does"
         )]
         let clamped = (padding.floor() as i64).clamp(0, 3);
-        self.set_global("editorPaddingX", Value::Number(serde_json::Number::from(clamped)), None);
+        self.set_global(
+            "editorPaddingX",
+            Value::Number(serde_json::Number::from(clamped)),
+            None,
+        );
     }
 
     /// The chat output padding, upstream's `getOutputPad`.
@@ -1946,7 +2185,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the chat output padding, upstream's `setOutputPad`.
     pub fn set_output_pad(&mut self, padding: u8) {
-        self.set_global("outputPad", Value::Number(serde_json::Number::from(padding)), None);
+        self.set_global(
+            "outputPad",
+            Value::Number(serde_json::Number::from(padding)),
+            None,
+        );
     }
 
     /// The autocomplete dropdown cap, upstream's `getAutocompleteMaxVisible`.
@@ -1965,7 +2208,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
             reason = "Math.floor restatement: the fraction drops the way upstream's floor does"
         )]
         let clamped = (max_visible.floor() as i64).clamp(3, 20);
-        self.set_global("autocompleteMaxVisible", Value::Number(serde_json::Number::from(clamped)), None);
+        self.set_global(
+            "autocompleteMaxVisible",
+            Value::Number(serde_json::Number::from(clamped)),
+            None,
+        );
     }
 
     /// The code-block indent, upstream's `getCodeBlockIndent`.
@@ -1980,7 +2227,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
     /// The mermaid rendering mode, upstream's `getMermaidRenderingMode`.
     #[must_use]
     pub fn get_mermaid_rendering_mode(&self) -> MermaidRenderingMode {
-        match self.merged_get_nested("markdown", "mermaid").and_then(Value::as_str) {
+        match self
+            .merged_get_nested("markdown", "mermaid")
+            .and_then(Value::as_str)
+        {
             Some("off") => MermaidRenderingMode::Off,
             Some("final") => MermaidRenderingMode::Final,
             _ => MermaidRenderingMode::Streaming,
@@ -1994,7 +2244,11 @@ impl<S: SettingsStorage> SettingsManager<S> {
             MermaidRenderingMode::Final => "final",
             MermaidRenderingMode::Streaming => "streaming",
         };
-        self.set_global("markdown", Value::String(value.to_string()), Some("mermaid"));
+        self.set_global(
+            "markdown",
+            Value::String(value.to_string()),
+            Some("mermaid"),
+        );
     }
 
     /// The warning toggles, upstream's `getWarnings`.
@@ -2058,7 +2312,8 @@ impl SettingsManager<FileSettingsStorage> {
     #[must_use]
     pub fn create(cwd: &str, agent_dir: &str, options: SettingsManagerCreateOptions) -> Self {
         let resolved_cwd = resolve_path(cwd, &process_cwd(), &crate::config::home_dir());
-        let resolved_agent_dir = resolve_path(agent_dir, &process_cwd(), &crate::config::home_dir());
+        let resolved_agent_dir =
+            resolve_path(agent_dir, &process_cwd(), &crate::config::home_dir());
         let storage = FileSettingsStorage::new(&resolved_cwd, &resolved_agent_dir);
         let settings_paths = SettingsPaths {
             global: Some(format!("{resolved_agent_dir}/settings.json")),

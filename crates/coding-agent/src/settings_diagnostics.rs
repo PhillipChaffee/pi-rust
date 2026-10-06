@@ -35,7 +35,11 @@ pub fn collect_settings_diagnostics<S: crate::settings_manager::SettingsStorage>
             diagnostic_type: "warning".to_string(),
             message: match error.path {
                 Some(path) => format!("Invalid settings file {path}: {}", error.message),
-                None => format!("Invalid {} settings: {}", scope_name(error.scope), error.message),
+                None => format!(
+                    "Invalid {} settings: {}",
+                    scope_name(error.scope),
+                    error.message
+                ),
             },
         })
         .collect()

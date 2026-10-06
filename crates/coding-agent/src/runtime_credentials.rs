@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use indexmap::IndexMap;
 use pi_ai::auth::credential_store::CredentialStore;
 use pi_ai::auth::types::{
-    ApiKeyCredential, AuthError, AuthOptions, AuthType, Credential, CredentialInfo, CredentialModifyFn,
+    ApiKeyCredential, AuthError, AuthOptions, AuthType, Credential, CredentialInfo,
+    CredentialModifyFn,
 };
 use pi_ai::types::BoxedFuture;
 use pi_ai::utils::abort::AbortError;
@@ -62,14 +63,20 @@ impl RuntimeCredentials {
 
     /// Drop the runtime API key, upstream's `removeRuntimeApiKey`.
     pub fn remove_runtime_api_key(&self, provider_id: &str) {
-        self.overrides.lock().unwrap_or_else(std::sync::PoisonError::into_inner).shift_remove(provider_id);
+        self.overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shift_remove(provider_id);
     }
 
     /// Whether the provider has a runtime API key, upstream's
     /// `hasRuntimeApiKey`.
     #[must_use]
     pub fn has_runtime_api_key(&self, provider_id: &str) -> bool {
-        self.overrides.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(provider_id)
+        self.overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(provider_id)
     }
 }
 
@@ -97,7 +104,10 @@ impl CredentialStore for RuntimeCredentials {
         })
     }
 
-    fn list<'a>(&'a self, options: Option<&'a AuthOptions>) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
+    fn list<'a>(
+        &'a self,
+        options: Option<&'a AuthOptions>,
+    ) -> BoxedFuture<'a, Result<Vec<CredentialInfo>, AuthError>> {
         Box::pin(async move {
             let mut entries: IndexMap<String, CredentialInfo> = self
                 .store
@@ -107,7 +117,10 @@ impl CredentialStore for RuntimeCredentials {
                 .map(|entry| (entry.provider_id.clone(), entry))
                 .collect();
             signal_check(options)?;
-            let overrides = self.overrides.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let overrides = self
+                .overrides
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             for (provider_id, _) in overrides.iter() {
                 entries.insert(
                     provider_id.clone(),

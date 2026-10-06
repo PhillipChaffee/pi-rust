@@ -16,6 +16,10 @@
 //! - The colored `console.log` lines carry through a printer seam
 //!   ([`run_migrations_with`]); the plain [`run_migrations`] prints them
 //!   uncolored, the chalk dependency riding the CLI's runtime styling.
+//! - The sweep sources its agent dir through `getAgentDir()`, upstream's
+//!   `process.env[ENV_AGENT_DIR]` test rig rides the env-independent
+//!   [`run_migrations_with_in`], the `_in` counterpart the auth and session
+//!   migrations already carry.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -23,12 +27,11 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::config::{encode_session_cwd, get_agent_dir, get_bin_dir, CONFIG_DIR_NAME};
+use crate::config::{CONFIG_DIR_NAME, encode_session_cwd, get_agent_dir};
 use crate::utils::text::strip_bom;
 
 /// The extension-migration guide, upstream's `MIGRATION_GUIDE_URL`.
-pub const MIGRATION_GUIDE_URL: &str =
-    "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
+pub const MIGRATION_GUIDE_URL: &str = "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
 /// The extensions documentation, upstream's `EXTENSIONS_DOC_URL`.
 pub const EXTENSIONS_DOC_URL: &str =
     "https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md";
@@ -39,7 +42,9 @@ pub type Printer<'a> = &'a mut dyn FnMut(&str);
 /// The keybindings migration seam, upstream's `migrateKeybindingsConfig`
 /// until the interactive-shell ticket lands the real table.
 pub type KeybindingsMigrator<'a> =
-    &'a mut dyn FnMut(&serde_json::Map<String, Value>) -> Option<(serde_json::Map<String, Value>, bool)>;
+    &'a mut dyn FnMut(
+        &serde_json::Map<String, Value>,
+    ) -> Option<(serde_json::Map<String, Value>, bool)>;
 
 /// Migrate legacy oauth.json and settings.json apiKeys to auth.json,
 /// upstream's `migrateAuthToAuthJson`.
@@ -54,7 +59,7 @@ pub fn migrate_auth_to_auth_json() -> Result<Vec<String>, String> {
     migrate_auth_to_auth_json_in(&get_agent_dir())
 }
 
-/// [`migrate_auth_to_auth_json`](migrate_auth_to_auth_json) against an
+/// [`migrate_auth_to_auth_json`] against an
 /// explicit agent directory, the test form.
 ///
 /// # Errors
@@ -76,7 +81,8 @@ pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Result<Vec<String>, Str
     // Migrate oauth.json.
     if Path::new(&oauth_path).exists() {
         let outcome = (|| {
-            let content = std::fs::read_to_string(&oauth_path).map_err(|error| error.to_string())?;
+            let content =
+                std::fs::read_to_string(&oauth_path).map_err(|error| error.to_string())?;
             let oauth: Value =
                 serde_json::from_str(strip_bom(&content)).map_err(|error| error.to_string())?;
             let Some(entries) = oauth.as_object() else {
@@ -91,7 +97,8 @@ pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Result<Vec<String>, Str
                 migrated.insert(provider.clone(), Value::Object(credential));
                 providers.push(provider.clone());
             }
-            std::fs::rename(&oauth_path, format!("{oauth_path}.migrated")).map_err(|error| error.to_string())
+            std::fs::rename(&oauth_path, format!("{oauth_path}.migrated"))
+                .map_err(|error| error.to_string())
         })();
         // Skip on error.
         let _ = outcome;
@@ -100,21 +107,23 @@ pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Result<Vec<String>, Str
     // Migrate settings.json apiKeys.
     if Path::new(&settings_path).exists() {
         let outcome = (|| {
-            let content = std::fs::read_to_string(&settings_path).map_err(|error| error.to_string())?;
-            let mut settings: serde_json::Map<String, Value> = serde_json::from_str(strip_bom(&content))
-                .map_err(|error| error.to_string())?;
+            let content =
+                std::fs::read_to_string(&settings_path).map_err(|error| error.to_string())?;
+            let mut settings: serde_json::Map<String, Value> =
+                serde_json::from_str(strip_bom(&content)).map_err(|error| error.to_string())?;
             let Some(api_keys) = settings.get("apiKeys").and_then(Value::as_object) else {
                 return Ok(());
             };
             for (provider, key) in api_keys {
                 if !migrated.contains_key(provider)
-                    && let Some(key) = key.as_str() {
-                        let mut credential = serde_json::Map::new();
-                        credential.insert("type".to_string(), Value::String("api_key".to_string()));
-                        credential.insert("key".to_string(), Value::String(key.to_string()));
-                        migrated.insert(provider.clone(), Value::Object(credential));
-                        providers.push(provider.clone());
-                    }
+                    && let Some(key) = key.as_str()
+                {
+                    let mut credential = serde_json::Map::new();
+                    credential.insert("type".to_string(), Value::String("api_key".to_string()));
+                    credential.insert("key".to_string(), Value::String(key.to_string()));
+                    migrated.insert(provider.clone(), Value::Object(credential));
+                    providers.push(provider.clone());
+                }
             }
             settings.shift_remove("apiKeys");
             std::fs::write(
@@ -159,8 +168,8 @@ pub fn migrate_sessions_from_agent_root() {
     migrate_sessions_from_agent_root_in(&get_agent_dir());
 }
 
-/// [`migrate_sessions_from_agent_root`](migrate_sessions_from_agent_root)
-/// against an explicit agent directory, the test form.
+/// [`migrate_sessions_from_agent_root`] against an explicit agent
+/// directory, the test form.
 pub fn migrate_sessions_from_agent_root_in(agent_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(agent_dir) else {
         return;
@@ -186,7 +195,8 @@ pub fn migrate_sessions_from_agent_root_in(agent_dir: &Path) {
             if first_line.trim().is_empty() {
                 return Ok(());
             }
-            let header: Value = serde_json::from_str(first_line).map_err(|error| error.to_string())?;
+            let header: Value =
+                serde_json::from_str(first_line).map_err(|error| error.to_string())?;
             if header.get("type").and_then(Value::as_str) != Some("session") {
                 return Ok(());
             }
@@ -241,8 +251,8 @@ fn migrate_commands_to_prompts(base_dir: &str, label: &str, print: Printer<'_>) 
 
 /// Migrate `keybindings.json` through the migrator seam, upstream's
 /// `migrateKeybindingsConfigFile`. Malformed files ignore silently.
-fn migrate_keybindings_config_file(migrate: KeybindingsMigrator<'_>) {
-    let config_path = get_agent_dir().join("keybindings.json");
+fn migrate_keybindings_config_file_in(agent_dir: &Path, migrate: KeybindingsMigrator<'_>) {
+    let config_path = agent_dir.join("keybindings.json");
     if !config_path.exists() {
         return;
     }
@@ -261,7 +271,10 @@ fn migrate_keybindings_config_file(migrate: KeybindingsMigrator<'_>) {
         }
         std::fs::write(
             &config_path,
-            format!("{}\n", serde_json::to_string_pretty(&migrated_config).map_err(|error| error.to_string())?),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&migrated_config).map_err(|error| error.to_string())?
+            ),
         )
         .map_err(|error| error.to_string())
     })();
@@ -270,11 +283,11 @@ fn migrate_keybindings_config_file(migrate: KeybindingsMigrator<'_>) {
 }
 
 /// Move fd/rg binaries from `tools/` to `bin/`, upstream's
-/// `migrateToolsToBin`.
-fn migrate_tools_to_bin(print: Printer<'_>) {
-    let agent_dir = get_agent_dir();
+/// `migrateToolsToBin`. The bin dir derives from the same agent dir,
+/// upstream's `getBinDir()` over the env-resolved agent dir.
+fn migrate_tools_to_bin_in(agent_dir: &Path, print: Printer<'_>) {
     let tools_dir = agent_dir.join("tools");
-    let bin_dir = get_bin_dir();
+    let bin_dir = agent_dir.join("bin");
 
     if !tools_dir.exists() {
         return;
@@ -314,7 +327,9 @@ fn check_deprecated_extension_dirs(base_dir: &str, label: &str) -> Vec<String> {
     let mut warnings = Vec::new();
 
     if hooks_dir.exists() {
-        warnings.push(format!("{label} hooks/ directory found. Hooks have been renamed to extensions."));
+        warnings.push(format!(
+            "{label} hooks/ directory found. Hooks have been renamed to extensions."
+        ));
     }
 
     if tools_dir.exists() {
@@ -346,15 +361,17 @@ fn check_deprecated_extension_dirs(base_dir: &str, label: &str) -> Vec<String> {
 
 /// Run the extension-system migrations and collect the deprecation
 /// warnings, upstream's `migrateExtensionSystem`.
-fn migrate_extension_system(cwd: &str, print: Printer<'_>) -> Vec<String> {
-    let agent_dir = get_agent_dir();
+fn migrate_extension_system_in(cwd: &str, agent_dir: &Path, print: Printer<'_>) -> Vec<String> {
     let project_dir = Path::new(cwd).join(CONFIG_DIR_NAME);
 
     migrate_commands_to_prompts(&agent_dir.to_string_lossy(), "Global", print);
     migrate_commands_to_prompts(&project_dir.to_string_lossy(), "Project", print);
 
     let mut warnings = check_deprecated_extension_dirs(&agent_dir.to_string_lossy(), "Global");
-    warnings.extend(check_deprecated_extension_dirs(&project_dir.to_string_lossy(), "Project"));
+    warnings.extend(check_deprecated_extension_dirs(
+        &project_dir.to_string_lossy(),
+        "Project",
+    ));
     warnings
 }
 
@@ -371,14 +388,33 @@ pub fn run_migrations(cwd: &str) -> MigrationReport {
     run_migrations_with(cwd, &mut print_line, &mut no_keybindings)
 }
 
-/// [`run_migrations`](run_migrations) over an explicit printer and
-/// keybindings migrator, the seam the tests drive.
-pub fn run_migrations_with(cwd: &str, print: Printer<'_>, migrate_keybindings: KeybindingsMigrator<'_>) -> MigrationReport {
-    let migrated_auth_providers = migrate_auth_to_auth_json().unwrap_or_default();
-    migrate_sessions_from_agent_root();
-    migrate_tools_to_bin(print);
-    migrate_keybindings_config_file(migrate_keybindings);
-    let deprecation_warnings = migrate_extension_system(cwd, print);
+/// [`run_migrations`] over an explicit printer and
+/// keybindings migrator, the sweep against the process agent dir.
+pub fn run_migrations_with(
+    cwd: &str,
+    print: Printer<'_>,
+    migrate_keybindings: KeybindingsMigrator<'_>,
+) -> MigrationReport {
+    run_migrations_with_in(cwd, &get_agent_dir(), print, migrate_keybindings)
+}
+
+/// [`run_migrations_with`] against an explicit agent
+/// directory.
+///
+/// The env-independent test seam in place of upstream's
+/// `process.env[ENV_AGENT_DIR]` — the `_in` counterpart the auth and session
+/// migrations already carry.
+pub fn run_migrations_with_in(
+    cwd: &str,
+    agent_dir: &Path,
+    print: Printer<'_>,
+    migrate_keybindings: KeybindingsMigrator<'_>,
+) -> MigrationReport {
+    let migrated_auth_providers = migrate_auth_to_auth_json_in(agent_dir).unwrap_or_default();
+    migrate_sessions_from_agent_root_in(agent_dir);
+    migrate_tools_to_bin_in(agent_dir, print);
+    migrate_keybindings_config_file_in(agent_dir, migrate_keybindings);
+    let deprecation_warnings = migrate_extension_system_in(cwd, agent_dir, print);
     MigrationReport {
         migrated_auth_providers,
         deprecation_warnings,
