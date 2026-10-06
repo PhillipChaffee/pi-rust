@@ -12,13 +12,80 @@ categories = ["development-tools", "command-line-utilities"]
 [dependencies]
 # The defaults module's `ThinkingLevel`, upstream's import from
 # `@earendil-works/pi-agent-core`. The remaining ADR 0003 runtime edges
-# (pi-ai, pi-tui, chord, pi-client, pi-protocol, pi-server) land with the
+# (pi-tui, chord, pi-client, pi-protocol, pi-server) land with the
 # tickets that first consume them.
 pi-agent-core = { path = "../agent" }
+# The base64 payloads the image and clipboard belts trade, upstream's
+# Buffer.prototype.toString("base64").
+base64 = "0.22"
+# The abort belt's `RaceError`/`AbortError` vocabulary (the crate's
+# `src/utils/abort.ts` is upstream's near-duplicate of ai's) and the
+# `ImageContent`/`TextContent` shapes the tool-result-images belt carries.
+pi-ai = { path = "../ai" }
+# The async substrate the stack decision pins. sync: the CancellationToken
+# abort plumbing and channels; time: sleep and the child-stdio grace timer;
+# macros: the select! races; process: child processes; rt: spawn_blocking
+# handoffs (upstream's worker threads); io-util: child stdout/stderr readers.
+tokio = { version = "1.47", default-features = false, features = [
+  "rt",
+  "sync",
+  "time",
+  "macros",
+  "process",
+  "io-util",
+] }
+# The CancellationToken the abort belt carries, the same token pi-ai's
+# transport options take.
+tokio-util = { version = "0.7", default-features = false }
+# ansi: strip-ansi's sequence grammar; json: the comment/trailing-comma
+# stripping passes upstream expresses as two RegExp passes.
+regex = "1.11"
+# frontmatter: SKILL.md/prompt-template YAML, upstream's npm `yaml`.
+yaml-rust2 = "0.13"
+# file:// URL normalization in the path belt (node's `fileURLToPath`) and
+# the hosted-git URL grammar, both WHATWG URL parsing like node's `URL`.
+url = "2.5"
+# The image surface, the restatement of the photon-node WASM module (decode
+# BMP/JPEG/GIF/WebP/PNG, Lanczos3 resize, PNG/JPEG encode).
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "gif",
+  "webp",
+  "bmp",
+] }
+# The native clipboard, the replacement pi-tui's decision #51 chose; its
+# first consumer is this crate (upstream's `getNativeClipboard`).
+arboard = "3.6"
+# The WSL clipboard-image bridge's temp-file name, upstream's `randomUUID`.
+uuid = { version = "1.26", features = ["v4"] }
+# fs-watch: the settings/models.json file watchers, upstream's node `fs.watch`.
+notify = "8"
+# syntax-highlight, the restatement of highlight.js: the Sublime syntax
+# engine with the pure-Rust fancy-regex backend (no onig), over two-face's
+# extended syntax set (the eager languages include nix, which the Sublime
+# default set lacks).
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
+
+[target.'cfg(unix)'.dependencies]
+# The process-tree kill the shell belt performs on shutdown, upstream's
+# `process.kill(-pid, "SIGKILL")`: the workspace forbids the unsafe raw
+# libc/libuv-equivalent calls, so the signal rides nix's safe wrapper,
+# matching the agent and tui crates' signal handling.
+nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
 # Scratch directories the session-cwd suites probe for existence.
 tempfile = "3"
+# The PNG fixture builder's deflate, upstream's `node:zlib.deflateSync`.
+flate2 = "1"
+# The truncate-to-width suite drives pi-tui's renderer helpers, upstream's
+# `@earendil-works/pi-tui` import in `test/truncate-to-width.test.ts`.
+pi-tui = { path = "../tui" }
+# macros/rt/sync/time: the current-thread runtime and the select!/sleep
+# races; test-util: the paused clock the clipboard timeout test drives.
+tokio = { version = "1.47", features = ["macros", "rt", "sync", "time", "test-util"] }
 
 # Upstream's `pi` bin target; the name is provisional per the map's
 # packaging fog. The CLI grammar and mode dispatch land with their tickets.
