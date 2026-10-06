@@ -8,6 +8,9 @@ Rust port of pi, the minimal terminal coding harness.
 User-written Rust code that extends a running Rust pi with tools, providers, commands, hooks, or UI. Distinguished from a TypeScript extension, which a Rust pi cannot execute.
 _Avoid_: plugin (reserved for the upstream chord-facet plugin system)
 
+**Extension receipt**:
+The hash-bound record that gates spawning an installed extension — artifact checksum, source inputs, and protocol version, recorded at enable time and re-verified fail-closed at every start. A Rust extension is a reviewed binary, not readable source; the receipt is what makes the review stick.
+
 **Parity**:
 Behavioral equivalence with upstream pi at the pinned commit. Full parity includes the Rust-native extension mechanism; it never includes executing TS/JS extension files.
 
