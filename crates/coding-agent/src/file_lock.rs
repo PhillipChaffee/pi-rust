@@ -8,7 +8,8 @@
 //! `lockfile.lock(..., { retries: 0, stale, onCompromised })`).
 //!
 //! The restated lock is a `mkdir` on `<target>.lock` (the dependency's default
-//! `lockfilePath`), created `0o700`; releasing removes the directory. An
+//! `lockfilePath`), created with the process umask exactly as the dependency's
+//! bare `fs.mkdir` call; releasing removes the directory. An
 //! `EEXIST` is the dependency's `ELOCKED`. Stale recovery follows the
 //! dependency's rule: a lock directory whose mtime is older than the stale
 //! window is removed and the acquire retried, so a crashed holder does not

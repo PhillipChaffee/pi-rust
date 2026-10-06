@@ -295,11 +295,14 @@ impl ProjectTrustStore {
         .map_err(|error| trust_error(error.to_string()))?;
         let guard =
             acquire_sync_retrying(&lock_dir).map_err(|error| trust_error(error.to_string()))?;
-        let outcome = find_nearest_trust_entry(&read_trust_file(&self.trust_path)?, cwd);
+        // The read outcome is computed before the release so a malformed file
+        // does not leave the lock directory behind, upstream's `finally`.
+        let outcome =
+            read_trust_file(&self.trust_path).map(|data| find_nearest_trust_entry(&data, cwd));
         guard
             .release()
             .map_err(|error| trust_error(error.to_string()))?;
-        Ok(outcome)
+        outcome
     }
 
     /// Record one decision, upstream's `set`.

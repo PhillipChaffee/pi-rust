@@ -327,9 +327,12 @@ impl SettingsStorage for FileSettingsStorage {
         if file_exists {
             release = Some(acquire_sync_retrying(&lock_dir).map_err(|error| error.to_string())?);
         }
-        let outcome = {
+        // The outcome is computed before the release so a failed callback or
+        // a failed read does not leave the lock directory behind — upstream
+        // releases in a `finally`.
+        let outcome = (|| {
             let current = if file_exists {
-                std::fs::read_to_string(path).ok()
+                Some(std::fs::read_to_string(path).map_err(|error| error.to_string())?)
             } else {
                 None
             };
@@ -347,7 +350,7 @@ impl SettingsStorage for FileSettingsStorage {
                 std::fs::write(path, next).map_err(|error| error.to_string())?;
             }
             Ok::<(), String>(())
-        };
+        })();
         if let Some(guard) = release {
             guard.release().map_err(|error| error.to_string())?;
         }
@@ -513,27 +516,31 @@ fn migrate_settings(settings: &mut Settings) {
         .get("retry")
         .is_some_and(|retry| retry.is_object() && !retry.is_array())
     {
-        let retry = settings.get("retry").and_then(Value::as_object);
-        if let Some(retry) = retry {
-            let provider = retry.get("provider").and_then(Value::as_object);
-            let max_delay = retry.get("maxDelayMs").and_then(Value::as_f64);
+        let retry_object = settings.get_mut("retry").and_then(Value::as_object_mut);
+        if let Some(retry_object) = retry_object {
+            // The number is carried as its original JSON value, not refloated
+            // through f64: upstream copies the JS number, whose stringify
+            // keeps `500` integral, and a refloat would both rewrite the
+            // saved text and drop the value out of the `as_i64` readers.
+            let max_delay = retry_object.get("maxDelayMs").cloned();
+            let provider = retry_object
+                .get("provider")
+                .and_then(Value::as_object)
+                .cloned();
             let provider_has_override = provider
+                .as_ref()
                 .and_then(|provider| provider.get("maxRetryDelayMs"))
                 .is_some_and(|value| !value.is_null());
-            if let Some(max_delay) = max_delay
+            if let Some(max_delay) = max_delay.filter(Value::is_number)
                 && !provider_has_override
             {
-                let mut next_provider = provider.cloned().unwrap_or_default();
-                next_provider.insert(
-                    "maxRetryDelayMs".to_string(),
-                    serde_json::Number::from_f64(max_delay).map_or(Value::Null, Value::Number),
-                );
-                let retry_object = settings.get_mut("retry").and_then(Value::as_object_mut);
-                if let Some(retry_object) = retry_object {
-                    retry_object.insert("provider".to_string(), Value::Object(next_provider));
-                    retry_object.shift_remove("maxDelayMs");
-                }
+                let mut next_provider = provider.unwrap_or_default();
+                next_provider.insert("maxRetryDelayMs".to_string(), max_delay);
+                retry_object.insert("provider".to_string(), Value::Object(next_provider));
             }
+            // Upstream deletes maxDelayMs whenever retry is an object —
+            // migrated or not, over a provider override or not.
+            retry_object.shift_remove("maxDelayMs");
         }
     }
 }
@@ -867,15 +874,29 @@ impl<S: SettingsStorage> SettingsManager<S> {
                     let in_memory_nested = value.and_then(Value::as_object);
                     let mut merged_nested = base_nested;
                     for nested_key in nested_modified {
-                        if let Some(nested_value) =
-                            in_memory_nested.and_then(|nested| nested.get(nested_key))
-                        {
-                            merged_nested.insert(nested_key.clone(), nested_value.clone());
+                        match in_memory_nested.and_then(|nested| nested.get(nested_key)) {
+                            Some(nested_value) => {
+                                merged_nested.insert(nested_key.clone(), nested_value.clone());
+                            }
+                            // Upstream assigns undefined for a nested key the
+                            // session removed, and JSON.stringify omits it.
+                            None => {
+                                merged_nested.shift_remove(nested_key);
+                            }
                         }
                     }
                     merged.insert(field.clone(), Value::Object(merged_nested));
-                } else if let Some(value) = value {
-                    merged.insert(field.clone(), value.clone());
+                } else {
+                    match value {
+                        Some(value) => {
+                            merged.insert(field.clone(), value.clone());
+                        }
+                        // Upstream assigns undefined for a field the session
+                        // removed, and JSON.stringify omits it.
+                        None => {
+                            merged.shift_remove(field);
+                        }
+                    }
                 }
             }
             Ok(Some(
@@ -954,6 +975,14 @@ impl<S: SettingsStorage> SettingsManager<S> {
             }
         }
         self.modified.mark(key, nested);
+        self.save();
+    }
+
+    /// Clear a global field, upstream's optional setters assigning `undefined`:
+    /// the key drops from the saved file instead of serializing as `null`.
+    fn remove_global(&mut self, key: &str) {
+        self.global_settings.shift_remove(key);
+        self.modified.mark(key, None);
         self.save();
     }
 
@@ -1380,11 +1409,20 @@ impl<S: SettingsStorage> SettingsManager<S> {
         if !timeout_ms.is_finite() || timeout_ms < 0.0 {
             return Err(format!("Invalid httpIdleTimeoutMs setting: {timeout_ms}"));
         }
-        self.set_global(
-            "httpIdleTimeoutMs",
-            serde_json::Number::from_f64(timeout_ms.floor()).map_or(Value::Null, Value::Number),
-            None,
-        );
+        let floored = timeout_ms.floor();
+        // Upstream stores the floored JS number, which stringify writes
+        // without a decimal; the integer representation keeps the saved file
+        // byte-identical. Floors at or beyond 2^63 stay floats.
+        let value = if floored < 2f64.powi(63) {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the bound above keeps the integral floor inside i64's exact range"
+            )]
+            Value::Number(serde_json::Number::from(floored as i64))
+        } else {
+            serde_json::Number::from_f64(floored).map_or(Value::Null, Value::Number)
+        };
+        self.set_global("httpIdleTimeoutMs", value, None);
         Ok(())
     }
 
@@ -1466,11 +1504,10 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the shell path, upstream's `setShellPath`.
     pub fn set_shell_path(&mut self, path: Option<&str>) {
-        self.set_global(
-            "shellPath",
-            path.map_or(Value::Null, |path| Value::String(path.to_string())),
-            None,
-        );
+        match path {
+            Some(path) => self.set_global("shellPath", Value::String(path.to_string()), None),
+            None => self.remove_global("shellPath"),
+        }
     }
 
     /// Whether startup is quiet, upstream's `getQuietStartup`.
@@ -1520,11 +1557,16 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the shell command prefix, upstream's `setShellCommandPrefix`.
     pub fn set_shell_command_prefix(&mut self, prefix: Option<&str>) {
-        self.set_global(
-            "shellCommandPrefix",
-            prefix.map_or(Value::Null, |prefix| Value::String(prefix.to_string())),
-            None,
-        );
+        match prefix {
+            Some(prefix) => {
+                self.set_global(
+                    "shellCommandPrefix",
+                    Value::String(prefix.to_string()),
+                    None,
+                );
+            }
+            None => self.remove_global("shellCommandPrefix"),
+        }
     }
 
     /// The npm command argv, upstream's `getNpmCommand`.
@@ -1542,18 +1584,21 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the npm command argv, upstream's `setNpmCommand`.
     pub fn set_npm_command(&mut self, command: Option<&[String]>) {
-        self.set_global(
-            "npmCommand",
-            command.map_or(Value::Null, |command| {
-                Value::Array(
-                    command
-                        .iter()
-                        .map(|part| Value::String(part.clone()))
-                        .collect(),
-                )
-            }),
-            None,
-        );
+        match command {
+            Some(command) => {
+                self.set_global(
+                    "npmCommand",
+                    Value::Array(
+                        command
+                            .iter()
+                            .map(|part| Value::String(part.clone()))
+                            .collect(),
+                    ),
+                    None,
+                );
+            }
+            None => self.remove_global("npmCommand"),
+        }
     }
 
     /// Whether the changelog collapses, upstream's `getCollapseChangelog`.
@@ -2052,18 +2097,21 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the enabled model patterns, upstream's `setEnabledModels`.
     pub fn set_enabled_models(&mut self, patterns: Option<&[String]>) {
-        self.set_global(
-            "enabledModels",
-            patterns.map_or(Value::Null, |patterns| {
-                Value::Array(
-                    patterns
-                        .iter()
-                        .map(|pattern| Value::String(pattern.clone()))
-                        .collect(),
-                )
-            }),
-            None,
-        );
+        match patterns {
+            Some(patterns) => {
+                self.set_global(
+                    "enabledModels",
+                    Value::Array(
+                        patterns
+                            .iter()
+                            .map(|pattern| Value::String(pattern.clone()))
+                            .collect(),
+                    ),
+                    None,
+                );
+            }
+            None => self.remove_global("enabledModels"),
+        }
     }
 
     /// The initial built-in tool selection, upstream's `getDefaultTools`.
@@ -2075,18 +2123,21 @@ impl<S: SettingsStorage> SettingsManager<S> {
 
     /// Set the built-in tool selection, upstream's `setDefaultTools`.
     pub fn set_default_tools(&mut self, tools: Option<&[String]>) {
-        self.set_global(
-            "defaultTools",
-            tools.map_or(Value::Null, |tools| {
-                Value::Array(
-                    tools
-                        .iter()
-                        .map(|tool| Value::String(tool.clone()))
-                        .collect(),
-                )
-            }),
-            None,
-        );
+        match tools {
+            Some(tools) => {
+                self.set_global(
+                    "defaultTools",
+                    Value::Array(
+                        tools
+                            .iter()
+                            .map(|tool| Value::String(tool.clone()))
+                            .collect(),
+                    ),
+                    None,
+                );
+            }
+            None => self.remove_global("defaultTools"),
+        }
     }
 
     /// The double-escape action, upstream's `getDoubleEscapeAction`.

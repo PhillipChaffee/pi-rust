@@ -1284,8 +1284,17 @@ impl ReadOnlyAuthStorage {
     }
 
     fn read_and_validate(&self) -> Result<AuthStorageData, AuthError> {
-        let content = std::fs::read_to_string(&self.auth_path)
-            .map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))?;
+        let content = match std::fs::read_to_string(&self.auth_path) {
+            Ok(content) => content,
+            // Upstream's ENOENT branch: a missing store file is the empty
+            // record, which the load then caches like any other.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AuthStorageData::new());
+            }
+            Err(error) => {
+                return Err(auth_error(format!("Failed to read auth.json: {error}")));
+            }
+        };
         let parsed: Value = serde_json::from_str(strip_bom(&content))
             .map_err(|error| auth_error(format!("Failed to read auth.json: {error}")))?;
         let Value::Object(entries) = parsed else {
