@@ -470,10 +470,9 @@ mod tests {
 
     #[test]
     fn the_export_error_conversions_reprint_their_sources() {
-        let io: ExportError = std::io::Error::new(std::io::ErrorKind::Other, "boom").into();
+        let io: ExportError = std::io::Error::other("boom").into();
         assert_eq!(io.to_string(), "boom");
-        let session: ExportError =
-            crate::session_manager::SessionManagerError::Io("gone".to_owned()).into();
+        let session: ExportError = SessionManagerError::Io("gone".to_owned()).into();
         assert_eq!(
             session.to_string(),
             "gone",

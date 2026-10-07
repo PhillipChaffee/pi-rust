@@ -3,6 +3,12 @@
 //! compaction kept-id remap through removed labels, raw-value path entries,
 //! the flush gates, and the unknown-leaf error.
 
+#![expect(
+    clippy::expect_used,
+    reason = "the tests pin outcomes; an unexpected result panics the test by design"
+)]
+#![expect(clippy::panic, reason = "tests assert by panicking")]
+
 use std::fs;
 
 use pi_agent_core::types::AgentMessage;
@@ -191,7 +197,7 @@ fn a_compaction_whose_kept_id_named_a_removed_label_remaps_to_the_replacement() 
 fn raw_path_entries_re_chain_and_raw_compactions_carry_their_kept_ids() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = format!("{}/raw-path.jsonl", dir.path().display());
-    std::fs::write(
+    fs::write(
         &path,
         concat!(
             r#"{"type":"session","version":3,"id":"raw","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#, "\n",
@@ -358,7 +364,7 @@ fn an_in_memory_branch_replaces_the_session_without_a_file() {
 fn a_raw_compaction_that_cannot_parse_still_remaps_through_the_labels() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = format!("{}/raw-compaction.jsonl", dir.path().display());
-    std::fs::write(
+    fs::write(
         &path,
         concat!(
             r#"{"type":"session","version":3,"id":"rawc","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#, "\n",

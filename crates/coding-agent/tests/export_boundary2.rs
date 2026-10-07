@@ -537,7 +537,7 @@ struct ProbeRunner {
     gist_ok: bool,
 }
 impl ProbeRunner {
-    fn gist_ok() -> Self {
+    const fn gist_ok() -> Self {
         Self { gist_ok: true }
     }
 }
