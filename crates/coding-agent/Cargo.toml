@@ -22,7 +22,6 @@ base64 = "0.22"
 # vocabulary rides and the JSON value layer the raw-line parse keeps, both
 # upstream's JSON.parse/stringify over the JSONL session files.
 serde = "1"
-serde_json = "1"
 # The abort belt's `RaceError`/`AbortError` vocabulary (the crate's
 # `src/utils/abort.ts` is upstream's near-duplicate of ai's) and the
 # `ImageContent`/`TextContent` shapes the tool-result-images belt carries.
@@ -30,8 +29,17 @@ pi-ai = { path = "../ai" }
 # The TUI component contract the export's custom-tool renderers invoke and
 # convert to HTML, upstream's `@earendil-works/pi-tui` import in
 # `core/export-html/tool-renderer.ts` (ADR 0003 edge; first production
-# consumer).
+# consumer); the settings manager's TUI-facing setting types (`TuiMode`,
+# `ScrollViewScrollbar`, the terminal capability overrides) ride it too.
 pi-tui = { path = "../tui" }
+# JSON; the stores serialize their wire-faithful shapes with serde_json, key
+# order preserved so saved files match upstream's insertion order. The
+# session entries' extras flatten rides the same order-preserved map for
+# wire round-trips.
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+# The JS `Map` semantics the runtime-credential enumeration rides:
+# insertion order, an overwrite keeping the original position.
+indexmap = "2"
 # The async substrate the stack decision pins. sync: the CancellationToken
 # abort plumbing and channels; time: sleep and the child-stdio grace timer;
 # macros: the select! races; process: child processes; rt: spawn_blocking
@@ -69,6 +77,8 @@ image = { version = "0.25", default-features = false, features = [
 arboard = "3.6"
 # The WSL clipboard-image bridge's temp-file name, upstream's `randomUUID`.
 uuid = { version = "1.26", features = ["v4"] }
+# The auth store's contended-lock backoff jitter, upstream's `Math.random`.
+rand = "0.9"
 # fs-watch: the settings/models.json file watchers, upstream's node `fs.watch`.
 notify = "8"
 # syntax-highlight, the restatement of highlight.js: the Sublime syntax

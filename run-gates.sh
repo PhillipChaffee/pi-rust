@@ -36,7 +36,9 @@ add "duplication" "jscpd"
 add "advisories" "osv-scanner scan -r ."
 # CDLA-Permissive-2.0: webpki-roots ships Mozilla's root store data under it.
 # Zlib: the compression stacks reqwest pulls (zlib-rs) ship under it.
-add "license-check" "osv-scanner scan -r . --licenses=MIT,Apache-2.0,ISC,BSD-3-Clause,BSD-2-Clause,MPL-2.0,PSF-2.0,Unicode-3.0,Python-2.0,Unlicense,CC0-1.0,0BSD,Apache-1.1,BSD-3-Clause-Clear,LGPL-3.0-only,BlueOak-1.0.0,CC-BY-3.0,CDLA-Permissive-2.0,Zlib"
+# BSL-1.0: arboard's Windows backend alone (clipboard-win, error-code); the
+# map's Windows exclusion keeps it uncompiled on every gate platform.
+add "license-check" "osv-scanner scan -r . --licenses=MIT,Apache-2.0,ISC,BSD-3-Clause,BSD-2-Clause,MPL-2.0,PSF-2.0,Unicode-3.0,Python-2.0,Unlicense,CC0-1.0,0BSD,Apache-1.1,BSD-3-Clause-Clear,LGPL-3.0-only,BlueOak-1.0.0,CC-BY-3.0,CDLA-Permissive-2.0,Zlib,BSL-1.0"
 add "deny-advisories" "cargo deny check advisories"
 add "deny-licenses" "cargo deny check licenses"
 add "deny-bans" "cargo deny check bans"
