@@ -402,11 +402,16 @@ fn the_default_export_paths_and_the_share_temp_directory_behave() {
     export_probe("export-default-tui", &temp);
     export_probe("export-default-cli", &temp);
     export_probe("share-gist-ok", &temp);
+    export_probe("share-radius-failed", &temp);
     export_probe("share-tmpdir", &temp);
 }
 /// The probe child: each mode runs one env-dependent scenario from the
 /// fixture root as the process cwd.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "each mode is one self-contained env scenario; splitting the probe would scatter the fixtures"
+)]
 fn the_export_probe() {
     let Ok(mode) = std::env::var(EXPORT_PROBE) else {
         return;
@@ -450,7 +455,10 @@ fn the_export_probe() {
                     timestamp: 42,
                 })))
                 .expect("append");
-            let mut source = ProbeSource { session };
+            let mut source = ProbeSource {
+                session,
+                radius: false,
+            };
             let mut ui = ProbeUi::default();
             let mut runner = ProbeRunner::gist_ok();
             let mut http = ProbeHttp;
@@ -469,6 +477,39 @@ fn the_export_probe() {
                 ui.statuses
             );
         }
+        "share-radius-failed" => {
+            let mut session = SessionManager::in_memory(None, None, None).expect("in-memory");
+            session
+                .append_message(AgentMessage::Standard(Message::User(UserMessage {
+                    content: UserContent::Text("hello".to_owned()),
+                    timestamp: 42,
+                })))
+                .expect("append");
+            let mut source = ProbeSource {
+                session,
+                radius: true,
+            };
+            let mut ui = ProbeUi::default();
+            let mut runner = ProbeRunner::gist_ok();
+            let mut http = ProbeHttp;
+            tokio_block_on(pi_coding_agent::session_share::share_session(
+                &mut source,
+                &mut ui,
+                &mut runner,
+                &mut http,
+            ))
+            .expect("the failed radius upload settles the flow");
+            assert_eq!(
+                ui.errors,
+                vec!["Failed to upload Radius artifact: unused"],
+                "the failed upload reports and skips the gist"
+            );
+            assert!(
+                ui.statuses.is_empty(),
+                "no share URL without a gist: {:?}",
+                ui.statuses
+            );
+        }
         "share-tmpdir" => {
             let mut session = SessionManager::in_memory(None, None, None).expect("in-memory");
             session
@@ -477,7 +518,10 @@ fn the_export_probe() {
                     timestamp: 42,
                 })))
                 .expect("append");
-            let mut source = ProbeSource { session };
+            let mut source = ProbeSource {
+                session,
+                radius: false,
+            };
             let mut ui = ProbeUi::default();
             let mut runner = ProbeRunner::gist_ok();
             let mut http = ProbeHttp;
@@ -499,6 +543,9 @@ fn the_export_probe() {
 /// The share source stand-in for the probe, upstream's session reads.
 struct ProbeSource {
     session: SessionManager,
+    /// When set, the source reports a Radius provider and token so the
+    /// upload leg runs.
+    radius: bool,
 }
 impl pi_coding_agent::session_share::ShareSessionSource for ProbeSource {
     fn session_manager(&self) -> &SessionManager {
@@ -514,10 +561,11 @@ impl pi_coding_agent::session_share::ShareSessionSource for ProbeSource {
         Box::pin(async { Ok(()) })
     }
     fn has_radius_provider(&self) -> bool {
-        false
+        self.radius
     }
     fn radius_token(&mut self) -> BoxedFuture<'_, Option<String>> {
-        Box::pin(async { None })
+        let radius = self.radius;
+        Box::pin(async move { radius.then(|| "token".to_owned()) })
     }
 }
 #[derive(Default)]
@@ -570,7 +618,9 @@ impl pi_coding_agent::session_share::ShareHttpClient for ProbeHttp {
         _token: &str,
         _body: &[u8],
     ) -> BoxedFuture<'_, pi_coding_agent::session_share::RadiusUploadOutcome> {
-        Box::pin(async { pi_coding_agent::session_share::RadiusUploadOutcome::Aborted })
+        Box::pin(async {
+            pi_coding_agent::session_share::RadiusUploadOutcome::Failed("unused".to_owned())
+        })
     }
 }
 /// The single-threaded runtime the async share call needs.
@@ -636,4 +686,15 @@ fn an_html_export_into_a_directory_reports_the_write_error() {
         matches!(error, pi_coding_agent::export_html::ExportError::Io(_)),
         "{error}"
     );
+}
+
+#[test]
+fn the_stub_tool_execute_resolves_to_a_future_without_running() {
+    let tool = stub_tool("rich");
+    // Invoking the executor runs the closure body and hands back the future;
+    // the future itself is dropped unawaited, the way the export never runs
+    // tools.
+    let arguments = serde_json::json!({});
+    let future = (tool.execute)("call-1", &arguments, None, None);
+    drop(future);
 }
