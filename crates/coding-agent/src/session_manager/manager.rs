@@ -149,7 +149,7 @@ impl SessionManager {
         }
         self.session_id = match options.as_ref().and_then(|options| options.id.clone()) {
             Some(id) => id,
-            None => uuidv7(None).map_err(|error| SessionManagerError::Io(error.to_string()))?,
+            None => uuidv7(None).map_err(SessionManagerError::from)?,
         };
         let timestamp = now_iso8601();
         let header = FileEntry::Session(SessionHeader {
@@ -264,8 +264,7 @@ impl SessionManager {
         };
         let mut file = fs::File::create(session_file)?;
         for entry in &self.file_entries {
-            let line = serde_json::to_string(entry)
-                .map_err(|error| SessionManagerError::Io(error.to_string()))?;
+            let line = serde_json::to_string(entry).map_err(SessionManagerError::from)?;
             writeln!(file, "{line}")?;
         }
         Ok(())
@@ -303,8 +302,7 @@ impl SessionManager {
                 .create_new(true)
                 .open(&session_file)?;
             for entry in &self.file_entries {
-                let line = serde_json::to_string(entry)
-                    .map_err(|error| SessionManagerError::Io(error.to_string()))?;
+                let line = serde_json::to_string(entry).map_err(SessionManagerError::from)?;
                 writeln!(file, "{line}")?;
             }
             self.flushed = true;
@@ -319,8 +317,7 @@ impl SessionManager {
         entry: SessionEntry,
     ) -> Result<String, SessionManagerError> {
         let id = entry.base().id.clone().unwrap_or_default();
-        let line = serde_json::to_string(&entry)
-            .map_err(|error| SessionManagerError::Io(error.to_string()))?;
+        let line = serde_json::to_string(&entry).map_err(SessionManagerError::from)?;
         self.file_entries.push(FileEntry::Entry(entry));
         let index = self.file_entries.len() - 1;
         if !id.is_empty() {

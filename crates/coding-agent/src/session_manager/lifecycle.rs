@@ -184,7 +184,7 @@ impl SessionManager {
         }
         let new_session_id = match options.and_then(|options| options.id) {
             Some(id) => id,
-            None => uuidv7(None).map_err(|error| SessionManagerError::Io(error.to_string()))?,
+            None => uuidv7(None).map_err(SessionManagerError::from)?,
         };
         let timestamp = now_iso8601();
         let new_session_file = Path::new(&dir)
@@ -206,7 +206,7 @@ impl SessionManager {
             extras: serde_json::Map::default(),
         };
         let header_line = serde_json::to_string(&FileEntry::Session(new_header))
-            .map_err(|error| SessionManagerError::Io(error.to_string()))?;
+            .map_err(SessionManagerError::from)?;
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -218,8 +218,7 @@ impl SessionManager {
             if matches!(entry, FileEntry::Session(_)) {
                 continue;
             }
-            let line = serde_json::to_string(entry)
-                .map_err(|error| SessionManagerError::Io(error.to_string()))?;
+            let line = serde_json::to_string(entry).map_err(SessionManagerError::from)?;
             writeln!(file, "{line}")?;
         }
         drop(file);

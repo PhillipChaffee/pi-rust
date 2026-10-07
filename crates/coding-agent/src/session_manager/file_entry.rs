@@ -188,6 +188,18 @@ impl From<std::io::Error> for SessionManagerError {
     }
 }
 
+impl From<pi_ai::utils::uuid::UuidV7Error> for SessionManagerError {
+    fn from(error: pi_ai::utils::uuid::UuidV7Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for SessionManagerError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
 /// Why reading a session header failed, upstream's
 /// `SessionHeaderScanLimitError` plus the IO errors it propagates.
 #[derive(Debug, Clone, PartialEq, Eq)]

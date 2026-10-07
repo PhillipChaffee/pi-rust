@@ -70,6 +70,12 @@ impl From<std::io::Error> for ExportError {
     }
 }
 
+impl From<serde_json::Error> for ExportError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
 impl From<SessionManagerError> for ExportError {
     fn from(error: SessionManagerError) -> Self {
         Self::Session(error.to_string())
@@ -372,6 +378,11 @@ fn generate_theme_vars(theme_name: Option<&str>, source: &dyn ThemeColorsSource)
 
 #[cfg(test)]
 mod tests {
+    #![expect(
+        clippy::expect_used,
+        reason = "tests pin outcomes; an unexpected result panics the test by design"
+    )]
+
     use super::*;
 
     #[test]
@@ -465,6 +476,18 @@ mod tests {
             adjust_brightness("not-a-color", 2.0),
             "not-a-color",
             "an unparseable color rides through"
+        );
+    }
+
+    #[test]
+    fn the_serde_failure_converts_into_the_io_arm() {
+        let error: ExportError =
+            serde_json::from_str::<crate::session_manager::SessionHeader>("not json")
+                .expect_err("not json")
+                .into();
+        assert!(
+            error.to_string().contains("line 1"),
+            "the serde message rides through: {error}"
         );
     }
 

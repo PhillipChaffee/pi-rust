@@ -184,8 +184,7 @@ pub fn generate_html(
         .unwrap_or_else(|| derived_export_colors.info_bg.clone());
 
     // Base64 encode session data to avoid escaping issues.
-    let session_json =
-        serde_json::to_string(session_data).map_err(|error| ExportError::Io(error.to_string()))?;
+    let session_json = serde_json::to_string(session_data).map_err(ExportError::from)?;
     let session_data_base64 =
         base64::engine::general_purpose::STANDARD.encode(session_json.as_bytes());
 

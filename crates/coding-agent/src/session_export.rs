@@ -50,8 +50,7 @@ pub fn export_session_to_jsonl(
         extras: serde_json::Map::default(),
     };
     let mut lines = vec![
-        serde_json::to_string(&FileEntry::Session(header))
-            .map_err(|error| SessionManagerError::Io(error.to_string()))?,
+        serde_json::to_string(&FileEntry::Session(header)).map_err(SessionManagerError::from)?,
     ];
 
     let mut parent_id: Option<String> = None;
@@ -70,18 +69,12 @@ pub fn export_session_to_jsonl(
             FileEntry::Session(_) => {}
         }
         parent_id = entry.entry_id().map(str::to_owned);
-        lines.push(
-            serde_json::to_string(&chained)
-                .map_err(|error| SessionManagerError::Io(error.to_string()))?,
-        );
+        lines.push(serde_json::to_string(&chained).map_err(SessionManagerError::from)?);
     }
     for entry in create_trailing_entries
         .map_or_else(Vec::new, |create| create(parent_id.as_deref(), &timestamp))
     {
-        lines.push(
-            serde_json::to_string(&entry)
-                .map_err(|error| SessionManagerError::Io(error.to_string()))?,
-        );
+        lines.push(serde_json::to_string(&entry).map_err(SessionManagerError::from)?);
     }
 
     let mut file = fs::File::create(&file_path)?;

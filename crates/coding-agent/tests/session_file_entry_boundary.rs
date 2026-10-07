@@ -133,6 +133,23 @@ fn the_header_parse_repairs_null_fields_and_rejects_missing_ids() {
 }
 
 #[test]
+fn the_serde_and_uuid_failures_convert_into_the_io_arm() {
+    let serde_error: SessionManagerError = serde_json::from_str::<SessionHeader>("not json")
+        .expect_err("not json")
+        .into();
+    assert!(
+        matches!(&serde_error, SessionManagerError::Io(message) if message.contains("line 1")),
+        "{serde_error}"
+    );
+    let uuid_error: SessionManagerError =
+        pi_ai::utils::uuid::UuidV7Error::TimestampOutOfRange.into();
+    assert!(
+        matches!(uuid_error, SessionManagerError::Io(_)),
+        "{uuid_error}"
+    );
+}
+
+#[test]
 fn the_error_taxonomy_displays_and_converts() {
     let io = SessionManagerError::from(std::io::Error::other("boom"));
     assert_eq!(io, SessionManagerError::Io("boom".to_owned()));
