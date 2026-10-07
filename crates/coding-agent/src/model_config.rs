@@ -322,7 +322,9 @@ impl Schema {
             Self::Array(element) => value
                 .as_array()
                 .is_some_and(|entries| entries.iter().all(|entry| element.check(entry))),
-            Self::Str | Self::NonEmptyStr => value.is_string(),
+            Self::Str => value.is_string(),
+            // A non-empty string, upstream's `Type.String({ minLength: 1 })`.
+            Self::NonEmptyStr => value.as_str().is_some_and(|text| !text.is_empty()),
             Self::NullableStr => value.is_string() || value.is_null(),
             Self::Num => value.is_number(),
             Self::Bool => value.is_boolean(),
@@ -345,7 +347,22 @@ fn check_thinking_level_map(value: &Value) -> bool {
     })
 }
 
-/// The `ModelCost` shape: the four required rates plus optional tiers.
+/// The `ModelCost` shape's tier walk: every entry carries `inputTokensAbove`
+/// and the four rates.
+fn check_cost_tiers(value: &Value) -> bool {
+    value.as_array().is_some_and(|entries| {
+        entries.iter().all(|entry| {
+            entry.as_object().is_some_and(|tier| {
+                tier.get("inputTokensAbove").is_some_and(Value::is_number)
+                    && ["input", "output", "cacheRead", "cacheWrite"]
+                        .iter()
+                        .all(|rate| tier.get(*rate).is_some_and(Value::is_number))
+            })
+        })
+    })
+}
+
+/// The models.json `cost` shape: the four required rates plus optional tiers.
 fn check_cost(value: &Value) -> bool {
     let Some(map) = value.as_object() else {
         return false;
@@ -355,18 +372,25 @@ fn check_cost(value: &Value) -> bool {
             return false;
         }
     }
-    map.get("tiers").as_ref().is_none_or(|tiers| {
-        tiers.as_array().is_some_and(|entries| {
-            entries.iter().all(|entry| {
-                entry.as_object().is_some_and(|tier| {
-                    tier.get("inputTokensAbove").is_some_and(Value::is_number)
-                        && ["input", "output", "cacheRead", "cacheWrite"]
-                            .iter()
-                            .all(|rate| tier.get(*rate).is_some_and(Value::is_number))
-                })
-            })
-        })
-    })
+    map.get("tiers")
+        .as_ref()
+        .is_none_or(|tiers| check_cost_tiers(tiers))
+}
+
+/// The `modelOverrides` cost shape, upstream's `ModelOverrideSchema.cost`:
+/// every rate optional, tiers optional.
+fn check_override_cost(value: &Value) -> bool {
+    let Some(map) = value.as_object() else {
+        return false;
+    };
+    for rate in ["input", "output", "cacheRead", "cacheWrite"] {
+        if !map.get(rate).is_none_or(Value::is_number) {
+            return false;
+        }
+    }
+    map.get("tiers")
+        .as_ref()
+        .is_none_or(|tiers| check_cost_tiers(tiers))
 }
 
 /// The models.json `compat` object's accepted surface, upstream's
@@ -453,10 +477,12 @@ fn check_compat(value: &Value) -> bool {
 }
 
 /// Walk one entry of a model definition or override, upstream's shared
-/// `ModelDefinitionSchema` members.
+/// `ModelDefinitionSchema` members. `override_cost` selects the override
+/// cost's all-optional rates, upstream's `ModelOverrideSchema.cost`.
 fn check_model_fields(
     prefix: &str,
     map: &serde_json::Map<String, Value>,
+    override_cost: bool,
     errors: &mut Vec<String>,
 ) {
     check_member(prefix, map, "name", &Schema::NonEmptyStr, errors);
@@ -476,7 +502,11 @@ fn check_model_fields(
         ));
     }
     if let Some(value) = map.get("cost")
-        && !check_cost(value)
+        && !(if override_cost {
+            check_override_cost(value)
+        } else {
+            check_cost(value)
+        })
     {
         errors.push(format!("{prefix}.cost: Expected object"));
     }
@@ -583,7 +613,7 @@ fn validate_models_config(value: &Value) -> Vec<String> {
                         {
                             errors.push(format!("{model_prefix}.id: Expected string"));
                         }
-                        check_model_fields(&model_prefix, model, &mut errors);
+                        check_model_fields(&model_prefix, model, false, &mut errors);
                     }
                 }
                 None => errors.push(format!("{prefix}.models: Expected array")),
@@ -598,7 +628,7 @@ fn validate_models_config(value: &Value) -> Vec<String> {
                             errors.push(format!("{override_prefix}: Expected object"));
                             continue;
                         };
-                        check_model_fields(&override_prefix, override_object, &mut errors);
+                        check_model_fields(&override_prefix, override_object, true, &mut errors);
                     }
                 }
                 None => errors.push(format!("{prefix}.modelOverrides: Expected object")),

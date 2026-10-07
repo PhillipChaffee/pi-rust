@@ -505,6 +505,29 @@ impl ModelRuntimeCore {
             collections.extension_providers.get(provider_id).cloned()
         };
         let config = self.models_config();
+        if base.is_none() && config.get_provider(provider_id).is_none() && extension.is_none() {
+            self.models.delete_provider(provider_id);
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .composition_errors
+                .remove(provider_id);
+            return;
+        }
+        if let Some(base) = &base
+            && config.get_provider(provider_id).is_none()
+            && extension.is_none()
+        {
+            // No overlays: the builtin streams untouched so its
+            // auth/login/stream behavior is exact.
+            self.models.set_provider(Arc::clone(base));
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .composition_errors
+                .remove(provider_id);
+            return;
+        }
         let composed = compose_model_provider(
             provider_id,
             base.clone(),
@@ -527,8 +550,6 @@ impl ModelRuntimeCore {
                     .composition_errors
                     .insert(provider_id.to_owned(), error);
                 match base {
-                    // No overlays: the builtin streams untouched so its
-                    // auth/login/stream behavior is exact.
                     Some(base) => self.models.set_provider(base),
                     None => self.models.delete_provider(provider_id),
                 }
@@ -1687,17 +1708,37 @@ impl ModelRuntimeCore {
                 state.availability_error_seq
             };
             let available = self.models.available(Some(provider_id), options);
+            let signal = options.and_then(|options| options.signal.clone());
             return Box::pin(async move {
-                let available = available.await.map_err(failure_from_models_race)?;
-                let mut state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if error_seq == state.availability_error_seq {
-                    state.availability_error = None;
+                let outcome = available.await;
+                let aborted = signal.as_ref().is_some_and(CancellationToken::is_cancelled);
+                match outcome {
+                    Ok(available) => {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if error_seq == state.availability_error_seq {
+                            state.availability_error = None;
+                        }
+                        drop(state);
+                        Ok(available)
+                    }
+                    // Upstream's catch records the failure on the error
+                    // surface before rethrowing; an aborted signal stays
+                    // unrecorded.
+                    Err(error) => {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if error_seq == state.availability_error_seq && !aborted {
+                            state.availability_error = Some(error.to_string());
+                        }
+                        drop(state);
+                        Err(error)
+                    }
                 }
-                drop(state);
-                Ok(available)
             });
         }
         let signal = options.and_then(|options| options.signal.clone());
@@ -1949,12 +1990,6 @@ impl ModelRuntimeCore {
         };
         self.enqueue_credential_operation(&provider_id, signal, task)
     }
-}
-
-/// The race failure a models-level operation reports; the Models surface
-/// already folds its races into [`ModelsFailure`].
-const fn failure_from_models_race(error: ModelsFailure) -> ModelsFailure {
-    error
 }
 
 /// The overrides conversion into pi-ai's resolution shape.

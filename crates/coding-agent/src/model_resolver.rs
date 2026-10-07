@@ -64,7 +64,8 @@ pub fn default_model_per_provider(provider: &str) -> Option<&'static str> {
         "vercel-ai-gateway" => Some("zai/glm-5.1"),
         "moonshotai" | "moonshotai-cn" | "opencode" | "opencode-go" => Some("kimi-k2.6"),
         "xai" => Some("grok-4.6"),
-        "groq" | "cerebras" => Some("gpt-oss-120b"),
+        "groq" => Some("openai/gpt-oss-120b"),
+        "cerebras" => Some("gpt-oss-120b"),
         "zai" | "zai-coding-cn" => Some("glm-5.3"),
         "mistral" => Some("devstral-medium-latest"),
         "minimax" | "minimax-cn" => Some("MiniMax-M2.7"),
@@ -124,9 +125,9 @@ fn is_alias(id: &str) -> bool {
     }
     // Dates are typically in format: -20241022 or -20250929
     let bytes = id.as_bytes();
-    bytes.len() >= 9
+    !(bytes.len() >= 9
         && bytes[bytes.len() - 9] == b'-'
-        && bytes[bytes.len() - 8..].iter().all(u8::is_ascii_digit)
+        && bytes[bytes.len() - 8..].iter().all(u8::is_ascii_digit))
 }
 
 /// Find an exact model reference match, upstream's
@@ -217,7 +218,6 @@ fn try_match_model(model_pattern: &str, available_models: &[Model]) -> Option<Mo
             .cloned()
             .collect();
         dated_versions.sort_by(|a, b| b.id.cmp(&a.id));
-        dated_versions.pop();
         dated_versions.first().cloned()
     } else {
         aliases.sort_by(|a, b| b.id.cmp(&a.id));
