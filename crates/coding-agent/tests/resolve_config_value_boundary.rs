@@ -362,9 +362,11 @@ fn is_command_config_value_and_is_config_value_configured() {
 fn an_invalid_utf8_command_output_resolves_to_none() {
     // node's execSync replaces invalid sequences; the port's read_to_string
     // fails, so the buffer stays empty and the resolution is None. Pinned as
-    // the documented divergence.
+    // the documented divergence. The byte rides printf's POSIX octal escape:
+    // bash interprets `\xHH` in the format string but dash does not, so the
+    // hex form yields the literal text on Linux's /bin/sh.
     assert_eq!(
-        resolve_config_value_uncached("!printf 'a\\xffb'", None),
+        resolve_config_value_uncached("!printf 'a\\377b'", None),
         None
     );
 }
