@@ -2644,6 +2644,8 @@ dependencies = [
  "pi-ai",
  "pi-tui",
  "regex",
+ "serde",
+ "serde_json",
  "syntect",
  "tempfile",
  "tokio",

@@ -17,5 +17,10 @@
 
 pub mod config;
 pub mod defaults;
+pub mod export_html;
+pub mod messages;
 pub mod session_cwd;
+pub mod session_export;
+pub mod session_manager;
+pub mod session_share;
 pub mod utils;
