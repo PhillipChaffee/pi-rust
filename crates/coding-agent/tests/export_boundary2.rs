@@ -630,12 +630,8 @@ fn an_html_export_into_a_directory_reports_the_write_error() {
     );
 
     // The standalone export takes it the same way.
-    let error = export_from_file(
-        &session_file,
-        ExportOptions::for_path(temp.clone()),
-        &NoThemeSource,
-    )
-    .expect_err("the output path is a directory");
+    let error = export_from_file(&session_file, ExportOptions::for_path(temp), &NoThemeSource)
+        .expect_err("the output path is a directory");
     assert!(
         matches!(error, pi_coding_agent::export_html::ExportError::Io(_)),
         "{error}"
