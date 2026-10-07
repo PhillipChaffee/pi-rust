@@ -15,7 +15,16 @@
 //! effort (map ticket "Decide the Rust stack").
 #![forbid(unsafe_code)]
 
+pub mod auth_storage;
 pub mod config;
 pub mod defaults;
+pub mod file_lock;
+pub mod migrations;
+pub mod project_trust;
+pub mod resolve_config_value;
+pub mod runtime_credentials;
 pub mod session_cwd;
+pub mod settings_diagnostics;
+pub mod settings_manager;
+pub mod trust_manager;
 pub mod utils;

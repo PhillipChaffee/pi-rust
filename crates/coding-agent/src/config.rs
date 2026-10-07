@@ -85,8 +85,9 @@ pub const ENV_SESSION_DIR: &str = "PI_CODING_AGENT_SESSION_DIR";
 ///
 /// Rust cannot mutate the process environment without the `unsafe` this
 /// workspace forbids, so tests inject a map-backed lookup and the process
-/// default reads the real environment.
-pub type EnvLookup = Box<dyn Fn(&str) -> Option<String>>;
+/// default reads the real environment. `Send + Sync` because consumers ride
+/// futures the stores share across waiters.
+pub type EnvLookup = Box<dyn Fn(&str) -> Option<String> + Send + Sync>;
 
 /// The process environment, upstream's `process.env` default.
 #[must_use]
