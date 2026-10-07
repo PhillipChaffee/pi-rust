@@ -175,18 +175,17 @@ pub fn acquire_once(lock_dir: &Path, stale_ms: Option<u64>) -> Result<FileLockGu
 /// # Errors
 /// The final [`LockError`] after the budget is spent.
 pub fn acquire_sync_retrying(lock_dir: &Path) -> Result<FileLockGuard, LockError> {
-    let mut last: Option<LockError> = None;
-    for attempt in 0..SYNC_MAX_ATTEMPTS {
+    let mut attempt = 0;
+    loop {
         match acquire_once(lock_dir, None) {
             Ok(guard) => return Ok(guard),
             Err(error) if error.is_locked() && attempt + 1 < SYNC_MAX_ATTEMPTS => {
-                last = Some(error);
+                attempt += 1;
                 std::thread::sleep(SYNC_RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
     }
-    Err(last.unwrap_or(LockError::Locked))
 }
 
 /// The options for an asynchronous acquire, upstream's

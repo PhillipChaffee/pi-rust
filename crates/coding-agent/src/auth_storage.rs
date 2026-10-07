@@ -853,35 +853,36 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
         }
 
         // Join or start the coalesced reload, upstream's readLatestData slot
-        // machinery.
+        // machinery. The reader count rises under the lock so a finishing
+        // reload never observes a zero reader count before this reader joins.
         let slot = {
             let mut state = self
                 .read_state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.reload.is_none() {
-                let slot = Arc::new(ReloadSlot {
-                    cancel: CancellationToken::new(),
-                    readers: std::sync::atomic::AtomicUsize::new(0),
-                    result: Mutex::new(None),
-                    ready: tokio::sync::Notify::new(),
+            let fresh = state.reload.is_none();
+            let joined = {
+                let slot = state.reload.get_or_insert_with(|| {
+                    Arc::new(ReloadSlot {
+                        cancel: CancellationToken::new(),
+                        readers: std::sync::atomic::AtomicUsize::new(0),
+                        result: Mutex::new(None),
+                        ready: tokio::sync::Notify::new(),
+                    })
                 });
-                state.reload = Some(Arc::clone(&slot));
-                let job = ReloadJob {
-                    storage: Arc::clone(&self.storage),
-                    read_state: Arc::clone(&self.read_state),
-                    auth_path: auth_path.clone(),
-                    slot: Arc::clone(&slot),
-                };
-                tokio::spawn(job.run());
-            }
-            let Some(slot) = state.reload.as_ref() else {
-                return Err(auth_error("reload slot vanished"));
+                if fresh {
+                    let job = ReloadJob {
+                        storage: Arc::clone(&self.storage),
+                        read_state: Arc::clone(&self.read_state),
+                        auth_path: auth_path.clone(),
+                        slot: Arc::clone(slot),
+                    };
+                    tokio::spawn(job.run());
+                }
+                slot.readers
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                Arc::clone(slot)
             };
-            let joined = Arc::clone(slot);
-            joined
-                .readers
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             drop(state);
             joined
         };
@@ -934,7 +935,7 @@ impl<B: AuthStorageBackend> AuthStorage<B> {
         };
         check_signal(options.and_then(|options| options.signal.as_ref()))?;
         match credential {
-            Some(Credential::ApiKey(api_key)) if api_key.key.is_some() => {
+            Some(Credential::ApiKey(api_key)) => {
                 let Some(key) = api_key.key.clone() else {
                     return Ok(Some(Credential::ApiKey(api_key)));
                 };
@@ -1326,7 +1327,7 @@ impl CredentialStore for ReadOnlyAuthStorage {
             };
             check_signal(options.and_then(|options| options.signal.as_ref()))?;
             match credential {
-                Some(Credential::ApiKey(api_key)) if api_key.key.is_some() => {
+                Some(Credential::ApiKey(api_key)) => {
                     let Some(key) = api_key.key.clone() else {
                         return Ok(Some(Credential::ApiKey(api_key)));
                     };
@@ -1352,14 +1353,19 @@ impl CredentialStore for ReadOnlyAuthStorage {
             check_signal(options.and_then(|options| options.signal.as_ref()))?;
             let data = self.load()?;
             check_signal(options.and_then(|options| options.signal.as_ref()))?;
+            #[expect(
+                clippy::expect_used,
+                reason = "the load validated every entry, so the re-parse cannot fail"
+            )]
             Ok(data
                 .iter()
-                .filter_map(|(provider_id, value)| {
-                    let credential: Credential = serde_json::from_value(value.clone()).ok()?;
-                    Some(CredentialInfo {
+                .map(|(provider_id, value)| {
+                    let credential: Credential =
+                        serde_json::from_value(value.clone()).expect("validated entry");
+                    CredentialInfo {
                         provider_id: provider_id.clone(),
                         auth_type: credential.auth_type(),
-                    })
+                    }
                 })
                 .collect())
         })

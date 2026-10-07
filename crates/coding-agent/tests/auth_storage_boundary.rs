@@ -416,6 +416,48 @@ async fn list_skips_malformed_entries() {
 }
 
 #[tokio::test]
+async fn read_passes_a_keyless_api_key_through_unresolved() {
+    // The keyless shape rides the passthrough arm the resolution path skips:
+    // nothing to resolve, the stored credential returns verbatim.
+    let mut data = AuthStorageData::new();
+    data.insert("anthropic".to_owned(), json!({"type": "api_key"}));
+    let storage = AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&data);
+
+    let credential = storage.read("anthropic", None).await.expect("read");
+    assert_eq!(
+        credential,
+        Some(Credential::ApiKey(ApiKeyCredential {
+            key: None,
+            env: None,
+        }))
+    );
+}
+
+#[tokio::test]
+async fn read_only_lists_the_stored_credential_types() {
+    let temp = temp_dir("pi-auth-ro-list-");
+    let path = temp.path().join("auth.json");
+    write_file(
+        &path,
+        r#"{"anthropic":{"type":"oauth","access":"a","refresh":"r","expires":1},"openai":{"type":"api_key","key":"sk"}}"#,
+    );
+    let store = ReadOnlyAuthStorage::new(&path.to_string_lossy()).expect("store");
+
+    let listed = store.list(None).await.expect("list");
+
+    assert_eq!(
+        listed
+            .iter()
+            .map(|info| (info.provider_id.as_str(), info.auth_type.to_string()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("anthropic", "oauth".to_string()),
+            ("openai", "api_key".to_string())
+        ],
+    );
+}
+
+#[tokio::test]
 async fn read_returns_a_stored_null_entry_as_no_credential() {
     let storage = in_memory(Value::Null);
 

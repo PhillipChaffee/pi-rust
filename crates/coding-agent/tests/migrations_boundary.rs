@@ -1,11 +1,11 @@
 //! Boundary tests binding the migrations branches the 1:1 suites leave
 //! untested, at pin 60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759.
 //!
-//! The process-agent-dir entry points (`run_migrations`, `run_migrations_with`,
-//! `migrate_auth_to_auth_json`, `migrate_sessions_from_agent_root`) read
-//! `get_agent_dir()` and would touch the developer's real `~/.pi`; the
+//! The process-agent-dir entry points (`run_migrations`,
+//! `migrate_auth_to_auth_json`, `migrate_sessions_from_agent_root`) read the
+//! process agent dir and would touch the developer's real `~/.pi`; the
 //! workspace forbids mutating the process environment, so every test here
-//! rides the `_in` seams over its own temp directory.
+//! rides the `_in` seams or the `_with` env seam over its own temp directory.
 
 #![expect(
     clippy::expect_used,
@@ -17,10 +17,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use pi_coding_agent::config::{CONFIG_DIR_NAME, encode_session_cwd};
+use pi_coding_agent::config::{CONFIG_DIR_NAME, EnvLookup, encode_session_cwd};
 use pi_coding_agent::migrations::{
-    MigrationReport, migrate_auth_to_auth_json_in, migrate_sessions_from_agent_root_in,
-    run_migrations_with_in,
+    MigrationReport, migrate_auth_to_auth_json_in, migrate_auth_to_auth_json_with,
+    migrate_sessions_from_agent_root_in, migrate_sessions_from_agent_root_with,
+    no_keybindings_migration, print_migration_line, run_migrations_with, run_migrations_with_in,
 };
 use serde_json::{Map, Value, json};
 
@@ -30,6 +31,13 @@ fn temp_dir(prefix: &str) -> tempfile::TempDir {
         .prefix(prefix)
         .tempdir()
         .expect("temp dir")
+}
+
+/// The environment upstream's test rig builds by setting
+/// `process.env[ENV_AGENT_DIR]`: one entry, the scratch agent dir.
+fn agent_dir_env(agent_dir: &str) -> EnvLookup {
+    let owned = agent_dir.to_string();
+    Box::new(move |key| (key == "PI_CODING_AGENT_DIR").then(|| owned.clone()))
 }
 
 /// Restore a directory's mode on drop, so a failing assertion cannot leave a
@@ -896,4 +904,75 @@ fn sweep_aggregates_the_auth_providers_and_deprecation_warnings_into_the_report(
         report.deprecation_warnings,
         vec!["Global hooks/ directory found. Hooks have been renamed to extensions.".to_string(),],
     );
+}
+
+// =============================================================================
+// process-agent-dir entry points over the injected environment
+// =============================================================================
+
+#[test]
+fn the_with_forms_drive_the_process_entries_through_the_injected_environment() {
+    // upstream's test rig points `process.env[ENV_AGENT_DIR]` at a scratch
+    // directory; the workspace cannot mutate the process environment, so the
+    // `_with` forms inject the same override through the env seam.
+    let temp = temp_dir("pi-mig-with-");
+    let agent_dir = temp.path().to_string_lossy().into_owned();
+    let env = agent_dir_env(&agent_dir);
+    fs::write(
+        temp.path().join("oauth.json"),
+        json!({"anthropic": {"access": "a", "refresh": "r", "expires": 1}}).to_string(),
+    )
+    .expect("oauth write");
+    fs::write(
+        temp.path().join("settings.json"),
+        json!({"apiKeys": {"openai": "sk-1"}}).to_string(),
+    )
+    .expect("settings write");
+    fs::write(
+        temp.path().join("session.jsonl"),
+        json!({"type": "session", "cwd": "/tmp/pi-mig-with-cwd"}).to_string(),
+    )
+    .expect("session write");
+
+    let providers = migrate_auth_to_auth_json_with(&env).expect("auth migration");
+    migrate_sessions_from_agent_root_with(&env);
+    let mut lines: Vec<String> = Vec::new();
+    let report = {
+        let mut print_line = |line: &str| lines.push(line.to_string());
+        let mut no_keybindings =
+            |_config: &Map<String, Value>| -> Option<(Map<String, Value>, bool)> { None };
+        run_migrations_with(&env, "", &mut print_line, &mut no_keybindings)
+    };
+
+    assert_eq!(providers, vec!["anthropic", "openai"]);
+    assert!(
+        temp.path().join("auth.json").exists(),
+        "the auth migration wrote the merged credentials"
+    );
+    assert_eq!(
+        report.migrated_auth_providers,
+        Vec::<String>::new(),
+        "the sweep's auth migration sees the fresh auth.json and skips"
+    );
+    let session_dir = temp
+        .path()
+        .join("sessions")
+        .join(encode_session_cwd("/tmp/pi-mig-with-cwd"));
+    assert!(
+        session_dir.join("session.jsonl").exists(),
+        "the session migrated under the injected agent dir"
+    );
+    assert!(lines.is_empty(), "nothing in the sweep prints");
+}
+
+#[test]
+fn the_default_printer_prints_and_the_default_keybindings_migrator_passes_through() {
+    // upstream's unoverridden defaults: console.log to stdout, and the
+    // keybindings config untouched until the interactive shell lands the
+    // real migration table.
+    print_migration_line("migrations boundary print");
+    let config = json!({"a": 1});
+    let outcome = no_keybindings_migration(config.as_object().expect("object"));
+
+    assert_eq!(outcome, None);
 }

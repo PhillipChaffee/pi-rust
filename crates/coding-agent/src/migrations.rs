@@ -17,9 +17,9 @@
 //!   ([`run_migrations_with`]); the plain [`run_migrations`] prints them
 //!   uncolored, the chalk dependency riding the CLI's runtime styling.
 //! - The sweep sources its agent dir through `getAgentDir()`, upstream's
-//!   `process.env[ENV_AGENT_DIR]` test rig rides the env-independent
-//!   [`run_migrations_with_in`], the `_in` counterpart the auth and session
-//!   migrations already carry.
+//!   `process.env[ENV_AGENT_DIR]` test rig rides the `_with` forms that
+//!   inject an environment lookup, the same seam the auth and session
+//!   migrations carry.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
@@ -27,7 +27,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::config::{CONFIG_DIR_NAME, encode_session_cwd, get_agent_dir};
+use crate::config::{
+    CONFIG_DIR_NAME, EnvLookup, default_env_lookup, encode_session_cwd, get_agent_dir_with,
+};
 use crate::utils::text::strip_bom;
 
 /// The extension-migration guide, upstream's `MIGRATION_GUIDE_URL`.
@@ -56,7 +58,16 @@ pub type KeybindingsMigrator<'a> =
 /// # Errors
 /// The filesystem failures the agent-dir operations raise.
 pub fn migrate_auth_to_auth_json() -> Result<Vec<String>, String> {
-    migrate_auth_to_auth_json_in(&get_agent_dir())
+    migrate_auth_to_auth_json_with(&default_env_lookup())
+}
+
+/// [`migrate_auth_to_auth_json`] over an injected environment lookup,
+/// upstream's `process.env[ENV_AGENT_DIR]` test rig.
+///
+/// # Errors
+/// The filesystem failures the agent-dir operations raise.
+pub fn migrate_auth_to_auth_json_with(env: &EnvLookup) -> Result<Vec<String>, String> {
+    migrate_auth_to_auth_json_in(&get_agent_dir_with(env))
 }
 
 /// [`migrate_auth_to_auth_json`] against an
@@ -165,7 +176,13 @@ pub fn migrate_auth_to_auth_json_in(agent_dir: &Path) -> Result<Vec<String>, Str
 /// them by the cwd in their session header (upstream issue 320). Files
 /// that cannot migrate skip silently.
 pub fn migrate_sessions_from_agent_root() {
-    migrate_sessions_from_agent_root_in(&get_agent_dir());
+    migrate_sessions_from_agent_root_with(&default_env_lookup());
+}
+
+/// [`migrate_sessions_from_agent_root`] over an injected environment
+/// lookup, upstream's `process.env[ENV_AGENT_DIR]` test rig.
+pub fn migrate_sessions_from_agent_root_with(env: &EnvLookup) {
+    migrate_sessions_from_agent_root_in(&get_agent_dir_with(env));
 }
 
 /// [`migrate_sessions_from_agent_root`] against an explicit agent
@@ -375,27 +392,51 @@ fn migrate_extension_system_in(cwd: &str, agent_dir: &Path, print: Printer<'_>) 
     warnings
 }
 
+/// The default migration printer, upstream's unoverridden `console.log`.
+#[doc(hidden)]
+#[expect(
+    clippy::print_stdout,
+    reason = "the migration report prints to stdout, upstream's console.log surface"
+)]
+pub fn print_migration_line(line: &str) {
+    println!("{line}");
+}
+
+/// The default keybindings migrator: the sweep rides the
+/// [`KeybindingsMigrator`] seam until the interactive-shell ticket lands the
+/// real table, so the default passes the config through untouched.
+#[doc(hidden)]
+#[must_use]
+pub const fn no_keybindings_migration(
+    _config: &serde_json::Map<String, Value>,
+) -> Option<(serde_json::Map<String, Value>, bool)> {
+    None
+}
+
 /// Run all migrations, upstream's `runMigrations`: the migrated auth
 /// providers plus the deprecation warnings.
 #[must_use]
 pub fn run_migrations(cwd: &str) -> MigrationReport {
-    #[expect(
-        clippy::print_stdout,
-        reason = "the migration report prints to stdout, upstream's console.log surface"
-    )]
-    let mut print_line = |line: &str| println!("{line}");
-    let mut no_keybindings = |_config: &serde_json::Map<String, Value>| -> Option<(serde_json::Map<String, Value>, bool)> { None };
-    run_migrations_with(cwd, &mut print_line, &mut no_keybindings)
+    run_migrations_with(
+        &default_env_lookup(),
+        cwd,
+        &mut print_migration_line,
+        &mut no_keybindings_migration,
+    )
 }
 
-/// [`run_migrations`] over an explicit printer and
-/// keybindings migrator, the sweep against the process agent dir.
+/// [`run_migrations`] over an injected environment lookup, an explicit
+/// printer, and a keybindings migrator.
+///
+/// The seams upstream threads through `process.env` and optional call
+/// arguments.
 pub fn run_migrations_with(
+    env: &EnvLookup,
     cwd: &str,
     print: Printer<'_>,
     migrate_keybindings: KeybindingsMigrator<'_>,
 ) -> MigrationReport {
-    run_migrations_with_in(cwd, &get_agent_dir(), print, migrate_keybindings)
+    run_migrations_with_in(cwd, &get_agent_dir_with(env), print, migrate_keybindings)
 }
 
 /// [`run_migrations_with`] against an explicit agent

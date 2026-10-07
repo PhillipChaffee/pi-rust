@@ -485,63 +485,60 @@ fn migrate_settings(settings: &mut Settings) {
         settings.shift_remove("websockets");
     }
 
-    if settings
+    if let Some(skills_settings) = settings
         .get("skills")
-        .is_some_and(|skills| skills.is_object() && !skills.is_array())
+        .filter(|skills| skills.is_object() && !skills.is_array())
+        .and_then(Value::as_object)
+        .cloned()
     {
-        let skills_settings = settings.get("skills").and_then(Value::as_object).cloned();
-        if let Some(skills_settings) = skills_settings {
-            let enable = skills_settings.get("enableSkillCommands").cloned();
-            if let Some(enable) = enable
-                && !settings.contains_key("enableSkillCommands")
-            {
-                settings.insert("enableSkillCommands".to_string(), enable);
+        let enable = skills_settings.get("enableSkillCommands").cloned();
+        if let Some(enable) = enable
+            && !settings.contains_key("enableSkillCommands")
+        {
+            settings.insert("enableSkillCommands".to_string(), enable);
+        }
+        let custom = skills_settings
+            .get("customDirectories")
+            .and_then(Value::as_array)
+            .cloned();
+        match custom {
+            Some(custom) if !custom.is_empty() => {
+                settings.insert("skills".to_string(), Value::Array(custom));
             }
-            let custom = skills_settings
-                .get("customDirectories")
-                .and_then(Value::as_array)
-                .cloned();
-            match custom {
-                Some(custom) if !custom.is_empty() => {
-                    settings.insert("skills".to_string(), Value::Array(custom));
-                }
-                _ => {
-                    settings.shift_remove("skills");
-                }
+            _ => {
+                settings.shift_remove("skills");
             }
         }
     }
 
-    if settings
-        .get("retry")
-        .is_some_and(|retry| retry.is_object() && !retry.is_array())
+    if let Some(retry_object) = settings
+        .get_mut("retry")
+        .filter(|retry| retry.is_object() && !retry.is_array())
+        .and_then(Value::as_object_mut)
     {
-        let retry_object = settings.get_mut("retry").and_then(Value::as_object_mut);
-        if let Some(retry_object) = retry_object {
-            // The number is carried as its original JSON value, not refloated
-            // through f64: upstream copies the JS number, whose stringify
-            // keeps `500` integral, and a refloat would both rewrite the
-            // saved text and drop the value out of the `as_i64` readers.
-            let max_delay = retry_object.get("maxDelayMs").cloned();
-            let provider = retry_object
-                .get("provider")
-                .and_then(Value::as_object)
-                .cloned();
-            let provider_has_override = provider
-                .as_ref()
-                .and_then(|provider| provider.get("maxRetryDelayMs"))
-                .is_some_and(|value| !value.is_null());
-            if let Some(max_delay) = max_delay.filter(Value::is_number)
-                && !provider_has_override
-            {
-                let mut next_provider = provider.unwrap_or_default();
-                next_provider.insert("maxRetryDelayMs".to_string(), max_delay);
-                retry_object.insert("provider".to_string(), Value::Object(next_provider));
-            }
-            // Upstream deletes maxDelayMs whenever retry is an object —
-            // migrated or not, over a provider override or not.
-            retry_object.shift_remove("maxDelayMs");
+        // The number is carried as its original JSON value, not refloated
+        // through f64: upstream copies the JS number, whose stringify
+        // keeps `500` integral, and a refloat would both rewrite the
+        // saved text and drop the value out of the `as_i64` readers.
+        let max_delay = retry_object.get("maxDelayMs").cloned();
+        let provider = retry_object
+            .get("provider")
+            .and_then(Value::as_object)
+            .cloned();
+        let provider_has_override = provider
+            .as_ref()
+            .and_then(|provider| provider.get("maxRetryDelayMs"))
+            .is_some_and(|value| !value.is_null());
+        if let Some(max_delay) = max_delay.filter(Value::is_number)
+            && !provider_has_override
+        {
+            let mut next_provider = provider.unwrap_or_default();
+            next_provider.insert("maxRetryDelayMs".to_string(), max_delay);
+            retry_object.insert("provider".to_string(), Value::Object(next_provider));
         }
+        // Upstream deletes maxDelayMs whenever retry is an object —
+        // migrated or not, over a provider override or not.
+        retry_object.shift_remove("maxDelayMs");
     }
 }
 

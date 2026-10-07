@@ -239,9 +239,13 @@ fn write_trust_file(path: &str, data: &TrustFile) -> Result<(), TrustError> {
             (key.clone(), value)
         })
         .collect();
+    #[expect(
+        clippy::expect_used,
+        reason = "a serde_json map of parsed JSON values serializes; only non-self-describing formats fail"
+    )]
     let content = format!(
         "{}\n",
-        serde_json::to_string_pretty(&sorted).unwrap_or_else(|_| "{}".to_string())
+        serde_json::to_string_pretty(&sorted).expect("trust decisions serialize")
     );
     if let Some(parent) = Path::new(path).parent() {
         std::fs::create_dir_all(parent).map_err(|error| trust_error(error.to_string()))?;
