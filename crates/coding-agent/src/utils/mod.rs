@@ -32,6 +32,7 @@ pub mod image_process;
 pub mod image_resize;
 pub mod image_resize_core;
 pub mod json;
+pub mod management_http;
 pub mod mime;
 pub mod open_browser;
 pub mod paths;
@@ -41,3 +42,5 @@ pub mod sleep;
 pub mod syntax_highlight;
 pub mod text;
 pub mod tool_result_images;
+
+pub mod minimatch;

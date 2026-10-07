@@ -217,7 +217,7 @@ fn in_memory(data: &AuthStorageData) -> AuthStorage<InMemoryAuthStorageBackend> 
 #[tokio::test]
 async fn runtime_overrides_mask_stored_credentials_without_persisting() {
     let storage = in_memory_store("anthropic", "stored-key");
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
 
     credentials.set_runtime_api_key("anthropic", "runtime-key".to_owned());
     let masked = credentials.read("anthropic", None).await.expect("read");
@@ -252,7 +252,7 @@ async fn enumeration_merges_overrides_without_exposing_keys() {
         serde_json::to_value(&oauth).expect("seed serializes"),
     );
     let storage = Arc::new(in_memory(&data));
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
     credentials.set_runtime_api_key("anthropic", "runtime-key".to_owned());
     credentials.set_runtime_api_key("openai", "other-runtime-key".to_owned());
 
@@ -275,7 +275,7 @@ async fn enumeration_merges_overrides_without_exposing_keys() {
 #[tokio::test]
 async fn forwards_operation_signals_to_the_persistent_store() {
     let signals = Arc::new(Mutex::new(Vec::new()));
-    let credentials = RuntimeCredentials::new(Box::new(RecordingStore {
+    let credentials = RuntimeCredentials::new(Arc::new(RecordingStore {
         signals: Arc::clone(&signals),
     }));
 
@@ -318,7 +318,7 @@ async fn forwards_operation_signals_to_the_persistent_store() {
 async fn keeps_a_runtime_override_when_persistent_deletion_is_cancelled() {
     let inner = in_memory_store("anthropic", "stored-key");
     let deletes = Arc::new(AtomicUsize::new(0));
-    let credentials = RuntimeCredentials::new(Box::new(AbortOnceDeleteStore {
+    let credentials = RuntimeCredentials::new(Arc::new(AbortOnceDeleteStore {
         inner,
         aborted: AtomicBool::new(false),
         deletes: Arc::clone(&deletes),
@@ -352,7 +352,7 @@ async fn keeps_a_runtime_override_when_persistent_deletion_is_cancelled() {
 #[tokio::test]
 async fn delete_clears_both_the_override_and_persisted_credential() {
     let storage = in_memory_store("anthropic", "stored-key");
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
     credentials.set_runtime_api_key("anthropic", "runtime-key".to_owned());
 
     credentials.delete("anthropic", None).await.expect("delete");

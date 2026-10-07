@@ -2005,8 +2005,12 @@ async fn persist_login_credential(
         completed = &mut mutation => completed,
     };
     match outcome {
-        _ if signal.is_cancelled() => Err(ModelsFailure::Aborted(AbortError)),
+        // A settled mutation returns the credential the way upstream's
+        // `await mutation; return credential` does, even when the signal
+        // fired during it — the runtime's synchronization step owns the
+        // abort from there.
         Ok(_) => Ok(credential),
+        Err(_error) if signal.is_cancelled() => Err(ModelsFailure::Aborted(AbortError)),
         Err(error) => Err(ModelsFailure::Models(ModelsError::with_cause(
             ModelsErrorCode::Auth,
             format!("Credential store modify failed for {provider_id}"),

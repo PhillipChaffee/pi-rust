@@ -7,6 +7,15 @@
 
 use pi_coding_agent::config::EnvLookup;
 
+/// The model-layer fixtures the #121 suites share. `allow` rather than
+/// `expect` because every test binary recompiles this module and consumes
+/// only the helpers its own suite drives.
+#[allow(
+    unused,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
+pub mod model_layer;
+
 /// A map-backed [`EnvLookup`], the injected environment the `_with`
 /// variants read in place of `process.env`.
 pub fn env_with(entries: &[(&str, &str)]) -> EnvLookup {

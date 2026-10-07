@@ -2,7 +2,7 @@
 //! upstream's `src/core/runtime-credentials.ts` at pin
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 use pi_ai::auth::credential_store::CredentialStore;
@@ -32,7 +32,7 @@ fn signal_check(options: Option<&AuthOptions>) -> Result<(), AuthError> {
 /// persisting, writes and modifications forward, and a successful delete
 /// clears the override.
 pub struct RuntimeCredentials {
-    store: Box<dyn CredentialStore>,
+    store: Arc<dyn CredentialStore>,
     overrides: Mutex<Overrides>,
 }
 
@@ -45,7 +45,7 @@ impl std::fmt::Debug for RuntimeCredentials {
 impl RuntimeCredentials {
     /// The overlay over `store`, upstream's constructor.
     #[must_use]
-    pub fn new(store: Box<dyn CredentialStore>) -> Self {
+    pub fn new(store: Arc<dyn CredentialStore>) -> Self {
         Self {
             store,
             overrides: Mutex::new(IndexMap::new()),
