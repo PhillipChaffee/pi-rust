@@ -30,6 +30,7 @@ pi-tui = { path = "../tui" }
 # JSON; the stores serialize their wire-faithful shapes with serde_json, key
 # order preserved so saved files match upstream's insertion order.
 
+serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 # The JS `Map` semantics the runtime-credential enumeration rides:
 # insertion order, an overwrite keeping the original position.

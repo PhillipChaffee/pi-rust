@@ -134,7 +134,7 @@ impl CredentialStore for CountingStore {
 
 #[tokio::test]
 async fn has_runtime_api_key_tracks_the_override() {
-    let credentials = RuntimeCredentials::new(Box::new(CountingStore::new()));
+    let credentials = RuntimeCredentials::new(Arc::new(CountingStore::new()));
 
     assert!(!credentials.has_runtime_api_key("anthropic"));
     credentials.set_runtime_api_key("anthropic", "key".to_owned());
@@ -146,7 +146,7 @@ async fn has_runtime_api_key_tracks_the_override() {
 #[tokio::test]
 async fn set_twice_keeps_one_entry_in_its_original_position() {
     let storage = in_memory(&AuthStorageData::new());
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
 
     credentials.set_runtime_api_key("anthropic", "first".to_owned());
     credentials.set_runtime_api_key("openai", "openai-key".to_owned());
@@ -168,7 +168,7 @@ async fn set_twice_keeps_one_entry_in_its_original_position() {
 #[tokio::test]
 async fn remove_then_readd_moves_the_entry_to_the_end() {
     let storage = in_memory(&AuthStorageData::new());
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
 
     credentials.set_runtime_api_key("anthropic", "first".to_owned());
     credentials.set_runtime_api_key("openai", "openai-key".to_owned());
@@ -198,7 +198,7 @@ async fn list_merge_keeps_the_original_position_of_an_overridden_entry() {
         serde_json::json!({"type": "api_key", "key": "stored"}),
     );
     let storage = in_memory(&data);
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
     credentials.set_runtime_api_key("anthropic", "runtime".to_owned());
 
     let listed = credentials.list(None).await.expect("list");
@@ -221,7 +221,7 @@ async fn list_merge_keeps_the_original_position_of_an_overridden_entry() {
 #[tokio::test]
 async fn a_pre_aborted_read_fails_without_touching_the_store() {
     let counting = CountingStore::new();
-    let credentials = RuntimeCredentials::new(Box::new(counting));
+    let credentials = RuntimeCredentials::new(Arc::new(counting));
     let token = CancellationToken::new();
     token.cancel();
     let options = AuthOptions {
@@ -238,7 +238,7 @@ async fn a_pre_aborted_read_fails_without_touching_the_store() {
 #[tokio::test]
 async fn a_pre_aborted_list_fails_after_the_store_reports() {
     let counting = CountingStore::new();
-    let credentials = RuntimeCredentials::new(Box::new(counting));
+    let credentials = RuntimeCredentials::new(Arc::new(counting));
     let token = CancellationToken::new();
     token.cancel();
     let options = AuthOptions {
@@ -255,7 +255,7 @@ async fn a_pre_aborted_list_fails_after_the_store_reports() {
 #[tokio::test]
 async fn a_pre_aborted_delete_fails_before_the_store_delete() {
     let counting = CountingStore::new();
-    let credentials = RuntimeCredentials::new(Box::new(counting));
+    let credentials = RuntimeCredentials::new(Arc::new(counting));
     let token = CancellationToken::new();
     token.cancel();
     let options = AuthOptions {
@@ -272,7 +272,7 @@ async fn a_pre_aborted_delete_fails_before_the_store_delete() {
 #[tokio::test]
 async fn modify_forwards_to_the_store_while_the_override_masks_reads() {
     let storage = in_memory(&AuthStorageData::new());
-    let credentials = RuntimeCredentials::new(Box::new(SharedStore(Arc::clone(&storage))));
+    let credentials = RuntimeCredentials::new(Arc::new(SharedStore(Arc::clone(&storage))));
     credentials.set_runtime_api_key("anthropic", "runtime".to_owned());
 
     let update: CredentialModifyFn = Box::new(|_current: Option<Credential>| {
@@ -305,7 +305,7 @@ async fn modify_forwards_to_the_store_while_the_override_masks_reads() {
 
 #[tokio::test]
 async fn the_debug_form_renders() {
-    let credentials = RuntimeCredentials::new(Box::new(CountingStore::new()));
+    let credentials = RuntimeCredentials::new(Arc::new(CountingStore::new()));
 
     assert!(format!("{credentials:?}").contains("RuntimeCredentials"));
 }
