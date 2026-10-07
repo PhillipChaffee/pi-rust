@@ -196,6 +196,21 @@ pub fn get_debug_log_path() -> PathBuf {
     get_agent_dir().join(format!("{APP_NAME}-debug.log"))
 }
 
+/// The share viewer base URL override, upstream's `PI_SHARE_VIEWER_URL`.
+pub const ENV_SHARE_VIEWER_URL: &str = "PI_SHARE_VIEWER_URL";
+
+/// The share viewer URL for a gist id, upstream's `getShareViewerUrl`:
+/// the override base or the default, suffixed with `#<gist id>`.
+#[must_use]
+pub fn get_share_viewer_url(gist_id: &str) -> String {
+    static DEFAULT_SHARE_VIEWER_URL: &str = "https://pi.dev/session/";
+    let base = std::env::var(ENV_SHARE_VIEWER_URL)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SHARE_VIEWER_URL.to_owned());
+    format!("{base}#{gist_id}")
+}
+
 // =============================================================================
 // Package dir
 // =============================================================================
