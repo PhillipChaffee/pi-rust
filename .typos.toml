@@ -34,3 +34,15 @@ UE = "UE"
 oint = "oint"
 multline = "multline"
 hom = "hom"
+# The session slice's doc comments and test names say "unparseable" (the
+# standard negation of "parseable", and the word the port's prose uses for
+# upstream's tolerance of malformed entry lines); typos' dictionary only
+# knows "unparsable".
+unparseable = "unparseable"
+
+# The export template's vendored third-party assets ship byte-verbatim from
+# the upstream pin (upstream's vendor/marked.min.js and
+# vendor/highlight.min.js); their minified tokens are vendor code, not
+# prose this repository spells.
+[files]
+extend-exclude = ["crates/coding-agent/src/export_html/assets"]

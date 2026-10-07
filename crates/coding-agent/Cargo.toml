@@ -18,18 +18,24 @@ pi-agent-core = { path = "../agent" }
 # The base64 payloads the image and clipboard belts trade, upstream's
 # Buffer.prototype.toString("base64").
 base64 = "0.22"
+# The session manager's wire codecs: the typed serde derives the entry
+# vocabulary rides and the JSON value layer the raw-line parse keeps, both
+# upstream's JSON.parse/stringify over the JSONL session files.
+serde = "1"
 # The abort belt's `RaceError`/`AbortError` vocabulary (the crate's
 # `src/utils/abort.ts` is upstream's near-duplicate of ai's) and the
 # `ImageContent`/`TextContent` shapes the tool-result-images belt carries.
 pi-ai = { path = "../ai" }
-# The settings manager's TUI-facing setting types (`TuiMode`,
-# `ScrollViewScrollbar`, the terminal capability overrides), upstream's
-# `@earendil-works/pi-tui` import in `core/settings-manager.ts`. First
-# consumer: the on-disk stores.
+# The TUI component contract the export's custom-tool renderers invoke and
+# convert to HTML, upstream's `@earendil-works/pi-tui` import in
+# `core/export-html/tool-renderer.ts` (ADR 0003 edge; first production
+# consumer); the settings manager's TUI-facing setting types (`TuiMode`,
+# `ScrollViewScrollbar`, the terminal capability overrides) ride it too.
 pi-tui = { path = "../tui" }
 # JSON; the stores serialize their wire-faithful shapes with serde_json, key
-# order preserved so saved files match upstream's insertion order.
-
+# order preserved so saved files match upstream's insertion order. The
+# session entries' extras flatten rides the same order-preserved map for
+# wire round-trips.
 serde_json = { version = "1.0.145", features = ["preserve_order"] }
 # The JS `Map` semantics the runtime-credential enumeration rides:
 # insertion order, an overwrite keeping the original position.

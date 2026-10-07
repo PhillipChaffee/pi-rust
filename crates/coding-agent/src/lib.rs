@@ -18,12 +18,17 @@
 pub mod auth_storage;
 pub mod config;
 pub mod defaults;
+pub mod export_html;
 pub mod file_lock;
+pub mod messages;
 pub mod migrations;
 pub mod project_trust;
 pub mod resolve_config_value;
 pub mod runtime_credentials;
 pub mod session_cwd;
+pub mod session_export;
+pub mod session_manager;
+pub mod session_share;
 pub mod settings_diagnostics;
 pub mod settings_manager;
 pub mod trust_manager;
