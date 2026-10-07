@@ -85,17 +85,8 @@ jobs:
       # evaluates the fail-under switches (lines, regions, functions), so the
       # upload below can still run on a gate failure (measured: exit 1 with
       # lcov.info on disk).
-      # TEMPORARY diagnostic for #141: run without the fail-under switches and
-      # export the JSON report so the uncovered-function set is fetchable as
-      # an artifact. Restored to the real gate before merge.
-      - name: Coverage report (diagnostic)
-        run: xvfb-run -a cargo llvm-cov nextest --workspace --json --output-path cov.json
-      - name: Upload coverage JSON (diagnostic)
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: coverage-json
-          path: cov.json
+      - name: Coverage gate (lines, regions, functions — 95 each)
+        run: xvfb-run -a cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-under-functions 95 --lcov --output-path lcov.info
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.
