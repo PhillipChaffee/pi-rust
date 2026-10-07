@@ -666,6 +666,10 @@ fn apply_extension(
 
 /// Bridge a legacy extension OAuth config onto pi-ai's [`OAuthAuth`],
 /// upstream's `adaptOAuth`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the 1:1 port of upstream's adaptOAuth carries the three closure bridges inline"
+)]
 fn adapt_oauth(config: &ExtensionOAuthConfig) -> OAuthAuth {
     let login_name = config.name.clone();
     let login: OAuthLoginFn = Arc::new({

@@ -22,6 +22,7 @@ use pi_ai::utils::abort::AbortError;
 
 use crate::auth_storage::{AuthStorageBackend, FileAuthStorageBackend, LockOutcome};
 use crate::config::get_agent_dir;
+use crate::file_lock::FileLock;
 use crate::utils::abort::race_with_abort_signal;
 use crate::utils::paths::{PathInputOptions, get_file_revision, normalize_path};
 use crate::utils::text::strip_bom;
@@ -266,6 +267,26 @@ impl FileModelsStore {
                 .to_string(),
         };
         let storage = Arc::new(FileAuthStorageBackend::new(&path)?);
+        let read_state = shared_read_state_for(&path);
+        Ok(Self {
+            storage,
+            path,
+            read_state,
+        })
+    }
+
+    /// The store over `path` with a replaced lock strategy, the test seam
+    /// standing in for upstream's `vi.spyOn(lockfile, "lock")`.
+    ///
+    /// # Errors
+    /// A path that does not normalize.
+    pub fn with_lock_strategy(
+        path: &str,
+        lock: Arc<dyn FileLock>,
+    ) -> Result<Self, ModelsStoreError> {
+        let path = normalize_path(path, &PathInputOptions::default())
+            .map_err(|error| -> ModelsStoreError { Box::new(error) })?;
+        let storage = Arc::new(FileAuthStorageBackend::with_lock_strategy(&path, lock));
         let read_state = shared_read_state_for(&path);
         Ok(Self {
             storage,
