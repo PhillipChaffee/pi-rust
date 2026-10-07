@@ -7,8 +7,9 @@
 //!
 //! - The `provider(id, options)` double implements
 //!   [`pi_ai::models::Provider`] directly; `getModels`' throw path is
-//!   unreachable for the fixture, and `stream`/`streamSimple` panic like
-//!   upstream's `throw new Error("unused")` guards.
+//!   unreachable for the fixture, and the stream dispatches no case drives
+//!   delegate to the shared fixture guard
+//!   [`common::model_layer::unused_stream`].
 //! - The markStarted/blocked promise pairs restate as the [`Gate`] notify
 //!   pair: the scripted closure marks `started` and parks on `blocked`,
 //!   whose stored permits keep both registration orders race-free.
@@ -25,7 +26,7 @@
 )]
 #![expect(
     clippy::panic,
-    reason = "the unused stream guards panic by design, upstream's throw new Error(\"unused\")"
+    reason = "the not-expected-outcome guard panics by design, upstream's fail()"
 )]
 
 #[expect(
@@ -257,7 +258,7 @@ impl Provider for ProviderDouble {
         _context: &Context,
         _options: Option<&StreamOptions>,
     ) -> AssistantMessageEventStream {
-        panic!("unused")
+        common::model_layer::unused_stream()
     }
 
     fn stream_simple(
@@ -266,7 +267,7 @@ impl Provider for ProviderDouble {
         _context: &Context,
         _options: Option<&SimpleStreamOptions>,
     ) -> AssistantMessageEventStream {
-        panic!("unused")
+        common::model_layer::unused_stream()
     }
 }
 

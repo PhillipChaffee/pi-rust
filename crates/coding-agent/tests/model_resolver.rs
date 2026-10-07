@@ -44,9 +44,9 @@ use pi_ai::providers::all::{builtin_catalog_provider_ids, builtin_models_of};
 use pi_ai::types::{Api, BoxedFuture, Modality, Model, ModelCost, ModelCostRates, ProviderId};
 use pi_coding_agent::model_resolver::{
     FindInitialModelOptions, ModelRuntimeView, ModelScopeDiagnostic, ModelScopeDiagnosticCode,
-    ResolveCliModelOptions, default_model_per_provider, find_initial_model, format_scope_warning,
-    parse_model_pattern, resolve_cli_model, resolve_model_scope,
-    resolve_model_scope_with_diagnostics,
+    ResolveCliModelOptions, ResolveCliModelResult, ResolveModelScopeResult,
+    default_model_per_provider, find_initial_model, format_scope_warning, parse_model_pattern,
+    resolve_cli_model, resolve_model_scope, resolve_model_scope_with_diagnostics,
 };
 
 /// The cost object upstream's `cost: { input, output, cacheRead, cacheWrite }`
@@ -336,6 +336,62 @@ fn patterns(patterns: &[&str]) -> Vec<String> {
     patterns.iter().copied().map(String::from).collect()
 }
 
+/// The invalid-thinking-suffix shape the warning cases pin: the pattern
+/// resolves its prefix model with no thinking level, and carries the
+/// warning the case asserts on.
+fn invalid_suffix_result(pattern: &str) -> (Model, String) {
+    let result = parse_model_pattern(pattern, &all_models(), None);
+    let resolved = result.model.expect("the pattern resolves");
+    assert!(result.thinking_level.is_none());
+    let warning = result.warning.expect("the invalid suffix warns");
+    (resolved, warning)
+}
+
+/// The scoped models' ids, the projection the diagnostics cases pin.
+fn scoped_model_ids(result: &ResolveModelScopeResult) -> Vec<&str> {
+    result
+        .scoped_models
+        .iter()
+        .map(|scoped| scoped.model.id.as_str())
+        .collect()
+}
+
+/// The CLI resolution over the all-models registry, upstream's
+/// `resolveCliModel` with no thinking flag: the error-free result the
+/// cases assert on.
+fn resolved_cli(cli_provider: Option<&str>, cli_model: &str) -> ResolveCliModelResult {
+    let runtime = FakeRuntime::models(all_models());
+    let result = resolve_cli_model(ResolveCliModelOptions {
+        cli_provider,
+        cli_model: Some(cli_model),
+        cli_thinking: None,
+        model_runtime: &runtime,
+    });
+    assert!(result.error.is_none());
+    result
+}
+
+/// The fallback-path CLI resolution over the neuralwatt registry,
+/// upstream's resolveCliModel calls: the error-free resolution with the
+/// resolved provider and thinking level the cases assert on.
+fn resolved_fallback(
+    cli_provider: Option<&str>,
+    cli_model: &str,
+    cli_thinking: Option<ThinkingLevel>,
+) -> (Model, Option<ThinkingLevel>) {
+    let runtime = FakeRuntime::models(models_with_neuralwatt());
+    let result = resolve_cli_model(ResolveCliModelOptions {
+        cli_provider,
+        cli_model: Some(cli_model),
+        cli_thinking,
+        model_runtime: &runtime,
+    });
+    assert!(result.error.is_none());
+    let resolved = result.model.expect("the fallback model resolves");
+    assert_eq!(resolved.provider.0, "neuralwatt");
+    (resolved, result.thinking_level)
+}
+
 /// The `getModel` read's signature, upstream's `getModel(provider, modelId)`
 /// closure.
 type ModelLookup = Box<dyn Fn(&str, &str) -> Option<Model> + Send + Sync>;
@@ -512,22 +568,16 @@ mod parse_model_pattern {
 
         #[test]
         fn sonnet_random_returns_sonnet_with_undefined_thinking_level_and_warning() {
-            let result = parse_model_pattern("sonnet:random", &all_models(), None);
-            let resolved = result.model.expect("the pattern resolves");
+            let (resolved, warning) = invalid_suffix_result("sonnet:random");
             assert_eq!(resolved.id, "claude-sonnet-4-5");
-            assert!(result.thinking_level.is_none());
-            let warning = result.warning.expect("the invalid suffix warns");
             assert!(warning.contains("Invalid thinking level"));
             assert!(warning.contains("random"));
         }
 
         #[test]
         fn gpt_4o_invalid_returns_gpt_4o_with_undefined_thinking_level_and_warning() {
-            let result = parse_model_pattern("gpt-4o:invalid", &all_models(), None);
-            let resolved = result.model.expect("the pattern resolves");
+            let (resolved, warning) = invalid_suffix_result("gpt-4o:invalid");
             assert_eq!(resolved.id, "gpt-4o");
-            assert!(result.thinking_level.is_none());
-            let warning = result.warning.expect("the invalid suffix warns");
             assert!(warning.contains("Invalid thinking level"));
         }
     }
@@ -595,11 +645,8 @@ mod parse_model_pattern {
 
         #[test]
         fn qwen3_coder_exacto_random_returns_model_with_undefined_thinking_level_and_warning() {
-            let result = parse_model_pattern("qwen/qwen3-coder:exacto:random", &all_models(), None);
-            let resolved = result.model.expect("the pattern resolves");
+            let (resolved, warning) = invalid_suffix_result("qwen/qwen3-coder:exacto:random");
             assert_eq!(resolved.id, "qwen/qwen3-coder:exacto");
-            assert!(result.thinking_level.is_none());
-            let warning = result.warning.expect("the invalid suffix warns");
             assert!(warning.contains("Invalid thinking level"));
             assert!(warning.contains("random"));
         }
@@ -607,12 +654,8 @@ mod parse_model_pattern {
         #[test]
         fn qwen3_coder_exacto_high_random_returns_model_with_undefined_thinking_level_and_warning()
         {
-            let result =
-                parse_model_pattern("qwen/qwen3-coder:exacto:high:random", &all_models(), None);
-            let resolved = result.model.expect("the pattern resolves");
+            let (resolved, warning) = invalid_suffix_result("qwen/qwen3-coder:exacto:high:random");
             assert_eq!(resolved.id, "qwen/qwen3-coder:exacto");
-            assert!(result.thinking_level.is_none());
-            let warning = result.warning.expect("the invalid suffix warns");
             assert!(warning.contains("Invalid thinking level"));
             assert!(warning.contains("random"));
         }
@@ -653,12 +696,7 @@ mod resolve_model_scope_with_diagnostics {
 
         let result = resolve_model_scope_with_diagnostics(&patterns, &runtime, None).await;
 
-        let scoped_ids: Vec<&str> = result
-            .scoped_models
-            .iter()
-            .map(|scoped| scoped.model.id.as_str())
-            .collect();
-        assert_eq!(scoped_ids, ["claude-sonnet-4-5", "gpt-4o"]);
+        assert_eq!(scoped_model_ids(&result), ["claude-sonnet-4-5", "gpt-4o"]);
         assert_eq!(
             result.scoped_models[0].thinking_level,
             Some(ThinkingLevel::High)
@@ -713,12 +751,7 @@ mod resolve_model_scope_with_diagnostics {
 
         let result = resolve_model_scope_with_diagnostics(&patterns, &runtime, None).await;
 
-        let scoped_ids: Vec<&str> = result
-            .scoped_models
-            .iter()
-            .map(|scoped| scoped.model.id.as_str())
-            .collect();
-        assert_eq!(scoped_ids, ["bracketed-model[1m]"]);
+        assert_eq!(scoped_model_ids(&result), ["bracketed-model[1m]"]);
         assert!(result.diagnostics.is_empty());
     }
 
@@ -732,12 +765,7 @@ mod resolve_model_scope_with_diagnostics {
 
         let result = resolve_model_scope_with_diagnostics(&patterns, &runtime, None).await;
 
-        let scoped_ids: Vec<&str> = result
-            .scoped_models
-            .iter()
-            .map(|scoped| scoped.model.id.as_str())
-            .collect();
-        assert_eq!(scoped_ids, ["bracketed-model[1m]"]);
+        assert_eq!(scoped_model_ids(&result), ["bracketed-model[1m]"]);
         assert_eq!(
             result.scoped_models[0].thinking_level,
             Some(ThinkingLevel::High)
@@ -752,50 +780,25 @@ mod resolve_cli_model {
 
     #[test]
     fn resolves_model_provider_id_without_provider() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: None,
-            cli_model: Some("openai/gpt-4o"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
-        let resolved = result.model.expect("the model resolves");
+        let resolved = resolved_cli(None, "openai/gpt-4o")
+            .model
+            .expect("the model resolves");
         assert_eq!(resolved.provider.0, "openai");
         assert_eq!(resolved.id, "gpt-4o");
     }
 
     #[test]
     fn resolves_fuzzy_patterns_within_an_explicit_provider() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: Some("openai"),
-            cli_model: Some("4o"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
-        let resolved = result.model.expect("the model resolves");
+        let resolved = resolved_cli(Some("openai"), "4o")
+            .model
+            .expect("the model resolves");
         assert_eq!(resolved.provider.0, "openai");
         assert_eq!(resolved.id, "gpt-4o");
     }
 
     #[test]
     fn supports_model_pattern_with_thinking_without_explicit_thinking() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: None,
-            cli_model: Some("sonnet:high"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
+        let result = resolved_cli(None, "sonnet:high");
         let resolved = result.model.expect("the model resolves");
         assert_eq!(resolved.id, "claude-sonnet-4-5");
         assert_eq!(result.thinking_level, Some(ThinkingLevel::High));
@@ -803,51 +806,27 @@ mod resolve_cli_model {
 
     #[test]
     fn prefers_exact_model_id_match_over_provider_inference() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: None,
-            cli_model: Some("openai/gpt-4o:extended"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
-        let resolved = result.model.expect("the model resolves");
+        let resolved = resolved_cli(None, "openai/gpt-4o:extended")
+            .model
+            .expect("the model resolves");
         assert_eq!(resolved.provider.0, "openrouter");
         assert_eq!(resolved.id, "openai/gpt-4o:extended");
     }
 
     #[test]
     fn does_not_strip_invalid_suffix_as_thinking_level_in_model() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: Some("openai"),
-            cli_model: Some("gpt-4o:extended"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
-        let resolved = result.model.expect("the model resolves");
+        let resolved = resolved_cli(Some("openai"), "gpt-4o:extended")
+            .model
+            .expect("the model resolves");
         assert_eq!(resolved.provider.0, "openai");
         assert_eq!(resolved.id, "gpt-4o:extended");
     }
 
     #[test]
     fn allows_custom_model_ids_for_explicit_providers_without_double_prefixing() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: Some("openrouter"),
-            cli_model: Some("openrouter/openai/ghost-model"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
-        let resolved = result.model.expect("the model resolves");
+        let resolved = resolved_cli(Some("openrouter"), "openrouter/openai/ghost-model")
+            .model
+            .expect("the model resolves");
         assert_eq!(resolved.provider.0, "openrouter");
         assert_eq!(resolved.id, "openai/ghost-model");
     }
@@ -949,17 +928,9 @@ mod resolve_cli_model {
 
     #[test]
     fn resolves_provider_prefixed_fuzzy_patterns() {
-        let runtime = FakeRuntime::models(all_models());
-
-        let result = resolve_cli_model(ResolveCliModelOptions {
-            cli_provider: None,
-            cli_model: Some("openrouter/qwen"),
-            cli_thinking: None,
-            model_runtime: &runtime,
-        });
-
-        assert!(result.error.is_none());
-        let resolved = result.model.expect("the model resolves");
+        let resolved = resolved_cli(None, "openrouter/qwen")
+            .model
+            .expect("the model resolves");
         assert_eq!(resolved.provider.0, "openrouter");
         assert_eq!(resolved.id, "qwen/qwen3-coder:exacto");
     }
@@ -971,115 +942,62 @@ mod resolve_cli_model {
 
         #[test]
         fn strips_thinking_suffix_from_custom_model_id_in_fallback_path() {
-            let runtime = FakeRuntime::models(models_with_neuralwatt());
-
-            let result = resolve_cli_model(ResolveCliModelOptions {
-                cli_provider: None,
-                cli_model: Some("neuralwatt/zai-org/GLM-5.1-FP8:high"),
-                cli_thinking: None,
-                model_runtime: &runtime,
-            });
-
-            assert!(result.error.is_none());
-            let resolved = result.model.expect("the fallback model resolves");
-            assert_eq!(resolved.provider.0, "neuralwatt");
+            let (resolved, thinking) =
+                resolved_fallback(None, "neuralwatt/zai-org/GLM-5.1-FP8:high", None);
             // The :high suffix must NOT leak into the model id sent to the API.
             assert_eq!(resolved.id, "zai-org/GLM-5.1-FP8");
             assert!(resolved.reasoning);
-            assert_eq!(result.thinking_level, Some(ThinkingLevel::High));
+            assert_eq!(thinking, Some(ThinkingLevel::High));
         }
 
         #[test]
         fn custom_model_without_thinking_suffix_works_normally_in_fallback_path() {
-            let runtime = FakeRuntime::models(models_with_neuralwatt());
-
-            let result = resolve_cli_model(ResolveCliModelOptions {
-                cli_provider: None,
-                cli_model: Some("neuralwatt/zai-org/GLM-5.1-FP8"),
-                cli_thinking: None,
-                model_runtime: &runtime,
-            });
-
-            assert!(result.error.is_none());
-            let resolved = result.model.expect("the fallback model resolves");
-            assert_eq!(resolved.provider.0, "neuralwatt");
+            let (resolved, thinking) =
+                resolved_fallback(None, "neuralwatt/zai-org/GLM-5.1-FP8", None);
             assert_eq!(resolved.id, "zai-org/GLM-5.1-FP8");
-            assert!(result.thinking_level.is_none());
+            assert!(thinking.is_none());
         }
 
         #[test]
         fn all_valid_thinking_levels_work_in_fallback_path() {
-            let runtime = FakeRuntime::models(models_with_neuralwatt());
-
             for (level, expected) in all_thinking_levels() {
-                let result = resolve_cli_model(ResolveCliModelOptions {
-                    cli_provider: None,
-                    cli_model: Some(&format!("neuralwatt/zai-org/GLM-5.1-FP8:{level}")),
-                    cli_thinking: None,
-                    model_runtime: &runtime,
-                });
-
-                assert!(result.error.is_none());
-                let resolved = result.model.expect("the fallback model resolves");
+                let (resolved, thinking) = resolved_fallback(
+                    None,
+                    &format!("neuralwatt/zai-org/GLM-5.1-FP8:{level}"),
+                    None,
+                );
                 assert_eq!(resolved.id, "zai-org/GLM-5.1-FP8");
-                assert_eq!(result.thinking_level, Some(expected));
+                assert_eq!(thinking, Some(expected));
             }
         }
 
         #[test]
         fn invalid_thinking_suffix_on_custom_model_is_treated_as_part_of_model_id() {
-            let runtime = FakeRuntime::models(models_with_neuralwatt());
-
-            let result = resolve_cli_model(ResolveCliModelOptions {
-                cli_provider: None,
-                cli_model: Some("neuralwatt/zai-org/GLM-5.1-FP8:banana"),
-                cli_thinking: None,
-                model_runtime: &runtime,
-            });
-
-            assert!(result.error.is_none());
-            let resolved = result.model.expect("the fallback model resolves");
-            assert_eq!(resolved.provider.0, "neuralwatt");
+            let (resolved, thinking) =
+                resolved_fallback(None, "neuralwatt/zai-org/GLM-5.1-FP8:banana", None);
             // Invalid suffix stays in the id (it's not a thinking level).
             assert_eq!(resolved.id, "zai-org/GLM-5.1-FP8:banana");
-            assert!(result.thinking_level.is_none());
+            assert!(thinking.is_none());
         }
 
         #[test]
         fn explicit_provider_with_custom_model_thinking_strips_suffix_correctly() {
-            let runtime = FakeRuntime::models(models_with_neuralwatt());
-
-            let result = resolve_cli_model(ResolveCliModelOptions {
-                cli_provider: Some("neuralwatt"),
-                cli_model: Some("zai-org/GLM-5.1-FP8:high"),
-                cli_thinking: None,
-                model_runtime: &runtime,
-            });
-
-            assert!(result.error.is_none());
-            let resolved = result.model.expect("the fallback model resolves");
-            assert_eq!(resolved.provider.0, "neuralwatt");
+            let (resolved, thinking) =
+                resolved_fallback(Some("neuralwatt"), "zai-org/GLM-5.1-FP8:high", None);
             assert_eq!(resolved.id, "zai-org/GLM-5.1-FP8");
-            assert_eq!(result.thinking_level, Some(ThinkingLevel::High));
+            assert_eq!(thinking, Some(ThinkingLevel::High));
         }
 
         #[test]
         fn with_explicit_thinking_the_suffix_is_kept_as_part_of_model_id() {
-            let runtime = FakeRuntime::models(models_with_neuralwatt());
-
-            let result = resolve_cli_model(ResolveCliModelOptions {
-                cli_provider: None,
-                cli_model: Some("neuralwatt/zai-org/GLM-5.1-FP8:high"),
-                cli_thinking: Some(ThinkingLevel::Medium),
-                model_runtime: &runtime,
-            });
-
-            assert!(result.error.is_none());
-            let resolved = result.model.expect("the fallback model resolves");
-            assert_eq!(resolved.provider.0, "neuralwatt");
+            let (resolved, thinking) = resolved_fallback(
+                None,
+                "neuralwatt/zai-org/GLM-5.1-FP8:high",
+                Some(ThinkingLevel::Medium),
+            );
             // :high is kept as part of the model id since --thinking was explicit.
             assert_eq!(resolved.id, "zai-org/GLM-5.1-FP8:high");
-            assert!(result.thinking_level.is_none());
+            assert!(thinking.is_none());
         }
     }
 }

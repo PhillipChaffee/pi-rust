@@ -314,6 +314,267 @@ async fn create_registry(models_path: &str) -> ModelRegistry {
     .await
 }
 
+/// The registry over a freshly written models.json, with the temp dir the
+/// test binds for its lifetime, upstream's writeRawModelsJson +
+/// createModelRegistry rig.
+async fn override_registry(providers: serde_json::Value) -> (tempfile::TempDir, ModelRegistry) {
+    let (dir, models_path) = rig();
+    write_raw_models_json(&models_path, providers);
+    let registry = create_registry(&models_path).await;
+    (dir, registry)
+}
+
+/// The registry over models.json a refresh case rewrites: the path stays
+/// with the test so the second write lands on the same file.
+async fn registry_written(models_path: &str, providers: serde_json::Value) -> ModelRegistry {
+    write_raw_models_json(models_path, providers);
+    create_registry(models_path).await
+}
+
+/// Whether the provider's composed models carry the id, the membership
+/// check the merge and refresh cases pin.
+fn provider_has(registry: &ModelRegistry, provider: &str, id: &str) -> bool {
+    models_for_provider(registry, provider)
+        .iter()
+        .any(|model| model.id == id)
+}
+
+/// The provider's model-id list, the projection the persistence cases pin.
+fn provider_model_ids(registry: &ModelRegistry, provider: &str) -> Vec<String> {
+    models_for_provider(registry, provider)
+        .into_iter()
+        .map(|model| model.id)
+        .collect()
+}
+
+/// The built-in sonnet the openrouter catalog carries, the find the
+/// override cases pin.
+fn sonnet_in(registry: &ModelRegistry) -> Model {
+    models_for_provider(registry, "openrouter")
+        .into_iter()
+        .find(|model| model.id == "anthropic/claude-sonnet-4")
+        .expect("the sonnet composes")
+}
+
+/// The built-in opus the openrouter catalog carries, the negative-control
+/// find the override cases pin.
+fn opus_in(registry: &ModelRegistry) -> Model {
+    models_for_provider(registry, "openrouter")
+        .into_iter()
+        .find(|model| model.id == "anthropic/claude-opus-4")
+        .expect("the opus composes")
+}
+
+/// The provider's registered model with the id, the find the persistence
+/// cases pin.
+fn registered_model(registry: &ModelRegistry, provider: &str, id: &str) -> Model {
+    registry
+        .find(provider, id)
+        .expect("the custom model composes")
+}
+
+/// The model's merged compat, the unwrap every compat case pins; the
+/// message keeps each case's own failure text.
+const fn compat_of<'a>(model: &'a Model, message: &str) -> &'a ModelCompat {
+    model.compat.as_ref().expect(message)
+}
+
+/// The named request-time header after auth resolution: pins the Ok arm
+/// and reads the header the case asserts on.
+async fn request_header(registry: &ModelRegistry, model: &Model, name: &str) -> Option<String> {
+    let auth = registry.get_api_key_and_headers(model).await;
+    assert!(auth.ok());
+    let ResolvedRequestAuth::Ok { headers, .. } = auth else {
+        unreachable!("auth.ok() pinned the Ok arm");
+    };
+    headers
+        .as_ref()
+        .and_then(|headers| headers.get(name))
+        .cloned()
+        .flatten()
+}
+
+/// The custom header every anthropic model resolves at request time, the
+/// loop the header-override cases pin.
+async fn anthropic_request_headers(registry: &ModelRegistry) {
+    for model in models_for_provider(registry, "anthropic") {
+        assert_eq!(
+            request_header(registry, &model, "X-Custom-Header")
+                .await
+                .as_deref(),
+            Some("custom-value"),
+        );
+    }
+}
+
+/// The anthropic provider config carrying one custom claude model, the
+/// fixture the merge cases write.
+fn json_anthropic_custom(base_url: &str, model_id: &str) -> serde_json::Value {
+    json_provider_config(base_url, &[(model_id, None)], "anthropic-messages")
+}
+
+/// The demo provider config the compat-schema cases spell: the fixture
+/// base URL and key, the given api and provider compat, and the model list.
+fn json_demo_provider(
+    api: &str,
+    base_url: &str,
+    provider_compat: Option<serde_json::Value>,
+    models: &[serde_json::Value],
+) -> serde_json::Value {
+    let mut provider = serde_json::json!({
+        "baseUrl": base_url,
+        "apiKey": "DEMO_KEY",
+        "api": api,
+        "models": models,
+    });
+    if let Some(compat) = provider_compat {
+        provider["compat"] = compat;
+    }
+    provider
+}
+
+/// The provider-level usage compat the compat-override cases spell.
+fn json_demo_usage_compat() -> serde_json::Value {
+    serde_json::json!({
+        "supportsUsageInStreaming": false,
+        "maxTokensField": "max_tokens",
+    })
+}
+
+/// The anthropic-messages demo rig carrying one provider compat flag, the
+/// shape the eager-streaming and cache-retention cases spell.
+async fn demo_compat_flag_rig(compat: serde_json::Value) -> (tempfile::TempDir, ModelRegistry) {
+    override_registry(serde_json::json!({
+        "demo": json_demo_provider(
+            "anthropic-messages",
+            "https://example.com",
+            Some(compat),
+            &[json_demo_model(true, &[])],
+        ),
+    }))
+    .await
+}
+
+/// The demo-model entry the compat-schema cases spell: the fixture shape
+/// with the given reasoning flag and any extra fields merged in.
+fn json_demo_model(reasoning: bool, extra: &[(&str, serde_json::Value)]) -> serde_json::Value {
+    let mut entry = serde_json::json!({
+        "id": "demo-model",
+        "reasoning": reasoning,
+        "input": ["text"],
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 1000,
+        "maxTokens": 100,
+    });
+    let fields = entry
+        .as_object_mut()
+        .expect("the demo-model literal composes");
+    for (key, value) in extra {
+        fields.insert((*key).to_owned(), value.clone());
+    }
+    entry
+}
+
+/// The composed demo model, the find every compat-schema case pins.
+fn demo_model(registry: &ModelRegistry) -> Model {
+    registry
+        .find("demo", "demo-model")
+        .expect("the demo model composes")
+}
+
+/// The custom-claude registration over the given base URL, the fixture the
+/// anthropic override-persistence cases register.
+fn anthropic_custom_claude(base_url: &str) -> ProviderConfigInput {
+    ProviderConfigInput {
+        base_url: Some(base_url.to_owned()),
+        ..registration(
+            base_url,
+            Api::from("anthropic-messages"),
+            vec![extension_model(
+                "custom-claude",
+                Api::from("anthropic-messages"),
+            )],
+        )
+    }
+}
+
+/// The custom-a/custom-b provider registration, the fixture the
+/// custom-provider persistence cases register.
+fn custom_pair_registration() -> ProviderConfigInput {
+    registration(
+        "https://custom.test/v1",
+        Api::from("openai-completions"),
+        vec![
+            extension_model("custom-a", Api::from("openai-completions")),
+            extension_model("custom-b", Api::from("openai-completions")),
+        ],
+    )
+}
+
+/// The registered custom pair, the fixture the persistence cases start
+/// from.
+fn register_custom_pair(registry: &ModelRegistry) {
+    registry
+        .register_provider_config("custom-provider", custom_pair_registration())
+        .expect("the custom provider registers");
+}
+
+/// The custom pair's ids after an override's refresh, the assertion the
+/// custom-provider persistence cases pin.
+fn assert_custom_pair_ids(registry: &ModelRegistry) {
+    assert_eq!(
+        provider_model_ids(registry, "custom-provider"),
+        vec!["custom-a", "custom-b"]
+    );
+}
+
+/// The custom pair refreshed under the given override registration, the
+/// pass the custom-provider persistence cases drive.
+async fn refreshed_custom_pair(registry: &ModelRegistry, overlay: ProviderConfigInput) {
+    registry
+        .register_provider_config("custom-provider", overlay)
+        .expect("the override registers");
+    registry.refresh(Some(offline_refresh())).await;
+    assert_custom_pair_ids(registry);
+}
+
+/// The OAuth config the display-name and overlay cases register: the
+/// never-running login, the echoing refresh, and the access-key getter.
+fn oauth_config(name: &str) -> ExtensionOAuthConfig {
+    ExtensionOAuthConfig {
+        name: name.to_owned(),
+        is_subscription: None,
+        uses_callback_server: None,
+        login: never_login(),
+        refresh_token: echo_refresh(),
+        get_api_key: Arc::new(|credentials: &OAuthCredentials| credentials.access.clone()),
+        modify_models: None,
+    }
+}
+
+/// The seeded counter file a command case hosts in the rig dir.
+fn seeded_counter(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let counter_file = dir.path().join(name);
+    std::fs::write(&counter_file, "0").expect("the counter seeds");
+    counter_file
+}
+
+/// The provider config carrying the api-key command with `authHeader: true`,
+/// the shape the auth-header resolution cases write.
+fn auth_header_config(command: &str) -> serde_json::Value {
+    let mut config = json_provider_with_api_key(command);
+    config["authHeader"] = serde_json::json!(true);
+    config
+}
+
+/// The test-model the provider config carries, the find the resolution
+/// cases pin.
+fn test_model(registry: &ModelRegistry) -> Model {
+    registry
+        .find("custom-provider", "test-model")
+        .expect("the test model composes")
+}
+
 /// The counter file's parsed value, upstream's `parseInt(readFileSync(...))`.
 fn counter_count(path: &std::path::Path) -> i64 {
     std::fs::read_to_string(path)
@@ -328,15 +589,10 @@ mod base_url_override_no_custom_models {
 
     #[tokio::test]
     async fn overriding_base_url_keeps_all_built_in_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_override_config("https://my-proxy.example.com/v1", None),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_override_config("https://my-proxy.example.com/v1", None),
+        }))
+        .await;
         let anthropic_models = models_for_provider(&registry, "anthropic");
 
         assert!(
@@ -353,15 +609,10 @@ mod base_url_override_no_custom_models {
 
     #[tokio::test]
     async fn overriding_base_url_changes_url_on_all_built_in_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_override_config("https://my-proxy.example.com/v1", None),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_override_config("https://my-proxy.example.com/v1", None),
+        }))
+        .await;
         for model in models_for_provider(&registry, "anthropic") {
             assert_eq!(model.base_url, "https://my-proxy.example.com/v1");
         }
@@ -369,60 +620,27 @@ mod base_url_override_no_custom_models {
 
     #[tokio::test]
     async fn overriding_headers_resolves_at_request_time() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_override_config(
-                    "https://my-proxy.example.com/v1",
-                    Some(&serde_json::json!({ "X-Custom-Header": "custom-value" })),
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        for model in models_for_provider(&registry, "anthropic") {
-            let auth = registry.get_api_key_and_headers(&model).await;
-            assert!(auth.ok());
-            let ResolvedRequestAuth::Ok { headers, .. } = auth else {
-                unreachable!("auth.ok() pinned the Ok arm");
-            };
-            assert_eq!(
-                headers
-                    .as_ref()
-                    .and_then(|headers| headers.get("X-Custom-Header")),
-                Some(&Some("custom-value".to_owned())),
-            );
-        }
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_override_config(
+                "https://my-proxy.example.com/v1",
+                Some(&serde_json::json!({ "X-Custom-Header": "custom-value" })),
+            ),
+        }))
+        .await;
+        anthropic_request_headers(&registry).await;
     }
 
     #[tokio::test]
     async fn headers_only_override_resolves_at_request_time() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": {
-                    "headers": { "X-Custom-Header": "custom-value" },
-                },
-            }),
-        );
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": {
+                "headers": { "X-Custom-Header": "custom-value" },
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
         assert!(registry.get_error().is_none());
-        for model in models_for_provider(&registry, "anthropic") {
-            let auth = registry.get_api_key_and_headers(&model).await;
-            assert!(auth.ok());
-            let ResolvedRequestAuth::Ok { headers, .. } = auth else {
-                unreachable!("auth.ok() pinned the Ok arm");
-            };
-            assert_eq!(
-                headers
-                    .as_ref()
-                    .and_then(|headers| headers.get("X-Custom-Header")),
-                Some(&Some("custom-value".to_owned())),
-            );
-        }
+        anthropic_request_headers(&registry).await;
     }
 
     #[tokio::test]
@@ -456,15 +674,10 @@ mod base_url_override_no_custom_models {
 
     #[tokio::test]
     async fn base_url_only_override_does_not_affect_other_providers() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_override_config("https://my-proxy.example.com/v1", None),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_override_config("https://my-proxy.example.com/v1", None),
+        }))
+        .await;
         let google_models = models_for_provider(&registry, "google");
 
         assert!(!google_models.is_empty(), "google models survive");
@@ -476,20 +689,15 @@ mod base_url_override_no_custom_models {
 
     #[tokio::test]
     async fn can_mix_base_url_override_and_models_merge() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_override_config("https://anthropic-proxy.example.com/v1", None),
-                "google": json_provider_config(
-                    "https://google-proxy.example.com/v1",
-                    &[("gemini-custom", None)],
-                    "google-generative-ai",
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_override_config("https://anthropic-proxy.example.com/v1", None),
+            "google": json_provider_config(
+                "https://google-proxy.example.com/v1",
+                &[("gemini-custom", None)],
+                "google-generative-ai",
+            ),
+        }))
+        .await;
 
         let anthropic_models = models_for_provider(&registry, "anthropic");
         assert!(anthropic_models.len() > 1);
@@ -510,13 +718,13 @@ mod base_url_override_no_custom_models {
     #[tokio::test]
     async fn refresh_picks_up_base_url_override_changes() {
         let (_dir, models_path) = rig();
-        write_raw_models_json(
+        let registry = registry_written(
             &models_path,
             serde_json::json!({
                 "anthropic": json_override_config("https://first-proxy.example.com/v1", None),
             }),
-        );
-        let registry = create_registry(&models_path).await;
+        )
+        .await;
         assert_eq!(
             models_for_provider(&registry, "anthropic")[0].base_url,
             "https://first-proxy.example.com/v1"
@@ -542,22 +750,17 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn built_in_provider_custom_models_inherit_api_and_base_url_without_explicit_fields() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "models": [{
-                        "id": "fake-provider/fake-model",
-                        "name": "Fake model",
-                        "reasoning": true,
-                        "input": ["text"],
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "models": [{
+                    "id": "fake-provider/fake-model",
+                    "name": "Fake model",
+                    "reasoning": true,
+                    "input": ["text"],
+                }],
+            },
+        }))
+        .await;
         assert!(registry.get_error().is_none());
 
         let model = registry
@@ -569,23 +772,18 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn non_built_in_provider_custom_models_still_require_base_url() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "my-custom-provider": {
-                    "apiKey": "test-key",
-                    "models": [{
-                        "id": "my-model",
-                        "api": "openai-completions",
-                        "reasoning": false,
-                        "input": ["text"],
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "my-custom-provider": {
+                "apiKey": "test-key",
+                "models": [{
+                    "id": "my-model",
+                    "api": "openai-completions",
+                    "reasoning": false,
+                    "input": ["text"],
+                }],
+            },
+        }))
+        .await;
         let error = registry.get_error().expect("the composition error reports");
         assert!(
             error.contains("baseUrl"),
@@ -595,16 +793,11 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn reports_every_provider_composition_error() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "broken-one": { "api": "openai-completions", "models": [{ "id": "one" }] },
-                "broken-two": { "api": "openai-completions", "models": [{ "id": "two" }] },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "broken-one": { "api": "openai-completions", "models": [{ "id": "one" }] },
+            "broken-two": { "api": "openai-completions", "models": [{ "id": "two" }] },
+        }))
+        .await;
         let error = registry.get_error().expect("the composition errors report");
 
         assert!(error.contains("Provider \"broken-one\""), "got: {error}");
@@ -613,19 +806,13 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn custom_provider_with_same_name_as_built_in_merges_with_built_in_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_provider_config(
-                    "https://my-proxy.example.com/v1",
-                    &[("claude-custom", None)],
-                    "anthropic-messages",
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_anthropic_custom(
+                "https://my-proxy.example.com/v1",
+                "claude-custom",
+            ),
+        }))
+        .await;
         let anthropic_models = models_for_provider(&registry, "anthropic");
 
         assert!(anthropic_models.len() > 1);
@@ -643,19 +830,14 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn custom_model_with_same_id_replaces_built_in_model_by_id() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": json_provider_config(
-                    "https://my-proxy.example.com/v1",
-                    &[("anthropic/claude-sonnet-4", None)],
-                    "openai-completions",
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": json_provider_config(
+                "https://my-proxy.example.com/v1",
+                &[("anthropic/claude-sonnet-4", None)],
+                "openai-completions",
+            ),
+        }))
+        .await;
         let sonnets: Vec<Model> = models_for_provider(&registry, "openrouter")
             .into_iter()
             .filter(|model| model.id == "anthropic/claude-sonnet-4")
@@ -667,19 +849,13 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn custom_provider_with_same_name_as_built_in_does_not_affect_other_built_in_providers() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_provider_config(
-                    "https://my-proxy.example.com/v1",
-                    &[("claude-custom", None)],
-                    "anthropic-messages",
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_anthropic_custom(
+                "https://my-proxy.example.com/v1",
+                "claude-custom",
+            ),
+        }))
+        .await;
 
         assert!(
             !models_for_provider(&registry, "google").is_empty(),
@@ -693,19 +869,13 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn provider_level_base_url_applies_to_both_built_in_and_custom_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "anthropic": json_provider_config(
-                    "https://merged-proxy.example.com/v1",
-                    &[("claude-custom", None)],
-                    "anthropic-messages",
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "anthropic": json_anthropic_custom(
+                "https://merged-proxy.example.com/v1",
+                "claude-custom",
+            ),
+        }))
+        .await;
         for model in models_for_provider(&registry, "anthropic") {
             assert_eq!(model.base_url, "https://merged-proxy.example.com/v1");
         }
@@ -713,38 +883,17 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn provider_level_compat_applies_to_custom_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "demo": {
-                    "baseUrl": "https://example.com/v1",
-                    "apiKey": "DEMO_KEY",
-                    "api": "openai-completions",
-                    "compat": {
-                        "supportsUsageInStreaming": false,
-                        "maxTokensField": "max_tokens",
-                    },
-                    "models": [{
-                        "id": "demo-model",
-                        "reasoning": false,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 1000,
-                        "maxTokens": 100,
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        let model = registry
-            .find("demo", "demo-model")
-            .expect("the demo model composes");
-        let compat: &ModelCompat = model
-            .compat
-            .as_ref()
-            .expect("the provider compat rides the model");
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "demo": json_demo_provider(
+                "openai-completions",
+                "https://example.com/v1",
+                Some(json_demo_usage_compat()),
+                &[json_demo_model(false, &[])],
+            ),
+        }))
+        .await;
+        let model = demo_model(&registry);
+        let compat = compat_of(&model, "the provider compat rides the model");
 
         assert_eq!(compat.supports_usage_in_streaming, Some(false));
         assert_eq!(compat.max_tokens_field, Some(MaxTokensField::MaxTokens));
@@ -752,42 +901,26 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn model_level_compat_overrides_provider_level_compat_for_custom_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "demo": {
-                    "baseUrl": "https://example.com/v1",
-                    "apiKey": "DEMO_KEY",
-                    "api": "openai-completions",
-                    "compat": {
-                        "supportsUsageInStreaming": false,
-                        "maxTokensField": "max_tokens",
-                    },
-                    "models": [{
-                        "id": "demo-model",
-                        "reasoning": false,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 1000,
-                        "maxTokens": 100,
-                        "compat": {
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "demo": json_demo_provider(
+                "openai-completions",
+                "https://example.com/v1",
+                Some(json_demo_usage_compat()),
+                &[json_demo_model(
+                    false,
+                    &[(
+                        "compat",
+                        serde_json::json!({
                             "supportsUsageInStreaming": true,
                             "maxTokensField": "max_completion_tokens",
-                        },
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        let model = registry
-            .find("demo", "demo-model")
-            .expect("the demo model composes");
-        let compat: &ModelCompat = model
-            .compat
-            .as_ref()
-            .expect("the merged compat rides the model");
+                        }),
+                    )],
+                )],
+            ),
+        }))
+        .await;
+        let model = demo_model(&registry);
+        let compat = compat_of(&model, "the merged compat rides the model");
 
         assert_eq!(compat.supports_usage_in_streaming, Some(true));
         assert_eq!(
@@ -798,25 +931,20 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn provider_level_compat_applies_to_built_in_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "compat": {
-                        "supportsUsageInStreaming": false,
-                        "supportsStrictMode": false,
-                    },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "compat": {
+                    "supportsUsageInStreaming": false,
+                    "supportsStrictMode": false,
                 },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+            },
+        }))
+        .await;
         let models = models_for_provider(&registry, "openrouter");
 
         assert!(!models.is_empty(), "the openrouter catalog is non-empty");
         for model in &models {
-            let compat: &ModelCompat = model.compat.as_ref().expect("the compat merges");
+            let compat = compat_of(model, "the compat merges");
             assert_eq!(compat.supports_usage_in_streaming, Some(false));
             assert_eq!(compat.supports_strict_mode, Some(false));
         }
@@ -825,36 +953,32 @@ mod custom_models_merge_behavior {
     #[tokio::test]
     async fn model_schema_accepts_thinking_level_map_and_compat_schema_accepts_strict_mode_and_cache_control_format()
      {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "demo": {
-                    "baseUrl": "https://example.com/v1",
-                    "apiKey": "DEMO_KEY",
-                    "api": "openai-completions",
-                    "models": [{
-                        "id": "demo-model",
-                        "reasoning": true,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 1000,
-                        "maxTokens": 100,
-                        "thinkingLevelMap": { "minimal": null, "high": "max" },
-                        "compat": {
-                            "supportsStrictMode": false,
-                            "cacheControlFormat": "anthropic",
-                        },
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        let model = registry
-            .find("demo", "demo-model")
-            .expect("the demo model composes");
-        let compat: &ModelCompat = model.compat.as_ref().expect("the compat parses");
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "demo": json_demo_provider(
+                "openai-completions",
+                "https://example.com/v1",
+                None,
+                &[json_demo_model(
+                    true,
+                    &[
+                        (
+                            "thinkingLevelMap",
+                            serde_json::json!({ "minimal": null, "high": "max" }),
+                        ),
+                        (
+                            "compat",
+                            serde_json::json!({
+                                "supportsStrictMode": false,
+                                "cacheControlFormat": "anthropic",
+                            }),
+                        ),
+                    ],
+                )],
+            ),
+        }))
+        .await;
+        let model = demo_model(&registry);
+        let compat = compat_of(&model, "the compat parses");
 
         assert!(registry.get_error().is_none());
         assert_eq!(
@@ -873,58 +997,53 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn compat_schema_accepts_chat_template_thinking_configuration() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "demo": {
-                    "baseUrl": "https://example.com/v1",
-                    "apiKey": "DEMO_KEY",
-                    "api": "openai-completions",
-                    "models": [
-                        {
-                            "id": "kwargs-model",
-                            "reasoning": true,
-                            "input": ["text"],
-                            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                            "contextWindow": 1000,
-                            "maxTokens": 100,
-                            "compat": {
-                                "thinkingFormat": "chat-template",
-                                "chatTemplateKwargs": {
-                                    "preserve_thinking": true,
-                                    "thinking": { "$var": "thinking.enabled" },
-                                },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "demo": {
+                "baseUrl": "https://example.com/v1",
+                "apiKey": "DEMO_KEY",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "kwargs-model",
+                        "reasoning": true,
+                        "input": ["text"],
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                        "contextWindow": 1000,
+                        "maxTokens": 100,
+                        "compat": {
+                            "thinkingFormat": "chat-template",
+                            "chatTemplateKwargs": {
+                                "preserve_thinking": true,
+                                "thinking": { "$var": "thinking.enabled" },
                             },
                         },
-                        {
-                            "id": "args-model",
-                            "reasoning": true,
-                            "input": ["text"],
-                            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                            "contextWindow": 1000,
-                            "maxTokens": 100,
-                            "compat": {
-                                "thinkingFormat": "baseten",
-                                "chatTemplateArgs": {
-                                    "enable_thinking": { "$var": "thinking.enabled" },
-                                },
+                    },
+                    {
+                        "id": "args-model",
+                        "reasoning": true,
+                        "input": ["text"],
+                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                        "contextWindow": 1000,
+                        "maxTokens": 100,
+                        "compat": {
+                            "thinkingFormat": "baseten",
+                            "chatTemplateArgs": {
+                                "enable_thinking": { "$var": "thinking.enabled" },
                             },
                         },
-                    ],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+                    },
+                ],
+            },
+        }))
+        .await;
         let kwargs_model = registry
             .find("demo", "kwargs-model")
             .expect("the kwargs model composes");
         let args_model = registry
             .find("demo", "args-model")
             .expect("the args model composes");
-        let kwargs_compat: &ModelCompat = kwargs_model.compat.as_ref().expect("the compat parses");
-        let args_compat: &ModelCompat = args_model.compat.as_ref().expect("the compat parses");
+        let kwargs_compat = compat_of(&kwargs_model, "the compat parses");
+        let args_compat = compat_of(&args_model, "the compat parses");
 
         assert!(registry.get_error().is_none());
         assert_eq!(
@@ -961,32 +1080,12 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn compat_schema_accepts_anthropic_eager_tool_input_streaming_flag() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "demo": {
-                    "baseUrl": "https://example.com",
-                    "apiKey": "DEMO_KEY",
-                    "api": "anthropic-messages",
-                    "compat": { "supportsEagerToolInputStreaming": false },
-                    "models": [{
-                        "id": "demo-model",
-                        "reasoning": true,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 1000,
-                        "maxTokens": 100,
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        let model = registry
-            .find("demo", "demo-model")
-            .expect("the demo model composes");
-        let compat: &ModelCompat = model.compat.as_ref().expect("the compat parses");
+        let (_dir, registry) = demo_compat_flag_rig(serde_json::json!({
+            "supportsEagerToolInputStreaming": false,
+        }))
+        .await;
+        let model = demo_model(&registry);
+        let compat = compat_of(&model, "the compat parses");
 
         assert!(registry.get_error().is_none());
         assert_eq!(compat.supports_eager_tool_input_streaming, Some(false));
@@ -994,32 +1093,12 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn compat_schema_accepts_long_cache_retention_flag() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "demo": {
-                    "baseUrl": "https://example.com",
-                    "apiKey": "DEMO_KEY",
-                    "api": "anthropic-messages",
-                    "compat": { "supportsLongCacheRetention": false },
-                    "models": [{
-                        "id": "demo-model",
-                        "reasoning": true,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 1000,
-                        "maxTokens": 100,
-                    }],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        let model = registry
-            .find("demo", "demo-model")
-            .expect("the demo model composes");
-        let compat: &ModelCompat = model.compat.as_ref().expect("the compat parses");
+        let (_dir, registry) = demo_compat_flag_rig(serde_json::json!({
+            "supportsLongCacheRetention": false,
+        }))
+        .await;
+        let model = demo_model(&registry);
+        let compat = compat_of(&model, "the compat parses");
 
         assert!(registry.get_error().is_none());
         assert_eq!(compat.supports_long_cache_retention, Some(false));
@@ -1027,39 +1106,34 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn model_level_base_url_overrides_provider_level_base_url_for_custom_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "opencode-go": {
-                    "baseUrl": "https://opencode.ai/zen/go/v1",
-                    "apiKey": "TEST_KEY",
-                    "models": [
-                        {
-                            "id": "minimax-m2.5",
-                            "api": "anthropic-messages",
-                            "baseUrl": "https://opencode.ai/zen/go",
-                            "reasoning": true,
-                            "input": ["text"],
-                            "cost": { "input": 0.3, "output": 1.2, "cacheRead": 0.03, "cacheWrite": 0 },
-                            "contextWindow": 204_800,
-                            "maxTokens": 131_072,
-                        },
-                        {
-                            "id": "glm-5",
-                            "api": "openai-completions",
-                            "reasoning": true,
-                            "input": ["text"],
-                            "cost": { "input": 1, "output": 3.2, "cacheRead": 0.2, "cacheWrite": 0 },
-                            "contextWindow": 204_800,
-                            "maxTokens": 131_072,
-                        },
-                    ],
-                },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "opencode-go": {
+                "baseUrl": "https://opencode.ai/zen/go/v1",
+                "apiKey": "TEST_KEY",
+                "models": [
+                    {
+                        "id": "minimax-m2.5",
+                        "api": "anthropic-messages",
+                        "baseUrl": "https://opencode.ai/zen/go",
+                        "reasoning": true,
+                        "input": ["text"],
+                        "cost": { "input": 0.3, "output": 1.2, "cacheRead": 0.03, "cacheWrite": 0 },
+                        "contextWindow": 204_800,
+                        "maxTokens": 131_072,
+                    },
+                    {
+                        "id": "glm-5",
+                        "api": "openai-completions",
+                        "reasoning": true,
+                        "input": ["text"],
+                        "cost": { "input": 1, "output": 3.2, "cacheRead": 0.2, "cacheWrite": 0 },
+                        "contextWindow": 204_800,
+                        "maxTokens": 131_072,
+                    },
+                ],
+            },
+        }))
+        .await;
         let m25 = registry
             .find("opencode-go", "minimax-m2.5")
             .expect("minimax composes");
@@ -1071,33 +1145,28 @@ mod custom_models_merge_behavior {
 
     #[tokio::test]
     async fn model_overrides_still_apply_when_provider_also_defines_models() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "baseUrl": "https://my-proxy.example.com/v1",
-                    "apiKey": "OPENROUTER_API_KEY",
-                    "api": "openai-completions",
-                    "models": [{
-                        "id": "custom/openrouter-model",
-                        "name": "Custom OpenRouter Model",
-                        "reasoning": false,
-                        "input": ["text"],
-                        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                        "contextWindow": 128_000,
-                        "maxTokens": 16_384,
-                    }],
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "name": "Overridden Built-in Sonnet",
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "baseUrl": "https://my-proxy.example.com/v1",
+                "apiKey": "OPENROUTER_API_KEY",
+                "api": "openai-completions",
+                "models": [{
+                    "id": "custom/openrouter-model",
+                    "name": "Custom OpenRouter Model",
+                    "reasoning": false,
+                    "input": ["text"],
+                    "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                    "contextWindow": 128_000,
+                    "maxTokens": 16_384,
+                }],
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "name": "Overridden Built-in Sonnet",
                     },
                 },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+            },
+        }))
+        .await;
         let models = models_for_provider(&registry, "openrouter");
 
         assert!(
@@ -1117,50 +1186,39 @@ mod custom_models_merge_behavior {
     #[tokio::test]
     async fn refresh_reloads_merged_custom_models_from_disk() {
         let (_dir, models_path) = rig();
-        write_raw_models_json(
+        let registry = registry_written(
             &models_path,
             serde_json::json!({
-                "anthropic": json_provider_config(
+                "anthropic": json_anthropic_custom(
                     "https://first-proxy.example.com/v1",
-                    &[("claude-custom", None)],
-                    "anthropic-messages",
+                    "claude-custom",
                 ),
             }),
-        );
-        let registry = create_registry(&models_path).await;
-        assert!(
-            models_for_provider(&registry, "anthropic")
-                .iter()
-                .any(|model| model.id == "claude-custom")
-        );
+        )
+        .await;
+        assert!(provider_has(&registry, "anthropic", "claude-custom"));
 
         write_raw_models_json(
             &models_path,
             serde_json::json!({
-                "anthropic": json_provider_config(
+                "anthropic": json_anthropic_custom(
                     "https://second-proxy.example.com/v1",
-                    &[("claude-custom-2", None)],
-                    "anthropic-messages",
+                    "claude-custom-2",
                 ),
             }),
         );
         registry.refresh(Some(offline_refresh())).await;
 
-        let anthropic_models = models_for_provider(&registry, "anthropic");
         assert!(
-            !anthropic_models
-                .iter()
-                .any(|model| model.id == "claude-custom"),
+            !provider_has(&registry, "anthropic", "claude-custom"),
             "the stale custom model drops"
         );
         assert!(
-            anthropic_models
-                .iter()
-                .any(|model| model.id == "claude-custom-2"),
+            provider_has(&registry, "anthropic", "claude-custom-2"),
             "the fresh custom model composes"
         );
         assert!(
-            anthropic_models
+            models_for_provider(&registry, "anthropic")
                 .iter()
                 .any(|model| model.id.contains("claude")),
             "the built-in models survive"
@@ -1170,35 +1228,27 @@ mod custom_models_merge_behavior {
     #[tokio::test]
     async fn removing_custom_models_from_models_json_keeps_built_in_provider_models() {
         let (_dir, models_path) = rig();
-        write_raw_models_json(
+        let registry = registry_written(
             &models_path,
             serde_json::json!({
-                "anthropic": json_provider_config(
+                "anthropic": json_anthropic_custom(
                     "https://proxy.example.com/v1",
-                    &[("claude-custom", None)],
-                    "anthropic-messages",
+                    "claude-custom",
                 ),
             }),
-        );
-        let registry = create_registry(&models_path).await;
-        assert!(
-            models_for_provider(&registry, "anthropic")
-                .iter()
-                .any(|model| model.id == "claude-custom")
-        );
+        )
+        .await;
+        assert!(provider_has(&registry, "anthropic", "claude-custom"));
 
         write_raw_models_json(&models_path, serde_json::json!({}));
         registry.refresh(Some(offline_refresh())).await;
 
-        let anthropic_models = models_for_provider(&registry, "anthropic");
         assert!(
-            !anthropic_models
-                .iter()
-                .any(|model| model.id == "claude-custom"),
+            !provider_has(&registry, "anthropic", "claude-custom"),
             "the removed custom model drops"
         );
         assert!(
-            anthropic_models
+            models_for_provider(&registry, "anthropic")
                 .iter()
                 .any(|model| model.id.contains("claude")),
             "the built-in models survive"
@@ -1211,57 +1261,40 @@ mod model_overrides_per_model_customization {
 
     #[tokio::test]
     async fn model_override_applies_to_a_single_built_in_model() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": { "name": "Custom Sonnet Name" },
-                    },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": { "name": "Custom Sonnet Name" },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
+        let sonnet = sonnet_in(&registry);
         assert_eq!(sonnet.name, "Custom Sonnet Name");
 
-        let opus = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-opus-4")
-            .expect("the opus composes");
+        let opus = opus_in(&registry);
         assert_ne!(opus.name, "Custom Sonnet Name");
     }
 
     #[tokio::test]
     async fn custom_model_and_model_override_carry_sampling_params() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "baseUrl": "https://my-proxy.example.com/v1",
-                    "api": "openai-completions",
-                    "models": [{
-                        "id": "custom/sampling-model",
-                        "samplingParams": { "temperature": 1, "top_p": 0.95, "top_k": 0 },
-                    }],
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "samplingParams": { "top_p": 0.9 },
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "baseUrl": "https://my-proxy.example.com/v1",
+                "api": "openai-completions",
+                "models": [{
+                    "id": "custom/sampling-model",
+                    "samplingParams": { "temperature": 1, "top_p": 0.95, "top_k": 0 },
+                }],
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "samplingParams": { "top_p": 0.9 },
                     },
                 },
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+            },
+        }))
+        .await;
         let models = models_for_provider(&registry, "openrouter");
 
         let custom = models
@@ -1279,10 +1312,7 @@ mod model_overrides_per_model_customization {
             serde_json::json!({ "temperature": 1, "top_p": 0.95, "top_k": 0 })
         );
 
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
+        let sonnet = sonnet_in(&registry);
         assert_eq!(
             serde_json::to_value(
                 sonnet
@@ -1294,37 +1324,25 @@ mod model_overrides_per_model_customization {
             serde_json::json!({ "top_p": 0.9 })
         );
 
-        let opus = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-opus-4")
-            .expect("the opus composes");
+        let opus = opus_in(&registry);
         assert!(opus.sampling_params.is_none(), "unconfigured stays unset");
     }
 
     #[tokio::test]
     async fn model_override_with_compat_open_router_routing() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "compat": { "openRouterRouting": { "only": ["amazon-bedrock"] } },
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "compat": { "openRouterRouting": { "only": ["amazon-bedrock"] } },
                     },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
-        let compat: &ModelCompat = sonnet.compat.as_ref().expect("the compat merges");
+        let sonnet = sonnet_in(&registry);
+        let compat = compat_of(&sonnet, "the compat merges");
         assert_eq!(
             compat.open_router_routing,
             Some(OpenRouterRouting {
@@ -1336,75 +1354,49 @@ mod model_overrides_per_model_customization {
 
     #[tokio::test]
     async fn supports_finish_reason_can_be_configured_at_provider_and_model_levels() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "compat": { "supportsFinishReason": true },
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "compat": { "supportsFinishReason": false },
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "compat": { "supportsFinishReason": true },
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "compat": { "supportsFinishReason": false },
                     },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
-        let opus = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-opus-4")
-            .expect("the opus composes");
+        let sonnet = sonnet_in(&registry);
+        let opus = opus_in(&registry);
 
         assert_eq!(
-            sonnet
-                .compat
-                .as_ref()
-                .expect("the compat merges")
-                .supports_finish_reason,
+            compat_of(&sonnet, "the compat merges").supports_finish_reason,
             Some(false)
         );
         assert_eq!(
-            opus.compat
-                .as_ref()
-                .expect("the compat merges")
-                .supports_finish_reason,
+            compat_of(&opus, "the compat merges").supports_finish_reason,
             Some(true)
         );
     }
 
     #[tokio::test]
     async fn model_override_deep_merges_compat_settings() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "compat": {
-                                "openRouterRouting": { "order": ["anthropic", "together"] },
-                            },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "compat": {
+                            "openRouterRouting": { "order": ["anthropic", "together"] },
                         },
                     },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
+        let sonnet = sonnet_in(&registry);
 
-        let compat: &ModelCompat = sonnet.compat.as_ref().expect("the compat merges");
+        let compat = compat_of(&sonnet, "the compat merges");
         assert_eq!(
             compat.open_router_routing,
             Some(OpenRouterRouting {
@@ -1416,51 +1408,32 @@ mod model_overrides_per_model_customization {
 
     #[tokio::test]
     async fn multiple_model_overrides_on_same_provider() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "compat": { "openRouterRouting": { "only": ["amazon-bedrock"] } },
-                        },
-                        "anthropic/claude-opus-4": {
-                            "compat": { "openRouterRouting": { "only": ["anthropic"] } },
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "compat": { "openRouterRouting": { "only": ["amazon-bedrock"] } },
+                    },
+                    "anthropic/claude-opus-4": {
+                        "compat": { "openRouterRouting": { "only": ["anthropic"] } },
                     },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
-        let opus = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-opus-4")
-            .expect("the opus composes");
+        let sonnet = sonnet_in(&registry);
+        let opus = opus_in(&registry);
 
         assert_eq!(
-            sonnet
-                .compat
-                .as_ref()
-                .expect("the compat merges")
-                .open_router_routing,
+            compat_of(&sonnet, "the compat merges").open_router_routing,
             Some(OpenRouterRouting {
                 only: Some(vec!["amazon-bedrock".to_owned()]),
                 ..OpenRouterRouting::default()
             })
         );
         assert_eq!(
-            opus.compat
-                .as_ref()
-                .expect("the compat merges")
-                .open_router_routing,
+            compat_of(&opus, "the compat merges").open_router_routing,
             Some(OpenRouterRouting {
                 only: Some(vec!["anthropic".to_owned()]),
                 ..OpenRouterRouting::default()
@@ -1470,52 +1443,36 @@ mod model_overrides_per_model_customization {
 
     #[tokio::test]
     async fn model_override_combined_with_base_url_override() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "baseUrl": "https://my-proxy.example.com/v1",
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": { "name": "Proxied Sonnet" },
-                    },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "baseUrl": "https://my-proxy.example.com/v1",
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": { "name": "Proxied Sonnet" },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
-
+        let sonnet = sonnet_in(&registry);
         assert_eq!(sonnet.base_url, "https://my-proxy.example.com/v1");
         assert_eq!(sonnet.name, "Proxied Sonnet");
 
-        let opus = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-opus-4")
-            .expect("the opus composes");
+        let opus = opus_in(&registry);
         assert_eq!(opus.base_url, "https://my-proxy.example.com/v1");
         assert_ne!(opus.name, "Proxied Sonnet");
     }
 
     #[tokio::test]
     async fn model_override_for_non_existent_model_id_is_ignored() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "nonexistent/model-id": { "name": "This should not appear" },
-                    },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "nonexistent/model-id": { "name": "This should not appear" },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
         let models = models_for_provider(&registry, "openrouter");
 
         assert!(
@@ -1529,26 +1486,18 @@ mod model_overrides_per_model_customization {
 
     #[tokio::test]
     async fn model_override_can_change_cost_fields_partially() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "cost": { "input": 99 },
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "cost": { "input": 99 },
                     },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
+        let sonnet = sonnet_in(&registry);
 
         // Input cost should be overridden
         assert_eq!(sonnet.cost.rates.input, 99.0);
@@ -1558,44 +1507,30 @@ mod model_overrides_per_model_customization {
 
     #[tokio::test]
     async fn model_override_can_add_headers_at_request_time() {
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "openrouter": {
-                    "modelOverrides": {
-                        "anthropic/claude-sonnet-4": {
-                            "headers": { "X-Custom-Model-Header": "value" },
-                        },
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "openrouter": {
+                "modelOverrides": {
+                    "anthropic/claude-sonnet-4": {
+                        "headers": { "X-Custom-Model-Header": "value" },
                     },
                 },
-            }),
-        );
+            },
+        }))
+        .await;
 
-        let registry = create_registry(&models_path).await;
-        let models = models_for_provider(&registry, "openrouter");
-        let sonnet = models
-            .iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
-
-        let auth = registry.get_api_key_and_headers(sonnet).await;
-        assert!(auth.ok());
-        let ResolvedRequestAuth::Ok { headers, .. } = auth else {
-            unreachable!("auth.ok() pinned the Ok arm");
-        };
+        let sonnet = sonnet_in(&registry);
         assert_eq!(
-            headers
-                .as_ref()
-                .and_then(|headers| headers.get("X-Custom-Model-Header")),
-            Some(&Some("value".to_owned())),
+            request_header(&registry, &sonnet, "X-Custom-Model-Header")
+                .await
+                .as_deref(),
+            Some("value"),
         );
     }
 
     #[tokio::test]
     async fn refresh_picks_up_model_override_changes() {
         let (_dir, models_path) = rig();
-        write_raw_models_json(
+        let registry = registry_written(
             &models_path,
             serde_json::json!({
                 "openrouter": {
@@ -1604,17 +1539,9 @@ mod model_overrides_per_model_customization {
                     },
                 },
             }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        assert_eq!(
-            models_for_provider(&registry, "openrouter")
-                .iter()
-                .find(|model| model.id == "anthropic/claude-sonnet-4")
-                .expect("the sonnet composes")
-                .name,
-            "First Name"
-        );
+        )
+        .await;
+        assert_eq!(sonnet_in(&registry).name, "First Name");
 
         write_raw_models_json(
             &models_path,
@@ -1628,20 +1555,13 @@ mod model_overrides_per_model_customization {
         );
         registry.refresh(Some(offline_refresh())).await;
 
-        assert_eq!(
-            models_for_provider(&registry, "openrouter")
-                .iter()
-                .find(|model| model.id == "anthropic/claude-sonnet-4")
-                .expect("the sonnet composes")
-                .name,
-            "Second Name"
-        );
+        assert_eq!(sonnet_in(&registry).name, "Second Name");
     }
 
     #[tokio::test]
     async fn removing_model_override_restores_built_in_values() {
         let (_dir, models_path) = rig();
-        write_raw_models_json(
+        let registry = registry_written(
             &models_path,
             serde_json::json!({
                 "openrouter": {
@@ -1650,25 +1570,14 @@ mod model_overrides_per_model_customization {
                     },
                 },
             }),
-        );
-
-        let registry = create_registry(&models_path).await;
-        assert_eq!(
-            models_for_provider(&registry, "openrouter")
-                .iter()
-                .find(|model| model.id == "anthropic/claude-sonnet-4")
-                .expect("the sonnet composes")
-                .name,
-            "Custom Name"
-        );
+        )
+        .await;
+        assert_eq!(sonnet_in(&registry).name, "Custom Name");
 
         write_raw_models_json(&models_path, serde_json::json!({}));
         registry.refresh(Some(offline_refresh())).await;
 
-        let restored = models_for_provider(&registry, "openrouter")
-            .into_iter()
-            .find(|model| model.id == "anthropic/claude-sonnet-4")
-            .expect("the sonnet composes");
+        let restored = sonnet_in(&registry);
         assert_ne!(restored.name, "Custom Name");
     }
 }
@@ -1719,17 +1628,7 @@ mod dynamic_provider_lifecycle {
                 ProviderConfigInput {
                     base_url: Some("https://provider.test/v1".to_owned()),
                     api: Some(Api::from("openai-completions")),
-                    oauth: Some(ExtensionOAuthConfig {
-                        name: "OAuth Provider".to_owned(),
-                        is_subscription: None,
-                        uses_callback_server: None,
-                        login: never_login(),
-                        refresh_token: echo_refresh(),
-                        get_api_key: Arc::new(|credentials: &OAuthCredentials| {
-                            credentials.access.clone()
-                        }),
-                        modify_models: None,
-                    }),
+                    oauth: Some(oauth_config("OAuth Provider")),
                     models: Some(vec![extension_model(
                         "demo-model",
                         Api::from("openai-completions"),
@@ -1747,7 +1646,7 @@ mod dynamic_provider_lifecycle {
     #[tokio::test]
     async fn model_overrides_apply_to_dynamically_registered_provider_models() {
         let (_dir, models_path) = rig();
-        write_raw_models_json(
+        let registry = registry_written(
             &models_path,
             serde_json::json!({
                 "extension-provider": {
@@ -1766,9 +1665,8 @@ mod dynamic_provider_lifecycle {
                     },
                 },
             }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        )
+        .await;
         registry
             .register_provider_config(
                 "extension-provider",
@@ -1801,16 +1699,11 @@ mod dynamic_provider_lifecycle {
             pi_ai::models::get_supported_thinking_levels(&model),
             vec![ModelThinkingLevel::High, ModelThinkingLevel::Xhigh]
         );
-        let auth = registry.get_api_key_and_headers(&model).await;
-        assert!(auth.ok());
-        let ResolvedRequestAuth::Ok { headers, .. } = auth else {
-            unreachable!("auth.ok() pinned the Ok arm");
-        };
         assert_eq!(
-            headers
-                .as_ref()
-                .and_then(|headers| headers.get("x-model-override")),
-            Some(&Some("enabled".to_owned())),
+            request_header(&registry, &model, "x-model-override")
+                .await
+                .as_deref(),
+            Some("enabled"),
         );
     }
 
@@ -2002,17 +1895,7 @@ mod dynamic_provider_lifecycle {
             .register_provider_config(
                 "anthropic",
                 ProviderConfigInput {
-                    oauth: Some(ExtensionOAuthConfig {
-                        name: "Custom Anthropic OAuth".to_owned(),
-                        is_subscription: None,
-                        uses_callback_server: None,
-                        login: never_login(),
-                        refresh_token: echo_refresh(),
-                        get_api_key: Arc::new(|credentials: &OAuthCredentials| {
-                            credentials.access.clone()
-                        }),
-                        modify_models: None,
-                    }),
+                    oauth: Some(oauth_config("Custom Anthropic OAuth")),
                     ..ProviderConfigInput::default()
                 },
             )
@@ -2109,31 +1992,17 @@ mod dynamic_provider_lifecycle {
             registry
                 .register_provider_config(
                     "anthropic",
-                    ProviderConfigInput {
-                        base_url: Some("https://custom.test/anthropic".to_owned()),
-                        ..registration(
-                            "https://custom.test/anthropic",
-                            Api::from("anthropic-messages"),
-                            vec![extension_model(
-                                "custom-claude",
-                                Api::from("anthropic-messages"),
-                            )],
-                        )
-                    },
+                    anthropic_custom_claude("https://custom.test/anthropic"),
                 )
                 .expect("the override registers");
             registry.refresh(Some(offline_refresh())).await;
 
-            let ids: Vec<String> = models_for_provider(&registry, "anthropic")
-                .into_iter()
-                .map(|model| model.id)
-                .collect();
-            assert_eq!(ids, vec!["custom-claude"]);
             assert_eq!(
-                registry
-                    .find("anthropic", "custom-claude")
-                    .expect("the custom model composes")
-                    .base_url,
+                provider_model_ids(&registry, "anthropic"),
+                vec!["custom-claude"]
+            );
+            assert_eq!(
+                registered_model(&registry, "anthropic", "custom-claude").base_url,
                 "https://custom.test/anthropic"
             );
         }
@@ -2146,17 +2015,7 @@ mod dynamic_provider_lifecycle {
             registry
                 .register_provider_config(
                     "anthropic",
-                    ProviderConfigInput {
-                        base_url: Some("https://custom.test/anthropic".to_owned()),
-                        ..registration(
-                            "https://custom.test/anthropic",
-                            Api::from("anthropic-messages"),
-                            vec![extension_model(
-                                "custom-claude",
-                                Api::from("anthropic-messages"),
-                            )],
-                        )
-                    },
+                    anthropic_custom_claude("https://custom.test/anthropic"),
                 )
                 .expect("the first override registers");
             registry
@@ -2170,16 +2029,12 @@ mod dynamic_provider_lifecycle {
                 .expect("the second override registers");
             registry.refresh(Some(offline_refresh())).await;
 
-            let ids: Vec<String> = models_for_provider(&registry, "anthropic")
-                .into_iter()
-                .map(|model| model.id)
-                .collect();
-            assert_eq!(ids, vec!["custom-claude"]);
             assert_eq!(
-                registry
-                    .find("anthropic", "custom-claude")
-                    .expect("the custom model composes")
-                    .base_url,
+                provider_model_ids(&registry, "anthropic"),
+                vec!["custom-claude"]
+            );
+            assert_eq!(
+                registered_model(&registry, "anthropic", "custom-claude").base_url,
                 "https://proxy.test/anthropic"
             );
         }
@@ -2189,26 +2044,10 @@ mod dynamic_provider_lifecycle {
             let (_dir, models_path) = rig();
             let registry = create_registry(&models_path).await;
 
-            registry
-                .register_provider_config(
-                    "custom-provider",
-                    registration(
-                        "https://custom.test/v1",
-                        Api::from("openai-completions"),
-                        vec![
-                            extension_model("custom-a", Api::from("openai-completions")),
-                            extension_model("custom-b", Api::from("openai-completions")),
-                        ],
-                    ),
-                )
-                .expect("the custom provider registers");
+            register_custom_pair(&registry);
             registry.refresh(Some(offline_refresh())).await;
 
-            let ids: Vec<String> = models_for_provider(&registry, "custom-provider")
-                .into_iter()
-                .map(|model| model.id)
-                .collect();
-            assert_eq!(ids, vec!["custom-a", "custom-b"]);
+            assert_custom_pair_ids(&registry);
         }
 
         #[tokio::test]
@@ -2216,33 +2055,17 @@ mod dynamic_provider_lifecycle {
             let (_dir, models_path) = rig();
             let registry = create_registry(&models_path).await;
 
-            registry
-                .register_provider_config(
-                    "custom-provider",
-                    registration(
-                        "https://custom.test/v1",
-                        Api::from("openai-completions"),
-                        vec![
-                            extension_model("custom-a", Api::from("openai-completions")),
-                            extension_model("custom-b", Api::from("openai-completions")),
-                        ],
-                    ),
-                )
-                .expect("the custom provider registers");
-            registry
-                .register_provider_config(
-                    "custom-provider",
-                    ProviderConfigInput {
-                        base_url: Some("https://proxy.test/custom".to_owned()),
-                        ..ProviderConfigInput::default()
-                    },
-                )
-                .expect("the override registers");
-            registry.refresh(Some(offline_refresh())).await;
+            register_custom_pair(&registry);
+            refreshed_custom_pair(
+                &registry,
+                ProviderConfigInput {
+                    base_url: Some("https://proxy.test/custom".to_owned()),
+                    ..ProviderConfigInput::default()
+                },
+            )
+            .await;
 
             let models = models_for_provider(&registry, "custom-provider");
-            let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
-            assert_eq!(ids, vec!["custom-a", "custom-b"]);
             assert!(
                 models
                     .iter()
@@ -2255,49 +2078,30 @@ mod dynamic_provider_lifecycle {
             let (_dir, models_path) = rig();
             let registry = create_registry(&models_path).await;
 
-            registry
-                .register_provider_config(
-                    "custom-provider",
-                    registration(
-                        "https://custom.test/v1",
-                        Api::from("openai-completions"),
-                        vec![
-                            extension_model("custom-a", Api::from("openai-completions")),
-                            extension_model("custom-b", Api::from("openai-completions")),
-                        ],
-                    ),
-                )
-                .expect("the custom provider registers");
-            registry
-                .register_provider_config(
-                    "custom-provider",
-                    ProviderConfigInput {
-                        headers: Some(BTreeMap::from([(
-                            "x-proxy".to_owned(),
-                            "enabled".to_owned(),
-                        )])),
-                        ..ProviderConfigInput::default()
-                    },
-                )
-                .expect("the override registers");
-            registry.refresh(Some(offline_refresh())).await;
+            register_custom_pair(&registry);
+            refreshed_custom_pair(
+                &registry,
+                ProviderConfigInput {
+                    headers: Some(BTreeMap::from([(
+                        "x-proxy".to_owned(),
+                        "enabled".to_owned(),
+                    )])),
+                    ..ProviderConfigInput::default()
+                },
+            )
+            .await;
 
             let models = models_for_provider(&registry, "custom-provider");
-            let ids: Vec<String> = models.iter().map(|model| model.id.clone()).collect();
-            assert_eq!(ids, vec!["custom-a", "custom-b"]);
             assert!(
                 models
                     .iter()
                     .all(|model| model.base_url == "https://custom.test/v1")
             );
-            let auth = registry.get_api_key_and_headers(&models[0]).await;
-            assert!(auth.ok());
-            let ResolvedRequestAuth::Ok { headers, .. } = auth else {
-                unreachable!("auth.ok() pinned the Ok arm");
-            };
             assert_eq!(
-                headers.as_ref().and_then(|headers| headers.get("x-proxy")),
-                Some(&Some("enabled".to_owned())),
+                request_header(&registry, &models[0], "x-proxy")
+                    .await
+                    .as_deref(),
+                Some("enabled"),
             );
         }
     }
@@ -2309,15 +2113,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_bang_prefix_executes_command_and_uses_stdout() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!echo test-api-key-from-command"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!echo test-api-key-from-command"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, Some("test-api-key-from-command".to_owned()));
@@ -2326,15 +2125,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_bang_prefix_trims_whitespace_from_command_output() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!echo '  spaced-key  '"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!echo '  spaced-key  '"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, Some("spaced-key".to_owned()));
@@ -2343,15 +2137,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_bang_prefix_handles_multiline_output() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!printf 'line1\\nline2'"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!printf 'line1\\nline2'"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, Some("line1\nline2".to_owned()));
@@ -2360,15 +2149,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_bang_prefix_returns_none_on_command_failure() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!exit 1"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!exit 1"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, None);
@@ -2377,15 +2161,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_bang_prefix_returns_none_on_nonexistent_command() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!nonexistent-command-12345"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!nonexistent-command-12345"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, None);
@@ -2394,15 +2173,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_bang_prefix_returns_none_on_empty_output() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!printf ''"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!printf ''"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, None);
@@ -2411,15 +2185,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_dollar_prefix_resolves_to_env_value() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("$TEST_API_KEY_12345"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("$TEST_API_KEY_12345"),
+        }))
+        .await;
         // Restated: upstream sets process.env; the resolution's env overlay
         // is the seam the port carries instead.
         let resolution = resolve_auth_with_env(
@@ -2439,15 +2208,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_braced_env_syntax_resolves_to_env_value() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("${TEST_BRACED_API_KEY_12345}"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("${TEST_BRACED_API_KEY_12345}"),
+        }))
+        .await;
         let resolution = resolve_auth_with_env(
             &registry,
             "custom-provider",
@@ -2465,17 +2229,12 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_interpolates_braced_env_references_inside_literals() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key(
-                    "${TEST_INTERPOLATED_PART_A_12345}_${TEST_INTERPOLATED_PART_B_12345}",
-                ),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key(
+                "${TEST_INTERPOLATED_PART_A_12345}_${TEST_INTERPOLATED_PART_B_12345}",
+            ),
+        }))
+        .await;
         let resolution = resolve_auth_with_env(
             &registry,
             "custom-provider",
@@ -2493,15 +2252,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_with_double_dollar_prefix_escapes_a_leading_dollar() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("$$TEST_API_KEY_12345"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("$$TEST_API_KEY_12345"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, Some("$TEST_API_KEY_12345".to_owned()));
@@ -2511,15 +2265,10 @@ mod api_key_resolution {
     async fn api_key_with_dollar_bang_escapes_a_literal_bang_and_still_interpolates_later_env_refs()
     {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("$!literal-$TEST_API_KEY_12345"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("$!literal-$TEST_API_KEY_12345"),
+        }))
+        .await;
         let resolution = resolve_auth_with_env(
             &registry,
             "custom-provider",
@@ -2537,15 +2286,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn plain_api_key_is_used_directly_even_when_it_matches_an_env_var() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("TEST_API_KEY_12345"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("TEST_API_KEY_12345"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         // Restated: upstream sets the matching env var to prove the literal
@@ -2558,15 +2302,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_as_literal_value_is_used_directly_when_not_an_env_var() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("literal_api_key_value"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("literal_api_key_value"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, Some("literal_api_key_value".to_owned()));
@@ -2575,15 +2314,10 @@ mod api_key_resolution {
     #[tokio::test]
     async fn api_key_command_can_use_shell_features_like_pipes() {
         clear_config_value_cache();
-        let (_dir, models_path) = rig();
-        write_raw_models_json(
-            &models_path,
-            serde_json::json!({
-                "custom-provider": json_provider_with_api_key("!echo 'hello world' | tr ' ' '-'"),
-            }),
-        );
-
-        let registry = create_registry(&models_path).await;
+        let (_dir, registry) = override_registry(serde_json::json!({
+            "custom-provider": json_provider_with_api_key("!echo 'hello world' | tr ' ' '-'"),
+        }))
+        .await;
         let api_key = registry.get_api_key_for_provider("custom-provider").await;
 
         assert_eq!(api_key, Some("hello-world".to_owned()));
@@ -2610,21 +2344,26 @@ mod api_key_resolution {
             )
         }
 
-        #[tokio::test]
-        async fn command_is_executed_on_every_provider_lookup() {
-            clear_config_value_cache();
+        /// The counting-command rig: the temp dir with a seeded counter file
+        /// and the registry whose provider resolves its key through that
+        /// counter, upstream's counting `apiKey` command fixtures.
+        async fn counting_rig() -> (tempfile::TempDir, String, std::path::PathBuf, ModelRegistry) {
             let (dir, models_path) = rig();
-            let counter_file = dir.path().join("counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
-
-            write_raw_models_json(
+            let counter_file = seeded_counter(&dir, "counter");
+            let registry = registry_written(
                 &models_path,
                 serde_json::json!({
                     "custom-provider": json_provider_with_api_key(counting_command(&counter_file).as_str()),
                 }),
-            );
+            )
+            .await;
+            (dir, models_path, counter_file, registry)
+        }
 
-            let registry = create_registry(&models_path).await;
+        #[tokio::test]
+        async fn command_is_executed_on_every_provider_lookup() {
+            clear_config_value_cache();
+            let (_dir, _models_path, counter_file, registry) = counting_rig().await;
             registry.get_api_key_for_provider("custom-provider").await;
             registry.get_api_key_for_provider("custom-provider").await;
             registry.get_api_key_for_provider("custom-provider").await;
@@ -2635,18 +2374,7 @@ mod api_key_resolution {
         #[tokio::test]
         async fn commands_are_re_executed_across_registry_instances() {
             clear_config_value_cache();
-            let (dir, models_path) = rig();
-            let counter_file = dir.path().join("counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
-
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key(counting_command(&counter_file).as_str()),
-                }),
-            );
-
-            let registry1 = create_registry(&models_path).await;
+            let (_dir, models_path, counter_file, registry1) = counting_rig().await;
             registry1.get_api_key_for_provider("custom-provider").await;
 
             let registry2 = create_registry(&models_path).await;
@@ -2658,16 +2386,11 @@ mod api_key_resolution {
         #[tokio::test]
         async fn different_commands_resolve_independently() {
             clear_config_value_cache();
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "provider-a": json_provider_with_api_key("!echo key-a"),
-                    "provider-b": json_provider_with_api_key("!echo key-b"),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "provider-a": json_provider_with_api_key("!echo key-a"),
+                "provider-b": json_provider_with_api_key("!echo key-b"),
+            }))
+            .await;
 
             assert_eq!(
                 registry.get_api_key_for_provider("provider-a").await,
@@ -2683,17 +2406,15 @@ mod api_key_resolution {
         async fn failed_commands_are_retried() {
             clear_config_value_cache();
             let (dir, models_path) = rig();
-            let counter_file = dir.path().join("counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
+            let counter_file = seeded_counter(&dir, "counter");
 
-            write_raw_models_json(
+            let registry = registry_written(
                 &models_path,
                 serde_json::json!({
                     "custom-provider": json_provider_with_api_key(failing_counting_command(&counter_file).as_str()),
                 }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            )
+            .await;
             let key1 = registry.get_api_key_for_provider("custom-provider").await;
             let key2 = registry.get_api_key_for_provider("custom-provider").await;
 
@@ -2705,15 +2426,10 @@ mod api_key_resolution {
         #[tokio::test]
         async fn provider_auth_status_reports_api_key_environment_variables_from_models_json() {
             clear_config_value_cache();
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key("$TEST_API_KEY_STATUS_TEST_98765"),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "custom-provider": json_provider_with_api_key("$TEST_API_KEY_STATUS_TEST_98765"),
+            }))
+            .await;
             // Restated: upstream sets the env var and asserts the status
             // surface reports it; the status path reads the process
             // environment with no injection seam, so the case asserts the
@@ -2732,17 +2448,12 @@ mod api_key_resolution {
         #[tokio::test]
         async fn provider_auth_status_reports_interpolated_api_key_environment_variables() {
             clear_config_value_cache();
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key(
-                        "${TEST_API_KEY_STATUS_PART_A_98765}_${TEST_API_KEY_STATUS_PART_B_98765}",
-                    ),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "custom-provider": json_provider_with_api_key(
+                    "${TEST_API_KEY_STATUS_PART_A_98765}_${TEST_API_KEY_STATUS_PART_B_98765}",
+                ),
+            }))
+            .await;
             let resolution = resolve_auth_with_env(
                 &registry,
                 "custom-provider",
@@ -2760,15 +2471,10 @@ mod api_key_resolution {
         #[tokio::test]
         async fn provider_auth_status_reports_non_env_api_key_values_from_models_json_as_a_config_key()
          {
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key("literal_api_key_value"),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "custom-provider": json_provider_with_api_key("literal_api_key_value"),
+            }))
+            .await;
 
             assert_eq!(
                 registry.get_provider_auth_status("custom-provider"),
@@ -2782,15 +2488,10 @@ mod api_key_resolution {
 
         #[tokio::test]
         async fn missing_explicit_env_api_key_keeps_provider_unavailable() {
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key("$TEST_API_KEY_MISSING_TEST_98765"),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "custom-provider": json_provider_with_api_key("$TEST_API_KEY_MISSING_TEST_98765"),
+            }))
+            .await;
 
             assert_eq!(
                 registry.get_provider_auth_status("custom-provider"),
@@ -2814,18 +2515,16 @@ mod api_key_resolution {
          {
             clear_config_value_cache();
             let (dir, models_path) = rig();
-            let counter_file = dir.path().join("status-counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
+            let counter_file = seeded_counter(&dir, "status-counter");
             let counter_path = to_sh_path(counter_file.display().to_string().as_str());
             let command = format!("!sh -c 'echo 1 > \"{counter_path}\"; echo key-value'");
-            write_raw_models_json(
+            let registry = registry_written(
                 &models_path,
                 serde_json::json!({
                     "custom-provider": json_provider_with_api_key(command.as_str()),
                 }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            )
+            .await;
 
             assert_eq!(
                 registry.get_provider_auth_status("custom-provider"),
@@ -2845,15 +2544,10 @@ mod api_key_resolution {
         #[tokio::test]
         async fn environment_variables_are_not_cached_changes_are_picked_up() {
             clear_config_value_cache();
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key("$TEST_API_KEY_CACHE_TEST_98765"),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "custom-provider": json_provider_with_api_key("$TEST_API_KEY_CACHE_TEST_98765"),
+            }))
+            .await;
             // Restated: upstream mutates process.env between lookups; the
             // port drives the two lookups with different env overlays,
             // which pins the same no-caching contract on the env surface.
@@ -2879,18 +2573,7 @@ mod api_key_resolution {
         #[tokio::test]
         async fn get_available_does_not_execute_command_backed_api_key_resolution() {
             clear_config_value_cache();
-            let (dir, models_path) = rig();
-            let counter_file = dir.path().join("counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
-
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": json_provider_with_api_key(counting_command(&counter_file).as_str()),
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
+            let (_dir, _models_path, counter_file, registry) = counting_rig().await;
             let available = registry.get_available();
 
             assert!(
@@ -2951,17 +2634,15 @@ mod api_key_resolution {
             std::fs::write(&token_file, "token-1").expect("the token seeds");
             let token_path = to_sh_path(token_file.display().to_string().as_str());
 
-            let mut config = json_provider_with_api_key(&format!("!sh -c 'cat \"{token_path}\"'"));
-            config["authHeader"] = serde_json::json!(true);
-            write_raw_models_json(
+            let registry = registry_written(
                 &models_path,
-                serde_json::json!({ "custom-provider": config }),
-            );
-
-            let registry = create_registry(&models_path).await;
-            let model = registry
-                .find("custom-provider", "test-model")
-                .expect("the test model composes");
+                serde_json::json!({
+                    "custom-provider":
+                        auth_header_config(&format!("!sh -c 'cat \"{token_path}\"'")),
+                }),
+            )
+            .await;
+            let model = test_model(&registry);
 
             let auth1 = registry.get_api_key_and_headers(&model).await;
             assert_eq!(
@@ -2988,23 +2669,17 @@ mod api_key_resolution {
         async fn get_api_key_and_headers_resolves_configured_auth_exactly_once() {
             clear_config_value_cache();
             let (dir, models_path) = rig();
-            let counter_file = dir.path().join("auth-counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
+            let counter_file = seeded_counter(&dir, "auth-counter");
             let counter_path = to_sh_path(counter_file.display().to_string().as_str());
             let command = format!(
                 "!sh -c 'count=$(cat \"{counter_path}\"); count=$((count + 1)); echo \"$count\" > \"{counter_path}\"; echo \"token-$count\"'"
             );
-            let mut config = json_provider_with_api_key(&command);
-            config["authHeader"] = serde_json::json!(true);
-            write_raw_models_json(
+            let registry = registry_written(
                 &models_path,
-                serde_json::json!({ "custom-provider": config }),
-            );
-
-            let registry = create_registry(&models_path).await;
-            let model = registry
-                .find("custom-provider", "test-model")
-                .expect("the test model composes");
+                serde_json::json!({ "custom-provider": auth_header_config(&command) }),
+            )
+            .await;
+            let model = test_model(&registry);
             let auth = registry.get_api_key_and_headers(&model).await;
 
             assert_eq!(
@@ -3021,8 +2696,7 @@ mod api_key_resolution {
         async fn stored_credentials_bypass_lower_priority_configured_auth_commands() {
             clear_config_value_cache();
             let (dir, models_path) = rig();
-            let counter_file = dir.path().join("fallback-counter");
-            std::fs::write(&counter_file, "0").expect("the counter seeds");
+            let counter_file = seeded_counter(&dir, "fallback-counter");
             let counter_path = to_sh_path(counter_file.display().to_string().as_str());
             let command = format!("!sh -c 'echo 1 > \"{counter_path}\"; echo fallback-key'");
             write_raw_models_json(
@@ -3037,9 +2711,7 @@ mod api_key_resolution {
             let registry =
                 common::model_layer::create_model_registry(storage.clone(), Some(&models_path))
                     .await;
-            let model = registry
-                .find("custom-provider", "test-model")
-                .expect("the test model composes");
+            let model = test_model(&registry);
             let auth = registry.get_api_key_and_headers(&model).await;
 
             assert!(auth.ok());
@@ -3053,23 +2725,16 @@ mod api_key_resolution {
         #[tokio::test]
         async fn get_api_key_and_headers_preserves_the_legacy_missing_key_auth_header_error() {
             clear_config_value_cache();
-            let (_dir, models_path) = rig();
-            write_raw_models_json(
-                &models_path,
-                serde_json::json!({
-                    "custom-provider": {
-                        "baseUrl": "https://example.test/v1",
-                        "api": "openai-completions",
-                        "authHeader": true,
-                        "models": [{ "id": "test-model" }],
-                    },
-                }),
-            );
-
-            let registry = create_registry(&models_path).await;
-            let model = registry
-                .find("custom-provider", "test-model")
-                .expect("the test model composes");
+            let (_dir, registry) = override_registry(serde_json::json!({
+                "custom-provider": {
+                    "baseUrl": "https://example.test/v1",
+                    "api": "openai-completions",
+                    "authHeader": true,
+                    "models": [{ "id": "test-model" }],
+                },
+            }))
+            .await;
+            let model = test_model(&registry);
             let auth = registry.get_api_key_and_headers(&model).await;
 
             assert_eq!(
@@ -3084,17 +2749,12 @@ mod api_key_resolution {
         async fn get_api_key_and_headers_returns_an_error_for_failed_auth_header_resolution() {
             clear_config_value_cache();
             let (_dir, models_path) = rig();
-            let mut config = json_provider_with_api_key("!exit 1");
-            config["authHeader"] = serde_json::json!(true);
-            write_raw_models_json(
+            let registry = registry_written(
                 &models_path,
-                serde_json::json!({ "custom-provider": config }),
-            );
-
-            let registry = create_registry(&models_path).await;
-            let model = registry
-                .find("custom-provider", "test-model")
-                .expect("the test model composes");
+                serde_json::json!({ "custom-provider": auth_header_config("!exit 1") }),
+            )
+            .await;
+            let model = test_model(&registry);
 
             let auth = registry.get_api_key_and_headers(&model).await;
             assert!(!auth.ok());

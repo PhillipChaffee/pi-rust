@@ -2,8 +2,7 @@
 //! `src/core/model-registry.ts` at pin
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
-//! Coding-agent internals use [`ModelRuntime`](crate::model_runtime::ModelRuntime)
-//! directly.
+//! Coding-agent internals use [`ModelRuntime`] directly.
 //!
 //! Porting restatement: upstream's `registerProvider` overloads split into
 //! [`ModelRegistry::register_provider`] (a native pi-ai provider object) and

@@ -11,9 +11,11 @@
 //!
 //! Porting restatements this file records:
 //!
-//! - The provider double implements [`pi_ai::models::Provider`] directly;
-//!   `stream`/`streamSimple` panic like upstream's `throw new Error("unused")`
-//!   guards.
+//! - The stalled provider implements [`pi_ai::models::Provider`] directly;
+//!   the stream dispatches no case drives resolve through the fixture's
+//!   [`common::model_layer::unused_stream`] guard, and the impl spells the
+//!   `pi_ai::types` names in full because the credential-sync suite owns
+//!   the shared spelling of the trimmed import block.
 //! - The `networkStarted` promise restates as a `Notify` permit and the
 //!   forever-pending refresh phase as [`std::future::pending`].
 
@@ -21,20 +23,18 @@
     clippy::expect_used,
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
-#![expect(
-    clippy::panic,
-    reason = "the unused stream guards panic by design, upstream's throw new Error(\"unused\")"
-)]
 
 #[expect(
     dead_code,
-    reason = "the fixture module compiles whole into every test binary; this suite drives only its model-layer helpers"
+    reason = "every test binary recompiles the shared fixture module; this suite drives only the model-layer helpers"
 )]
 mod common;
 
 use std::sync::Arc;
 
-use common::model_layer::{create_in_memory_model_registry, in_memory_auth_storage, model};
+use common::model_layer::{
+    create_in_memory_model_registry, in_memory_auth_storage, model, unused_stream,
+};
 use pi_ai::auth::types::{
     ApiKeyAuth, ApiKeyAuthInput, ApiKeyCheckFn, ApiKeyCredential, ApiKeyLoginFn, ApiKeyResolveFn,
     AuthCheck, AuthInteraction, AuthResult, AuthType, Credential, ModelAuth, ProviderAuth,
@@ -42,8 +42,6 @@ use pi_ai::auth::types::{
 use pi_ai::models::{
     ModelsRefreshOptions, Provider, ProviderError, ProviderModelError, RefreshModelsContext,
 };
-use pi_ai::types::{BoxedFuture, Context, Model, SimpleStreamOptions, StreamOptions};
-use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use pi_coding_agent::auth_storage::AuthStorageData;
 use tokio::sync::Notify;
 
@@ -143,7 +141,7 @@ impl Provider for StalledLoginProvider {
         &self.auth
     }
 
-    fn get_models(&self) -> Result<Vec<Model>, ProviderModelError> {
+    fn get_models(&self) -> Result<Vec<pi_ai::types::Model>, ProviderModelError> {
         Ok(vec![model("stalled-login", "dynamic")])
     }
 
@@ -154,7 +152,7 @@ impl Provider for StalledLoginProvider {
     fn refresh_models(
         &self,
         context: RefreshModelsContext,
-    ) -> BoxedFuture<'_, Result<(), ProviderError>> {
+    ) -> pi_ai::types::BoxedFuture<'_, Result<(), ProviderError>> {
         if !context.allow_network {
             return Box::pin(async { Ok(()) });
         }
@@ -167,20 +165,20 @@ impl Provider for StalledLoginProvider {
 
     fn stream(
         &self,
-        _model: &Model,
-        _context: &Context,
-        _options: Option<&StreamOptions>,
-    ) -> AssistantMessageEventStream {
-        panic!("unused")
+        _model: &pi_ai::types::Model,
+        _context: &pi_ai::types::Context,
+        _options: Option<&pi_ai::types::StreamOptions>,
+    ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+        unused_stream()
     }
 
     fn stream_simple(
         &self,
-        _model: &Model,
-        _context: &Context,
-        _options: Option<&SimpleStreamOptions>,
-    ) -> AssistantMessageEventStream {
-        panic!("unused")
+        _model: &pi_ai::types::Model,
+        _context: &pi_ai::types::Context,
+        _options: Option<&pi_ai::types::SimpleStreamOptions>,
+    ) -> pi_ai::utils::event_stream::AssistantMessageEventStream {
+        unused_stream()
     }
 }
 

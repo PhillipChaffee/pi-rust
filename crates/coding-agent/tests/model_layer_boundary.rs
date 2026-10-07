@@ -42,6 +42,7 @@
 )]
 mod common;
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -49,7 +50,9 @@ use std::time::Duration;
 use common::model_layer::model;
 use pi_ai::auth::types::{ApiKeyAuth, ApiKeyCredential, AuthResult, Credential, ProviderAuth};
 use pi_ai::http::mock::{MockRouteBuilder, RecordedRequest};
-use pi_ai::http::{HttpClient, HttpError, MockHttpClient, MockResponse, json_response};
+use pi_ai::http::{
+    HttpClient, HttpError, HttpResponse, MockHttpClient, MockResponse, json_response,
+};
 use pi_ai::models::{
     CatalogPersist, CreateModelsOptions, CreateProviderOptions, ModelsRefreshOptions, Provider,
     ProviderApi, ProviderError, PublishFn, RefreshModelsContext, create_models, create_provider,
@@ -156,6 +159,29 @@ mod remote_catalog {
     /// joined with the provider id.
     fn catalog_route(mock: &MockHttpClient) -> MockRouteBuilder<'_> {
         mock.on(|request| request.url.contains("/api/models/providers/test-provider"))
+    }
+
+    /// The wired catalog rig: provider and fresh store over the mock, the
+    /// setup every ladder case shares.
+    fn catalog_rig(
+        mock: &MockHttpClient,
+        local_generated_at: Option<i64>,
+    ) -> (Arc<dyn Provider>, Arc<InMemoryModelsStore>) {
+        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
+        let provider = catalog_provider(client, local_generated_at);
+        let store = Arc::new(InMemoryModelsStore::default());
+        (provider, store)
+    }
+
+    /// The 200 catalog body stamped with the fixture etag, the first
+    /// response the etag cases send.
+    fn etag_body(id: &str) -> MockResponse {
+        json_response(200, &catalog_map(id)).with_header("etag", "\"catalog-1\"")
+    }
+
+    /// The 304 revalidation answer stamped with the fixture etag.
+    fn etag_304() -> MockResponse {
+        MockResponse::status(304).with_header("etag", "\"catalog-1\"")
     }
 
     /// The network knobs of one refresh, upstream's `overrides` param: the
@@ -274,9 +300,7 @@ mod remote_catalog {
     async fn keyed_catalog_version_headers_refresh_ttl_and_forced_refresh() {
         let mock = MockHttpClient::new();
         catalog_route(&mock).respond(json_response(200, &catalog_map("dynamic")));
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        let (provider, store) = catalog_rig(&mock, None);
 
         refresh_provider(&provider, &store, RefreshOverrides::default())
             .await
@@ -326,9 +350,7 @@ mod remote_catalog {
             .with_header("last-modified", "Thu, 23 Jul 2026 10:01:00 GMT");
         let mock = MockHttpClient::new();
         catalog_route(&mock).respond_sequence(vec![older, newer]);
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, Some(local_generated_at));
-        let store = Arc::new(InMemoryModelsStore::default());
+        let (provider, store) = catalog_rig(&mock, Some(local_generated_at));
 
         refresh_provider(&provider, &store, RefreshOverrides::default())
             .await
@@ -362,14 +384,9 @@ mod remote_catalog {
     /// moves only the freshness window.
     #[tokio::test]
     async fn revalidates_a_stored_catalog_with_its_etag_and_keeps_the_overlay_on_304() {
-        let dynamic =
-            json_response(200, &catalog_map("dynamic")).with_header("etag", "\"catalog-1\"");
-        let unchanged = MockResponse::status(304).with_header("etag", "\"catalog-1\"");
         let mock = MockHttpClient::new();
-        catalog_route(&mock).respond_sequence(vec![dynamic, unchanged]);
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        catalog_route(&mock).respond_sequence(vec![etag_body("dynamic"), etag_304()]);
+        let (provider, store) = catalog_rig(&mock, None);
 
         refresh_provider(&provider, &store, RefreshOverrides::default())
             .await
@@ -422,14 +439,10 @@ mod remote_catalog {
     /// next refresh fetches instead of revalidating.
     #[tokio::test]
     async fn drops_a_stale_etag_when_the_overlay_becomes_unavailable() {
-        let dynamic =
-            json_response(200, &catalog_map("dynamic")).with_header("etag", "\"catalog-1\"");
         let unimplemented = MockResponse::status(501).with_body("not implemented");
         let mock = MockHttpClient::new();
-        catalog_route(&mock).respond_sequence(vec![dynamic, unimplemented]);
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        catalog_route(&mock).respond_sequence(vec![etag_body("dynamic"), unimplemented]);
+        let (provider, store) = catalog_rig(&mock, None);
 
         refresh_provider(&provider, &store, RefreshOverrides::default())
             .await
@@ -458,21 +471,16 @@ mod remote_catalog {
     /// keeps everything.
     #[tokio::test]
     async fn keeps_the_etag_and_overlay_after_a_transient_failure() {
-        let dynamic =
-            json_response(200, &catalog_map("dynamic")).with_header("etag", "\"catalog-1\"");
         let rate_limited = MockResponse::status(429).with_body("rate limited");
-        let unchanged = MockResponse::status(304).with_header("etag", "\"catalog-1\"");
         let mock = MockHttpClient::new();
         catalog_route(&mock).respond_sequence(vec![
-            dynamic,
+            etag_body("dynamic"),
             rate_limited.clone(),
             rate_limited.clone(),
             rate_limited,
-            unchanged,
+            etag_304(),
         ]);
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        let (provider, store) = catalog_rig(&mock, None);
 
         refresh_provider(&provider, &store, RefreshOverrides::default())
             .await
@@ -543,9 +551,7 @@ mod remote_catalog {
                 Ok(json_response(200, &catalog_map("newer")))
             }
         });
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        let (provider, store) = catalog_rig(&mock, None);
         let store_handle: Arc<dyn ModelsStore> = Arc::<InMemoryModelsStore>::clone(&store);
         let models = create_models(Some(CreateModelsOptions {
             models_store: Some(store_handle),
@@ -596,9 +602,7 @@ mod remote_catalog {
     async fn treats_unimplemented_catalog_routes_as_an_unavailable_overlay() {
         let mock = MockHttpClient::new();
         catalog_route(&mock).respond(MockResponse::status(501).with_body("not implemented"));
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        let (provider, store) = catalog_rig(&mock, None);
 
         refresh_provider(&provider, &store, RefreshOverrides::default())
             .await
@@ -618,9 +622,7 @@ mod remote_catalog {
     async fn a_404_marks_the_catalog_unavailable_but_keeps_the_stored_models() {
         let mock = MockHttpClient::new();
         catalog_route(&mock).respond(MockResponse::status(404).with_body("gone"));
-        let client: Arc<dyn HttpClient> = Arc::new(mock.clone());
-        let provider = catalog_provider(client, None);
-        let store = Arc::new(InMemoryModelsStore::default());
+        let (provider, store) = catalog_rig(&mock, None);
         ModelsStore::write(
             &*store,
             "test-provider",
@@ -674,32 +676,77 @@ mod management_http {
         mock.on(|request| request.url.contains("example.test"))
     }
 
+    /// The attempt-counting rig the scripted retry cases share: the client
+    /// pair plus the counter the handler bumps and the case reads back.
+    fn counted_rig() -> (Arc<dyn HttpClient>, MockHttpClient, Arc<AtomicUsize>) {
+        let (client, mock) = mock_client();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        (client, mock, attempts)
+    }
+
+    /// The scripted route over the counted rig: every request bumps the
+    /// counter and runs the case's body, upstream's fetch handler that
+    /// counts its calls.
+    fn scripted_route<F, Fut>(mock: &MockHttpClient, attempts: Arc<AtomicUsize>, body: F)
+    where
+        F: Fn(usize) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<MockResponse, HttpError>> + Send,
+    {
+        test_route(mock).respond_fn({
+            let body = Arc::new(body);
+            move |_request| {
+                let attempts = Arc::clone(&attempts);
+                let body = Arc::clone(&body);
+                async move { body(attempts.fetch_add(1, Ordering::SeqCst)).await }
+            }
+        });
+    }
+
+    /// The 200 `{"ok": true}` body the successful attempt answers with.
+    fn ok_body() -> MockResponse {
+        json_response(200, &serde_json::json!({"ok": true}))
+    }
+
+    /// The GET over the test client with the given retry options, the call
+    /// every retry case drives.
+    ///
+    /// # Panics
+    /// The request failure, which these cases' successful answers cannot
+    /// produce.
+    async fn retry_get(
+        client: &Arc<dyn HttpClient>,
+        options: FetchRetryOptions,
+        message: &str,
+    ) -> HttpResponse {
+        fetch_with_retry(
+            client,
+            "https://example.test",
+            Vec::new(),
+            CancellationToken::new(),
+            options,
+        )
+        .await
+        .expect(message)
+    }
+
     /// Upstream's first case: two transport failures then the answer — the
     /// default ladder carries two retries.
     #[tokio::test]
     async fn retries_a_transient_transport_failure() {
-        let (client, mock) = mock_client();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let handler_attempts = Arc::clone(&attempts);
-        test_route(&mock).respond_fn(move |_request| {
-            let attempts = Arc::clone(&handler_attempts);
-            async move {
-                match attempts.fetch_add(1, Ordering::SeqCst) {
-                    0 | 1 => Err(HttpError::Transport("fetch failed".to_owned())),
-                    _ => Ok(json_response(200, &serde_json::json!({"ok": true}))),
-                }
+        let (client, mock, attempts) = counted_rig();
+        scripted_route(&mock, Arc::clone(&attempts), |attempt| async move {
+            match attempt {
+                0 | 1 => Err(HttpError::Transport("fetch failed".to_owned())),
+                _ => Ok(ok_body()),
             }
         });
 
-        let response = fetch_with_retry(
+        let response = retry_get(
             &client,
-            "https://example.test",
-            Vec::new(),
-            CancellationToken::new(),
             FetchRetryOptions::default(),
+            "the retried request lands",
         )
-        .await
-        .expect("the retried request lands");
+        .await;
 
         assert_eq!(response.status, 200);
         assert_eq!(
@@ -716,31 +763,23 @@ mod management_http {
     /// Rust — the header restatement covers it.
     #[tokio::test]
     async fn shares_the_timeout_budget_across_attempts() {
-        let (client, mock) = mock_client();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let handler_attempts = Arc::clone(&attempts);
-        test_route(&mock).respond_fn(move |_request| {
-            let attempts = Arc::clone(&handler_attempts);
-            async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    return Err(HttpError::Transport("fetch failed".to_owned()));
-                }
-                Ok(json_response(200, &serde_json::json!({"ok": true})))
+        let (client, mock, attempts) = counted_rig();
+        scripted_route(&mock, Arc::clone(&attempts), |attempt| async move {
+            if attempt == 0 {
+                return Err(HttpError::Transport("fetch failed".to_owned()));
             }
+            Ok(ok_body())
         });
 
-        let response = fetch_with_retry(
+        let response = retry_get(
             &client,
-            "https://example.test",
-            Vec::new(),
-            CancellationToken::new(),
             FetchRetryOptions {
                 timeout_ms: Some(1_000),
                 ..FetchRetryOptions::default()
             },
+            "the budget survives the first failure",
         )
-        .await
-        .expect("the budget survives the first failure");
+        .await;
 
         assert_eq!(response.status, 200);
         assert_eq!(
@@ -755,34 +794,26 @@ mod management_http {
     /// is aborted and retried; the paused clock makes the sleeps instant.
     #[tokio::test(start_paused = true)]
     async fn retries_an_attempt_timeout() {
-        let (client, mock) = mock_client();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let handler_attempts = Arc::clone(&attempts);
-        test_route(&mock).respond_fn(move |_request| {
-            let attempts = Arc::clone(&handler_attempts);
-            async move {
-                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                    // The hung attempt: the sleep passes the attempt
-                    // budget, so the outer select's attempt deadline
-                    // wins before the handler answers.
-                    tokio::time::sleep(Duration::from_millis(5_000)).await;
-                }
-                Ok(json_response(200, &serde_json::json!({"ok": true})))
+        let (client, mock, attempts) = counted_rig();
+        scripted_route(&mock, Arc::clone(&attempts), |attempt| async move {
+            if attempt == 0 {
+                // The hung attempt: the sleep passes the attempt
+                // budget, so the outer select's attempt deadline
+                // wins before the handler answers.
+                tokio::time::sleep(Duration::from_millis(5_000)).await;
             }
+            Ok(ok_body())
         });
 
-        let response = fetch_with_retry(
+        let response = retry_get(
             &client,
-            "https://example.test",
-            Vec::new(),
-            CancellationToken::new(),
             FetchRetryOptions {
                 attempt_timeout_ms: Some(4_000),
                 ..FetchRetryOptions::default()
             },
+            "the retried attempt answers",
         )
-        .await
-        .expect("the retried attempt answers");
+        .await;
 
         assert_eq!(response.status, 200);
         assert_eq!(
@@ -798,20 +829,15 @@ mod management_http {
     #[tokio::test]
     async fn retries_transient_http_responses_and_returns_the_successful_response() {
         let (client, mock) = mock_client();
-        test_route(&mock).respond_sequence(vec![
-            MockResponse::status(503).with_body("busy"),
-            json_response(200, &serde_json::json!({"ok": true})),
-        ]);
+        test_route(&mock)
+            .respond_sequence(vec![MockResponse::status(503).with_body("busy"), ok_body()]);
 
-        let response = fetch_with_retry(
+        let response = retry_get(
             &client,
-            "https://example.test",
-            Vec::new(),
-            CancellationToken::new(),
             FetchRetryOptions::default(),
+            "the 503 retried into the answer",
         )
-        .await
-        .expect("the 503 retried into the answer");
+        .await;
 
         assert_eq!(response.status, 200);
         assert_eq!(mock.request_count(), 2);

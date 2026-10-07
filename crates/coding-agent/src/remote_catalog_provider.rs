@@ -8,7 +8,7 @@
 //! deserialize into a full [`Model`] are dropped rather than carried as
 //! broken shapes (upstream's spread kept whatever the JSON carried); the
 //! `Last-Modified` date parser handles the RFC 1123 format HTTP sends, and
-//! an unparseable date stores `0` like upstream's `Number.isNaN` branch.
+//! an unparsable date stores `0` like upstream's `Number.isNaN` branch.
 
 use std::sync::{Arc, Mutex};
 
@@ -99,7 +99,7 @@ fn remote_models(entry: Option<&ModelsStoreEntry>, local_generated_at: Option<i6
 }
 
 /// Parse an RFC 1123 HTTP date (`Wed, 21 Oct 2015 07:28:00 GMT`) into Unix
-/// milliseconds, `0` when the header is absent or unparseable, the port of
+/// milliseconds, `0` when the header is absent or unparsable, the port of
 /// upstream's `Date.parse(...) ?? NaN → 0`.
 fn parse_http_date_ms(header: Option<&str>) -> i64 {
     let Some(text) = header else {

@@ -73,24 +73,25 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The zero-usage message a double's stream settles with, upstream's inline
-/// message literal.
+/// message literal: the identity fields ride the model, everything else
+/// takes the empty/default shape.
 fn message_for(model: &Model, stop_reason: StopReason) -> AssistantMessage {
     AssistantMessage {
-        content: Vec::new(),
         api: model.api.clone(),
         provider: model.provider.clone(),
         model: model.id.clone(),
+        usage: Usage::default(),
+        timestamp: 0,
+        content: Vec::new(),
+        stop_reason,
         response_model: None,
         response_id: None,
         provider_thinking_level: None,
         diagnostics: None,
-        usage: Usage::default(),
-        stop_reason,
         deferred: None,
         error_message: None,
         raw_stop_reason: None,
         end_turn: None,
-        timestamp: 0,
     }
 }
 

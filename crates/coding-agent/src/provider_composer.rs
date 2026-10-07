@@ -12,8 +12,9 @@
 //! routing/kwarg objects merge one level deeper the way upstream's
 //! `mergeCompat` special-cases them. The extension OAuth callback
 //! vocabulary (`OAuthLoginCallbacks` and friends) lives here — pi-ai's
-//! canonical flows speak [`AuthInteraction`], and only the extension
-//! contract carries the legacy shape; `adaptOAuth` bridges the two.
+//! canonical flows speak `pi_ai::auth::types::AuthInteraction`, and only
+//! the extension contract carries the legacy shape; `adaptOAuth` bridges
+//! the two.
 //!
 //! The legacy `OAuthPrompt.allowEmpty` flag has no slot in pi-ai's prompt
 //! vocabulary and is dropped by the bridge, like upstream's spread into a

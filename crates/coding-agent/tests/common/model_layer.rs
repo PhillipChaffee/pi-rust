@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use pi_ai::types::{Api, Context, Modality, Model, ModelCost, ModelCostRates, ProviderId};
+use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use pi_coding_agent::auth_storage::{AuthStorage, AuthStorageData, InMemoryAuthStorageBackend};
 use pi_coding_agent::model_registry::ModelRegistry;
 use pi_coding_agent::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
@@ -118,4 +119,19 @@ pub async fn create_in_memory_model_registry(
         .await
         .expect("the fixture runtime constructs"),
     )
+}
+
+/// The stream guard the provider doubles delegate to for the dispatches no
+/// case drives, upstream's `throw new Error("unused")` method bodies: an
+/// accidental dispatch fails the test instead of streaming.
+///
+/// # Panics
+/// Always — the guard exists so a reached dispatch fails loudly.
+#[expect(
+    clippy::panic,
+    reason = "the guard panics by design, upstream's throw new Error(\"unused\")"
+)]
+#[must_use]
+pub fn unused_stream() -> AssistantMessageEventStream {
+    panic!("unused")
 }

@@ -179,7 +179,7 @@ mod compat_schema {
         ("require_parameters", super::Schema::Bool),
         (
             "data_collection",
-            super::Schema::StrLits(&["deny", "allow"]),
+            super::Schema::StrLiterals(&["deny", "allow"]),
         ),
         ("zdr", super::Schema::Bool),
         ("enforce_distillable_text", super::Schema::Bool),
@@ -236,7 +236,7 @@ mod compat_schema {
         super::Schema::Object(&[
             (
                 "$var",
-                super::Schema::StrLits(&["thinking.enabled", "thinking.effort"]),
+                super::Schema::StrLiterals(&["thinking.enabled", "thinking.effort"]),
             ),
             ("omitWhenOff", super::Schema::Bool),
         ]),
@@ -271,7 +271,7 @@ enum Schema {
     /// Any JSON value, upstream's `Type.Unknown()`.
     Any,
     /// One of these exact string values, upstream's `Type.Literal` union.
-    StrLits(&'static [&'static str]),
+    StrLiterals(&'static [&'static str]),
     /// A non-empty string, upstream's `Type.String({ minLength: 1 })`.
     NonEmptyStr,
     /// Any of these variants, upstream's `Type.Union`.
@@ -290,7 +290,7 @@ impl Schema {
             Self::Bool => "Expected boolean".to_owned(),
             Self::Nullable => "Expected null".to_owned(),
             Self::Any => "Expected any value".to_owned(),
-            Self::StrLits(literals) => format!(
+            Self::StrLiterals(literals) => format!(
                 "Expected union value: {}",
                 literals
                     .iter()
@@ -330,7 +330,9 @@ impl Schema {
             Self::Bool => value.is_boolean(),
             Self::Nullable => value.is_null(),
             Self::Any => true,
-            Self::StrLits(literals) => value.as_str().is_some_and(|text| literals.contains(&text)),
+            Self::StrLiterals(literals) => {
+                value.as_str().is_some_and(|text| literals.contains(&text))
+            }
             Self::Union(variants) => variants.iter().any(|variant| variant.check(value)),
         }
     }
@@ -495,7 +497,7 @@ fn check_model_fields(
         errors.push(format!("{prefix}.thinkingLevelMap: Expected object"));
     }
     if let Some(value) = map.get("input")
-        && !Schema::Array(&Schema::StrLits(&["text", "image"])).check(value)
+        && !Schema::Array(&Schema::StrLiterals(&["text", "image"])).check(value)
     {
         errors.push(format!(
             "{prefix}.input: Expected union value: \"text\" | \"image\""
@@ -584,7 +586,7 @@ fn validate_models_config(value: &Value) -> Vec<String> {
             &prefix,
             provider,
             "oauth",
-            &Schema::StrLits(&["radius"]),
+            &Schema::StrLiterals(&["radius"]),
             &mut errors,
         );
         if let Some(value) = provider.get("headers")
@@ -723,7 +725,7 @@ impl ModelConfig {
         self.providers.keys().cloned().collect()
     }
 
-    /// The load error, when the file was unreadable, unparseable, or
+    /// The load error, when the file was unreadable, unparsable, or
     /// schema-invalid.
     #[must_use]
     pub fn get_error(&self) -> Option<&str> {
