@@ -794,3 +794,24 @@ async fn a_failing_radius_upload_reports_upstreams_message() {
         "no gist upload after the radius failure"
     );
 }
+
+#[test]
+fn an_export_to_the_filesystem_root_reports_the_write_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut session =
+        SessionManager::in_memory(Some(&dir.path().display().to_string()), None, None)
+            .expect("in-memory");
+    session
+        .append_message(user_message("hello"))
+        .expect("append");
+
+    let error = export_session_to_jsonl(&session, Some("/"), None)
+        .expect_err("the root is not a writable file");
+    assert!(
+        matches!(
+            error,
+            pi_coding_agent::session_manager::SessionManagerError::Io(_)
+        ),
+        "{error}"
+    );
+}

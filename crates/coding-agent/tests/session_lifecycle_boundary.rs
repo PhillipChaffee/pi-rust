@@ -190,3 +190,27 @@ fn a_directory_that_does_not_normalize_rejects_create_and_fork() {
         "{fork_error}"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn listing_with_a_directory_that_does_not_normalize_rejects() {
+    let error = SessionManager::list("/tmp", Some("file://host/path"), None)
+        .await
+        .expect_err("normalize");
+    assert!(
+        matches!(error, SessionManagerError::PathNormalize(_)),
+        "{error}"
+    );
+}
+
+#[test]
+fn opening_with_a_directory_that_does_not_normalize_rejects() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let session_file = format!("{}/session.jsonl", dir.path().display());
+    fs::write(&session_file, format!("{}\n", user_header("ovr", "/tmp"))).expect("write session");
+    let error =
+        SessionManager::open(&session_file, Some("file://host/path"), None).expect_err("normalize");
+    assert!(
+        matches!(error, SessionManagerError::PathNormalize(_)),
+        "{error}"
+    );
+}

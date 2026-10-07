@@ -603,3 +603,41 @@ fn writing_the_export_into_a_directory_reports_the_io_arm() {
         "{error}"
     );
 }
+
+#[test]
+fn an_html_export_into_a_directory_reports_the_write_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let temp = dir.path().display().to_string();
+    let session_file = format!("{temp}/session.jsonl");
+    fs::write(
+        &session_file,
+        r#"{"type":"session","version":3,"id":"dir","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+    )
+    .expect("write session");
+    let session = SessionManager::open(&session_file, None, None).expect("open");
+
+    // The session-file export takes the output path verbatim.
+    let error = export_session_to_html(
+        &session,
+        None,
+        ExportOptions::for_path(temp.clone()),
+        &NoThemeSource,
+    )
+    .expect_err("the output path is a directory");
+    assert!(
+        matches!(error, pi_coding_agent::export_html::ExportError::Io(_)),
+        "{error}"
+    );
+
+    // The standalone export takes it the same way.
+    let error = export_from_file(
+        &session_file,
+        ExportOptions::for_path(temp.clone()),
+        &NoThemeSource,
+    )
+    .expect_err("the output path is a directory");
+    assert!(
+        matches!(error, pi_coding_agent::export_html::ExportError::Io(_)),
+        "{error}"
+    );
+}

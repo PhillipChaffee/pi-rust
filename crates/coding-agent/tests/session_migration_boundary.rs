@@ -266,3 +266,12 @@ fn a_missing_file_reports_the_io_arm_of_the_header_scan() {
         "{error}"
     );
 }
+
+#[test]
+fn a_non_path_input_falls_back_to_itself_and_loads_nothing() {
+    let entries = load_entries_from_file("file://host/missing.jsonl");
+    assert!(
+        entries.is_empty(),
+        "the un-normalizable path degrades to the empty load"
+    );
+}

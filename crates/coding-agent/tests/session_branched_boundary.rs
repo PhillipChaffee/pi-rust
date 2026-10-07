@@ -397,3 +397,42 @@ fn a_raw_compaction_that_cannot_parse_still_remaps_through_the_labels() {
         panic!("the tokensBefore-less compaction rides as a raw value");
     }
 }
+
+#[test]
+fn a_raw_compaction_without_a_kept_id_still_re_chains() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = format!("{}/raw-keptless.jsonl", dir.path().display());
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"rk","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#, "\n",
+            r#"{"type":"label","id":"l1","parentId":null,"timestamp":"2026-01-01T00:00:00.000Z","targetId":"l1","label":"x"}"#, "\n",
+            r#"{"type":"compaction","id":"c1","parentId":"l1","timestamp":"2026-01-01T00:00:01.000Z","summary":"s"}"#, "\n",
+        ),
+    )
+    .expect("write raw-keptless file");
+    let mut session = SessionManager::open(&path, None, None).expect("open");
+
+    session.create_branched_session("c1").expect("branch");
+    let entries = session.entries();
+    assert_eq!(
+        entries.len(),
+        1,
+        "the self-targeting label drops with no rebuild: its target left the path"
+    );
+    if let FileEntry::Other(value) = &entries[0] {
+        assert_eq!(value["type"], "compaction");
+        assert_eq!(
+            value.get("firstKeptEntryId"),
+            None,
+            "the compaction never carried a kept id and gains none"
+        );
+        assert_eq!(
+            value["parentId"],
+            serde_json::Value::Null,
+            "the raw compaction re-chains onto the root"
+        );
+    } else {
+        panic!("the tokensBefore-less compaction rides as a raw value");
+    }
+}

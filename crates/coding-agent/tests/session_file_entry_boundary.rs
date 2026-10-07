@@ -218,3 +218,16 @@ fn a_header_with_a_malformed_typed_field_rejects() {
         assert!(parsed.is_err(), "a non-typed field value rejects: {wire}");
     }
 }
+
+#[test]
+fn a_session_typed_line_that_fails_the_typed_parse_rides_raw() {
+    let parsed = serde_json::from_value::<FileEntry>(json!({
+        "type": "session", "timestamp": "2026-01-01T00:00:00.000Z"
+    }))
+    .expect("the line still parses");
+    assert_eq!(
+        parsed,
+        FileEntry::Other(json!({"type": "session", "timestamp": "2026-01-01T00:00:00.000Z"})),
+        "an id-less session line rides raw"
+    );
+}

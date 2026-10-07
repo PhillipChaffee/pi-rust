@@ -226,3 +226,62 @@ fn branching_to_an_unknown_summary_entry_errors() {
         "the branch summary reports the unknown entry like branch does"
     );
 }
+
+#[test]
+fn a_self_parented_or_parentless_entry_roots_the_tree() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = format!("{}/roots.jsonl", dir.path().display());
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"session","version":3,"id":"roots","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#, "\n",
+            r#"{"type":"custom","id":"s","parentId":"s","timestamp":"2026-01-01T00:00:00.000Z","customType":"self"}"#, "\n",
+            r#"{"type":"custom","id":"p","timestamp":"2026-01-01T00:00:01.000Z","customType":"parentless"}"#, "\n",
+        ),
+    )
+    .expect("write roots file");
+
+    let session = SessionManager::open(&path, None, None).expect("open");
+    let tree = session.get_tree();
+    assert_eq!(
+        tree.len(),
+        2,
+        "a self-parent and a parentless entry both root"
+    );
+    let ids: Vec<Option<&str>> = tree.iter().map(|node| node.entry.entry_id()).collect();
+    assert_eq!(
+        ids,
+        vec![Some("s"), Some("p")],
+        "file order keeps the roots"
+    );
+    assert!(tree[0].children.is_empty() && tree[1].children.is_empty());
+}
+
+#[test]
+fn branch_with_summary_from_a_reset_leaf_parents_at_root() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let temp = dir.path().display().to_string();
+    let mut session = SessionManager::create(&temp, Some(&temp), None).expect("create");
+    let first = session
+        .append_message(user_message("hello"))
+        .expect("append");
+    session
+        .append_message(assistant_message("flush"))
+        .expect("append");
+    session.reset_leaf();
+
+    let summary_id = session
+        .branch_with_summary(None, "the summary", None, None, None)
+        .expect("branch");
+    let summary = session.get_entry(&summary_id).expect("the summary entry");
+    assert_eq!(
+        summary.entry_parent_id(),
+        None,
+        "the summary parents at the root"
+    );
+    assert_eq!(session.get_leaf_id(), Some(summary_id.as_str()));
+    let _ = first;
+    let file = session.session_file().expect("file");
+    let lines = fs::read_to_string(file).expect("read").lines().count();
+    assert_eq!(lines, 4, "header + two entries + the appended summary");
+}
