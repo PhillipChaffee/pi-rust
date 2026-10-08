@@ -1,0 +1,35 @@
+[package]
+name = "pi-import"
+version = "0.1.0"
+edition = "2024"
+description = "TS-pi to Rust-pi migration tool: sessions, settings, trust, and provider credentials, per the import-tool decision"
+license = "MIT"
+repository = "https://github.com/PhillipChaffee/pi-rust"
+readme = "README.md"
+keywords = ["import", "migration", "coding-agent", "cli"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+# The formats the tool writes: the agent-dir derivation and session-cwd
+# encoding, the session tree's header codec and parser, the stores (auth,
+# settings, trust), and the legacy-source migration rules, all upstream
+# parity at the port tickets' restatements.
+pi-coding-agent = { path = "../coding-agent" }
+# The credential union the auth entries validate against, upstream's
+# `@earendil-works/pi-ai` types the auth store reads through.
+pi-ai = { path = "../ai" }
+# The JSON value layer every artifact reads and writes through; key order
+# preserved so written files match upstream's insertion order, the same
+# serde_json configuration the stores carry.
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+# The report's Serialize derives, the --json render.
+serde = { version = "1", features = ["derive"] }
+
+# The TS→Rust import tool's binary; the one workspace crate with no upstream
+# counterpart (ADR 0003 addendum; decided by the import-tool ticket #13).
+[[bin]]
+name = "pi-import"
+path = "src/main.rs"
+
+[lints]
+workspace = true
