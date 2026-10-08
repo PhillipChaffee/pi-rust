@@ -2668,6 +2668,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-import"
+version = "0.1.0"
+dependencies = [
+ "pi-ai",
+ "pi-coding-agent",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pi-protocol"
 version = "0.1.0"
 dependencies = [
