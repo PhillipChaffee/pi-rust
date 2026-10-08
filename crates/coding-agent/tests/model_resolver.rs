@@ -30,10 +30,6 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
-#[expect(
-    dead_code,
-    reason = "the shared fixture module compiles env helpers this suite does not drive"
-)]
 mod common;
 
 use common::model_layer::model;

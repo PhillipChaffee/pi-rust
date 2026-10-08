@@ -69,10 +69,6 @@ use pi_coding_agent::provider_composer::{
 };
 use pi_coding_agent::resolve_config_value::clear_config_value_cache;
 
-#[expect(
-    dead_code,
-    reason = "the fixture module is compiled into every test binary and this suite consumes only the model fixtures"
-)]
 mod common;
 
 /// The per-test rig: a temp dir whose lifetime the test binds and the
