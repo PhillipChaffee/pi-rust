@@ -16,6 +16,8 @@
 #![forbid(unsafe_code)]
 
 pub mod auth_storage;
+pub mod cache_stats;
+pub mod compaction;
 pub mod config;
 pub mod defaults;
 pub mod export_html;
@@ -28,6 +30,7 @@ pub mod model_resolver;
 pub mod model_runtime;
 pub mod models_store;
 pub mod project_trust;
+pub mod provider_attribution;
 pub mod provider_composer;
 pub mod radius;
 pub mod remote_catalog_provider;
@@ -39,5 +42,7 @@ pub mod session_manager;
 pub mod session_share;
 pub mod settings_diagnostics;
 pub mod settings_manager;
+pub mod telemetry;
 pub mod trust_manager;
+pub mod usage_totals;
 pub mod utils;

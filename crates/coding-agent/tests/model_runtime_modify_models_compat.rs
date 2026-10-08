@@ -51,10 +51,6 @@ use tokio_util::sync::CancellationToken;
 
 /// The shared fixture module compiles whole into every test binary; the
 /// config suites' env lookups stay unused in this one.
-#[expect(
-    dead_code,
-    reason = "every test binary recompiles the shared fixture module and consumes only its own helpers"
-)]
 mod common;
 
 use common::model_layer::{
