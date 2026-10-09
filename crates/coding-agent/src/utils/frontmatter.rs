@@ -109,6 +109,28 @@ pub fn strip_frontmatter(content: &str) -> Result<String, FrontmatterError> {
     parse_frontmatter(content).map(|parsed| parsed.body)
 }
 
+/// Read a string-valued key from a parsed frontmatter mapping, upstream's
+/// `frontmatter.description` / `frontmatter["argument-hint"]` property
+/// reads: non-string values read as absent.
+#[must_use]
+pub fn frontmatter_string<'a>(frontmatter: &'a Yaml, key: &str) -> Option<&'a str> {
+    frontmatter
+        .as_hash()?
+        .get(&Yaml::String(key.to_string()))
+        .and_then(Yaml::as_str)
+}
+
+/// Whether a frontmatter key holds YAML `true`, upstream's
+/// `frontmatter["disable-model-invocation"] === true`.
+#[must_use]
+pub fn frontmatter_is_true(frontmatter: &Yaml, key: &str) -> bool {
+    frontmatter
+        .as_hash()
+        .and_then(|hash| hash.get(&Yaml::String(key.to_string())))
+        .and_then(Yaml::as_bool)
+        .unwrap_or(false)
+}
+
 fn normalize_newlines(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
 }
