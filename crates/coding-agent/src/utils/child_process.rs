@@ -137,56 +137,64 @@ pub fn spawn_process_sync(
 /// Which pipe a drain event arrived on.
 #[derive(Clone, Copy)]
 enum Drain {
-    /// A chunk arrived on stdout.
-    StdoutChunk,
-    /// A chunk arrived on stderr.
-    StderrChunk,
+    /// A chunk arrived on either pipe.
+    Chunk,
     /// The stdout pipe reached EOF, upstream's `end` event.
     StdoutEnd,
     /// The stderr pipe reached EOF, upstream's `end` event.
     StderrEnd,
 }
 
-/// Wait for a child process to terminate without hanging on inherited
-/// stdio handles, upstream's `waitForChildProcess`.
+/// The chunk listener the streaming wait feeds, shared by the bash tool's
+/// operations (upstream's shared `onData` over both pipes). The boolean is
+/// `true` for stderr chunks.
+pub type OnChildChunk = Arc<dyn Fn(&[u8], bool) + Send + Sync>;
+
+/// The pipe-and-exit wait core both wrappers share and the 5303 regression
+/// drives directly.
 ///
-/// After `exit` the pipes must fall idle before the result settles: the
-/// grace timer re-arms on every chunk, so an actively writing descendant
-/// keeps the drain alive, while a quiet inherited handle releases after
-/// the `EXIT_STDIO_GRACE_MS` constant. Both pipes reaching EOF with the exit settle
-/// immediately, upstream's `close` event. The child's exit code is `None`
-/// when a signal killed it; spawn failures surface at spawn time in Rust
-/// and the callers handle them there, upstream's rejected promise.
-pub async fn wait_for_child_process(child: Child) -> Option<i32> {
-    let mut child = child;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let mut stdout_ended = stdout.is_none();
-    let mut stderr_ended = stderr.is_none();
-
+/// `exit` resolves once with the exit code (`None` on a signal), the two
+/// readers deliver every chunk to `on_chunk` and then an end marker. The
+/// loop settles when the exit has landed and both pipes have fallen
+/// idle — the grace timer re-arms on every chunk, so an actively writing
+/// descendant keeps the drain alive while a quiet inherited handle releases
+/// after `EXIT_STDIO_GRACE_MS`, upstream's re-armed grace timer over the
+/// same stream events.
+pub async fn wait_for_pipes<R1, R2, E>(
+    stdout: R1,
+    stderr: R2,
+    exit: E,
+    on_chunk: OnChildChunk,
+) -> Option<i32>
+where
+    R1: tokio::io::AsyncRead + Unpin + Send + 'static,
+    R2: tokio::io::AsyncRead + Unpin + Send + 'static,
+    E: Future<Output = Option<i32>>,
+{
     let (sender, mut drain_rx) = tokio::sync::mpsc::unbounded_channel();
-    if let Some(pipe) = stdout {
-        tokio::task::spawn(drain_pipe(
-            pipe,
-            sender.clone(),
-            Drain::StdoutChunk,
-            Drain::StdoutEnd,
-        ));
-    }
-    if let Some(pipe) = stderr {
-        tokio::task::spawn(drain_pipe(
-            pipe,
-            sender.clone(),
-            Drain::StderrChunk,
-            Drain::StderrEnd,
-        ));
-    }
-    // The wait loop reads only the end markers; the guard keeps a fully
-    // drained channel from being polled.
-    drop(sender);
+    tokio::task::spawn(drain_pipe(
+        stdout,
+        sender.clone(),
+        Drain::Chunk,
+        Drain::StdoutEnd,
+        Arc::clone(&on_chunk),
+        false,
+    ));
+    tokio::task::spawn(drain_pipe(
+        stderr,
+        sender,
+        Drain::Chunk,
+        Drain::StderrEnd,
+        on_chunk,
+        true,
+    ));
 
-    let grace = Duration::from_millis(EXIT_STDIO_GRACE_MS);
+    let mut exit = Box::pin(exit);
+    // The outer `None` is "not yet exited"; the inner `None` is a signal
+    // death, upstream's `null` exit code.
     let mut exit_code: Option<Option<i32>> = None;
+    let mut stdout_ended = false;
+    let mut stderr_ended = false;
     // The idle timer only runs post-exit, upstream's armIdleTimer guards.
     let mut idle_deadline: Option<tokio::time::Instant> = None;
 
@@ -202,18 +210,18 @@ pub async fn wait_for_child_process(child: Child) -> Option<i32> {
             }
         };
         tokio::select! {
-            status = child.wait(), if exit_code.is_none() => {
-                exit_code = Some(status.ok().and_then(|settled| settled.code()));
-                idle_deadline = Some(tokio::time::Instant::now() + grace);
+            code = &mut exit, if exit_code.is_none() => {
+                exit_code = Some(code);
+                idle_deadline = Some(tokio::time::Instant::now() + grace());
             }
             drain = next_drain => {
                 match drain {
-                    Some(Drain::StdoutChunk | Drain::StderrChunk) => {
+                    Some(Drain::Chunk) => {
                         // Output is still arriving after exit; defer
                         // finalizing so the tail is not destroyed mid-write,
                         // upstream's onData re-arm.
                         if exit_code.is_some() {
-                            idle_deadline = Some(tokio::time::Instant::now() + grace);
+                            idle_deadline = Some(tokio::time::Instant::now() + grace());
                         }
                     }
                     Some(Drain::StdoutEnd) => stdout_ended = true,
@@ -230,13 +238,62 @@ pub async fn wait_for_child_process(child: Child) -> Option<i32> {
     exit_code.flatten()
 }
 
-/// Drain one pipe to EOF on its own task, delivering chunk notifications
-/// and then the end marker to the shared wait channel.
+/// The post-exit idle grace, [`EXIT_STDIO_GRACE_MS`] as a duration.
+const fn grace() -> Duration {
+    Duration::from_millis(EXIT_STDIO_GRACE_MS)
+}
+
+/// Wait for a child process to terminate without hanging on inherited
+/// stdio handles, upstream's `waitForChildProcess`.
+///
+/// The pipes' data is not consumed — callers attach their own listeners
+/// (upstream's `on("data")`) or use [`wait_for_child_process_streaming`].
+pub async fn wait_for_child_process(child: Child) -> Option<i32> {
+    let mut child = child;
+    let stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match child.stdout.take() {
+        Some(pipe) => Box::new(pipe),
+        None => Box::new(tokio::io::empty()),
+    };
+    let stderr: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match child.stderr.take() {
+        Some(pipe) => Box::new(pipe),
+        None => Box::new(tokio::io::empty()),
+    };
+    let exit = async move { child.wait().await.ok().and_then(|settled| settled.code()) };
+    wait_for_pipes(
+        stdout,
+        stderr,
+        exit,
+        Arc::new(|_chunk: &[u8], _is_stderr: bool| {}),
+    )
+    .await
+}
+
+/// Wait for a child process, delivering every stdout/stderr chunk to
+/// `on_chunk` — the form the built-in shell operations run, upstream's data
+/// listeners over both pipes plus the shared wait.
+pub async fn wait_for_child_process_streaming(child: Child, on_chunk: OnChildChunk) -> Option<i32> {
+    let mut child = child;
+    let stdout: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match child.stdout.take() {
+        Some(pipe) => Box::new(pipe),
+        None => Box::new(tokio::io::empty()),
+    };
+    let stderr: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match child.stderr.take() {
+        Some(pipe) => Box::new(pipe),
+        None => Box::new(tokio::io::empty()),
+    };
+    let exit = async move { child.wait().await.ok().and_then(|settled| settled.code()) };
+    wait_for_pipes(stdout, stderr, exit, on_chunk).await
+}
+
+/// Drain one pipe to EOF on its own task, delivering each chunk to the
+/// shared listener and then the end marker to the wait channel.
 async fn drain_pipe<R>(
     mut pipe: R,
     sender: tokio::sync::mpsc::UnboundedSender<Drain>,
     chunk: Drain,
     end: Drain,
+    on_chunk: OnChildChunk,
+    is_stderr: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin + 'static,
 {
@@ -244,7 +301,8 @@ async fn drain_pipe<R>(
     loop {
         match tokio::io::AsyncReadExt::read(&mut pipe, &mut buffer).await {
             Ok(0) | Err(_) => break,
-            Ok(_) => {
+            Ok(read) => {
+                on_chunk(&buffer[..read], is_stderr);
                 if sender.send(chunk).is_err() {
                     return;
                 }

@@ -87,6 +87,31 @@ notify = "8"
 # default set lacks).
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
+# The read tool's macOS NFD path variant, upstream's `String.normalize("NFD")`
+# (the same crate pi-agent-core's path-variant ladder rides).
+unicode-normalization = "0.1"
+# The find/grep tools' native walk: fd's hierarchical `.gitignore` handling
+# and ripgrep's file-walk defaults restated on the ignore crate's walker,
+# with globset carrying fd's glob semantics (the recorded restatement the
+# 3302/3303 regressions pin).
+ignore = "0.4"
+globset = "0.4"
+# The tools manager's no-redirect version probe, upstream's
+# `redirect: "manual"` fetch: the process-default client follows redirects,
+# so the probe client refuses them to read the Location header.
+reqwest = { version = "0.12.28", default-features = false, features = [
+  "rustls-tls",
+  "http2",
+  "charset",
+  "system-proxy",
+  "gzip",
+  "brotli",
+  "deflate",
+  "stream",
+] }
+# The byte-stream adapter the probe client wraps reqwest's chunk stream in,
+# the same futures-util the pi-ai seam's stream impls ride.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 
 [target.'cfg(unix)'.dependencies]
 # The process-tree kill the shell belt performs on shutdown, upstream's

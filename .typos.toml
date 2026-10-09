@@ -39,6 +39,11 @@ hom = "hom"
 # upstream's tolerance of malformed entry lines); typos' dictionary only
 # knows "unparsable".
 unparseable = "unparseable"
+# The path-utils suite's NFD fixture spells "café" as the source literal
+# "caf\u{e9}", so typos sees only the bare "caf" fragment and flags it
+# against "calf"; the accent is the fixture's point (APFS normalization
+# insensitivity), so the escape stays.
+caf = "caf"
 
 # The export template's vendored third-party assets ship byte-verbatim from
 # the upstream pin (upstream's vendor/marked.min.js and

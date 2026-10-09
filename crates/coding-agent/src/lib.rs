@@ -17,8 +17,10 @@
 
 pub mod auth_storage;
 pub mod config;
+pub mod core;
 pub mod defaults;
 pub mod export_html;
+pub mod extensions;
 pub mod file_lock;
 pub mod messages;
 pub mod migrations;
@@ -39,5 +41,6 @@ pub mod session_manager;
 pub mod session_share;
 pub mod settings_diagnostics;
 pub mod settings_manager;
+pub mod tools;
 pub mod trust_manager;
 pub mod utils;
