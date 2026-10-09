@@ -32,10 +32,6 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
-#[expect(
-    dead_code,
-    reason = "the fixture module compiles whole into every test binary; this suite drives only its model-layer helpers"
-)]
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};

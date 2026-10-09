@@ -17,6 +17,8 @@
 
 pub mod auth_guidance;
 pub mod auth_storage;
+pub mod cache_stats;
+pub mod compaction;
 pub mod config;
 pub mod defaults;
 pub mod diagnostics;
@@ -34,6 +36,7 @@ pub mod package_manager;
 pub mod pi_manifest;
 pub mod project_trust;
 pub mod prompt_templates;
+pub mod provider_attribution;
 pub mod provider_composer;
 pub mod radius;
 pub mod remote_catalog_provider;
@@ -49,5 +52,7 @@ pub mod settings_manager;
 pub mod skills;
 pub mod source_info;
 pub mod system_prompt;
+pub mod telemetry;
 pub mod trust_manager;
+pub mod usage_totals;
 pub mod utils;

@@ -181,6 +181,16 @@ pub fn session_entry_to_context_messages(entry: &FileEntry) -> Vec<AgentMessage>
     let FileEntry::Entry(entry) = entry else {
         return Vec::new();
     };
+    typed_entry_to_context_messages(entry)
+}
+
+/// The typed-union projection [`session_entry_to_context_messages`] runs for
+/// `FileEntry::Entry` values.
+///
+/// Borrowed so entry scans (compaction cut points, turn-start searches) do
+/// not clone the whole entry per probe.
+#[must_use]
+pub fn typed_entry_to_context_messages(entry: &SessionEntry) -> Vec<AgentMessage> {
     match entry {
         SessionEntry::Message(message_entry) => message_entry
             .message

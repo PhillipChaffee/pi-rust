@@ -44,5 +44,11 @@ unparseable = "unparseable"
 # the upstream pin (upstream's vendor/marked.min.js and
 # vendor/highlight.min.js); their minified tokens are vendor code, not
 # prose this repository spells.
+# The compaction suite's large-session fixture ships byte-verbatim from the
+# upstream pin (upstream's test/fixtures/large-session.jsonl): a real TS-pi
+# session whose transcript prose carries its own spellings.
 [files]
-extend-exclude = ["crates/coding-agent/src/export_html/assets"]
+extend-exclude = [
+    "crates/coding-agent/src/export_html/assets",
+    "crates/coding-agent/tests/fixtures/large-session.jsonl",
+]

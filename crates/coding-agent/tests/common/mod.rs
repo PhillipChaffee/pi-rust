@@ -14,10 +14,19 @@ use pi_coding_agent::config::EnvLookup;
     unused,
     reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
 )]
+pub mod compaction;
+#[allow(
+    unused,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
 pub mod model_layer;
 
 /// A map-backed [`EnvLookup`], the injected environment the `_with`
 /// variants read in place of `process.env`.
+#[allow(
+    dead_code,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
 pub fn env_with(entries: &[(&str, &str)]) -> EnvLookup {
     let owned: Vec<(String, String)> = entries
         .iter()
@@ -32,6 +41,10 @@ pub fn env_with(entries: &[(&str, &str)]) -> EnvLookup {
 }
 
 /// An environment with no entries, the lookup for the fallback branches.
+#[allow(
+    dead_code,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
 pub fn empty_env() -> EnvLookup {
     Box::new(|_| None)
 }
