@@ -285,6 +285,15 @@ async fn package_skill_and_extension_resources_stamp_their_package_metadata() {
         "---\nname: pkg-skill\ndescription: from the package\n---\nbody",
     );
     let extension_ts = env.write("pkg/extensions/tool.ts", "");
+    // The package sweep selects extension entries by the execute bit
+    // (ADR 0007's executability restatement of upstream's `.ts` file
+    // pattern).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&extension_ts, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
 
     let mut manager = in_memory_manager();
     manager.set_packages(&[serde_json::Value::String(

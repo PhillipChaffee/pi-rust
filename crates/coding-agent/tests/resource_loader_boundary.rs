@@ -16,6 +16,7 @@
 )]
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use pi_coding_agent::auth_guidance::{
     format_no_api_key_found_message, format_no_model_selected_message,
@@ -25,16 +26,21 @@ use pi_coding_agent::config::{get_docs_path, get_examples_path, get_readme_path}
 use pi_coding_agent::diagnostics::ResourceDiagnosticKind;
 use pi_coding_agent::footer_data_provider::find_git_paths;
 use pi_coding_agent::package_manager::{
-    DefaultPackageManager, DefaultPackageManagerOptions, PathMetadata, ResolvedPaths, ResourceType,
-    SkillDiscoveryMode, is_local_source, resource_precedence_rank,
+    DefaultPackageManager, PackageManagerOptions, ParsedSource, PathMetadata, ResolvedPaths,
+    ResourceType, SkillDiscoveryMode, resource_precedence_rank,
 };
 use pi_coding_agent::pi_manifest::{PiManifest, read_pi_manifest, read_pi_manifest_value};
 use pi_coding_agent::resource_loader::{
     DefaultResourceLoader, DefaultResourceLoaderOptions, PathWithMetadata, PromptSource,
     ResourceExtensionPaths,
 };
-use pi_coding_agent::settings_manager::{Settings, SettingsManager, SettingsManagerCreateOptions};
+use pi_coding_agent::settings_manager::{
+    InMemorySettingsStorage, Settings, SettingsManager, SettingsManagerCreateOptions,
+    SettingsStorage,
+};
 use pi_coding_agent::source_info::{SourceOrigin, SourceScope};
+
+type InMemoryHandle = Arc<Mutex<SettingsManager<InMemorySettingsStorage>>>;
 
 // === auth-guidance ==========================================================
 
@@ -224,17 +230,40 @@ fn find_git_paths_returns_none_without_a_head_or_a_repo() {
 
 #[test]
 fn classifies_package_sources() {
-    assert!(!is_local_source("npm:foo"));
-    assert!(!is_local_source("git:https://github.com/org/repo"));
-    assert!(!is_local_source("https://github.com/org/repo"));
-    assert!(!is_local_source("ssh://git@github.com/org/repo"));
-    // Upstream's git-URL regex carries no `git+` alternative — a
-    // `git+https://` spec parses as neither git nor npm, and the fallback
-    // reads it local.
-    assert!(is_local_source("git+https://github.com/org/repo"));
-    assert!(is_local_source("./local/dir"));
-    assert!(is_local_source("/absolute/path"));
-    assert!(is_local_source("plain-name"));
+    let manager = manager_with("/tmp", "/tmp/agent", &settings_handle());
+    // An `npm:` spec is a parse error, the npm channel's drop (ADR 0007).
+    assert!(manager.parse_source("npm:foo").is_err());
+    assert!(matches!(
+        manager.parse_source("git:https://github.com/org/repo"),
+        Ok(ParsedSource::Git(_))
+    ));
+    assert!(matches!(
+        manager.parse_source("https://github.com/org/repo"),
+        Ok(ParsedSource::Git(_))
+    ));
+    assert!(matches!(
+        manager.parse_source("ssh://git@github.com/org/repo"),
+        Ok(ParsedSource::Git(_))
+    ));
+    // Upstream's git-URL vocabulary carries no `git+` alternative — a
+    // `git+https://` spec parses as neither git nor a remote protocol, and
+    // the parser reads it local.
+    assert!(matches!(
+        manager.parse_source("git+https://github.com/org/repo"),
+        Ok(ParsedSource::Local(_))
+    ));
+    assert!(matches!(
+        manager.parse_source("./local/dir"),
+        Ok(ParsedSource::Local(_))
+    ));
+    assert!(matches!(
+        manager.parse_source("/absolute/path"),
+        Ok(ParsedSource::Local(_))
+    ));
+    assert!(matches!(
+        manager.parse_source("plain-name"),
+        Ok(ParsedSource::Local(_))
+    ));
 }
 
 #[test]
@@ -301,41 +330,53 @@ fn auto_extension_entries_prefer_explicit_entries_and_index_files() {
     std::fs::write(manifest_dir.join("e.ts"), "export default 1;").expect("write");
     std::fs::write(manifest_dir.join("other.ts"), "export default 2;").expect("write");
 
-    let entries = pi_coding_agent::package_manager::collect_auto_extension_entries(
-        &manifest_dir.to_string_lossy(),
-    );
+    let entries = pi_coding_agent::package_manager::collect_auto_extension_entries(&manifest_dir);
     assert_eq!(
         entries,
         vec![manifest_dir.join("e.ts").to_string_lossy().into_owned()]
     );
 
-    // A directory with an index file resolves to it.
+    // A directory with an index file resolves to it. The index convention
+    // restates to an executable `index` (ADR 0007's executability filter).
     let index_dir = dir.path().join("indexed");
     std::fs::create_dir_all(&index_dir).expect("mkdir");
-    std::fs::write(index_dir.join("index.ts"), "export default 1;").expect("write");
-    let entries = pi_coding_agent::package_manager::collect_auto_extension_entries(
-        &index_dir.to_string_lossy(),
-    );
+    std::fs::write(index_dir.join("index"), "export default 1;").expect("write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            index_dir.join("index"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+    }
+    let entries = pi_coding_agent::package_manager::collect_auto_extension_entries(&index_dir);
     assert_eq!(
         entries,
-        vec![index_dir.join("index.ts").to_string_lossy().into_owned()]
+        vec![index_dir.join("index").to_string_lossy().into_owned()]
     );
 
-    // An undecorated directory collects its direct .ts/.js children.
+    // An undecorated directory collects its direct executable children;
+    // a non-executable file never surfaces.
     let loose_dir = dir.path().join("loose");
     std::fs::create_dir_all(&loose_dir).expect("mkdir");
-    std::fs::write(loose_dir.join("a.ts"), "").expect("write");
-    std::fs::write(loose_dir.join("b.js"), "").expect("write");
+    for name in ["a", "b"] {
+        let path = loose_dir.join(name);
+        std::fs::write(&path, "").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
     std::fs::write(loose_dir.join("c.txt"), "").expect("write");
-    let mut entries = pi_coding_agent::package_manager::collect_auto_extension_entries(
-        &loose_dir.to_string_lossy(),
-    );
+    let mut entries = pi_coding_agent::package_manager::collect_auto_extension_entries(&loose_dir);
     entries.sort();
     assert_eq!(
         entries,
         vec![
-            loose_dir.join("a.ts").to_string_lossy().into_owned(),
-            loose_dir.join("b.js").to_string_lossy().into_owned(),
+            loose_dir.join("a").to_string_lossy().into_owned(),
+            loose_dir.join("b").to_string_lossy().into_owned(),
         ]
     );
 }
@@ -351,7 +392,7 @@ fn auto_skill_entries_follow_the_flavor_depth_rule() {
 
     // The pi flavor loads root .md files only at the traversal root.
     let mut pi_entries = pi_coding_agent::package_manager::collect_auto_skill_entries(
-        &skills_dir.to_string_lossy(),
+        &skills_dir,
         SkillDiscoveryMode::Pi,
     );
     pi_entries.sort();
@@ -375,7 +416,7 @@ fn auto_skill_entries_follow_the_flavor_depth_rule() {
     std::fs::write(agents_dir.join("root.md"), "").expect("write");
     std::fs::write(agents_dir.join("sub/notes.md"), "").expect("write");
     let agents_entries = pi_coding_agent::package_manager::collect_auto_skill_entries(
-        &agents_dir.to_string_lossy(),
+        &agents_dir,
         SkillDiscoveryMode::Agents,
     );
     assert_eq!(
@@ -397,9 +438,7 @@ fn ancestor_agents_skill_dirs_stop_at_the_git_root() {
     std::fs::create_dir_all(&deep).expect("mkdir");
     std::fs::create_dir_all(repo.join(".git")).expect("git dir");
 
-    let dirs = pi_coding_agent::package_manager::collect_ancestor_agents_skill_dirs(
-        &deep.to_string_lossy(),
-    );
+    let dirs = pi_coding_agent::package_manager::collect_ancestor_agents_skill_dirs(&deep);
     assert_eq!(
         dirs,
         vec![
@@ -425,9 +464,7 @@ fn auto_prompt_and_theme_entries_skip_ignored_children() {
     std::fs::write(prompts_dir.join(".gitignore"), "a.md\n").expect("write");
 
     assert_eq!(
-        pi_coding_agent::package_manager::collect_auto_prompt_entries(
-            &prompts_dir.to_string_lossy()
-        ),
+        pi_coding_agent::package_manager::collect_auto_prompt_entries(&prompts_dir),
         Vec::<String>::new()
     );
 
@@ -436,27 +473,37 @@ fn auto_prompt_and_theme_entries_skip_ignored_children() {
     std::fs::write(themes_dir.join("x.json"), "{}").expect("write");
     std::fs::write(themes_dir.join("y.md"), "").expect("write");
     assert_eq!(
-        pi_coding_agent::package_manager::collect_auto_theme_entries(&themes_dir.to_string_lossy()),
+        pi_coding_agent::package_manager::collect_auto_theme_entries(&themes_dir),
         vec![themes_dir.join("x.json").to_string_lossy().into_owned()]
     );
 }
 
 // === package-manager resolution =============================================
 
-fn manager_for(cwd: &str, agent_dir: &str) -> DefaultPackageManager {
-    DefaultPackageManager::new(&DefaultPackageManagerOptions {
+fn settings_handle() -> InMemoryHandle {
+    Arc::new(Mutex::new(SettingsManager::in_memory(
+        &Settings::new(),
+        SettingsManagerCreateOptions::default(),
+    )))
+}
+
+fn manager_with<S: SettingsStorage + 'static>(
+    cwd: &str,
+    agent_dir: &str,
+    settings: &Arc<Mutex<SettingsManager<S>>>,
+) -> DefaultPackageManager<S> {
+    DefaultPackageManager::new(PackageManagerOptions {
         cwd: cwd.to_string(),
         agent_dir: agent_dir.to_string(),
+        settings: Arc::clone(settings),
+        command_runner: None,
+        env: None,
+        http_client: None,
     })
 }
 
-fn in_memory_manager() -> SettingsManager<pi_coding_agent::settings_manager::InMemorySettingsStorage>
-{
-    SettingsManager::in_memory(&Settings::new(), SettingsManagerCreateOptions::default())
-}
-
-#[test]
-fn resolve_collects_auto_discovered_directories_with_precedence() {
+#[tokio::test]
+async fn resolve_collects_auto_discovered_directories_with_precedence() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -465,9 +512,12 @@ fn resolve_collects_auto_discovered_directories_with_precedence() {
     std::fs::write(agent_dir.join("skills/user.md"), "").expect("write");
     std::fs::write(cwd.join(".pi/skills/project.md"), "").expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let settings_manager = in_memory_manager();
-    let resolved = manager.resolve(&settings_manager);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings_handle(),
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     assert_eq!(resolved.skills.len(), 2);
     // Project resources sort before user resources.
@@ -489,8 +539,8 @@ fn resolve_collects_auto_discovered_directories_with_precedence() {
     ));
 }
 
-#[test]
-fn resolve_gates_project_discovery_on_project_trust() {
+#[tokio::test]
+async fn resolve_gates_project_discovery_on_project_trust() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -499,15 +549,19 @@ fn resolve_gates_project_discovery_on_project_trust() {
     std::fs::write(agent_dir.join("skills/user.md"), "").expect("write");
     std::fs::write(cwd.join(".pi/skills/project.md"), "").expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let settings_manager = SettingsManager::create(
+    let settings = Arc::new(Mutex::new(SettingsManager::create(
         &cwd.to_string_lossy(),
         &agent_dir.to_string_lossy(),
         SettingsManagerCreateOptions {
             project_trusted: Some(false),
         },
+    )));
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings,
     );
-    let resolved = manager.resolve(&settings_manager);
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     assert_eq!(resolved.skills.len(), 1);
     assert_eq!(
@@ -516,8 +570,8 @@ fn resolve_gates_project_discovery_on_project_trust() {
     );
 }
 
-#[test]
-fn resolve_carries_the_agents_skills_trees_with_their_own_base_dirs() {
+#[tokio::test]
+async fn resolve_carries_the_agents_skills_trees_with_their_own_base_dirs() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -529,9 +583,12 @@ fn resolve_carries_the_agents_skills_trees_with_their_own_base_dirs() {
     std::fs::write(cwd.join(".agents/skills/sub/SKILL.md"), "").expect("write");
     std::fs::write(env.path().join(".agents/skills/sub/outer.md"), "").expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let settings_manager = in_memory_manager();
-    let resolved = manager.resolve(&settings_manager);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings_handle(),
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     let project_entry = resolved
         .skills
@@ -569,8 +626,8 @@ fn resolve_carries_the_agents_skills_trees_with_their_own_base_dirs() {
     );
 }
 
-#[test]
-fn resolve_canonical_dedup_keeps_the_first_path() {
+#[tokio::test]
+async fn resolve_canonical_dedup_keeps_the_first_path() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = agent_dir.clone();
@@ -579,10 +636,17 @@ fn resolve_canonical_dedup_keeps_the_first_path() {
 
     // The same file through a settings entry and through auto-discovery:
     // the settings entry (rank 2) lands first and wins.
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let mut settings_manager = in_memory_manager();
-    settings_manager.set_skill_paths(&["skills/dup.md".to_string()]);
-    let resolved = manager.resolve(&settings_manager);
+    let settings = settings_handle();
+    settings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_skill_paths(&["skills/dup.md".to_string()]);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings,
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     assert_eq!(resolved.skills.len(), 1);
     assert!(matches!(
@@ -592,8 +656,8 @@ fn resolve_canonical_dedup_keeps_the_first_path() {
     assert_eq!(resolved.skills[0].metadata.source, "local");
 }
 
-#[test]
-fn resolve_extension_sources_collects_local_paths() {
+#[tokio::test]
+async fn resolve_extension_sources_collects_local_paths() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -601,8 +665,17 @@ fn resolve_extension_sources_collects_local_paths() {
     let ext_file = env.path().join("ext.ts");
     std::fs::write(&ext_file, "").expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let resolved = manager.resolve_extension_sources(&[ext_file.to_string_lossy().into_owned()]);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings_handle(),
+    );
+    // The loader always asks for the temporary scope, upstream's
+    // `resolveExtensionSources(paths, { temporary: true })`.
+    let resolved = manager
+        .resolve_extension_sources(&[ext_file.to_string_lossy().into_owned()], false, true)
+        .await
+        .expect("resolve");
 
     assert_eq!(resolved.extensions.len(), 1);
     assert_eq!(PathBuf::from(&resolved.extensions[0].path), ext_file);
@@ -616,16 +689,31 @@ fn resolve_extension_sources_collects_local_paths() {
     ));
 }
 
-#[test]
-fn resolve_extension_sources_skips_package_forms_until_the_install_arm_lands() {
-    let manager = manager_for("/tmp", "/tmp/agent");
-    let resolved =
-        manager.resolve_extension_sources(&["npm:foo".to_string(), "git+https://x".to_string()]);
+#[tokio::test]
+async fn resolve_extension_sources_rejects_npm_and_reads_git_plus_urls_local() {
+    let manager = manager_with("/tmp", "/tmp/agent", &settings_handle());
+    // The npm channel drops (ADR 0007): an `npm:` source is a parse error,
+    // not a skipped entry.
+    let error = manager
+        .resolve_extension_sources(&["npm:foo".to_string()], false, true)
+        .await
+        .expect_err("an npm source is a parse error");
+    assert!(
+        error.0.contains("npm package sources are not supported"),
+        "{error:?}"
+    );
+    // A `git+https://` spec parses as neither a git URL nor a remote
+    // protocol — the parser reads it local, and the resolver probes the
+    // path; a missing path contributes no entries.
+    let resolved = manager
+        .resolve_extension_sources(&["git+https://x".to_string()], false, true)
+        .await
+        .expect("resolve");
     assert_eq!(resolved, ResolvedPaths::default());
 }
 
-#[test]
-fn local_package_sources_collect_package_resources() {
+#[tokio::test]
+async fn local_package_sources_collect_package_resources() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -641,14 +729,21 @@ fn local_package_sources_collect_package_resources() {
     )
     .expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let mut settings_manager = in_memory_manager();
+    let settings = settings_handle();
     // Global package entries resolve against the agent dir, upstream's
     // `getBaseDirForScope`; the fixture uses an absolute source.
-    settings_manager.set_packages(&[serde_json::Value::String(
-        package_root.to_string_lossy().into_owned(),
-    )]);
-    let resolved = manager.resolve(&settings_manager);
+    settings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_packages(&[serde_json::Value::String(
+            package_root.to_string_lossy().into_owned(),
+        )]);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings,
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     assert_eq!(resolved.skills.len(), 1);
     assert_eq!(
@@ -666,8 +761,8 @@ fn local_package_sources_collect_package_resources() {
     );
 }
 
-#[test]
-fn a_package_manifest_carries_only_its_own_entries() {
+#[tokio::test]
+async fn a_package_manifest_carries_only_its_own_entries() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -682,12 +777,19 @@ fn a_package_manifest_carries_only_its_own_entries() {
     )
     .expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let mut settings_manager = in_memory_manager();
-    settings_manager.set_packages(&[serde_json::Value::String(
-        package_root.to_string_lossy().into_owned(),
-    )]);
-    let resolved = manager.resolve(&settings_manager);
+    let settings = settings_handle();
+    settings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_packages(&[serde_json::Value::String(
+            package_root.to_string_lossy().into_owned(),
+        )]);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings,
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     // The manifest's presence short-circuits the default-layout sweep:
     // only its own entries load.
@@ -699,8 +801,8 @@ fn a_package_manifest_carries_only_its_own_entries() {
     );
 }
 
-#[test]
-fn a_local_package_directory_without_resources_becomes_one_extension_entry() {
+#[tokio::test]
+async fn a_local_package_directory_without_resources_becomes_one_extension_entry() {
     let env = tempfile::tempdir().expect("tempdir");
     let agent_dir = env.path().join("agent");
     let cwd = env.path().join("project");
@@ -712,12 +814,19 @@ fn a_local_package_directory_without_resources_becomes_one_extension_entry() {
     )
     .expect("write");
 
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let mut settings_manager = in_memory_manager();
-    settings_manager.set_packages(&[serde_json::Value::String(
-        package_root.to_string_lossy().into_owned(),
-    )]);
-    let resolved = manager.resolve(&settings_manager);
+    let settings = settings_handle();
+    settings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_packages(&[serde_json::Value::String(
+            package_root.to_string_lossy().into_owned(),
+        )]);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings,
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     assert_eq!(resolved.extensions.len(), 1);
     assert_eq!(PathBuf::from(&resolved.extensions[0].path), package_root);
@@ -918,8 +1027,7 @@ async fn the_pre_trust_flow_runs_and_reports_the_bootstrap_set() {
     let env = LoaderEnv::new();
     let mut loader = DefaultResourceLoader::new(env.options(), env.file_manager());
 
-    let seen: std::sync::Arc<std::sync::Mutex<Option<usize>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen: Arc<Mutex<Option<usize>>> = Arc::new(Mutex::new(None));
     let seen_for_callback = seen.clone();
     loader
         .reload(Some(
@@ -1377,8 +1485,8 @@ fn expansion_passes_non_template_text_through() {
 
 // === package manifest glob entries ==========================================
 
-#[test]
-fn manifest_glob_entries_expand_and_drop_dot_segments() {
+#[tokio::test]
+async fn manifest_glob_entries_expand_and_drop_dot_segments() {
     let env = tempfile::tempdir().expect("tempdir");
     let package_root = env.path().join("pkg");
     std::fs::create_dir_all(package_root.join("prompts/sub")).expect("mkdir");
@@ -1396,10 +1504,17 @@ fn manifest_glob_entries_expand_and_drop_dot_segments() {
     std::fs::create_dir_all(&agent_dir).expect("mkdir");
     let cwd = env.path().join("project");
     std::fs::create_dir_all(&cwd).expect("mkdir");
-    let manager = manager_for(&cwd.to_string_lossy(), &agent_dir.to_string_lossy());
-    let mut settings_manager = in_memory_manager();
-    settings_manager.set_packages(&[serde_json::Value::String("../pkg".to_string())]);
-    let resolved = manager.resolve(&settings_manager);
+    let settings = settings_handle();
+    settings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_packages(&[serde_json::Value::String("../pkg".to_string())]);
+    let manager = manager_with(
+        &cwd.to_string_lossy(),
+        &agent_dir.to_string_lossy(),
+        &settings,
+    );
+    let resolved = manager.resolve(None).await.expect("resolve");
 
     let paths: Vec<String> = resolved.prompts.iter().map(|p| p.path.clone()).collect();
     assert!(paths.iter().any(|p| p.ends_with("prompts/a.md")));
