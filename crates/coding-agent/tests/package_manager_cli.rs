@@ -40,10 +40,6 @@ use pi_coding_agent::settings_manager::{
     FileSettingsStorage, SettingsManager, SettingsManagerCreateOptions,
 };
 
-#[expect(
-    dead_code,
-    reason = "the shared fixture module is compiled into every test binary and this suite consumes only the settings helpers"
-)]
 mod common;
 
 /// The CLI rig: a temp tree with the agent dir, project dir, and the

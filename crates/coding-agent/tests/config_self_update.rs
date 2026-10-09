@@ -462,7 +462,7 @@ fn the_pi_manifest_keeps_string_arrays_and_rejects_other_shapes() {
 
     std::fs::write(&path, r#"{"name":"pkg","pi":5}"#).expect("write");
     assert_eq!(
-        read_pi_manifest(&path),
+        read_pi_manifest(path.to_string_lossy().as_ref()),
         None,
         "a non-object pi is no manifest"
     );
@@ -472,7 +472,7 @@ fn the_pi_manifest_keeps_string_arrays_and_rejects_other_shapes() {
         r#"{"name":"pkg","pi":{"prompts":["./prompts/a.md"],"themes":["./themes/dark.json"],"extensions":[1]}}"#,
     )
     .expect("write");
-    let manifest = read_pi_manifest(&path).expect("manifest");
+    let manifest = read_pi_manifest(path.to_string_lossy().as_ref()).expect("manifest");
     assert_eq!(manifest.prompts, Some(vec!["./prompts/a.md".to_string()]));
     assert_eq!(
         manifest.themes,

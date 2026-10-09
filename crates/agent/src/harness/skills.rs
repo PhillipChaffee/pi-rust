@@ -463,7 +463,13 @@ async fn add_ignore_rules(
 /// handoff to npm `ignore` does. A leading `/` drops before the prefix,
 /// preserving the root-anchored reading; unanchored patterns stay
 /// unanchored at their new depth.
-fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
+///
+/// Public workspace-wide: upstream re-implements this line rewriting three
+/// times (`packages/agent/src/harness/skills.ts`, the coding-agent's
+/// `core/skills.ts`, and its `core/package-manager.ts`), and the port keeps
+/// one npm-`ignore` restatement for all of them.
+#[must_use]
+pub fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return None;
@@ -642,13 +648,27 @@ fn validate_description(description: Option<&str>) -> Vec<String> {
 
 /// The per-directory ignore matcher, upstream's `IgnoreMatcher`
 /// (`ReturnType<typeof ignore>`) built on the Rust `ignore` crate.
-struct IgnoreMatcher {
+///
+/// Public workspace-wide: upstream's coding-agent re-implements the same
+/// npm-`ignore` semantics twice more (`core/skills.ts` and
+/// `core/package-manager.ts`), and the port keeps one restatement for all
+/// of them.
+#[derive(Debug)]
+pub struct IgnoreMatcher {
     builder: GitignoreBuilder,
     matcher: Gitignore,
 }
 
+impl Default for IgnoreMatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IgnoreMatcher {
-    fn new() -> Self {
+    /// The empty matcher, upstream's `ignore()` call.
+    #[must_use]
+    pub fn new() -> Self {
         let mut builder = GitignoreBuilder::new("");
         // npm `ignore` matches case-insensitively by default; the builder
         // re-translates no lines yet, so this cannot fail.
@@ -663,7 +683,7 @@ impl IgnoreMatcher {
     ///
     /// npm filters blank, comment, and dangling-backslash lines rather than
     /// rejecting them; a line the builder refuses drops the same way.
-    fn add(&mut self, patterns: &[String]) {
+    pub fn add(&mut self, patterns: &[String]) {
         if patterns.is_empty() {
             return;
         }
@@ -686,7 +706,8 @@ impl IgnoreMatcher {
     /// a whitelist match only overrides ignores matched at the same level.
     /// The walk re-expresses that over `Gitignore::matched`; ancestors test
     /// as directories.
-    fn ignores(&self, rel_path: &str) -> bool {
+    #[must_use]
+    pub fn ignores(&self, rel_path: &str) -> bool {
         let is_dir = rel_path.ends_with('/');
         let path = rel_path.strip_suffix('/').unwrap_or(rel_path);
         let segments: Vec<&str> = path

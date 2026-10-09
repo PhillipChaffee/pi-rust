@@ -30,10 +30,6 @@
     reason = "a wrong abort outcome is reported by panicking"
 )]
 
-#[expect(
-    dead_code,
-    reason = "the fixture module is compiled into every test binary and this suite consumes only the model fixtures"
-)]
 mod common;
 
 #[cfg(unix)]

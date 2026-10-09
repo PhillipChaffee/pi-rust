@@ -29,10 +29,6 @@
     reason = "the not-expected-outcome guard panics by design, upstream's fail()"
 )]
 
-#[expect(
-    dead_code,
-    reason = "the fixture module compiles whole into every test binary; this suite drives only its model-layer helpers"
-)]
 mod common;
 
 use std::sync::Arc;

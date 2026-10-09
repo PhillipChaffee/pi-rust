@@ -25,10 +25,6 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
-#[expect(
-    dead_code,
-    reason = "the fixture module compiles whole into every test binary; this suite drives only its model helpers"
-)]
 mod common;
 
 use std::sync::Arc;

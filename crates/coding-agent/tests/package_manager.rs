@@ -39,10 +39,6 @@ use pi_coding_agent::settings_manager::{
     InMemorySettingsStorage, SettingsManager, SettingsManagerCreateOptions,
 };
 
-#[expect(
-    dead_code,
-    reason = "the shared fixture module is compiled into every test binary and this suite consumes only its settings helpers"
-)]
 mod common;
 
 // =============================================================================

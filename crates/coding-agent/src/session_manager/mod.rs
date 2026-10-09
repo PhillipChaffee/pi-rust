@@ -36,7 +36,7 @@ pub mod types;
 
 pub use context::{
     ByIdIndex, LeafId, SessionContext, SessionModel, build_context_entries, build_session_context,
-    build_session_path, session_entry_to_context_messages,
+    build_session_path, session_entry_to_context_messages, typed_entry_to_context_messages,
 };
 pub use discovery::{
     SessionInfo, SessionListProgress, find_most_recent_session, get_default_session_dir,

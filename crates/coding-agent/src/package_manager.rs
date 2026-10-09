@@ -1,6 +1,13 @@
 //! The package manager, upstream's `src/core/package-manager.ts` at pin
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
+//! The full port in one manager: the static resource resolution the
+//! resource loader consumes (settings entries, auto-discovery, the
+//! `!`/`+`/`-` override patterns, package sources) shares the struct with
+//! the install arms (`crate:`/git/tarball/local channels, update flows,
+//! receipts). The static-half slice recorded the install arm as deferred
+//! to this ticket; the deferral retires with it (#129).
+//!
 //! Porting restatements this module records:
 //!
 //! - **The npm source kind drops** (ADR 0007). The dual-channel grammar is
@@ -90,15 +97,8 @@ pub struct PathMetadata {
 }
 
 /// Where a resource's provenance claims it came from, upstream's `origin`
-/// union.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceOrigin {
-    /// A package delivered it, upstream's `"package"`.
-    Package,
-    /// A settings array or auto-discovery contributed it, upstream's
-    /// `"top-level"`.
-    TopLevel,
-}
+/// union — the [`crate::source_info`] enum under its wire-facing name.
+pub use crate::source_info::SourceOrigin as ResourceOrigin;
 
 impl ResourceOrigin {
     /// The wire's tag, upstream's union member.
@@ -237,16 +237,9 @@ pub struct ConfiguredPackage {
     pub installed_path: Option<String>,
 }
 
-/// The scopes a source resolves at, upstream's `SourceScope`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceScope {
-    /// User settings, upstream's `"user"`.
-    User,
-    /// Project settings, upstream's `"project"`.
-    Project,
-    /// A transient `resolveExtensionSources` call, upstream's `"temporary"`.
-    Temporary,
-}
+/// The scopes a source resolves at, upstream's `SourceScope` — the
+/// [`crate::source_info`] enum the loader's provenance shares.
+pub use crate::source_info::SourceScope;
 
 /// The installable scopes, upstream's `InstalledSourceScope`.
 pub type InstalledSourceScope = SourceScope;
@@ -773,7 +766,10 @@ fn collect_skill_entries(
     entries
 }
 
-fn collect_auto_skill_entries(dir: &Path, mode: SkillDiscoveryMode) -> Vec<PathBuf> {
+/// The skill entries behind one auto-discovered skills directory,
+/// upstream's `collectAutoSkillEntries`.
+#[must_use]
+pub fn collect_auto_skill_entries(dir: &Path, mode: SkillDiscoveryMode) -> Vec<PathBuf> {
     collect_skill_entries(dir, mode, &build_ignore_matcher(dir, dir), None)
 }
 
@@ -796,7 +792,8 @@ pub(crate) fn find_git_repo_root(start_dir: &Path) -> Option<PathBuf> {
 /// The `.agents/skills` directories from the cwd up to the git root,
 /// upstream's `collectAncestorAgentsSkillDirs` — the walk stops at the repo
 /// root (or the filesystem root when outside a repo).
-pub(crate) fn collect_ancestor_agents_skill_dirs(start_dir: &Path) -> Vec<PathBuf> {
+#[must_use]
+pub fn collect_ancestor_agents_skill_dirs(start_dir: &Path) -> Vec<PathBuf> {
     let mut skill_dirs = Vec::new();
     let resolved_start_dir = start_dir.to_path_buf();
     let git_repo_root = find_git_repo_root(&resolved_start_dir);
@@ -817,13 +814,15 @@ pub(crate) fn collect_ancestor_agents_skill_dirs(start_dir: &Path) -> Vec<PathBu
 
 /// Walk a directory collecting prompt markdown files, upstream's
 /// `collectAutoPromptEntries`.
-fn collect_auto_prompt_entries(dir: &Path) -> Vec<PathBuf> {
+#[must_use]
+pub fn collect_auto_prompt_entries(dir: &Path) -> Vec<PathBuf> {
     collect_extension_leaf_files(dir, ResourceType::Prompts)
 }
 
 /// Walk a directory collecting theme JSON files, upstream's
 /// `collectAutoThemeEntries`.
-fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
+#[must_use]
+pub fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
     collect_extension_leaf_files(dir, ResourceType::Themes)
 }
 
@@ -898,7 +897,8 @@ fn normalize_manifest_entry(dir: &Path, entry: &str) -> PathBuf {
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
     let package_json_path = dir.join("package.json");
     if package_json_path.exists()
-        && let Some(manifest) = crate::pi_manifest::read_pi_manifest(&package_json_path)
+        && let Some(manifest) =
+            crate::pi_manifest::read_pi_manifest(package_json_path.to_string_lossy().as_ref())
         && let Some(entries) = manifest.extensions.filter(|entries| !entries.is_empty())
     {
         let resolved: Vec<PathBuf> = entries
@@ -934,10 +934,13 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
 }
 
 /// Discover extension entries from a directory's contents, upstream's
-/// `collectAutoExtensionEntries`: the directory's own explicit entries win,
-/// else each entry contributes — an executable file is an extension (the
-/// restated `.ts`/`.js` rule), a directory contributes its explicit entries.
-fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
+/// `collectAutoExtensionEntries`.
+///
+/// The directory's own explicit entries win; else each entry contributes —
+/// an executable file is an extension (the restated `.ts`/`.js` rule), a
+/// directory contributes its explicit entries.
+#[must_use]
+pub fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
     let mut entries = Vec::new();
     if !dir.exists() {
         return entries;
@@ -988,7 +991,8 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
 /// Collect a directory's resource files per type, upstream's
 /// `collectResourceFiles`: skills walk their `pi`-mode rules, extensions
 /// use the smart discovery, the rest walk their file patterns.
-fn collect_resource_files(dir: &Path, resource_type: ResourceType) -> Vec<PathBuf> {
+#[must_use]
+pub fn collect_resource_files(dir: &Path, resource_type: ResourceType) -> Vec<PathBuf> {
     match resource_type {
         ResourceType::Skills => collect_skill_entries(
             dir,
@@ -2185,7 +2189,8 @@ fn tarball_url(source: &str) -> Option<&str> {
 /// Compute the precedence rank for a resource, upstream's
 /// `resourcePrecedenceRank`: lower wins; project settings entries over
 /// auto-discovered, user over packages.
-fn resource_precedence_rank(metadata: &PathMetadata) -> i32 {
+#[must_use]
+pub fn resource_precedence_rank(metadata: &PathMetadata) -> i32 {
     if metadata.origin == ResourceOrigin::Package {
         return 4;
     }
@@ -4353,8 +4358,9 @@ fn collect_package_resources_impl(
         return true;
     }
 
-    if let Some(manifest) = crate::pi_manifest::read_pi_manifest(&package_root.join("package.json"))
-    {
+    if let Some(manifest) = crate::pi_manifest::read_pi_manifest(
+        package_root.join("package.json").to_string_lossy().as_ref(),
+    ) {
         for resource_type in ResourceType::all() {
             let entries = manifest_entries(&manifest, resource_type);
             add_manifest_entries(
@@ -4446,7 +4452,9 @@ fn collect_default_resources(
     target: &mut indexmap::IndexMap<PathBuf, AccumulatedResource>,
     metadata: &PathMetadata,
 ) {
-    let manifest = crate::pi_manifest::read_pi_manifest(&package_root.join("package.json"));
+    let manifest = crate::pi_manifest::read_pi_manifest(
+        package_root.join("package.json").to_string_lossy().as_ref(),
+    );
     let entries = manifest
         .as_ref()
         .and_then(|manifest| manifest_entries(manifest, resource_type));
@@ -4516,7 +4524,9 @@ fn collect_manifest_files(
     package_root: &Path,
     resource_type: ResourceType,
 ) -> (Vec<PathBuf>, HashSet<PathBuf>) {
-    let manifest = crate::pi_manifest::read_pi_manifest(&package_root.join("package.json"));
+    let manifest = crate::pi_manifest::read_pi_manifest(
+        package_root.join("package.json").to_string_lossy().as_ref(),
+    );
     let entries = manifest
         .as_ref()
         .and_then(|manifest| manifest_entries(manifest, resource_type));

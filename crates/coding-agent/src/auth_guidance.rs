@@ -1,21 +1,22 @@
-//! Provider-login guidance strings, upstream's
-//! `src/core/auth-guidance.ts` at pin `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
+//! Login guidance strings, upstream's `src/core/auth-guidance.ts` at pin
+//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 
 use crate::config::get_docs_path;
 
+/// The provider display name standing in for a missing provider, upstream's
+/// `UNKNOWN_PROVIDER`.
 const UNKNOWN_PROVIDER: &str = "unknown";
 
-/// The docs-relative provider login help, upstream's `getProviderLoginHelp`.
+/// Where to send a user who needs to log in, upstream's
+/// `getProviderLoginHelp`.
 #[must_use]
 pub fn get_provider_login_help() -> String {
-    let docs = get_docs_path();
-    ["providers.md", "models.md"]
-        .iter()
-        .map(|name| docs.join(name).to_string_lossy().into_owned())
-        .fold(
-            String::from("Use /login to log into a provider via OAuth or API key. See:"),
-            |joined, line| format!("{joined}\n  {line}"),
-        )
+    [
+        "Use /login to log into a provider via OAuth or API key. See:".to_string(),
+        format!("  {}/providers.md", get_docs_path()),
+        format!("  {}/models.md", get_docs_path()),
+    ]
+    .join("\n")
 }
 
 /// The message when no models are available, upstream's
@@ -35,9 +36,9 @@ pub fn format_no_model_selected_message() -> String {
     )
 }
 
-/// The message when no API key is found, upstream's
-/// `formatNoApiKeyFoundMessage`: the unknown provider reads as the
-/// selected model.
+/// The message when a provider has no API key, upstream's
+/// `formatNoApiKeyFoundMessage`; the unknown provider reads as "the
+/// selected model".
 #[must_use]
 pub fn format_no_api_key_found_message(provider: &str) -> String {
     let provider_display = if provider == UNKNOWN_PROVIDER {
