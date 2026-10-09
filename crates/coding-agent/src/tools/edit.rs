@@ -22,10 +22,10 @@ use crate::utils::text::split_bom;
 
 use super::bash::SystemPromptContribution;
 use super::edit_diff::edit_access_error;
-use super::file_mutation_queue::with_file_mutation_queue;
-use super::io_error;
+use super::file_mutation_queue::{throw_if_aborted, with_file_mutation_queue};
 use super::path_utils::resolve_to_cwd;
-use super::tool_definition_wrapper::wrap_tool_definition;
+use super::tool_definition_wrapper::wrap_cwd_tool;
+use super::{io_error, strict_sampling, tool_schema};
 
 /// The edit tool's input, upstream's `EditToolInput`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,9 +149,8 @@ pub const EDIT_TOOL_SYSTEM_PROMPT_CONTRIBUTION: SystemPromptContribution =
 
 /// The edit tool's schema, upstream's `editSchema`.
 fn edit_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
+    tool_schema(
+        &json!({
             "path": {
                 "type": "string",
                 "description": "Path to the file to edit (relative or absolute)"
@@ -174,9 +173,9 @@ fn edit_schema() -> Value {
                     "required": ["oldText", "newText"]
                 }
             }
-        },
-        "required": ["path", "edits"]
-    })
+        }),
+        &["path", "edits"],
+    )
 }
 
 /// Whether the value is a single-edit object, upstream's
@@ -318,35 +317,23 @@ async fn execute_edit_tool(
         resolve_to_cwd(&path, effective_cwd).map_err(|error| io_error(error.to_string()))?;
 
     with_file_mutation_queue(&absolute_path, async {
-        // Do not reject from an abort event listener here: that would
-        // release the mutation queue while an in-flight filesystem
-        // operation may still finish. Checking signal.aborted after each
-        // await observes the same aborts while keeping the queue locked
-        // until the current operation has settled.
-        let throw_if_aborted = || -> Result<(), AgentToolError> {
-            if signal.is_some_and(AbortSignal::aborted) {
-                return Err(io_error("Operation aborted"));
-            }
-            Ok(())
-        };
-
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         // Check if file exists.
         if let Err(error) = (ops.access)(absolute_path.clone()).await {
-            throw_if_aborted()?;
+            throw_if_aborted(signal)?;
             let message = error.downcast_ref::<std::io::Error>().map_or_else(
                 || format!("Could not edit file: {path}. Error: {error}."),
                 |io| edit_access_error(&path, io),
             );
             return Err(io_error(message));
         }
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         // Read the file.
         let buffer = (ops.read_file)(absolute_path.clone()).await?;
         let raw_content = String::from_utf8_lossy(&buffer).into_owned();
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         // Strip BOM before matching. The model will not include an
         // invisible BOM in oldText.
@@ -357,14 +344,14 @@ async fn execute_edit_tool(
         let normalized_content = normalize_to_lf(&content);
         let applied = apply_edits_to_normalized_content(&normalized_content, &edits, &path)
             .map_err(io_error)?;
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         let final_content = format!(
             "{bom}{}",
             restore_line_endings(&applied.new_content, original_ending)
         );
         (ops.write_file)(absolute_path.clone(), final_content).await?;
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         let diff_result = generate_diff_string(&applied.base_content, &applied.new_content, 4);
         let unified_patch =
@@ -410,11 +397,7 @@ pub fn create_edit_tool_definition(cwd: &str, options: Option<EditToolOptions>) 
                 .collect(),
         ),
         parameters: edit_schema(),
-        constrained_sampling: Some(pi_ai::types::ConstrainedSamplingSetting::Config(
-            pi_ai::types::ConstrainedSamplingConfig::JsonSchema {
-                strict: pi_ai::types::Strictness::Prefer,
-            },
-        )),
+        constrained_sampling: Some(strict_sampling()),
         // The edit tool renders its own framing (the diff preview).
         render_shell: Some(crate::extensions::types::RenderShell::SelfRender),
         prepare_arguments: Some(Arc::new(prepare_edit_arguments)),
@@ -431,5 +414,5 @@ pub fn create_edit_tool_definition(cwd: &str, options: Option<EditToolOptions>) 
 #[must_use]
 pub fn create_edit_tool(cwd: &str, options: Option<EditToolOptions>) -> AgentHarnessTool {
     let definition = create_edit_tool_definition(cwd, options);
-    wrap_tool_definition::<crate::extensions::types::CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

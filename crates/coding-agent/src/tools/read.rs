@@ -17,13 +17,13 @@ use serde_json::{Value, json};
 use crate::extensions::types::{ExtensionContext, ToolDefinition};
 use crate::utils::image_process::{ProcessImageOptions, ProcessImageResult, process_image};
 
-use super::io_error;
 use super::path_utils::resolve_read_path_async;
-use super::tool_definition_wrapper::wrap_tool_definition;
+use super::tool_definition_wrapper::wrap_cwd_tool;
 use super::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, TruncationOptions, TruncationResult,
     format_size, truncate_head,
 };
+use super::{io_error, strict_sampling, tool_schema};
 
 /// The read tool's input, upstream's `ReadToolInput`.
 #[derive(Clone, Debug, PartialEq)]
@@ -130,9 +130,8 @@ pub const READ_TOOL_SYSTEM_PROMPT_CONTRIBUTION: super::bash::SystemPromptContrib
 
 /// The read tool's schema, upstream's `readSchema`.
 fn read_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
+    tool_schema(
+        &json!({
             "path": {
                 "type": "string",
                 "description": "Path to the file to read (relative or absolute)"
@@ -145,9 +144,9 @@ fn read_schema() -> Value {
                 "type": "number",
                 "description": "Maximum number of lines to read"
             }
-        },
-        "required": ["path"]
-    })
+        }),
+        &["path"],
+    )
 }
 
 fn parse_input(params: &Value) -> Result<ReadToolInput, AgentToolError> {
@@ -444,11 +443,7 @@ pub fn create_read_tool_definition(cwd: &str, options: Option<ReadToolOptions>) 
                 .collect(),
         ),
         parameters: read_schema(),
-        constrained_sampling: Some(pi_ai::types::ConstrainedSamplingSetting::Config(
-            pi_ai::types::ConstrainedSamplingConfig::JsonSchema {
-                strict: pi_ai::types::Strictness::Prefer,
-            },
-        )),
+        constrained_sampling: Some(strict_sampling()),
         render_shell: None,
         prepare_arguments: None,
         execution_mode: None,
@@ -471,5 +466,5 @@ pub fn create_read_tool(
     options: Option<ReadToolOptions>,
 ) -> pi_agent_core::harness::types::AgentHarnessTool {
     let definition = create_read_tool_definition(cwd, options);
-    wrap_tool_definition::<crate::extensions::types::CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

@@ -12,10 +12,10 @@ use serde_json::{Value, json};
 use crate::extensions::types::{ExtensionContext, ToolDefinition};
 
 use super::bash::SystemPromptContribution;
-use super::io_error;
 use super::path_utils::{path_exists, resolve_to_cwd};
-use super::tool_definition_wrapper::wrap_tool_definition;
+use super::tool_definition_wrapper::wrap_cwd_tool;
 use super::truncate::{DEFAULT_MAX_BYTES, TruncationOptions, truncate_head};
+use super::{io_error, text_result};
 
 /// The default entry limit, upstream's `DEFAULT_LIMIT`.
 pub const DEFAULT_LIMIT: usize = 500;
@@ -179,10 +179,6 @@ fn sort_entries(entries: &mut [String]) {
 
 /// The ls tool's execution body, upstream's `createLsToolDefinition`
 /// execute.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the body mirrors upstream's single execute: the entry walk, the directory/file split, and the notice assembly"
-)]
 async fn execute_ls_tool(
     params: &Value,
     signal: Option<&AbortSignal>,
@@ -303,16 +299,7 @@ async fn execute_ls_tool(
         let _ = write!(output, "\n\n[{}]", notices.join(". "));
     }
 
-    Ok(AgentToolResult {
-        content: vec![AgentToolContent::Text(TextContent {
-            text: output,
-            text_signature: None,
-        })],
-        details: details.to_wire(),
-        usage: None,
-        added_tool_names: None,
-        terminate: None,
-    })
+    Ok(text_result(output, details.to_wire()))
 }
 
 /// Build the ls tool definition, upstream's `createLsToolDefinition`.
@@ -356,5 +343,5 @@ pub fn create_ls_tool_definition(cwd: &str, options: Option<LsToolOptions>) -> T
 #[must_use]
 pub fn create_ls_tool(cwd: &str, options: Option<LsToolOptions>) -> AgentHarnessTool {
     let definition = create_ls_tool_definition(cwd, options);
-    wrap_tool_definition::<crate::extensions::types::CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

@@ -41,6 +41,62 @@ pub(crate) fn io_error(message: impl Into<String>) -> pi_agent_core::types::Agen
     Box::new(std::io::Error::other(message.into()))
 }
 
+/// The strict-JSON-schema sampling setting every built-in tool declares,
+/// upstream's `constrainedSampling` config.
+pub(crate) const fn strict_sampling() -> pi_ai::types::ConstrainedSamplingSetting {
+    pi_ai::types::ConstrainedSamplingSetting::Config(
+        pi_ai::types::ConstrainedSamplingConfig::JsonSchema {
+            strict: pi_ai::types::Strictness::Prefer,
+        },
+    )
+}
+
+/// The tool input schema envelope every built-in tool declares, upstream's
+/// `bashSchema`-family wrappers (`{ type: "object", properties, required }`).
+pub(crate) fn tool_schema(properties: &serde_json::Value, required: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    })
+}
+
+/// The search tools' shared path resolution, upstream's effective-cwd
+/// fallback: the context cwd wins when non-empty, and the requested path
+/// (defaulting to the cwd itself) resolves against it.
+pub(crate) fn resolve_search_path(
+    ctx: Option<&dyn crate::extensions::ExtensionContext>,
+    cwd: &str,
+    path: Option<&str>,
+) -> Result<String, pi_agent_core::types::AgentToolError> {
+    let effective_cwd = ctx
+        .map(crate::extensions::ExtensionContext::cwd)
+        .filter(|ctx_cwd| !ctx_cwd.is_empty())
+        .unwrap_or(cwd);
+    path_utils::resolve_to_cwd(path.unwrap_or("."), effective_cwd)
+        .map_err(|error| io_error(error.to_string()))
+}
+
+/// The text-block tool result the tools settle with, upstream's
+/// `{ content: [{ type: "text", text }], details }`.
+pub(crate) fn text_result(
+    output: String,
+    details: serde_json::Value,
+) -> pi_agent_core::types::AgentToolResult {
+    pi_agent_core::types::AgentToolResult {
+        content: vec![pi_agent_core::types::AgentToolContent::Text(
+            pi_ai::types::TextContent {
+                text: output,
+                text_signature: None,
+            },
+        )],
+        details,
+        usage: None,
+        added_tool_names: None,
+        terminate: None,
+    }
+}
+
 /// The hex form of `len` random bytes, upstream's
 /// `randomBytes(len).toString("hex")` at the temp-file and extract-dir
 /// naming sites.

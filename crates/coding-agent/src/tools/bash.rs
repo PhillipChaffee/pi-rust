@@ -29,12 +29,14 @@ use pi_agent_core::types::{AgentToolContent, AgentToolError, AgentToolResult};
 use pi_ai::types::{BoxedFuture, TextContent};
 use serde_json::{Value, json};
 
-use crate::extensions::types::{CwdContext, ExtensionContext, ToolDefinition};
+use crate::extensions::types::{ExtensionContext, ToolDefinition};
 use crate::utils::shell::{
     CommandTransport, ShellConfig, ShellError, get_shell_config, get_shell_env,
 };
 
 use super::output_accumulator::{OutputAccumulator, OutputAccumulatorOptions};
+use super::strict_sampling;
+use super::tool_schema;
 use super::truncate::{
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, TruncatedBy, TruncationResult, format_size,
 };
@@ -495,9 +497,8 @@ pub struct ShellToolConfig {
 
 /// The shell tools' input schema, upstream's `bashSchema`.
 fn bash_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
+    tool_schema(
+        &json!({
             "command": {
                 "type": "string",
                 "description": "Shell command to execute"
@@ -506,9 +507,9 @@ fn bash_schema() -> Value {
                 "type": "number",
                 "description": "Timeout in seconds (optional, no default timeout)"
             }
-        },
-        "required": ["command"]
-    })
+        }),
+        &["command"],
+    )
 }
 
 fn parse_input(params: &Value) -> Result<BashToolInput, AgentToolError> {
@@ -911,11 +912,7 @@ pub fn create_shell_tool_definition(
             None
         },
         parameters: bash_schema(),
-        constrained_sampling: Some(pi_ai::types::ConstrainedSamplingSetting::Config(
-            pi_ai::types::ConstrainedSamplingConfig::JsonSchema {
-                strict: pi_ai::types::Strictness::Prefer,
-            },
-        )),
+        constrained_sampling: Some(strict_sampling()),
         render_shell: None,
         prepare_arguments: None,
         execution_mode: None,
@@ -954,5 +951,5 @@ pub fn create_bash_tool_definition(cwd: &str, options: Option<BashToolOptions>) 
 #[must_use]
 pub fn create_bash_tool(cwd: &str, options: Option<BashToolOptions>) -> AgentHarnessTool {
     let definition = create_bash_tool_definition(cwd, options);
-    crate::tools::tool_definition_wrapper::wrap_tool_definition::<CwdContext>(definition, None)
+    crate::tools::tool_definition_wrapper::wrap_cwd_tool(definition)
 }

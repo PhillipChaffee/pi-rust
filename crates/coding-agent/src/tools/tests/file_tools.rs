@@ -50,6 +50,15 @@ pub(super) async fn run_definition(
     (definition.execute)("test-call", &args, signal, None, ctx).await
 }
 
+/// The plain read invocation, the suite's default `run_definition` call
+/// shape against the temp file.
+async fn run_read(
+    tool: &ToolDefinition,
+    path: &std::path::Path,
+) -> Result<AgentToolResult, AgentToolError> {
+    run_definition(tool, json!({ "path": path.to_string_lossy() }), None, None).await
+}
+
 /// The first text block, the single-text-block reader the suites share.
 pub(super) fn first_text(result: &AgentToolResult) -> String {
     match result.content.first() {
@@ -93,6 +102,36 @@ const PNG_1X1_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADU
 // read tool
 // ---------------------------------------------------------------------------
 
+/// The disk-backed edit operations with the settle delays the concurrency
+/// probes rely on, the shared shape of the two queued-write tests.
+fn slow_disk_edit_operations() -> EditOperations {
+    EditOperations {
+        access: Arc::new(|path| {
+            Box::pin(async move {
+                tokio::fs::File::open(&path)
+                    .await
+                    .map(|_| ())
+                    .map_err(AgentToolError::from)
+            })
+        }),
+        read_file: Arc::new(|path| {
+            Box::pin(async move {
+                let buffer = tokio::fs::read(&path).await.map_err(AgentToolError::from)?;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Ok(buffer)
+            })
+        }),
+        write_file: Arc::new(|path, content| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::fs::write(&path, content.as_bytes())
+                    .await
+                    .map_err(AgentToolError::from)
+            })
+        }),
+    }
+}
+
 #[test]
 pub(super) fn read_reads_file_contents_that_fit_within_limits() {
     block_on(async {
@@ -102,14 +141,7 @@ pub(super) fn read_reads_file_contents_that_fit_within_limits() {
         std::fs::write(&test_file, content).unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         let output = text_output(&result);
         assert_eq!(output, content);
         // No truncation message since file fits within limits
@@ -125,14 +157,7 @@ pub(super) fn read_handles_nonexistent_files() {
         let test_file = dir.path().join("nonexistent.txt");
         let tool = create_read_tool_definition("/", None);
 
-        let error = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let error = run_read(&tool, &test_file).await.unwrap_err();
         assert!(
             error.to_string().to_lowercase().contains("no such file")
                 || error.to_string().contains("ENOENT"),
@@ -151,14 +176,7 @@ pub(super) fn read_truncates_files_exceeding_line_limit() {
         std::fs::write(&test_file, lines.join("\n")).unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         let output = text_output(&result);
         assert!(output.contains("Line 1"));
         assert!(output.contains("Line 2000"));
@@ -178,14 +196,7 @@ pub(super) fn read_truncates_when_byte_limit_exceeded() {
         std::fs::write(&test_file, lines.join("\n")).unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         let output = text_output(&result);
         assert!(output.contains("Line 1:"));
         // Should show byte limit message
@@ -305,14 +316,7 @@ pub(super) fn read_includes_truncation_details_when_truncated() {
         std::fs::write(&test_file, lines.join("\n")).unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         let details = &result.details;
         assert!(details.is_object());
         let truncation = &details["truncation"];
@@ -337,14 +341,7 @@ pub(super) fn read_detects_image_mime_type_from_file_magic_not_extension() {
         .unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         assert!(matches!(result.content.first(), Some(Content::Text(_))));
         assert!(text_output(&result).contains("Read image file [image/png]"));
 
@@ -362,14 +359,7 @@ pub(super) fn read_reads_bmp_files_from_disk_as_png_image_attachments() {
         std::fs::write(&test_file, tiny_bmp_1x1_red_24bpp()).unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         assert!(matches!(result.content.first(), Some(Content::Text(_))));
         assert!(text_output(&result).contains("Read image file [image/png]"));
         assert!(text_output(&result).contains("[Image converted from image/bmp to image/png.]"));
@@ -391,14 +381,7 @@ pub(super) fn read_treats_files_with_image_extension_but_non_image_content_as_te
         std::fs::write(&test_file, "definitely not a png").unwrap();
         let tool = create_read_tool_definition("/", None);
 
-        let result = run_definition(
-            &tool,
-            json!({ "path": test_file.to_string_lossy() }),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = run_read(&tool, &test_file).await.unwrap();
         let output = text_output(&result);
         assert!(output.contains("definitely not a png"));
         assert!(image_content(&result).is_none());
@@ -1565,31 +1548,7 @@ pub(super) fn mutation_queue_preserves_both_parallel_edits_on_the_same_file() {
         let file_path = dir.path().join("parallel-edit.txt");
         std::fs::write(&file_path, "alpha\nbeta\ngamma\n").unwrap();
 
-        let operations = EditOperations {
-            access: Arc::new(|path| {
-                Box::pin(async move {
-                    tokio::fs::File::open(&path)
-                        .await
-                        .map(|_| ())
-                        .map_err(AgentToolError::from)
-                })
-            }),
-            read_file: Arc::new(|path| {
-                Box::pin(async move {
-                    let buffer = tokio::fs::read(&path).await.map_err(AgentToolError::from)?;
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    Ok(buffer)
-                })
-            }),
-            write_file: Arc::new(|path, content| {
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    tokio::fs::write(&path, content.as_bytes())
-                        .await
-                        .map_err(AgentToolError::from)
-                })
-            }),
-        };
+        let operations = slow_disk_edit_operations();
         let tool = create_edit_tool(
             dir.path().to_string_lossy().as_ref(),
             Some(EditToolOptions {
@@ -1635,31 +1594,7 @@ pub(super) fn mutation_queue_shares_the_queue_between_edit_and_write() {
         let file_path = dir.path().join("mixed.txt");
         std::fs::write(&file_path, "original\n").unwrap();
 
-        let edit_operations = EditOperations {
-            access: Arc::new(|path| {
-                Box::pin(async move {
-                    tokio::fs::File::open(&path)
-                        .await
-                        .map(|_| ())
-                        .map_err(AgentToolError::from)
-                })
-            }),
-            read_file: Arc::new(|path| {
-                Box::pin(async move {
-                    let buffer = tokio::fs::read(&path).await.map_err(AgentToolError::from)?;
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    Ok(buffer)
-                })
-            }),
-            write_file: Arc::new(|path, content| {
-                Box::pin(async move {
-                    tokio::time::sleep(Duration::from_millis(30)).await;
-                    tokio::fs::write(&path, content.as_bytes())
-                        .await
-                        .map_err(AgentToolError::from)
-                })
-            }),
-        };
+        let edit_operations = slow_disk_edit_operations();
         let write_operations = WriteOperations {
             mkdir: Arc::new(|_dir| Box::pin(async { Ok(()) })),
             write_file: Arc::new(|path, content| {

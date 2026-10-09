@@ -17,10 +17,10 @@ use serde_json::{Value, json};
 use crate::extensions::types::{ExtensionContext, ToolDefinition};
 
 use super::bash::SystemPromptContribution;
-use super::file_mutation_queue::with_file_mutation_queue;
-use super::io_error;
+use super::file_mutation_queue::{throw_if_aborted, with_file_mutation_queue};
 use super::path_utils::resolve_to_cwd;
-use super::tool_definition_wrapper::wrap_tool_definition;
+use super::tool_definition_wrapper::wrap_cwd_tool;
+use super::{io_error, strict_sampling, tool_schema};
 
 /// The write tool's input, upstream's `WriteToolInput`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,9 +98,8 @@ pub const WRITE_TOOL_SYSTEM_PROMPT_CONTRIBUTION: SystemPromptContribution =
 
 /// The write tool's schema, upstream's `writeSchema`.
 fn write_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
+    tool_schema(
+        &json!({
             "path": {
                 "type": "string",
                 "description": "Path to the file to write (relative or absolute)"
@@ -109,9 +108,9 @@ fn write_schema() -> Value {
                 "type": "string",
                 "description": "Content to write to the file"
             }
-        },
-        "required": ["path", "content"]
-    })
+        }),
+        &["path", "content"],
+    )
 }
 
 fn parse_input(params: &Value) -> Result<WriteToolInput, AgentToolError> {
@@ -150,26 +149,14 @@ async fn execute_write_tool(
     );
 
     with_file_mutation_queue(&absolute_path, async {
-        // Do not reject from an abort event listener here: that would
-        // release the mutation queue while an in-flight filesystem
-        // operation may still finish. Checking signal.aborted after each
-        // await observes the same aborts while keeping the queue locked
-        // until the current operation has settled.
-        let throw_if_aborted = || -> Result<(), AgentToolError> {
-            if signal.is_some_and(AbortSignal::aborted) {
-                return Err(io_error("Operation aborted"));
-            }
-            Ok(())
-        };
-
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
         // Create parent directories if needed.
         (ops.mkdir)(dir).await?;
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         // Write the file contents.
         (ops.write_file)(absolute_path.clone(), input.content.clone()).await?;
-        throw_if_aborted()?;
+        throw_if_aborted(signal)?;
 
         Ok(AgentToolResult {
             content: vec![AgentToolContent::Text(TextContent {
@@ -210,11 +197,7 @@ pub fn create_write_tool_definition(
                 .collect(),
         ),
         parameters: write_schema(),
-        constrained_sampling: Some(pi_ai::types::ConstrainedSamplingSetting::Config(
-            pi_ai::types::ConstrainedSamplingConfig::JsonSchema {
-                strict: pi_ai::types::Strictness::Prefer,
-            },
-        )),
+        constrained_sampling: Some(strict_sampling()),
         render_shell: None,
         prepare_arguments: None,
         execution_mode: None,
@@ -230,5 +213,5 @@ pub fn create_write_tool_definition(
 #[must_use]
 pub fn create_write_tool(cwd: &str, options: Option<WriteToolOptions>) -> AgentHarnessTool {
     let definition = create_write_tool_definition(cwd, options);
-    wrap_tool_definition::<crate::extensions::types::CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

@@ -20,13 +20,13 @@ use serde_json::{Value, json};
 use crate::extensions::types::{ExtensionContext, ToolDefinition};
 
 use super::bash::SystemPromptContribution;
-use super::io_error;
-use super::path_utils::resolve_to_cwd;
-use super::tool_definition_wrapper::wrap_tool_definition;
+
+use super::tool_definition_wrapper::wrap_cwd_tool;
 use super::truncate::{
     DEFAULT_MAX_BYTES, GREP_MAX_LINE_LENGTH, TruncationOptions, TruncationResult, truncate_head,
     truncate_line_default,
 };
+use super::{io_error, resolve_search_path, text_result, tool_schema};
 
 /// The default match limit, upstream's `DEFAULT_LIMIT`.
 pub const DEFAULT_LIMIT: usize = 100;
@@ -161,9 +161,8 @@ pub const GREP_TOOL_SYSTEM_PROMPT_CONTRIBUTION: SystemPromptContribution =
 
 /// The grep tool's schema, upstream's `grepSchema`.
 fn grep_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
+    tool_schema(
+        &json!({
             "pattern": {
                 "type": "string",
                 "description": "Search pattern (regex or literal string)"
@@ -192,9 +191,9 @@ fn grep_schema() -> Value {
                 "type": "number",
                 "description": "Maximum number of matches to return (default: 100)"
             }
-        },
-        "required": ["pattern"]
-    })
+        }),
+        &["pattern"],
+    )
 }
 
 fn parse_input(params: &Value) -> Result<GrepToolInput, AgentToolError> {
@@ -286,12 +285,7 @@ async fn execute_grep_tool(
     if signal.is_some_and(AbortSignal::aborted) {
         return Err(io_error("Operation aborted"));
     }
-    let effective_cwd = ctx
-        .map(ExtensionContext::cwd)
-        .filter(|ctx_cwd| !ctx_cwd.is_empty())
-        .unwrap_or(cwd);
-    let search_path = resolve_to_cwd(input.path.as_deref().unwrap_or("."), effective_cwd)
-        .map_err(|error| io_error(error.to_string()))?;
+    let search_path = resolve_search_path(ctx, cwd, input.path.as_deref())?;
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -568,16 +562,7 @@ async fn execute_grep_tool(
         let _ = write!(output, "\n\n[{}]", notices.join(". "));
     }
 
-    Ok(AgentToolResult {
-        content: vec![AgentToolContent::Text(TextContent {
-            text: output,
-            text_signature: None,
-        })],
-        details: details.to_wire(),
-        usage: None,
-        added_tool_names: None,
-        terminate: None,
-    })
+    Ok(text_result(output, details.to_wire()))
 }
 
 /// Build the grep tool definition, upstream's `createGrepToolDefinition`.
@@ -621,5 +606,5 @@ pub fn create_grep_tool_definition(cwd: &str, options: Option<GrepToolOptions>) 
 #[must_use]
 pub fn create_grep_tool(cwd: &str, options: Option<GrepToolOptions>) -> AgentHarnessTool {
     let definition = create_grep_tool_definition(cwd, options);
-    wrap_tool_definition::<crate::extensions::types::CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

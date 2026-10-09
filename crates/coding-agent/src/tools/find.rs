@@ -24,10 +24,10 @@ use serde_json::{Value, json};
 use crate::extensions::types::{ExtensionContext, ToolDefinition};
 
 use super::bash::SystemPromptContribution;
-use super::io_error;
-use super::path_utils::{path_exists, resolve_to_cwd};
-use super::tool_definition_wrapper::wrap_tool_definition;
+use super::path_utils::path_exists;
+use super::tool_definition_wrapper::wrap_cwd_tool;
 use super::truncate::{DEFAULT_MAX_BYTES, TruncationOptions, TruncationResult, truncate_head};
+use super::{io_error, resolve_search_path, text_result, tool_schema};
 
 /// The default result limit, upstream's `DEFAULT_LIMIT`.
 pub const DEFAULT_LIMIT: usize = 1000;
@@ -197,9 +197,8 @@ pub const FIND_TOOL_SYSTEM_PROMPT_CONTRIBUTION: SystemPromptContribution =
 
 /// The find tool's schema, upstream's `findSchema`.
 fn find_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
+    tool_schema(
+        &json!({
             "pattern": {
                 "type": "string",
                 "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"
@@ -212,9 +211,9 @@ fn find_schema() -> Value {
                 "type": "number",
                 "description": "Maximum number of results (default: 1000)"
             }
-        },
-        "required": ["pattern"]
-    })
+        }),
+        &["pattern"],
+    )
 }
 
 fn parse_input(params: &Value) -> Result<FindToolInput, AgentToolError> {
@@ -387,12 +386,7 @@ async fn execute_find_tool(
     if signal.is_some_and(AbortSignal::aborted) {
         return Err(io_error("Operation aborted"));
     }
-    let effective_cwd = ctx
-        .map(ExtensionContext::cwd)
-        .filter(|ctx_cwd| !ctx_cwd.is_empty())
-        .unwrap_or(cwd);
-    let search_path = resolve_to_cwd(input.path.as_deref().unwrap_or("."), effective_cwd)
-        .map_err(|error| io_error(error.to_string()))?;
+    let search_path = resolve_search_path(ctx, cwd, input.path.as_deref())?;
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -481,16 +475,7 @@ async fn execute_find_tool(
     }
 
     let (result_output, details) = format_results(&relativized, effective_limit, true);
-    Ok(AgentToolResult {
-        content: vec![AgentToolContent::Text(TextContent {
-            text: result_output,
-            text_signature: None,
-        })],
-        details: details.unwrap_or(Value::Null),
-        usage: None,
-        added_tool_names: None,
-        terminate: None,
-    })
+    Ok(text_result(result_output, details.unwrap_or(Value::Null)))
 }
 
 /// Build the find tool definition, upstream's `createFindToolDefinition`.
@@ -534,5 +519,5 @@ pub fn create_find_tool_definition(cwd: &str, options: Option<FindToolOptions>) 
 #[must_use]
 pub fn create_find_tool(cwd: &str, options: Option<FindToolOptions>) -> AgentHarnessTool {
     let definition = create_find_tool_definition(cwd, options);
-    wrap_tool_definition::<crate::extensions::types::CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

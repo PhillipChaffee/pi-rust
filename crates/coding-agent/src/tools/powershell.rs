@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use pi_agent_core::harness::types::AgentHarnessTool;
 
-use crate::extensions::types::{CwdContext, ToolDefinition};
+use crate::extensions::types::ToolDefinition;
 use crate::utils::shell::get_power_shell_config;
 
 use super::bash::{
@@ -19,7 +19,7 @@ use super::bash::{
     BashToolInput, BashToolOptions, ShellToolConfig, SystemPromptContribution,
     create_shell_tool_definition,
 };
-use super::tool_definition_wrapper::wrap_tool_definition;
+use super::tool_definition_wrapper::wrap_cwd_tool;
 
 /// The UTF-8 output preamble every powershell command prepends, upstream's
 /// `UTF8_OUTPUT_PREFIX`.
@@ -133,5 +133,5 @@ pub fn create_power_shell_tool(
     options: Option<PowerShellToolOptions>,
 ) -> AgentHarnessTool {
     let definition = create_power_shell_tool_definition(cwd, options);
-    wrap_tool_definition::<CwdContext>(definition, None)
+    wrap_cwd_tool(definition)
 }

@@ -18,9 +18,10 @@ use std::future::Future;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
-
+use pi_agent_core::harness::context::AbortSignal;
 use pi_agent_core::types::AgentToolError;
+
+use tokio::sync::Notify;
 
 /// The process-global registry, upstream's `fileMutationQueues`.
 fn registry() -> &'static Mutex<HashMap<String, Arc<Notify>>> {
@@ -98,6 +99,23 @@ impl Drop for QueueSlotGuard {
             queues.remove(&self.path_key);
         }
     }
+}
+
+/// The abort probe the file tools poll between awaits, upstream's
+/// `throwIfAborted`.
+///
+/// The mutation queue must not release from an abort event listener while
+/// an in-flight filesystem operation may still finish, so the tools check
+/// `signal.aborted` after each await instead: the same aborts are observed
+/// while the queue stays locked until the current operation has settled.
+///
+/// # Errors
+/// The aborted rejection, upstream's throw.
+pub(crate) fn throw_if_aborted(signal: Option<&AbortSignal>) -> Result<(), AgentToolError> {
+    if signal.is_some_and(AbortSignal::aborted) {
+        return Err(super::io_error("Operation aborted"));
+    }
+    Ok(())
 }
 
 /// Run `fn` while holding the mutation queue for the canonical path,

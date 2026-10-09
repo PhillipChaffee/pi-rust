@@ -12,12 +12,19 @@ use std::sync::Arc;
 use pi_agent_core::harness::types::{AgentHarnessTool, AgentHarnessToolExecuteFn};
 use pi_ai::types::Tool;
 
-use crate::extensions::types::{ExtensionContext, ToolDefinition};
+use crate::extensions::types::{CwdContext, ExtensionContext, ToolDefinition};
 
 /// Erase the concrete context behind the trait object the tool execute
 /// closure passes.
 fn erase_context<C: ExtensionContext>(context: &C) -> &dyn ExtensionContext {
     context
+}
+
+/// Wrap a definition into the harness tool over the standalone `CwdContext`
+/// default, the shape upstream's per-tool `createXTool` one-liners share.
+#[must_use]
+pub fn wrap_cwd_tool(definition: ToolDefinition) -> AgentHarnessTool {
+    wrap_tool_definition::<CwdContext>(definition, None)
 }
 
 /// Wrap a [`ToolDefinition`] into a harness tool for the core runtime,
