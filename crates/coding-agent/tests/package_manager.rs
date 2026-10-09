@@ -32,8 +32,8 @@ use serde_json::{Value, json};
 use pi_coding_agent::config::EnvLookup;
 use pi_coding_agent::package_manager::{
     CommandRunOptions, CommandRunner, DefaultPackageManager, InstallReceipt, PackageManagerError,
-    PackageManagerOptions, PackageSourceView, ParsedSource, ProgressAction, ProgressEvent,
-    ProgressEventType, ResolvedResource, SourceScope, TarballSource,
+    PackageManagerOptions, PackageSourceView, PackageUpdate, ParsedSource, ProgressAction,
+    ProgressEvent, ProgressEventType, ResolvedPaths, ResolvedResource, SourceScope, TarballSource,
 };
 use pi_coding_agent::settings_manager::{
     InMemorySettingsStorage, SettingsManager, SettingsManagerCreateOptions,
@@ -88,27 +88,37 @@ fn fake_cargo_install() -> FakeBehavior {
     Box::new(
         |command: &str, args: &[String], _options: &CommandRunOptions| {
             if command == "cargo" && args.first().map(String::as_str) == Some("install") {
-                let root_index = args
-                    .iter()
-                    .position(|arg| arg == "--root")
-                    .expect("--root present");
-                let stage_root = args.get(root_index + 1).cloned().unwrap_or_default();
-                std::fs::create_dir_all(Path::new(&stage_root).join("bin")).expect("stage bin");
-                std::fs::write(Path::new(&stage_root).join("bin/example"), "#!/bin/sh\n")
-                    .expect("bin");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(
-                        Path::new(&stage_root).join("bin/example"),
-                        std::fs::Permissions::from_mode(0o755),
-                    )
-                    .expect("chmod");
-                }
+                stage_bin_example(&staged_root(args));
             }
             Ok(FakeOutcome::ok())
         },
     )
+}
+
+/// The `--root` stage root the cargo-install fake receives, the value the
+/// staged fixtures populate.
+fn staged_root(args: &[String]) -> String {
+    let root_index = args
+        .iter()
+        .position(|arg| arg == "--root")
+        .expect("--root present");
+    args.get(root_index + 1).cloned().unwrap_or_default()
+}
+
+/// The staged `bin/example` the atomic rename lands, the cargo-install
+/// fixture's payload.
+fn stage_bin_example(stage_root: &str) {
+    std::fs::create_dir_all(Path::new(stage_root).join("bin")).expect("stage bin");
+    std::fs::write(Path::new(stage_root).join("bin/example"), "#!/bin/sh\n").expect("bin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            Path::new(stage_root).join("bin/example"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod");
+    }
 }
 
 /// The recording command runner, upstream's `vi.spyOn(packageManager as any,
@@ -300,6 +310,19 @@ impl Rig {
         self
     }
 
+    /// Re-home the manager at `cwd` with HOME pointed at the temp root, the
+    /// seam the agents-dir discovery cases drive.
+    fn with_home_env_at(&mut self, cwd: &Path, agent_dir: &Path) {
+        self.package_manager = DefaultPackageManager::new(PackageManagerOptions {
+            cwd: cwd.to_string_lossy().into_owned(),
+            agent_dir: agent_dir.to_string_lossy().into_owned(),
+            settings: Arc::clone(&self.settings),
+            command_runner: None,
+            env: Some(home_env_lookup(&self.temp_dir)),
+            http_client: None,
+        });
+    }
+
     fn set_packages(&self, packages: &Value) {
         self.settings
             .lock()
@@ -479,6 +502,102 @@ impl RawSettingsAccess for SettingsManager<InMemorySettingsStorage> {
 }
 
 // =============================================================================
+// Shared fixtures, the blocks the ported cases repeat
+// =============================================================================
+
+/// Whether a resolved resource names `path` and sits enabled, the
+/// path-equality probe the resolve cases assert with.
+fn resolves_enabled(resources: &[ResolvedResource], path: &Path) -> bool {
+    resources
+        .iter()
+        .any(|resource| resource.path == path.to_string_lossy() && resource.enabled)
+}
+
+/// Whether a resolved resource names `path` and sits disabled, the
+/// path-equality probe the exclusion cases assert with.
+fn resolves_disabled(resources: &[ResolvedResource], path: &Path) -> bool {
+    resources
+        .iter()
+        .any(|resource| resource.path == path.to_string_lossy() && !resource.enabled)
+}
+
+/// The SKILL.md fixture body, the frontmatter the discovery rules key on.
+fn skill_markdown(name: &str, description: &str, body: &str) -> String {
+    format!("---\nname: {name}\ndescription: {description}\n---\n{body}")
+}
+
+/// The `pi-package-install.json` receipt body the crate channel writes;
+/// only the resolved version varies across the fixtures.
+fn installed_receipt_json(resolved_version: &str) -> String {
+    format!(
+        r#"{{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"{resolved_version}","files":{{}}}}"#
+    )
+}
+
+/// The installed `crate:example` fixture: the receipt at `resolved_version`
+/// beside the install dir the resolve and update paths reconcile.
+fn stage_installed_crate(rig: &Rig, resolved_version: &str) {
+    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
+    rig.write(
+        ".pi/crates/example/pi-package-install.json",
+        &installed_receipt_json(resolved_version),
+    );
+}
+
+/// `resolve_extension_sources` over the rig's manager, the call the
+/// manifest and multi-file cases repeat.
+async fn resolve_sources(
+    rig: &Rig,
+    sources: &[String],
+    local: bool,
+    temporary: bool,
+) -> ResolvedPaths {
+    rig.package_manager
+        .resolve_extension_sources(sources, local, temporary)
+        .await
+        .expect("resolve")
+}
+
+/// `check_for_available_updates` over the rig's manager, the call the
+/// registry-arms cases repeat.
+async fn check_updates(rig: &Rig) -> Vec<PackageUpdate> {
+    rig.package_manager
+        .check_for_available_updates()
+        .await
+        .expect("check")
+}
+
+/// The crates.io registry mock answering `max_version` for `crate:example`,
+/// boxed as the manager's client.
+fn crates_io_client(max_version: &str) -> Arc<dyn pi_ai::http::HttpClient> {
+    let mock = pi_ai::http::MockHttpClient::new();
+    mock.on(|request| request.url.contains("/api/v1/crates/example"))
+        .respond(pi_ai::http::json_response(
+            200,
+            &json!({ "crate": { "max_version": max_version } }),
+        ));
+    Arc::new(mock)
+}
+
+/// The manager over the rig's dirs with the runner recording through the
+/// rig and the given client, the wiring the crate-channel cases repeat.
+fn rig_with_runner_client(
+    rig: &mut Rig,
+    runner: FakeRunner,
+    client: Arc<dyn pi_ai::http::HttpClient>,
+) {
+    rig.runner = Some(runner.clone());
+    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
+        cwd: rig.temp_dir.to_string_lossy().into_owned(),
+        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
+        settings: Arc::clone(&rig.settings),
+        command_runner: Some(Arc::new(runner)),
+        env: Some(common::env_with(&[])),
+        http_client: Some(client),
+    });
+}
+
+// =============================================================================
 // resolve
 // =============================================================================
 
@@ -552,17 +671,12 @@ async fn resolve_resolves_skill_paths_from_settings() {
     let rig = Rig::new();
     let skill_file = rig.write(
         "agent/skills/my-skill/SKILL.md",
-        "---\nname: test-skill\ndescription: A test skill\n---\nContent",
+        &skill_markdown("test-skill", "A test skill", "Content"),
     );
     rig.set_setting("skills", json!(["skills"]));
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == skill_file.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &skill_file));
 }
 
 #[tokio::test]
@@ -570,16 +684,11 @@ async fn resolve_auto_discovers_root_markdown_skills() {
     let rig = Rig::new();
     let skill_file = rig.write(
         "agent/skills/single-file.md",
-        "---\nname: single-file\ndescription: A root markdown skill\n---\nContent",
+        &skill_markdown("single-file", "A root markdown skill", "Content"),
     );
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == skill_file.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &skill_file));
 }
 
 #[tokio::test]
@@ -589,12 +698,7 @@ async fn resolve_resolves_project_paths_relative_to_the_pi_dir() {
     rig.set_project_setting("extensions", json!(["extensions/project-ext"]));
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .extensions
-            .iter()
-            .any(|resource| resource.path == ext_path.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.extensions, &ext_path));
 }
 
 #[tokio::test]
@@ -604,12 +708,7 @@ async fn resolve_auto_discovers_user_prompts_with_overrides() {
     rig.set_setting("prompts", json!(["!prompts/auto.md"]));
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .prompts
-            .iter()
-            .any(|resource| resource.path == prompt_path.to_string_lossy() && !resource.enabled)
-    );
+    assert!(resolves_disabled(&result.prompts, &prompt_path));
 }
 
 #[tokio::test]
@@ -622,7 +721,7 @@ async fn resolve_resolves_symlinked_user_and_project_resources_once() {
     rig.write_executable("shared-resources/extensions/shared");
     rig.write(
         "shared-resources/skills/shared-skill/SKILL.md",
-        "---\nname: shared-skill\ndescription: Shared skill\n---\nContent",
+        &skill_markdown("shared-skill", "Shared skill", "Content"),
     );
     rig.write("shared-resources/prompts/shared.md", "Shared prompt");
     rig.write(
@@ -677,12 +776,7 @@ async fn resolve_auto_discovers_project_prompts_with_overrides() {
     rig.set_project_setting("prompts", json!(["!prompts/is.md"]));
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .prompts
-            .iter()
-            .any(|resource| resource.path == prompt_path.to_string_lossy() && !resource.enabled)
-    );
+    assert!(resolves_disabled(&result.prompts, &prompt_path));
 }
 
 #[tokio::test]
@@ -725,7 +819,7 @@ async fn uses_the_agent_dir_as_base_dir_for_user_pi_skills() {
     let rig = Rig::new();
     let skill_path = rig.write(
         "agent/skills/user-pi/SKILL.md",
-        "---\nname: user-pi\ndescription: user pi\n---\n",
+        &skill_markdown("user-pi", "user pi", ""),
     );
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
@@ -748,7 +842,7 @@ async fn uses_the_project_pi_dir_as_base_dir_for_project_pi_skills() {
     let project_base_dir = rig.temp_dir.join(".pi");
     let skill_path = rig.write(
         ".pi/skills/project-pi/SKILL.md",
-        "---\nname: project-pi\ndescription: project pi\n---\n",
+        &skill_markdown("project-pi", "project pi", ""),
     );
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
@@ -768,18 +862,12 @@ async fn uses_the_project_pi_dir_as_base_dir_for_project_pi_skills() {
 #[tokio::test]
 async fn uses_the_agents_dir_as_base_dir_for_user_agents_skills() {
     let mut rig = Rig::new();
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(home_env_lookup(&rig.temp_dir)),
-        http_client: None,
-    });
+    let (home_cwd, home_agent_dir) = (rig.temp_dir.clone(), rig.agent_dir.clone());
+    rig.with_home_env_at(&home_cwd, &home_agent_dir);
     let agents_base_dir = rig.temp_dir.join(".agents");
     let skill_path = rig.write(
         ".agents/skills/user-agents/SKILL.md",
-        "---\nname: user-agents\ndescription: user agents\n---\n",
+        &skill_markdown("user-agents", "user agents", ""),
     );
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
@@ -806,12 +894,12 @@ async fn uses_each_project_agents_dir_as_base_dir() {
     let repo_agents_base_dir = repo_root.join(".agents");
     let repo_skill = rig.write(
         "repo/.agents/skills/repo/SKILL.md",
-        "---\nname: repo\ndescription: repo\n---\n",
+        &skill_markdown("repo", "repo", ""),
     );
     let package_agents_base_dir = repo_root.join("packages/.agents");
     let package_skill = rig.write(
         "repo/packages/.agents/skills/package/SKILL.md",
-        "---\nname: package\ndescription: package\n---\n",
+        &skill_markdown("package", "package", ""),
     );
 
     let mut rig = rig;
@@ -852,32 +940,22 @@ async fn scans_agents_skills_from_the_cwd_up_to_the_git_root() {
 
     let above_repo_skill = rig.write(
         ".agents/skills/above-repo/SKILL.md",
-        "---\nname: above-repo\ndescription: above\n---\n",
+        &skill_markdown("above-repo", "above", ""),
     );
     let repo_root_skill = rig.write(
         "repo/.agents/skills/repo-root/SKILL.md",
-        "---\nname: repo-root\ndescription: repo\n---\n",
+        &skill_markdown("repo-root", "repo", ""),
     );
     let nested_skill = rig.write(
         "repo/packages/.agents/skills/nested/SKILL.md",
-        "---\nname: nested\ndescription: nested\n---\n",
+        &skill_markdown("nested", "nested", ""),
     );
 
     let mut rig = rig;
     rig.with_cwd(&nested_cwd);
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == repo_root_skill.to_string_lossy() && resource.enabled)
-    );
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == nested_skill.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &repo_root_skill));
+    assert!(resolves_enabled(&result.skills, &nested_skill));
     assert!(
         !result
             .skills
@@ -894,28 +972,18 @@ async fn scans_agents_skills_up_to_the_filesystem_root_outside_a_repo() {
 
     let root_skill = rig.write(
         "non-repo/.agents/skills/root/SKILL.md",
-        "---\nname: root\ndescription: root\n---\n",
+        &skill_markdown("root", "root", ""),
     );
     let middle_skill = rig.write(
         "non-repo/a/.agents/skills/middle/SKILL.md",
-        "---\nname: middle\ndescription: middle\n---\n",
+        &skill_markdown("middle", "middle", ""),
     );
 
     let mut rig = rig;
     rig.with_cwd(&nested_cwd);
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == root_skill.to_string_lossy() && resource.enabled)
-    );
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == middle_skill.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &root_skill));
+    assert!(resolves_enabled(&result.skills, &middle_skill));
 }
 
 #[tokio::test]
@@ -923,19 +991,19 @@ async fn ignores_root_markdown_in_agents_skills_but_discovers_nested_skills() {
     let rig = Rig::new();
     rig.write(
         ".agents/skills/root-file.md",
-        "---\nname: root-file\ndescription: Root markdown file\n---\n",
+        &skill_markdown("root-file", "Root markdown file", ""),
     );
     let nested_skill = rig.write(
         ".agents/skills/nested-skill/SKILL.md",
-        "---\nname: nested-skill\ndescription: Nested skill\n---\n",
+        &skill_markdown("nested-skill", "Nested skill", ""),
     );
     let nested_markdown_skill = rig.write(
         ".agents/skills/third-party/child-skill.md",
-        "---\nname: child-skill\ndescription: Nested markdown skill\n---\n",
+        &skill_markdown("child-skill", "Nested markdown skill", ""),
     );
     let deeply_nested = rig.write(
         ".agents/skills/third-party/vendor/pack/deep-skill.md",
-        "---\nname: deep-skill\ndescription: Deep markdown skill\n---\n",
+        &skill_markdown("deep-skill", "Deep markdown skill", ""),
     );
 
     let work_cwd = rig.mkdir("work");
@@ -949,21 +1017,11 @@ async fn ignores_root_markdown_in_agents_skills_but_discovers_nested_skills() {
                 .join(".agents/skills/root-file.md")
                 .to_string_lossy()
     }));
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == nested_skill.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &nested_skill));
     assert!(result.skills.iter().any(|resource| resource.path
         == nested_markdown_skill.to_string_lossy()
         && resource.enabled));
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == deeply_nested.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &deeply_nested));
 }
 
 #[tokio::test]
@@ -976,18 +1034,11 @@ async fn keeps_the_user_agents_skills_user_scoped_when_the_cwd_sits_under_home()
 
     let home_skill = rig.write(
         ".agents/skills/home-skill/SKILL.md",
-        "---\nname: home-skill\ndescription: home\n---\n",
+        &skill_markdown("home-skill", "home", ""),
     );
 
     let mut rig = rig;
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: cwd.to_string_lossy().into_owned(),
-        agent_dir: local_agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(home_env_lookup(&rig.temp_dir)),
-        http_client: None,
-    });
+    rig.with_home_env_at(&cwd, &local_agent_dir);
     let result = rig.package_manager.resolve(None).await.expect("resolve");
     let matching: Vec<_> = result
         .skills
@@ -1023,7 +1074,7 @@ async fn dedupes_user_skill_entries_when_the_agent_skills_dir_symlinks_the_agent
     }
     let skill_path = rig.write(
         ".agents/skills/foo/SKILL.md",
-        "---\nname: foo\ndescription: foo\n---\n",
+        &skill_markdown("foo", "foo", ""),
     );
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
@@ -1048,11 +1099,11 @@ async fn respects_a_gitignore_in_skill_directories() {
     rig.write("agent/skills/.gitignore", "venv\n__pycache__\n");
     rig.write(
         "agent/skills/good-skill/SKILL.md",
-        "---\nname: good-skill\ndescription: Good\n---\nContent",
+        &skill_markdown("good-skill", "Good", "Content"),
     );
     rig.write(
         "agent/skills/venv/bad-skill/SKILL.md",
-        "---\nname: bad-skill\ndescription: Bad\n---\nContent",
+        &skill_markdown("bad-skill", "Bad", "Content"),
     );
     rig.set_setting("skills", json!(["skills"]));
 
@@ -1067,16 +1118,11 @@ async fn does_not_apply_the_parent_gitignore_to_pi_discovery() {
     rig.write(".gitignore", ".pi\n");
     let skill_path = rig.write(
         ".pi/skills/auto-skill/SKILL.md",
-        "---\nname: auto-skill\ndescription: Auto\n---\nContent",
+        &skill_markdown("auto-skill", "Auto", "Content"),
     );
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == skill_path.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.skills, &skill_path));
 }
 
 // =============================================================================
@@ -1088,17 +1134,14 @@ async fn resolves_extension_sources_from_local_paths() {
     let rig = Rig::new();
     let ext_path = rig.write_executable("ext");
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[ext_path.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
-    assert!(
-        result
-            .extensions
-            .iter()
-            .any(|resource| resource.path == ext_path.to_string_lossy() && resource.enabled)
-    );
+    let result = resolve_sources(
+        &rig,
+        &[ext_path.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
+    assert!(resolves_enabled(&result.extensions, &ext_path));
 }
 
 #[tokio::test]
@@ -1108,18 +1151,20 @@ async fn resolves_extension_sources_from_directories_with_a_pi_manifest() {
     rig.write_executable("my-package/src/index");
     rig.write(
         "my-package/skills/my-skill/SKILL.md",
-        "---\nname: my-skill\ndescription: Test\n---\nContent",
+        &skill_markdown("my-skill", "Test", "Content"),
     );
     rig.write(
         "my-package/package.json",
         r#"{"name":"my-package","pi":{"extensions":["./src/index"],"skills":["./skills"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     let debug_paths: Vec<String> = result
         .extensions
         .iter()
@@ -1149,11 +1194,11 @@ async fn keeps_pi_manifest_entries_with_leading_tilde_package_relative() {
     let direct_extension_path = rig.write_executable("tilde-manifest-package/~extensions/main");
     let direct_skill_path = rig.write(
         "tilde-manifest-package/~skills/direct-skill/SKILL.md",
-        "---\nname: direct-skill\ndescription: Direct\n---\nContent",
+        &skill_markdown("direct-skill", "Direct", "Content"),
     );
     let slash_skill_path = rig.write(
         "tilde-manifest-package/~skills/slash-skill/SKILL.md",
-        "---\nname: slash-skill\ndescription: Slash\n---\nContent",
+        &skill_markdown("slash-skill", "Slash", "Content"),
     );
     rig.write(
         "tilde-manifest-package/package.json",
@@ -1161,11 +1206,13 @@ async fn keeps_pi_manifest_entries_with_leading_tilde_package_relative() {
     );
     let _ = (direct_extension_path.clone(), direct_skill_path.clone());
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(result.extensions.iter().any(|resource| resource.path
         == pkg_dir.join("~extensions/main").to_string_lossy()
         && resource.enabled));
@@ -1188,11 +1235,13 @@ async fn resolves_extension_sources_from_auto_discovery_layouts() {
     rig.write_executable("auto-pkg/extensions/main");
     rig.write("auto-pkg/themes/dark.json", "{}");
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_enabled(&result.extensions, "main") || find_with(&result.extensions, "main"));
     assert!(find_enabled(&result.themes, "dark.json"));
 }
@@ -1203,24 +1252,21 @@ async fn stops_recursing_when_a_package_skill_directory_contains_skill_md() {
     let pkg_dir = rig.temp_dir.join("skill-root-pkg");
     let root_skill = rig.write(
         "skill-root-pkg/skills/root-skill/SKILL.md",
-        "---\nname: root-skill\ndescription: Root skill\n---\n",
+        &skill_markdown("root-skill", "Root skill", ""),
     );
     let nested_skill = rig.write(
         "skill-root-pkg/skills/root-skill/nested-skill/SKILL.md",
-        "---\nname: nested-skill\ndescription: Nested skill\n---\n",
+        &skill_markdown("nested-skill", "Nested skill", ""),
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
-    assert!(
-        result
-            .skills
-            .iter()
-            .any(|resource| resource.path == root_skill.to_string_lossy() && resource.enabled)
-    );
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
+    assert!(resolves_enabled(&result.skills, &root_skill));
     assert!(
         !result
             .skills
@@ -1673,11 +1719,11 @@ async fn filters_skills_with_an_exclusion_pattern() {
     let rig = Rig::new();
     rig.write(
         "agent/skills/good-skill/SKILL.md",
-        "---\nname: good-skill\ndescription: Good\n---\nContent",
+        &skill_markdown("good-skill", "Good", "Content"),
     );
     rig.write(
         "agent/skills/bad-skill/SKILL.md",
-        "---\nname: bad-skill\ndescription: Bad\n---\nContent",
+        &skill_markdown("bad-skill", "Bad", "Content"),
     );
     rig.set_setting("skills", json!(["skills", "!**/bad-skill"]));
 
@@ -1695,12 +1741,7 @@ async fn works_without_patterns() {
     rig.set_setting("extensions", json!(["extensions/my-ext"]));
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
-    assert!(
-        result
-            .extensions
-            .iter()
-            .any(|resource| resource.path == ext_path.to_string_lossy() && resource.enabled)
-    );
+    assert!(resolves_enabled(&result.extensions, &ext_path));
 }
 
 // =============================================================================
@@ -1719,11 +1760,13 @@ async fn supports_glob_patterns_in_manifest_extensions() {
         r#"{"name":"manifest-pkg","pi":{"extensions":["extensions","node_modules/dep/extensions","!**/skip"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_enabled(&result.extensions, "local"));
     assert!(find_enabled(&result.extensions, "remote"));
     assert!(!find_with(&result.extensions, "skip"));
@@ -1735,22 +1778,24 @@ async fn supports_glob_patterns_in_manifest_skills() {
     let pkg_dir = rig.temp_dir.join("skill-manifest-pkg");
     rig.write(
         "skill-manifest-pkg/skills/good-skill/SKILL.md",
-        "---\nname: good-skill\ndescription: Good\n---\nContent",
+        &skill_markdown("good-skill", "Good", "Content"),
     );
     rig.write(
         "skill-manifest-pkg/skills/bad-skill/SKILL.md",
-        "---\nname: bad-skill\ndescription: Bad\n---\nContent",
+        &skill_markdown("bad-skill", "Bad", "Content"),
     );
     rig.write(
         "skill-manifest-pkg/package.json",
         r#"{"name":"skill-manifest-pkg","pi":{"skills":["skills","!**/bad-skill"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_with(&result.skills, "good-skill"));
     assert!(
         !result
@@ -1766,22 +1811,24 @@ async fn expands_positive_glob_manifest_entries_before_collecting_skills() {
     let pkg_dir = rig.temp_dir.join("skill-manifest-glob-pkg");
     rig.write(
         "skill-manifest-glob-pkg/plugins/pdf-to-markdown/skills/pdf-to-markdown/SKILL.md",
-        "---\nname: pdf-to-markdown\ndescription: PDF to Markdown\n---\nContent",
+        &skill_markdown("pdf-to-markdown", "PDF to Markdown", "Content"),
     );
     rig.write(
         "skill-manifest-glob-pkg/plugins/nutrient-dws/skills/document-processor-api/SKILL.md",
-        "---\nname: document-processor-api\ndescription: DWS\n---\nContent",
+        &skill_markdown("document-processor-api", "DWS", "Content"),
     );
     rig.write(
         "skill-manifest-glob-pkg/package.json",
         r#"{"name":"skill-manifest-glob-pkg","pi":{"skills":["./plugins/*/skills"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_with(&result.skills, "pdf-to-markdown/SKILL.md"));
     assert!(find_with(&result.skills, "document-processor-api/SKILL.md"));
 }
@@ -1803,11 +1850,11 @@ async fn sorts_manifest_glob_matches_and_uses_exact_entries_for_dot_paths() {
     rig.write_executable("manifest-glob-semantics-pkg/extension-groups/group/index");
     rig.write(
         "manifest-glob-semantics-pkg/plugins/local/skills/local-skill/SKILL.md",
-        "---\nname: local-skill\ndescription: Local\n---\n",
+        &skill_markdown("local-skill", "Local", ""),
     );
     rig.write(
         "manifest-glob-semantics-pkg/linked-plugin-source/skills/linked-skill/SKILL.md",
-        "---\nname: linked-skill\ndescription: Linked\n---\n",
+        &skill_markdown("linked-skill", "Linked", ""),
     );
     #[cfg(unix)]
     std::os::unix::fs::symlink(
@@ -1820,11 +1867,13 @@ async fn sorts_manifest_glob_matches_and_uses_exact_entries_for_dot_paths() {
         r#"{"name":"manifest-glob-semantics-pkg","pi":{"extensions":["./extension-files/*","./extension-groups/*/"],"skills":["./plugins/*/skills","./plugins/linked/skills"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     let relative: Vec<String> = result
         .extensions
         .iter()
@@ -2088,15 +2137,15 @@ async fn force_includes_multiple_resources() {
     let pkg_dir = rig.temp_dir.join("multi-force-pkg");
     rig.write(
         "multi-force-pkg/skills/skill-a/SKILL.md",
-        "---\nname: skill-a\ndescription: A\n---\nContent",
+        &skill_markdown("skill-a", "A", "Content"),
     );
     rig.write(
         "multi-force-pkg/skills/skill-b/SKILL.md",
-        "---\nname: skill-b\ndescription: B\n---\nContent",
+        &skill_markdown("skill-b", "B", "Content"),
     );
     rig.write(
         "multi-force-pkg/skills/skill-c/SKILL.md",
-        "---\nname: skill-c\ndescription: C\n---\nContent",
+        &skill_markdown("skill-c", "C", "Content"),
     );
     rig.set_packages(&json!([
         {
@@ -2141,11 +2190,13 @@ async fn handles_force_include_in_manifest_patterns() {
         r#"{"name":"manifest-force-pkg","pi":{"extensions":["extensions","!**/two","+extensions/two"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_enabled(&result.extensions, "one"));
     assert!(find_enabled(&result.extensions, "two"));
     assert!(find_enabled(&result.extensions, "three"));
@@ -2326,11 +2377,13 @@ async fn loads_only_the_index_entry_from_subdirectories() {
     .expect("write");
     rig.write_executable("multifile-pkg/extensions/standalone");
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_with(&result.extensions, "subagent/index"));
     assert!(find_with(&result.extensions, "standalone"));
     assert!(!find_with(&result.extensions, "agents"));
@@ -2352,11 +2405,13 @@ async fn respects_a_pi_manifest_in_subdirectories() {
         r#"{"pi":{"extensions":["./main"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_with(&result.extensions, "custom/main"));
     assert!(!find_with(&result.extensions, "utils"));
 }
@@ -2370,11 +2425,13 @@ async fn handles_mixed_top_level_files_and_subdirectories() {
     std::fs::write(rig.temp_dir.join("mixed-pkg/extensions/complex/a"), "stub").expect("write");
     std::fs::write(rig.temp_dir.join("mixed-pkg/extensions/complex/b"), "stub").expect("write");
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert!(find_with(&result.extensions, "simple"));
     assert!(find_with(&result.extensions, "complex/index"));
     assert!(!find_with(&result.extensions, "complex/a"));
@@ -2407,11 +2464,13 @@ async fn skips_subdirectories_without_an_index_entry_or_manifest() {
     .expect("write");
     rig.write_executable("no-entry-pkg/extensions/valid");
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     let debug: Vec<String> = result
         .extensions
         .iter()
@@ -2444,11 +2503,13 @@ async fn resolves_a_local_directory_without_resources_as_one_extension() {
     rig.write_executable("crate-bin-pkg/bin/pi-llm-tools");
     rig.write_executable("crate-bin-pkg/bin/other-tool");
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     assert_eq!(result.extensions.len(), 1);
     assert_eq!(
         result.extensions[0].path,
@@ -2489,31 +2550,12 @@ async fn collects_crate_channel_binaries_through_the_bin_convention() {
 #[tokio::test]
 async fn updates_a_crate_source_whose_registry_version_is_newer() {
     let mut rig = Rig::new();
-    let installed = rig.temp_dir.join(".pi/crates/example");
-    std::fs::create_dir_all(&installed).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
 
-    let mock = pi_ai::http::MockHttpClient::new();
-    mock.on(|request| request.url.contains("/api/v1/crates/example"))
-        .respond(pi_ai::http::json_response(
-            200,
-            &json!({ "crate": { "max_version": "1.2.0" } }),
-        ));
-    let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock.clone());
+    let client = crates_io_client("1.2.0");
     let runner = FakeRunner::new(fake_cargo_install());
-    rig.runner = Some(runner.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: Some(Arc::new(runner)),
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_runner_client(&mut rig, runner, client);
 
     rig.package_manager
         .update(Some("crate:example"))
@@ -2542,20 +2584,10 @@ impl Rig {
 #[tokio::test]
 async fn skips_a_crate_update_when_the_installed_version_matches_latest() {
     let mut rig = Rig::new();
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.3.1","files":{}}"#,
-    );
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
+    stage_installed_crate(&rig, "1.3.1");
     rig.set_project_packages(&json!(["crate:example"]));
 
-    let mock = pi_ai::http::MockHttpClient::new();
-    mock.on(|request| request.url.contains("/api/v1/crates/example"))
-        .respond(pi_ai::http::json_response(
-            200,
-            &json!({ "crate": { "max_version": "1.3.1" } }),
-        ));
-    let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock.clone());
+    let client = crates_io_client("1.3.1");
     rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
         cwd: rig.temp_dir.to_string_lossy().into_owned(),
         agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
@@ -2660,11 +2692,13 @@ async fn skips_refreshing_temporary_git_sources_when_offline() {
         std::fs::set_permissions(&index, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&["git:github.com/example/repo".to_string()], false, true)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &["git:github.com/example/repo".to_string()],
+        false,
+        true,
+    )
+    .await;
     assert!(find_with(&result.extensions, "extensions/index"));
 }
 
@@ -2693,12 +2727,7 @@ async fn does_not_query_the_registry_during_resolve_for_installed_unpinned_crate
 #[tokio::test]
 async fn reinstalls_a_pinned_crate_when_the_installed_version_mismatches() {
     let mut rig = Rig::new();
-    let installed_dir = rig.temp_dir.join(".pi/crates/example");
-    std::fs::create_dir_all(&installed_dir).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example@2.0.0"]));
 
     rig.with_runner(FakeRunner::new(fake_cargo_install()));
@@ -2713,40 +2742,18 @@ async fn reinstalls_a_pinned_crate_when_the_installed_version_mismatches() {
     assert_eq!(command, "cargo");
     assert!(args.contains(&"--version".to_string()));
     assert!(args.contains(&"2.0.0".to_string()));
-    let _ = installed_dir;
 }
 
 #[tokio::test]
 async fn reports_updates_for_installed_unpinned_crates() {
     let mut rig = Rig::new();
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
 
-    let mock = pi_ai::http::MockHttpClient::new();
-    mock.on(|request| request.url.contains("/api/v1/crates/example"))
-        .respond(pi_ai::http::json_response(
-            200,
-            &json!({ "crate": { "max_version": "1.2.3" } }),
-        ));
-    let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    let client = crates_io_client("1.2.3");
+    rig_with_client(&mut rig, client);
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert_eq!(updates.len(), 1);
     assert_eq!(updates[0].source, "crate:example");
     assert_eq!(updates[0].display_name, "example");
@@ -2757,45 +2764,20 @@ async fn reports_updates_for_installed_unpinned_crates() {
 #[tokio::test]
 async fn does_not_report_updates_when_the_installed_version_is_newer_than_the_registry() {
     let mut rig = Rig::new();
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"2.0.0","files":{}}"#,
-    );
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
+    stage_installed_crate(&rig, "2.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
 
-    let mock = pi_ai::http::MockHttpClient::new();
-    mock.on(|request| request.url.contains("/api/v1/crates/example"))
-        .respond(pi_ai::http::json_response(
-            200,
-            &json!({ "crate": { "max_version": "1.9.0" } }),
-        ));
-    let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    let client = crates_io_client("1.9.0");
+    rig_with_client(&mut rig, client);
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty());
 }
 
 #[tokio::test]
 async fn skips_pinned_sources_when_checking_for_updates() {
     let mut rig = Rig::new();
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
+    stage_installed_crate(&rig, "1.0.0");
     let parsed = rig
         .package_manager
         .parse_source("git:github.com/example/repo@v1")
@@ -2826,11 +2808,7 @@ async fn skips_pinned_sources_when_checking_for_updates() {
         http_client: Some(client),
     });
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty());
     assert_eq!(
         mock.recorded().len(),
@@ -2843,11 +2821,7 @@ async fn skips_pinned_sources_when_checking_for_updates() {
 #[tokio::test]
 async fn check_for_available_updates_answers_nothing_when_offline() {
     let rig = Rig::with_env(&[("PI_OFFLINE", "1")]);
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty());
 }
 
@@ -2863,22 +2837,8 @@ async fn installs_a_crate_source_with_a_locked_build_and_a_receipt() {
     let installed_dir = rig.agent_dir.join("crates/example");
     rig.with_runner(FakeRunner::new(Box::new(move |command, args, _options| {
         if command == "cargo" && args.first().map(String::as_str) == Some("install") {
-            let root_index = args
-                .iter()
-                .position(|arg| arg == "--root")
-                .expect("--root present");
-            let stage_root = args.get(root_index + 1).cloned().unwrap_or_default();
-            std::fs::create_dir_all(Path::new(&stage_root).join("bin")).expect("stage bin");
-            std::fs::write(Path::new(&stage_root).join("bin/example"), "#!/bin/sh\n").expect("bin");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    Path::new(&stage_root).join("bin/example"),
-                    std::fs::Permissions::from_mode(0o755),
-                )
-                .expect("chmod");
-            }
+            let stage_root = staged_root(args);
+            stage_bin_example(&stage_root);
             *sink
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stage_root);
@@ -3330,6 +3290,33 @@ fn existing_git_checkout(rig: &Rig, slug: &str) -> PathBuf {
     target
 }
 
+/// The git fake whose clone creates the target directory, so a clone
+/// install lands.
+fn clone_creating_target() -> FakeRunner {
+    FakeRunner::new(Box::new(|command, args, _options| {
+        if command == "git" && args.first().map(String::as_str) == Some("clone") {
+            let target = args.get(2).cloned().unwrap_or_default();
+            std::fs::create_dir_all(&target).expect("target dir");
+        }
+        Ok(FakeOutcome::ok())
+    }))
+}
+
+/// The four-probe git table the upstream-branch reconcile ladder drives:
+/// the upstream branch is `origin/main`, the heads answer `remote_head`
+/// and `local_head`, and the commit lookups agree with the remote.
+fn upstream_branch_fake(remote_head: &str, local_head: &str) -> FakeRunner {
+    git_fake(
+        &[
+            (UPSTREAM_ABBREV_KEY, "origin/main"),
+            (UPSTREAM_REV_KEY, remote_head),
+            (HEAD_REV_KEY, local_head),
+            (UPSTREAM_COMMIT_KEY, remote_head),
+        ],
+        &[],
+    )
+}
+
 // =============================================================================
 // The tarball channel
 // =============================================================================
@@ -3723,15 +3710,7 @@ async fn unpack_tarball_accepts_an_inside_staged_symlink_and_rejects_a_hardlink(
 async fn installs_an_existing_unpinned_checkout_to_its_upstream_branch_target() {
     let mut rig = Rig::new();
     let target = existing_git_checkout(&rig, "repo");
-    rig.with_runner(git_fake(
-        &[
-            (UPSTREAM_ABBREV_KEY, "origin/main"),
-            (UPSTREAM_REV_KEY, "remote-head"),
-            (HEAD_REV_KEY, "local-head"),
-            (UPSTREAM_COMMIT_KEY, "remote-head"),
-        ],
-        &[],
-    ));
+    rig.with_runner(upstream_branch_fake("remote-head", "local-head"));
 
     rig.package_manager
         .install("git:github.com/user/repo", false)
@@ -3865,15 +3844,7 @@ async fn update_reconciles_an_unpinned_git_checkout_through_the_pool() {
     let mut rig = Rig::new();
     existing_git_checkout(&rig, "repo");
     rig.set_packages(&json!(["git:github.com/user/repo"]));
-    rig.with_runner(git_fake(
-        &[
-            (UPSTREAM_ABBREV_KEY, "origin/main"),
-            (UPSTREAM_REV_KEY, "remote-head"),
-            (HEAD_REV_KEY, "local-head"),
-            (UPSTREAM_COMMIT_KEY, "remote-head"),
-        ],
-        &[],
-    ));
+    rig.with_runner(upstream_branch_fake("remote-head", "local-head"));
 
     rig.package_manager
         .update(Some("git:github.com/user/repo"))
@@ -3890,13 +3861,7 @@ async fn update_reconciles_an_unpinned_git_checkout_through_the_pool() {
 async fn update_installs_a_missing_git_checkout() {
     let mut rig = Rig::new();
     rig.set_packages(&json!(["git:github.com/user/repo"]));
-    rig.with_runner(FakeRunner::new(Box::new(|command, args, _options| {
-        if command == "git" && args.first().map(String::as_str) == Some("clone") {
-            let target = args.get(2).cloned().unwrap_or_default();
-            std::fs::create_dir_all(&target).expect("target dir");
-        }
-        Ok(FakeOutcome::ok())
-    })));
+    rig.with_runner(clone_creating_target());
 
     rig.package_manager
         .update(Some("git:github.com/user/repo"))
@@ -3927,15 +3892,7 @@ async fn update_keeps_a_current_git_checkout_untouched() {
     let mut rig = Rig::new();
     existing_git_checkout(&rig, "repo");
     rig.set_packages(&json!(["git:github.com/user/repo"]));
-    rig.with_runner(git_fake(
-        &[
-            (UPSTREAM_ABBREV_KEY, "origin/main"),
-            (UPSTREAM_REV_KEY, "same-head"),
-            (HEAD_REV_KEY, "same-head"),
-            (UPSTREAM_COMMIT_KEY, "same-head"),
-        ],
-        &[],
-    ));
+    rig.with_runner(upstream_branch_fake("same-head", "same-head"));
 
     rig.package_manager
         .update(Some("git:github.com/user/repo"))
@@ -3968,15 +3925,7 @@ async fn update_recovers_a_clean_state_when_the_incomplete_marker_exists() {
         .join(".repo.pi-update-incomplete");
     std::fs::write(&marker, "").expect("marker");
     rig.set_packages(&json!(["git:github.com/user/repo"]));
-    rig.with_runner(git_fake(
-        &[
-            (UPSTREAM_ABBREV_KEY, "origin/main"),
-            (UPSTREAM_REV_KEY, "same-head"),
-            (HEAD_REV_KEY, "same-head"),
-            (UPSTREAM_COMMIT_KEY, "same-head"),
-        ],
-        &[],
-    ));
+    rig.with_runner(upstream_branch_fake("same-head", "same-head"));
 
     rig.package_manager
         .update(Some("git:github.com/user/repo"))
@@ -4048,15 +3997,7 @@ async fn refreshes_a_temporary_git_checkout_when_online() {
 
     let events: Arc<Mutex<Vec<ProgressEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&events);
-    rig.with_runner(git_fake(
-        &[
-            (UPSTREAM_ABBREV_KEY, "origin/main"),
-            (UPSTREAM_REV_KEY, "remote-head"),
-            (HEAD_REV_KEY, "local-head"),
-            (UPSTREAM_COMMIT_KEY, "remote-head"),
-        ],
-        &[],
-    ));
+    rig.with_runner(upstream_branch_fake("remote-head", "local-head"));
     rig.package_manager
         .set_progress_callback(Some(Box::new(move |event| {
             sink.lock()
@@ -4064,11 +4005,8 @@ async fn refreshes_a_temporary_git_checkout_when_online() {
                 .push(event.clone());
         })));
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&["git:github.com/user/repo".to_string()], false, true)
-        .await
-        .expect("resolve");
+    let result =
+        resolve_sources(&rig, &["git:github.com/user/repo".to_string()], false, true).await;
     assert!(find_with(&result.extensions, "extensions/index"));
 
     let recorded = rig.package_manager_list_commands();
@@ -4090,13 +4028,7 @@ async fn refreshes_a_temporary_git_checkout_when_online() {
 #[tokio::test]
 async fn removes_a_git_checkout_its_marker_and_empty_parents() {
     let mut rig = Rig::new();
-    rig.with_runner(FakeRunner::new(Box::new(|command, args, _options| {
-        if command == "git" && args.first().map(String::as_str) == Some("clone") {
-            let target = args.get(2).cloned().unwrap_or_default();
-            std::fs::create_dir_all(&target).expect("target dir");
-        }
-        Ok(FakeOutcome::ok())
-    })));
+    rig.with_runner(clone_creating_target());
     rig.package_manager
         .install("git:github.com/user/repo", false)
         .await
@@ -4123,13 +4055,7 @@ async fn removes_a_git_checkout_its_marker_and_empty_parents() {
 #[tokio::test]
 async fn prunes_against_a_deleted_install_root() {
     let mut rig = Rig::new();
-    rig.with_runner(FakeRunner::new(Box::new(|command, args, _options| {
-        if command == "git" && args.first().map(String::as_str) == Some("clone") {
-            let target = args.get(2).cloned().unwrap_or_default();
-            std::fs::create_dir_all(&target).expect("target dir");
-        }
-        Ok(FakeOutcome::ok())
-    })));
+    rig.with_runner(clone_creating_target());
     rig.package_manager
         .install("git:github.com/user/repo", false)
         .await
@@ -4308,23 +4234,11 @@ async fn suggests_a_git_shorthand_with_ref() {
 #[tokio::test]
 async fn update_skips_pinned_crate_sources() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example@1.0.0"]));
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(pi_ai::http::MockHttpClient::new());
     let runner = FakeRunner::rejecting("no command may run");
-    rig.runner = Some(runner.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: Some(Arc::new(runner)),
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_runner_client(&mut rig, runner, client);
 
     rig.package_manager
         .update(Some("crate:example@1.0.0"))
@@ -4342,24 +4256,12 @@ async fn update_skips_pinned_crate_sources() {
 #[tokio::test]
 async fn a_registry_lookup_failure_preserves_the_update() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
     // The empty mock answers nothing: the registry lookup fails.
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(pi_ai::http::MockHttpClient::new());
     let runner = FakeRunner::new(fake_cargo_install());
-    rig.runner = Some(runner.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: Some(Arc::new(runner)),
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_runner_client(&mut rig, runner, client);
 
     rig.package_manager
         .update(Some("crate:example"))
@@ -4376,15 +4278,7 @@ async fn update_installs_a_missing_crate() {
     rig.set_project_packages(&json!(["crate:fresh"]));
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(pi_ai::http::MockHttpClient::new());
     let runner = FakeRunner::new(fake_cargo_install());
-    rig.runner = Some(runner.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: Some(Arc::new(runner)),
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_runner_client(&mut rig, runner, client);
 
     rig.package_manager
         .update(Some("crate:fresh"))
@@ -4400,38 +4294,19 @@ async fn update_installs_a_missing_crate() {
 #[tokio::test]
 async fn check_degrades_to_no_update_when_the_registry_is_unreachable() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(pi_ai::http::MockHttpClient::new());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_client(&mut rig, client);
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "a transport failure reports nothing");
 }
 
 #[tokio::test]
 async fn check_degrades_to_no_update_when_the_registry_body_fails_midstream() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
     rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
         cwd: rig.temp_dir.to_string_lossy().into_owned(),
@@ -4442,101 +4317,52 @@ async fn check_degrades_to_no_update_when_the_registry_body_fails_midstream() {
         http_client: Some(Arc::new(FailingBodyClient)),
     });
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "a body failure reports nothing");
 }
 
 #[tokio::test]
 async fn check_degrades_to_no_update_when_the_registry_answers_an_empty_body() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
     let mock = pi_ai::http::MockHttpClient::new();
     mock.on(|request| request.url.contains("/api/v1/crates/example"))
         .respond(pi_ai::http::MockResponse::status(200));
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock);
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_client(&mut rig, client);
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "an empty body reports nothing");
 }
 
 #[tokio::test]
 async fn check_degrades_to_no_update_when_the_registry_answers_garbage() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
     let mock = pi_ai::http::MockHttpClient::new();
     mock.on(|request| request.url.contains("/api/v1/crates/example"))
         .respond(pi_ai::http::MockResponse::status(200).with_body("not-json"));
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock);
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_client(&mut rig, client);
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "garbage reports nothing");
 }
 
 #[tokio::test]
 async fn check_degrades_to_no_update_when_the_registry_omits_max_version() {
     let mut rig = Rig::new();
-    std::fs::create_dir_all(rig.temp_dir.join(".pi/crates/example")).expect("install dir");
-    rig.write(
-        ".pi/crates/example/pi-package-install.json",
-        r#"{"kind":"pi-package-install","schemaVersion":1,"channel":"crate","source":"crate:example","resolvedVersion":"1.0.0","files":{}}"#,
-    );
+    stage_installed_crate(&rig, "1.0.0");
     rig.set_project_packages(&json!(["crate:example"]));
     let mock = pi_ai::http::MockHttpClient::new();
     mock.on(|request| request.url.contains("/api/v1/crates/example"))
         .respond(pi_ai::http::json_response(200, &json!({ "crate": {} })));
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock);
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_client(&mut rig, client);
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "a missing max_version reports nothing");
 }
 
@@ -4576,11 +4402,7 @@ async fn check_reports_a_git_update_when_the_remote_moved() {
         ),
     );
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert_eq!(updates.len(), 1, "{updates:?}");
     assert_eq!(updates[0].source, "git:github.com/user/repo");
     assert_eq!(updates[0].display_name, "github.com/user/repo");
@@ -4610,11 +4432,7 @@ async fn check_falls_back_to_the_remote_head_symref() {
         ),
     );
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert_eq!(updates.len(), 1, "{updates:?}");
     assert_eq!(updates[0].update_type.as_str(), "git");
 }
@@ -4639,11 +4457,7 @@ async fn check_reports_no_update_when_the_remote_head_matches() {
         ),
     );
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "matching heads report nothing");
 }
 
@@ -4658,11 +4472,7 @@ async fn check_tolerates_a_failing_git_probe() {
         git_fake(&[(UPSTREAM_ABBREV_KEY, "origin/main")], &[HEAD_REV_KEY]),
     );
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "a failing probe reports nothing");
 }
 
@@ -4684,11 +4494,7 @@ async fn check_determines_no_remote_head_when_ls_remote_answers_nothing() {
         ),
     );
 
-    let updates = rig
-        .package_manager
-        .check_for_available_updates()
-        .await
-        .expect("check");
+    let updates = check_updates(&rig).await;
     assert!(updates.is_empty(), "a missing remote HEAD reports nothing");
 }
 
@@ -4735,11 +4541,7 @@ async fn the_receipt_write_failure_surfaces_when_the_package_plants_a_receipt_di
     // land: the post-rename receipt write fails closed.
     rig.with_runner(FakeRunner::new(Box::new(|command, args, _options| {
         if command == "cargo" && args.first().map(String::as_str) == Some("install") {
-            let root_index = args
-                .iter()
-                .position(|arg| arg == "--root")
-                .expect("--root present");
-            let stage_root = args.get(root_index + 1).cloned().unwrap_or_default();
+            let stage_root = staged_root(args);
             std::fs::create_dir_all(Path::new(&stage_root).join("pi-package-install.json"))
                 .expect("receipt directory");
         }
@@ -4901,11 +4703,13 @@ async fn manifest_glob_entries_expand_for_plain_slash_and_absolute_spellings() {
         r#"{"name":"glob-spellings-pkg","pi":{"extensions":["top*","./sub/*","/inside/*","q?mark"]}}"#,
     );
 
-    let result = rig
-        .package_manager
-        .resolve_extension_sources(&[pkg_dir.to_string_lossy().into_owned()], false, false)
-        .await
-        .expect("resolve");
+    let result = resolve_sources(
+        &rig,
+        &[pkg_dir.to_string_lossy().into_owned()],
+        false,
+        false,
+    )
+    .await;
     let mut names: Vec<String> = result
         .extensions
         .iter()
@@ -4944,7 +4748,7 @@ async fn an_unfiltered_type_collects_through_the_manifest_or_the_convention_dir(
     rig.write_executable("manifest-arm-pkg/extensions/only");
     rig.write(
         "manifest-arm-pkg/skills/manifest-skill/SKILL.md",
-        "---\nname: manifest-skill\ndescription: Manifest\n---\n",
+        &skill_markdown("manifest-skill", "Manifest", ""),
     );
     rig.write(
         "manifest-arm-pkg/package.json",
@@ -5055,14 +4859,7 @@ async fn resolve_installs_a_missing_tarball_source() {
         )])),
     );
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(mock);
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_client(&mut rig, client);
     rig.set_packages(&json!([url]));
 
     let result = rig.package_manager.resolve(None).await.expect("resolve");
@@ -5097,15 +4894,11 @@ async fn resolve_installs_a_missing_tarball_source() {
 async fn list_configured_packages_reports_user_scoped_install_paths() {
     let mut rig = Rig::new();
     let runner = FakeRunner::new(fake_cargo_install());
-    rig.runner = Some(runner.clone());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: Some(Arc::new(runner)),
-        env: Some(common::env_with(&[])),
-        http_client: Some(Arc::new(pi_ai::http::MockHttpClient::new())),
-    });
+    rig_with_runner_client(
+        &mut rig,
+        runner,
+        Arc::new(pi_ai::http::MockHttpClient::new()),
+    );
     rig.set_packages(&json!(["crate:installed"]));
     rig.set_project_packages(&json!(["crate:installed"]));
 
@@ -5205,13 +4998,7 @@ async fn get_installed_path_reports_each_channel() {
 #[tokio::test]
 async fn installs_a_pinned_git_checkout_by_cloning_and_checking_out() {
     let mut rig = Rig::new();
-    rig.with_runner(FakeRunner::new(Box::new(|command, args, _options| {
-        if command == "git" && args.first().map(String::as_str) == Some("clone") {
-            let target = args.get(2).cloned().unwrap_or_default();
-            std::fs::create_dir_all(&target).expect("target dir");
-        }
-        Ok(FakeOutcome::ok())
-    })));
+    rig.with_runner(clone_creating_target());
 
     rig.package_manager
         .install("git:github.com/user/repo@v2", false)
@@ -5372,14 +5159,7 @@ async fn the_tarball_stage_surfaces_a_creation_failure() {
         .expect("lock the tarballs root");
     }
     let client: Arc<dyn pi_ai::http::HttpClient> = Arc::new(pi_ai::http::MockHttpClient::new());
-    rig.package_manager = DefaultPackageManager::new(PackageManagerOptions {
-        cwd: rig.temp_dir.to_string_lossy().into_owned(),
-        agent_dir: rig.agent_dir.to_string_lossy().into_owned(),
-        settings: Arc::clone(&rig.settings),
-        command_runner: None,
-        env: Some(common::env_with(&[])),
-        http_client: Some(client),
-    });
+    rig_with_client(&mut rig, client);
 
     let result = rig
         .package_manager
@@ -5413,15 +5193,7 @@ async fn the_git_marker_write_failure_surfaces() {
         )
         .expect("lock the parent");
     }
-    rig.with_runner(git_fake(
-        &[
-            (UPSTREAM_ABBREV_KEY, "origin/main"),
-            (UPSTREAM_REV_KEY, "remote-head"),
-            (HEAD_REV_KEY, "local-head"),
-            (UPSTREAM_COMMIT_KEY, "remote-head"),
-        ],
-        &[],
-    ));
+    rig.with_runner(upstream_branch_fake("remote-head", "local-head"));
 
     let result = rig
         .package_manager

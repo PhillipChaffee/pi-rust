@@ -38,7 +38,7 @@ use pi_ai::auth::types::{
 use pi_ai::types::{Api, BoxedFuture};
 use pi_coding_agent::auth_storage::{AuthStorage, InMemoryAuthStorageBackend};
 use pi_coding_agent::cli::auth_check::{
-    AuthCheckOptions, AuthCheckReason, AuthCheckStatus, check_provider_auth,
+    AuthCheckOptions, AuthCheckReason, AuthCheckResult, AuthCheckStatus, check_provider_auth,
     create_auth_check_model_runtime, get_provider_credential,
 };
 use pi_coding_agent::cli::auth_command::{
@@ -49,7 +49,9 @@ use pi_coding_agent::cli::auth_command::{
 use pi_coding_agent::cli::credential_print::{CredentialPrintKind, resolve_credential_for_print};
 use pi_coding_agent::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use pi_coding_agent::models_store::InMemoryCodingAgentModelsStore;
-use pi_coding_agent::provider_composer::{ExtensionOAuthConfig, ProviderConfigInput};
+use pi_coding_agent::provider_composer::{
+    ExtensionOAuthConfig, ExtensionOAuthRefreshFn, ProviderConfigInput,
+};
 
 fn args_view(provider: Option<&str>, model: Option<&str>) -> AuthCommandArgs {
     AuthCommandArgs {
@@ -80,13 +82,11 @@ fn auth_data(
         .collect()
 }
 
-async fn runtime_with_api_key_credentials(key: &str) -> ModelRuntime {
-    let storage = AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[(
-        "openai",
-        serde_json::json!({ "type": "api_key", "key": key }),
-    )]));
+/// The runtime over the given credential store, the suite's create
+/// fixture: no model catalog storage, no network, no refresh on create.
+async fn runtime_with_credentials(credentials: Arc<dyn CredentialStore>) -> ModelRuntime {
     ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(storage)),
+        credentials: Some(credentials),
         models_path: Some(None),
         models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
         allow_model_network: false,
@@ -95,6 +95,108 @@ async fn runtime_with_api_key_credentials(key: &str) -> ModelRuntime {
     })
     .await
     .expect("runtime creates")
+}
+
+/// The registered api-key provider whose key is a template or literal, the
+/// registration seam's simplest input.
+fn register_api_key_provider(runtime: &ModelRuntime, name: &str, display: &str, api_key: &str) {
+    runtime
+        .register_provider(
+            name,
+            ProviderConfigInput {
+                name: Some(display.to_string()),
+                api: Some(Api::from("openai-completions")),
+                api_key: Some(api_key.to_string()),
+                ..ProviderConfigInput::default()
+            },
+        )
+        .expect("the registration validates");
+}
+
+/// The auth check over the default options, the check cases' shared call.
+async fn check_provider(
+    runtime: &ModelRuntime,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> AuthCheckResult {
+    check_provider_auth(
+        &args_view(provider, model),
+        runtime,
+        AuthCheckOptions::default(),
+    )
+    .await
+    .expect("check")
+}
+
+/// The credential-print resolution over the no-signal default options, the
+/// print cases' shared call.
+async fn resolve_print(
+    runtime: &ModelRuntime,
+    provider: Option<&str>,
+    model: Option<&str>,
+    kind: CredentialPrintKind,
+    min_expiry_ms: Option<i64>,
+) -> Result<String, AuthCommandError> {
+    resolve_credential_for_print(
+        &args_view(provider, model),
+        runtime,
+        kind,
+        min_expiry_ms,
+        None,
+    )
+    .await
+}
+
+/// The refresh spy's recorded call count, the refresh assertions' probe.
+fn refresh_count(spy: &RefreshSpy) -> usize {
+    spy.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+/// The OAuth credentials the login flow answers, the shared login fixture.
+fn login_credentials() -> OAuthCredentials {
+    OAuthCredentials {
+        access: "login-access".to_string(),
+        refresh: "refresh-token".to_string(),
+        expires: now_ms() + 60_000,
+        extra: BTreeMap::new(),
+    }
+}
+
+/// The shared OAuth provider registration: the login closure answers
+/// `login_credentials`, the refresh closure is the rig's own, and the
+/// model catalog carries one `oauth-model` entry.
+fn register_oauth_provider(runtime: &ModelRuntime, refresh_token: ExtensionOAuthRefreshFn) {
+    runtime
+        .register_provider(
+            "oauth-provider",
+            ProviderConfigInput {
+                name: Some("OAuth Provider".to_string()),
+                base_url: Some("https://example.test/v1".to_string()),
+                api: Some(Api::from("openai-completions")),
+                oauth: Some(ExtensionOAuthConfig {
+                    name: "OAuth subscription".to_string(),
+                    is_subscription: None,
+                    uses_callback_server: None,
+                    login: Arc::new(|_callbacks| Box::pin(async { Ok(login_credentials()) })),
+                    refresh_token,
+                    get_api_key: Arc::new(|credentials| credentials.access.clone()),
+                    modify_models: None,
+                }),
+                models: Some(vec![oauth_model()]),
+                ..ProviderConfigInput::default()
+            },
+        )
+        .expect("the registration validates");
+}
+
+async fn runtime_with_api_key_credentials(key: &str) -> ModelRuntime {
+    let storage = AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[(
+        "openai",
+        serde_json::json!({ "type": "api_key", "key": key }),
+    )]));
+    runtime_with_credentials(Arc::new(storage)).await
 }
 
 /// The OAuth rig: a credential expiring at `expires_ms` with access token
@@ -122,77 +224,41 @@ async fn oauth_rig(
     ));
     let spy: RefreshSpy = Arc::new(Mutex::new(Vec::new()));
     let credentials: Arc<dyn CredentialStore> = storage.clone();
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(credentials),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
+    let runtime = runtime_with_credentials(credentials).await;
 
     let spy_for_closure = Arc::clone(&spy);
-    let runtime = runtime;
-    runtime
-        .register_provider(
-            "oauth-provider",
-            ProviderConfigInput {
-                name: Some("OAuth Provider".to_string()),
-                base_url: Some("https://example.test/v1".to_string()),
-                api: Some(Api::from("openai-completions")),
-                oauth: Some(ExtensionOAuthConfig {
-                    name: "OAuth subscription".to_string(),
-                    is_subscription: None,
-                    uses_callback_server: None,
-                    login: Arc::new(|_callbacks| {
-                        Box::pin(async {
-                            Ok(OAuthCredentials {
-                                access: "login-access".to_string(),
-                                refresh: "refresh-token".to_string(),
-                                expires: now_ms() + 60_000,
-                                extra: BTreeMap::new(),
-                            })
-                        })
-                    }),
-                    refresh_token: Arc::new(move |credentials, _signal| {
-                        spy_for_closure
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(credentials.clone());
-                        match outcome {
-                            RefreshOutcome::Fresh => {
-                                let refreshed = OAuthCredentials {
-                                    access: "fresh-token".to_string(),
-                                    expires: now_ms() + 60 * 60 * 1000,
-                                    ..credentials
-                                };
-                                Box::pin(async move { Ok(refreshed) })
-                            }
-                            RefreshOutcome::Soon => {
-                                let refreshed = OAuthCredentials {
-                                    access: "soon-token".to_string(),
-                                    expires: now_ms() + 10 * 60 * 1000,
-                                    ..credentials
-                                };
-                                Box::pin(async move { Ok(refreshed) })
-                            }
-                            RefreshOutcome::Fails => {
-                                let error: Box<dyn std::error::Error + Send + Sync> =
-                                    Box::new(std::io::Error::other("refresh failed"));
-                                Box::pin(async move { Err(error) })
-                            }
-                        }
-                    }),
-                    get_api_key: Arc::new(|credentials| credentials.access.clone()),
-                    modify_models: None,
-                }),
-                models: Some(vec![oauth_model()]),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
+    register_oauth_provider(
+        &runtime,
+        Arc::new(move |credentials, _signal| {
+            spy_for_closure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(credentials.clone());
+            match outcome {
+                RefreshOutcome::Fresh => {
+                    let refreshed = OAuthCredentials {
+                        access: "fresh-token".to_string(),
+                        expires: now_ms() + 60 * 60 * 1000,
+                        ..credentials
+                    };
+                    Box::pin(async move { Ok(refreshed) })
+                }
+                RefreshOutcome::Soon => {
+                    let refreshed = OAuthCredentials {
+                        access: "soon-token".to_string(),
+                        expires: now_ms() + 10 * 60 * 1000,
+                        ..credentials
+                    };
+                    Box::pin(async move { Ok(refreshed) })
+                }
+                RefreshOutcome::Fails => {
+                    let error: Box<dyn std::error::Error + Send + Sync> =
+                        Box::new(std::io::Error::other("refresh failed"));
+                    Box::pin(async move { Err(error) })
+                }
+            }
+        }),
+    );
     (runtime, spy, storage)
 }
 
@@ -245,13 +311,7 @@ fn oauth_model() -> pi_coding_agent::provider_composer::ProviderModelInput {
 #[tokio::test]
 async fn reports_a_configured_provider_as_ready() {
     let runtime = runtime_with_api_key_credentials("test-key").await;
-    let result = check_provider_auth(
-        &args_view(Some("openai"), None),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let result = check_provider(&runtime, Some("openai"), None).await;
     assert!(matches!(result.status, AuthCheckStatus::Ready));
     assert_eq!(result.provider, "openai");
     assert!(
@@ -265,23 +325,11 @@ async fn reports_a_configured_provider_as_ready() {
 #[tokio::test]
 async fn resolves_the_provider_from_the_model_flag() {
     let runtime = runtime_with_api_key_credentials("test-key").await;
-    let from_model = check_provider_auth(
-        &args_view(None, Some("openai/gpt-5.5")),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let from_model = check_provider(&runtime, None, Some("openai/gpt-5.5")).await;
     assert!(matches!(from_model.status, AuthCheckStatus::Ready));
     assert_eq!(from_model.provider, "openai");
 
-    let from_both = check_provider_auth(
-        &args_view(Some("openai"), Some("gpt-5.5")),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let from_both = check_provider(&runtime, Some("openai"), Some("gpt-5.5")).await;
     assert!(matches!(from_both.status, AuthCheckStatus::Ready));
     assert_eq!(from_both.provider, "openai");
 }
@@ -307,13 +355,7 @@ async fn reads_credentials_without_refreshing_oauth_when_requested() {
 #[tokio::test]
 async fn reports_an_unknown_provider_as_not_ready() {
     let runtime = runtime_with_api_key_credentials("test-key").await;
-    let result = check_provider_auth(
-        &args_view(Some("not-installed"), None),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let result = check_provider(&runtime, Some("not-installed"), None).await;
     assert!(matches!(result.status, AuthCheckStatus::NotReady));
     assert_eq!(result.provider, "not-installed");
     assert!(
@@ -340,35 +382,15 @@ async fn does_not_treat_an_unresolved_stored_environment_reference_as_configured
         auth_path.to_string_lossy().as_ref(),
     )
     .expect("read-only store");
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(read_only)),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
-    runtime
-        .register_provider(
-            "unresolved-ref",
-            ProviderConfigInput {
-                name: Some("Unresolved Reference".to_string()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("$MISSING_AUTH_CHECK_KEY".to_string()),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
-
-    let result = check_provider_auth(
-        &args_view(Some("unresolved-ref"), None),
+    let runtime = runtime_with_credentials(Arc::new(read_only)).await;
+    register_api_key_provider(
         &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+        "unresolved-ref",
+        "Unresolved Reference",
+        "$MISSING_AUTH_CHECK_KEY",
+    );
+
+    let result = check_provider(&runtime, Some("unresolved-ref"), None).await;
     assert!(
         matches!(result.status, AuthCheckStatus::NotReady),
         "the unresolved reference reads unconfigured, got {result:?}"
@@ -393,24 +415,9 @@ async fn reports_malformed_auth_state_as_invalid() {
         auth_path.to_string_lossy().as_ref(),
     )
     .expect("read-only store");
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(read_only)),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
+    let runtime = runtime_with_credentials(Arc::new(read_only)).await;
 
-    let result = check_provider_auth(
-        &args_view(Some("openai"), None),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let result = check_provider(&runtime, Some("openai"), None).await;
     assert!(matches!(result.status, AuthCheckStatus::Invalid));
     assert!(
         result
@@ -429,35 +436,15 @@ async fn does_not_create_an_auth_file_or_its_parent_directory() {
         auth_path.to_string_lossy().as_ref(),
     )
     .expect("read-only store");
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(read_only)),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
-    runtime
-        .register_provider(
-            "absent-ref",
-            ProviderConfigInput {
-                name: Some("Absent Reference".to_string()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("$MISSING_AUTH_CHECK_KEY".to_string()),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
-
-    let result = check_provider_auth(
-        &args_view(Some("absent-ref"), None),
+    let runtime = runtime_with_credentials(Arc::new(read_only)).await;
+    register_api_key_provider(
         &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+        "absent-ref",
+        "Absent Reference",
+        "$MISSING_AUTH_CHECK_KEY",
+    );
+
+    let result = check_provider(&runtime, Some("absent-ref"), None).await;
     assert!(
         matches!(result.status, AuthCheckStatus::NotReady),
         "the absent reference reads unconfigured, got {result:?}"
@@ -521,11 +508,11 @@ async fn creates_an_auth_check_runtime_without_catalog_storage() {
 #[tokio::test]
 async fn prints_a_resolved_api_key() {
     let runtime = runtime_with_api_key_credentials("test-api-key").await;
-    let resolved = resolve_credential_for_print(
-        &args_view(Some("openai"), None),
+    let resolved = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("openai"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -536,23 +523,17 @@ async fn prints_a_resolved_api_key() {
 #[tokio::test]
 async fn refreshes_an_expired_oauth_token_before_printing_it() {
     let (runtime, spy, storage) = runtime_with_expired_oauth().await;
-    let resolved = resolve_credential_for_print(
-        &args_view(Some("oauth-provider"), None),
+    let resolved = resolve_print(
         &runtime,
-        CredentialPrintKind::BearerToken,
+        Some("oauth-provider"),
         None,
+        CredentialPrintKind::BearerToken,
         None,
     )
     .await
     .expect("resolves");
     assert_eq!(resolved, "fresh-token");
-    assert_eq!(
-        spy.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1,
-        "one refresh"
-    );
+    assert_eq!(refresh_count(&spy), 1, "one refresh");
     let stored = storage
         .read("oauth-provider", None)
         .await
@@ -625,15 +606,9 @@ async fn parses_credential_commands_and_rejects_invalid_arguments() {
     ]));
     assert!(parse_auth_command(&["auth".to_string(), "unknown".to_string()]).is_err());
 
-    let error = resolve_credential_for_print(
-        &args_view(None, None),
-        &runtime,
-        CredentialPrintKind::ApiKey,
-        None,
-        None,
-    )
-    .await
-    .expect_err("no target");
+    let error = resolve_print(&runtime, None, None, CredentialPrintKind::ApiKey, None)
+        .await
+        .expect_err("no target");
     assert!(
         error
             .0
@@ -645,11 +620,11 @@ async fn parses_credential_commands_and_rejects_invalid_arguments() {
 #[tokio::test]
 async fn rejects_a_credential_print_across_the_credential_types() {
     let (runtime, _spy, _storage) = runtime_with_expired_oauth().await;
-    let error = resolve_credential_for_print(
-        &args_view(Some("oauth-provider"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("oauth-provider"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -952,16 +927,7 @@ async fn failing_store_runtime() -> (ModelRuntime, Arc<FailingStore>) {
         fail_list: AtomicBool::new(false),
     });
     let credentials: Arc<dyn CredentialStore> = store.clone();
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(credentials),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
+    let runtime = runtime_with_credentials(credentials).await;
     (runtime, store)
 }
 
@@ -997,13 +963,7 @@ async fn reads_the_stored_oauth_access_token_without_refreshing() {
     .await
     .expect("credential");
     assert_eq!(credential.as_deref(), Some("old-token"));
-    assert_eq!(
-        spy.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        0,
-        "no refresh"
-    );
+    assert_eq!(refresh_count(&spy), 0, "no refresh");
 }
 
 #[tokio::test]
@@ -1018,13 +978,7 @@ async fn refreshes_oauth_when_the_credential_read_requests_it() {
     .await
     .expect("credential");
     assert_eq!(credential.as_deref(), Some("fresh-token"));
-    assert_eq!(
-        spy.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1,
-        "one refresh"
-    );
+    assert_eq!(refresh_count(&spy), 1, "one refresh");
 }
 
 #[tokio::test]
@@ -1071,13 +1025,7 @@ async fn propagates_the_auth_resolution_failure_through_the_credential_read() {
 async fn reports_a_failing_credential_store_as_invalid() {
     let (runtime, store) = failing_store_runtime().await;
     store.fail_read.store(true, Ordering::SeqCst);
-    let result = check_provider_auth(
-        &args_view(Some("openai"), None),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let result = check_provider(&runtime, Some("openai"), None).await;
     assert!(
         matches!(result.status, AuthCheckStatus::Invalid),
         "{result:?}"
@@ -1108,13 +1056,7 @@ async fn reports_a_failing_oauth_refresh_as_invalid() {
             .reason
             .is_some_and(|reason| reason.as_str() == "invalid_state")
     );
-    assert_eq!(
-        spy.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1,
-        "the refresh ran"
-    );
+    assert_eq!(refresh_count(&spy), 1, "the refresh ran");
 }
 
 #[tokio::test]
@@ -1132,13 +1074,7 @@ async fn reports_a_recorded_availability_failure_as_invalid() {
         "{failure}"
     );
 
-    let result = check_provider_auth(
-        &args_view(Some("openai"), None),
-        &runtime,
-        AuthCheckOptions::default(),
-    )
-    .await
-    .expect("check");
+    let result = check_provider(&runtime, Some("openai"), None).await;
     assert!(
         matches!(result.status, AuthCheckStatus::Invalid),
         "{result:?}"
@@ -1152,29 +1088,16 @@ async fn reports_a_recorded_availability_failure_as_invalid() {
 
 #[tokio::test]
 async fn reports_an_unresolvable_model_target_for_the_check() {
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(
-            AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
-        )),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
-    runtime
-        .register_provider(
-            "nomodels-provider",
-            ProviderConfigInput {
-                name: Some("Nomodels Provider".to_string()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("sk-nomodels".to_string()),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
+    let runtime = runtime_with_credentials(Arc::new(
+        AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
+    ))
+    .await;
+    register_api_key_provider(
+        &runtime,
+        "nomodels-provider",
+        "Nomodels Provider",
+        "sk-nomodels",
+    );
 
     let error = check_provider_auth(
         &args_view(Some("nomodels-provider"), Some("whatever")),
@@ -1247,50 +1170,15 @@ async fn reads_not_ready_when_the_credential_vanishes_between_reads() {
         stale: stale.clone(),
         inner: Arc::new(InMemoryCredentialStore::default()),
     });
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(credentials),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
-    runtime
-        .register_provider(
-            "oauth-provider",
-            ProviderConfigInput {
-                name: Some("OAuth Provider".to_string()),
-                base_url: Some("https://example.test/v1".to_string()),
-                api: Some(Api::from("openai-completions")),
-                oauth: Some(ExtensionOAuthConfig {
-                    name: "OAuth subscription".to_string(),
-                    is_subscription: None,
-                    uses_callback_server: None,
-                    login: Arc::new(|_callbacks| {
-                        Box::pin(async {
-                            Ok(OAuthCredentials {
-                                access: "login-access".to_string(),
-                                refresh: "refresh-token".to_string(),
-                                expires: now_ms() + 60_000,
-                                extra: BTreeMap::new(),
-                            })
-                        })
-                    }),
-                    refresh_token: Arc::new(|_credentials, _signal| {
-                        let error: Box<dyn std::error::Error + Send + Sync> =
-                            Box::new(std::io::Error::other("no refresh should run"));
-                        Box::pin(async move { Err(error) })
-                    }),
-                    get_api_key: Arc::new(|credentials| credentials.access.clone()),
-                    modify_models: None,
-                }),
-                models: Some(vec![oauth_model()]),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
+    let runtime = runtime_with_credentials(credentials).await;
+    register_oauth_provider(
+        &runtime,
+        Arc::new(|_credentials, _signal| {
+            let error: Box<dyn std::error::Error + Send + Sync> =
+                Box::new(std::io::Error::other("no refresh should run"));
+            Box::pin(async move { Err(error) })
+        }),
+    );
 
     let result = check_provider_auth(
         &args_view(Some("oauth-provider"), None),
@@ -1349,16 +1237,7 @@ async fn shared_model_runtime() -> ModelRuntime {
             serde_json::json!({ "type": "api_key", "key": "sk-beta" }),
         ),
     ]));
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(storage)),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
+    let runtime = runtime_with_credentials(Arc::new(storage)).await;
     for (provider, key) in [("alpha", "sk-alpha"), ("beta", "sk-beta")] {
         runtime
             .register_provider(
@@ -1380,18 +1259,10 @@ async fn shared_model_runtime() -> ModelRuntime {
 /// The runtime with one api-key provider registered and an empty store, the
 /// shape whose credential comes from the registration alone.
 async fn static_key_runtime() -> ModelRuntime {
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(
-            AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
-        )),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
+    let runtime = runtime_with_credentials(Arc::new(
+        AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
+    ))
+    .await;
     runtime
         .register_provider(
             "solo-provider",
@@ -1411,11 +1282,11 @@ async fn static_key_runtime() -> ModelRuntime {
 #[tokio::test]
 async fn reports_an_unknown_provider() {
     let runtime = static_key_runtime().await;
-    let error = resolve_credential_for_print(
-        &args_view(Some("not-registered"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("not-registered"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1431,11 +1302,11 @@ async fn prints_through_the_requested_provider_model() {
     // The provider's own model scan falls back to a custom model id for an
     // unknown id; the print resolves the auth through that model.
     let runtime = shared_model_runtime().await;
-    let resolved = resolve_credential_for_print(
-        &args_view(Some("alpha"), Some("no-such-model-xyz")),
+    let resolved = resolve_print(
         &runtime,
+        Some("alpha"),
+        Some("no-such-model-xyz"),
         CredentialPrintKind::ApiKey,
-        None,
         None,
     )
     .await
@@ -1445,34 +1316,21 @@ async fn prints_through_the_requested_provider_model() {
 
 #[tokio::test]
 async fn reports_an_unresolvable_model_for_the_requested_provider() {
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(
-            AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
-        )),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
-    runtime
-        .register_provider(
-            "nomodels-provider",
-            ProviderConfigInput {
-                name: Some("Nomodels Provider".to_string()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("sk-nomodels".to_string()),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
-    let error = resolve_credential_for_print(
-        &args_view(Some("nomodels-provider"), Some("whatever")),
+    let runtime = runtime_with_credentials(Arc::new(
+        AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
+    ))
+    .await;
+    register_api_key_provider(
         &runtime,
+        "nomodels-provider",
+        "Nomodels Provider",
+        "sk-nomodels",
+    );
+    let error = resolve_print(
+        &runtime,
+        Some("nomodels-provider"),
+        Some("whatever"),
         CredentialPrintKind::ApiKey,
-        None,
         None,
     )
     .await
@@ -1486,11 +1344,11 @@ async fn reports_an_unresolvable_model_for_the_requested_provider() {
 #[tokio::test]
 async fn prints_an_api_key_resolved_from_the_registration_without_a_stored_credential() {
     let runtime = static_key_runtime().await;
-    let resolved = resolve_credential_for_print(
-        &args_view(Some("solo-provider"), None),
+    let resolved = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("solo-provider"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1506,20 +1364,18 @@ async fn prints_a_bearer_token_from_a_valid_credential_without_refreshing() {
         RefreshOutcome::Fresh,
     )
     .await;
-    let resolved = resolve_credential_for_print(
-        &args_view(Some("oauth-provider"), None),
+    let resolved = resolve_print(
         &runtime,
-        CredentialPrintKind::BearerToken,
+        Some("oauth-provider"),
         None,
+        CredentialPrintKind::BearerToken,
         None,
     )
     .await
     .expect("resolves");
     assert_eq!(resolved, "valid-token");
     assert_eq!(
-        spy.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
+        refresh_count(&spy),
         0,
         "the default min-expiry stays inside the token's life"
     );
@@ -1533,34 +1389,28 @@ async fn refreshes_when_min_expiry_demands_a_fresher_token() {
         RefreshOutcome::Fresh,
     )
     .await;
-    let resolved = resolve_credential_for_print(
-        &args_view(Some("oauth-provider"), None),
+    let resolved = resolve_print(
         &runtime,
+        Some("oauth-provider"),
+        None,
         CredentialPrintKind::BearerToken,
         Some(30 * 60_000),
-        None,
     )
     .await
     .expect("resolves");
     assert_eq!(resolved, "fresh-token");
-    assert_eq!(
-        spy.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len(),
-        1,
-        "one refresh"
-    );
+    assert_eq!(refresh_count(&spy), 1, "one refresh");
 }
 
 #[tokio::test]
 async fn rejects_when_the_refreshed_token_misses_the_min_expiry() {
     let (runtime, _spy, _storage) = oauth_rig(0, "old-token", RefreshOutcome::Soon).await;
-    let error = resolve_credential_for_print(
-        &args_view(Some("oauth-provider"), None),
+    let error = resolve_print(
         &runtime,
+        Some("oauth-provider"),
+        None,
         CredentialPrintKind::BearerToken,
         Some(30 * 60_000),
-        None,
     )
     .await
     .expect_err("too soon");
@@ -1570,11 +1420,11 @@ async fn rejects_when_the_refreshed_token_misses_the_min_expiry() {
 #[tokio::test]
 async fn rejects_a_bearer_print_for_an_api_key_provider() {
     let runtime = runtime_with_api_key_credentials("test-api-key").await;
-    let error = resolve_credential_for_print(
-        &args_view(Some("openai"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::BearerToken,
+        Some("openai"),
         None,
+        CredentialPrintKind::BearerToken,
         None,
     )
     .await
@@ -1589,18 +1439,10 @@ async fn rejects_a_bearer_print_for_an_api_key_provider() {
 async fn reports_no_usable_credential_for_a_provider_without_auth() {
     // A provider with no auth configuration resolves nothing; each print
     // kind reports its own missing credential.
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(
-            AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
-        )),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
+    let runtime = runtime_with_credentials(Arc::new(
+        AuthStorage::<InMemoryAuthStorageBackend>::in_memory(&auth_data(&[])),
+    ))
+    .await;
     runtime
         .register_provider(
             "authless-provider",
@@ -1612,22 +1454,22 @@ async fn reports_no_usable_credential_for_a_provider_without_auth() {
         )
         .expect("the registration validates");
 
-    let error = resolve_credential_for_print(
-        &args_view(Some("authless-provider"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::BearerToken,
+        Some("authless-provider"),
         None,
+        CredentialPrintKind::BearerToken,
         None,
     )
     .await
     .expect_err("no bearer");
     assert_eq!(error.0, "No usable OAuth bearer token is configured");
 
-    let error = resolve_credential_for_print(
-        &args_view(Some("authless-provider"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("authless-provider"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1645,33 +1487,19 @@ async fn propagates_the_unresolvable_api_key_template() {
         auth_path.to_string_lossy().as_ref(),
     )
     .expect("read-only store");
-    let runtime = ModelRuntime::create(CreateModelRuntimeOptions {
-        credentials: Some(Arc::new(read_only)),
-        models_path: Some(None),
-        models_store: Some(Arc::new(InMemoryCodingAgentModelsStore::default())),
-        allow_model_network: false,
-        refresh_on_create: Some(false),
-        ..CreateModelRuntimeOptions::default()
-    })
-    .await
-    .expect("runtime creates");
-    runtime
-        .register_provider(
-            "tmpl-provider",
-            ProviderConfigInput {
-                name: Some("Template Provider".to_string()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("$MISSING_CREDENTIAL_PRINT_KEY".to_string()),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the registration validates");
-
-    let error = resolve_credential_for_print(
-        &args_view(Some("tmpl-provider"), None),
+    let runtime = runtime_with_credentials(Arc::new(read_only)).await;
+    register_api_key_provider(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        "tmpl-provider",
+        "Template Provider",
+        "$MISSING_CREDENTIAL_PRINT_KEY",
+    );
+
+    let error = resolve_print(
+        &runtime,
+        Some("tmpl-provider"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1687,11 +1515,11 @@ async fn propagates_the_unresolvable_api_key_template() {
 #[tokio::test]
 async fn reports_a_model_not_found_without_a_provider() {
     let runtime = shared_model_runtime().await;
-    let error = resolve_credential_for_print(
-        &args_view(None, Some("no-such-model-xyz")),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
         None,
+        Some("no-such-model-xyz"),
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1705,11 +1533,11 @@ async fn reports_a_model_not_found_without_a_provider() {
 #[tokio::test]
 async fn reports_multiple_matched_providers() {
     let runtime = shared_model_runtime().await;
-    let error = resolve_credential_for_print(
-        &args_view(None, Some("shared-model")),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
         None,
+        Some("shared-model"),
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1731,11 +1559,11 @@ async fn reports_multiple_matched_providers() {
 async fn propagates_the_credential_list_failure() {
     let (runtime, store) = failing_store_runtime().await;
     store.fail_list.store(true, Ordering::SeqCst);
-    let error = resolve_credential_for_print(
-        &args_view(Some("openai"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("openai"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await
@@ -1747,11 +1575,11 @@ async fn propagates_the_credential_list_failure() {
 async fn propagates_the_auth_resolution_failure() {
     let (runtime, store) = failing_store_runtime().await;
     store.fail_read.store(true, Ordering::SeqCst);
-    let error = resolve_credential_for_print(
-        &args_view(Some("openai"), None),
+    let error = resolve_print(
         &runtime,
-        CredentialPrintKind::ApiKey,
+        Some("openai"),
         None,
+        CredentialPrintKind::ApiKey,
         None,
     )
     .await

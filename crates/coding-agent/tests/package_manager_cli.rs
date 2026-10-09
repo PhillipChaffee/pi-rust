@@ -243,28 +243,8 @@ fn prepare_managed_install(
     let artifact_bytes = std::fs::read(&artifact).expect("artifact bytes");
 
     let version = target_version.to_string();
-    let served = Arc::new(Mutex::new(artifact_bytes));
     let mock = pi_ai::http::MockHttpClient::new();
-    let route_version = version.clone();
-    mock.on(move |request| {
-        request
-            .url
-            .ends_with(&format!("/api/installer/releases/{route_version}/download"))
-    })
-    .respond_fn({
-        let served = Arc::clone(&served);
-        move |_request| {
-            let bytes = served
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            Box::pin(async move {
-                Ok(pi_ai::http::MockResponse::status(200)
-                    .with_header("content-type", "application/gzip")
-                    .with_body(bytes))
-            })
-        }
-    });
+    route_release_download(&mock, &version, artifact_bytes);
     // The update plan's version check rides the same client, upstream's
     // mockManagedUpdate answering both endpoints.
     mock.on(|request| request.url == "https://pi.dev/api/latest-version")
@@ -317,6 +297,45 @@ async fn run(rig: &mut CliRig, args: &[String]) -> (bool, CommandExit) {
     rig.stdout = out;
     rig.stderr = err;
     result.expect("command handles")
+}
+
+/// Run the command through the rig, pinning the consumed flag and the exit
+/// the grammar arm reports — the dispatch cases' shared prologue.
+async fn run_command(rig: &mut CliRig, command: &[&str], exit: CommandExit) {
+    let args = CliRig::args(command);
+    let (consumed, reported) = run(rig, &args).await;
+    assert!(consumed);
+    assert_eq!(reported, exit);
+}
+
+/// The packages array persisted at `path`, the settings file the
+/// persistence cases read back.
+fn stored_packages(path: &Path) -> Vec<serde_json::Value> {
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("settings")).expect("json");
+    settings
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .expect("packages")
+        .clone()
+}
+
+/// A project settings file declaring `packages`, the trust-gating fixture.
+fn write_project_packages(rig: &CliRig, packages: &serde_json::Value) {
+    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
+    rig.write(
+        "project/.pi/settings.json",
+        &json!({ "packages": packages }).to_string(),
+    );
+}
+
+/// Record the project trust decision, the remembered-trust fixture.
+fn remember_project_trust(rig: &CliRig, trusted: bool) {
+    let trust_store =
+        pi_coding_agent::trust_manager::ProjectTrustStore::new(&rig.agent_dir.to_string_lossy());
+    trust_store
+        .set(&rig.project_dir.to_string_lossy(), Some(trusted))
+        .expect("trust set");
 }
 
 /// The config-command runner: [`handle_config_command`] with the rig's
@@ -381,6 +400,41 @@ fn prepare_managed_update(
     managed_root
 }
 
+/// The client answering the latest-version route with `version`, stashed
+/// on the rig; the mock returns for sites adding further routes.
+fn client_with_latest_version(rig: &mut CliRig, version: &str) -> pi_ai::http::MockHttpClient {
+    let mock = pi_ai::http::MockHttpClient::new();
+    route_latest_version(&mock, &json!({ "version": version }));
+    rig.client.replace(Arc::new(mock.clone()));
+    mock
+}
+
+/// The active release's version pointer, the managed-update fixture's
+/// current-version file.
+fn managed_current_version(managed_root: &Path) -> String {
+    std::fs::read_to_string(managed_root.join("current-version")).expect("current version")
+}
+
+/// The latest-version body naming the released version, the shape
+/// `prepare_managed_update` reads the artifact version from.
+fn managed_latest_body(version: &str) -> serde_json::Value {
+    json!({ "packageName": "pi-coding-agent", "version": version })
+}
+
+/// The managed-update fixture over a scripted release artifact: the
+/// tarball at `artifact_name` runs `bin_script`, the latest-version route
+/// answers `latest_body`.
+fn stage_managed_update(
+    rig: &mut CliRig,
+    artifact_name: &str,
+    bin_script: &str,
+    latest_body: &serde_json::Value,
+) -> PathBuf {
+    let artifact = rig.temp_dir.join(artifact_name);
+    write_tarball_with_pi_script(&artifact, bin_script);
+    prepare_managed_update(rig, latest_body, &artifact)
+}
+
 // =============================================================================
 // Grammar and dispatch
 // =============================================================================
@@ -388,10 +442,7 @@ fn prepare_managed_update(
 #[tokio::test]
 async fn shows_the_install_subcommand_help() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["install", "--help"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["install", "--help"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("pi install <source> [-l]"));
@@ -401,10 +452,7 @@ async fn shows_the_install_subcommand_help() {
 #[tokio::test]
 async fn shows_a_friendly_error_for_unknown_install_options() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["install", "--unknown"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["install", "--unknown"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Unknown option --unknown for \"install\"."));
     assert!(
@@ -417,10 +465,7 @@ async fn shows_a_friendly_error_for_unknown_install_options() {
 #[tokio::test]
 async fn shows_a_friendly_error_for_a_missing_install_source() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["install"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["install"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Missing install source."));
     assert!(stderr.contains("Usage: pi install <source> [-l]"));
@@ -430,10 +475,12 @@ async fn shows_a_friendly_error_for_a_missing_install_source() {
 #[tokio::test]
 async fn rejects_update_models_combined_with_another_update_target() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--models", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--models", "--self"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("--models cannot be combined with --self")
@@ -450,19 +497,14 @@ async fn persists_global_relative_local_package_paths_relative_to_settings() {
     let relative_pkg_dir = rig.project_dir.join("packages/local-package");
     std::fs::create_dir_all(&relative_pkg_dir).expect("pkg dir");
 
-    let args = CliRig::args(&["install", "./packages/local-package"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(
+        &mut rig,
+        &["install", "./packages/local-package"],
+        CommandExit::OK,
+    )
+    .await;
 
-    let settings_path = rig.agent_dir.join("settings.json");
-    let settings: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("settings"))
-            .expect("json");
-    let packages = settings
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .expect("packages");
+    let packages = stored_packages(&rig.agent_dir.join("settings.json"));
     assert_eq!(packages.len(), 1);
     let stored = packages[0].as_str().expect("string entry");
     let resolved = std::fs::canonicalize(rig.agent_dir.join(stored)).expect("resolve");
@@ -514,10 +556,12 @@ async fn blocks_local_package_changes_when_the_project_is_untrusted() {
     std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
     rig.write("project/.pi/settings.json", "{}");
 
-    let args = CliRig::args(&["install", "-l", "./local-package"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["install", "-l", "./local-package"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("Project is not trusted. Use --approve to modify local package config.")
@@ -555,16 +599,9 @@ async fn allows_local_package_install_to_initialize_fresh_project_settings() {
 #[tokio::test]
 async fn skips_untrusted_project_package_settings_for_list() {
     let mut rig = CliRig::new();
-    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
-    rig.write(
-        "project/.pi/settings.json",
-        &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
-    );
+    write_project_packages(&rig, &json!(["crate:@project/pkg"]));
 
-    let args = CliRig::args(&["list"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("No packages installed."));
     assert!(!stdout.contains("Project packages:"));
@@ -573,21 +610,10 @@ async fn skips_untrusted_project_package_settings_for_list() {
 #[tokio::test]
 async fn uses_remembered_project_trust_for_list() {
     let mut rig = CliRig::new();
-    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
-    rig.write(
-        "project/.pi/settings.json",
-        &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
-    );
-    let trust_store =
-        pi_coding_agent::trust_manager::ProjectTrustStore::new(&rig.agent_dir.to_string_lossy());
-    trust_store
-        .set(&rig.project_dir.to_string_lossy(), Some(true))
-        .expect("trust set");
+    write_project_packages(&rig, &json!(["crate:@project/pkg"]));
+    remember_project_trust(&rig, true);
 
-    let args = CliRig::args(&["list"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("Project packages:"));
     assert!(stdout.contains("crate:@project/pkg"));
@@ -597,21 +623,10 @@ async fn uses_remembered_project_trust_for_list() {
 #[tokio::test]
 async fn overrides_remembered_trust_for_list_with_no_approve() {
     let mut rig = CliRig::new();
-    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
-    rig.write(
-        "project/.pi/settings.json",
-        &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
-    );
-    let trust_store =
-        pi_coding_agent::trust_manager::ProjectTrustStore::new(&rig.agent_dir.to_string_lossy());
-    trust_store
-        .set(&rig.project_dir.to_string_lossy(), Some(true))
-        .expect("trust set");
+    write_project_packages(&rig, &json!(["crate:@project/pkg"]));
+    remember_project_trust(&rig, true);
 
-    let args = CliRig::args(&["list", "--no-approve"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list", "--no-approve"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("No packages installed."));
     assert!(!stdout.contains("Project packages:"));
@@ -620,16 +635,9 @@ async fn overrides_remembered_trust_for_list_with_no_approve() {
 #[tokio::test]
 async fn approves_project_trust_for_list_with_approve() {
     let mut rig = CliRig::new();
-    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
-    rig.write(
-        "project/.pi/settings.json",
-        &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
-    );
+    write_project_packages(&rig, &json!(["crate:@project/pkg"]));
 
-    let args = CliRig::args(&["list", "--approve"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list", "--approve"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("Project packages:"));
     assert!(stdout.contains("crate:@project/pkg"));
@@ -649,10 +657,7 @@ async fn uses_the_default_project_trust_for_list() {
         &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
     );
 
-    let args = CliRig::args(&["list"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("Project packages:"));
     assert!(stdout.contains("crate:@project/pkg"));
@@ -671,16 +676,9 @@ async fn lets_the_trust_store_override_the_default_project_trust() {
         "project/.pi/settings.json",
         &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
     );
-    let trust_store =
-        pi_coding_agent::trust_manager::ProjectTrustStore::new(&rig.agent_dir.to_string_lossy());
-    trust_store
-        .set(&rig.project_dir.to_string_lossy(), Some(false))
-        .expect("trust set");
+    remember_project_trust(&rig, false);
 
-    let args = CliRig::args(&["list"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("No packages installed."));
     assert!(!stdout.contains("Project packages:"));
@@ -694,23 +692,13 @@ async fn suggests_the_configured_source_when_the_update_input_omits_the_prefix()
         &json!({ "packages": ["crate:pi-formatter"] }).to_string(),
     );
 
-    let args = CliRig::args(&["update", "pi-formatter"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "pi-formatter"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Did you mean crate:pi-formatter?"));
     let stdout = rig.stdout_text();
     assert!(!stdout.contains("Updated pi-formatter"));
 
-    let settings: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(rig.agent_dir.join("settings.json")).expect("settings"),
-    )
-    .expect("json");
-    let packages = settings
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-        .expect("packages");
+    let packages = stored_packages(&rig.agent_dir.join("settings.json"));
     assert!(
         packages
             .iter()
@@ -733,10 +721,7 @@ async fn allows_explicit_self_update_checks_when_automatic_version_checks_are_di
         ));
     rig.client.replace(Arc::new(mock.clone()));
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["update", "--self"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains(&format!("pi is already up to date (v{VERSION})")));
     assert!(!rig.stderr_text().contains("Error"));
@@ -762,8 +747,7 @@ async fn updates_installer_managed_pi_through_a_staged_immutable_release() {
     assert!(consumed);
     assert_eq!(exit, CommandExit::OK, "stderr: {}", rig.stderr_text());
 
-    let current = std::fs::read_to_string(install.managed_root.join("current-version"))
-        .expect("current version");
+    let current = managed_current_version(&install.managed_root);
     assert_eq!(current, format!("{target_version}\n"));
     assert!(
         install
@@ -800,12 +784,8 @@ async fn rejects_a_concurrent_managed_update() {
     );
     let held = pi_coding_agent::file_lock::acquire_once(&lock_dir, None).expect("hold the lock");
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
-    let current = std::fs::read_to_string(install.managed_root.join("current-version"))
-        .expect("current version");
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
+    let current = managed_current_version(&install.managed_root);
     assert_eq!(current, format!("{VERSION}\n"), "the active release stays");
     let stdout = rig.stdout_text();
     assert!(!stdout.contains("Updated pi from"));
@@ -822,16 +802,17 @@ async fn rejects_forced_managed_reinstalls() {
     let target_version = newer_patch_version();
     let install = prepare_managed_install(&mut rig, &target_version, 0);
 
-    let args = CliRig::args(&["update", "--self", "--force"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--self", "--force"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("Managed pi installations do not support --force")
     );
-    let current = std::fs::read_to_string(install.managed_root.join("current-version"))
-        .expect("current version");
+    let current = managed_current_version(&install.managed_root);
     assert_eq!(current, format!("{VERSION}\n"));
 }
 
@@ -841,12 +822,8 @@ async fn keeps_the_managed_release_active_when_its_update_fails() {
     let target_version = newer_patch_version();
     let install = prepare_managed_install(&mut rig, &target_version, 23);
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
-    let current = std::fs::read_to_string(install.managed_root.join("current-version"))
-        .expect("current version");
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
+    let current = managed_current_version(&install.managed_root);
     assert_eq!(current, format!("{VERSION}\n"));
     assert!(
         !install
@@ -890,10 +867,7 @@ async fn retries_a_transient_self_update_version_check() {
         });
     rig.client.replace(Arc::new(mock.clone()));
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["update", "--self"], CommandExit::OK).await;
     assert_eq!(
         attempts.load(std::sync::atomic::Ordering::SeqCst),
         3,
@@ -920,10 +894,7 @@ async fn treats_an_unrecognized_first_argument_as_a_non_package_command() {
 #[tokio::test]
 async fn shows_a_friendly_error_for_unknown_update_options() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--unknown"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--unknown"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Unknown option --unknown for \"update\"."));
     assert!(stderr.contains("pi update [source|self|pi]"));
@@ -932,10 +903,7 @@ async fn shows_a_friendly_error_for_unknown_update_options() {
 #[tokio::test]
 async fn shows_a_friendly_error_for_unknown_list_options() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["list", "--unknown"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["list", "--unknown"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Unknown option --unknown for \"list\"."));
     assert!(stderr.contains("pi list [--approve|--no-approve]"));
@@ -944,10 +912,7 @@ async fn shows_a_friendly_error_for_unknown_list_options() {
 #[tokio::test]
 async fn shows_a_friendly_error_for_a_missing_remove_source() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["remove"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["remove"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Missing remove source."));
     assert!(stderr.contains("pi remove <source>"));
@@ -956,10 +921,12 @@ async fn shows_a_friendly_error_for_a_missing_remove_source() {
 #[tokio::test]
 async fn rejects_a_second_positional_argument() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["install", "./first", "./second"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["install", "./first", "./second"],
+        CommandExit::FAIL,
+    )
+    .await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Unexpected argument ./second."));
     assert!(stderr.contains("pi install <source>"));
@@ -996,10 +963,7 @@ async fn rejects_update_only_flags_on_the_other_commands() {
 #[tokio::test]
 async fn rejects_a_missing_extension_value() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--extension"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--extension"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Missing value for --extension."));
     assert!(stderr.contains("pi update [source|self|pi]"));
@@ -1008,10 +972,12 @@ async fn rejects_a_missing_extension_value() {
 #[tokio::test]
 async fn rejects_a_second_extension_option() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--extension", "a", "--extension", "b"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--extension", "a", "--extension", "b"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("--extension can only be provided once")
@@ -1021,20 +987,19 @@ async fn rejects_a_second_extension_option() {
 #[tokio::test]
 async fn rejects_all_combined_with_other_update_targets() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--all", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--all", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text().contains(
             "--all cannot be combined with --self, --extensions, --models, or --extension"
         )
     );
 
-    let args = CliRig::args(&["update", "--all", "crate:some-package"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--all", "crate:some-package"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("--all cannot be combined with a positional source")
@@ -1044,10 +1009,12 @@ async fn rejects_all_combined_with_other_update_targets() {
 #[tokio::test]
 async fn rejects_models_combined_with_a_positional_source() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--models", "crate:some-package"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--models", "crate:some-package"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("--models cannot be combined with a positional source")
@@ -1057,19 +1024,23 @@ async fn rejects_models_combined_with_a_positional_source() {
 #[tokio::test]
 async fn rejects_extension_combined_with_other_targets() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "--extension", "a", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--extension", "a", "--self"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("--extension cannot be combined with --self, --extensions, or --all")
     );
 
-    let args = CliRig::args(&["update", "--extension", "a", "b"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "--extension", "a", "b"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("--extension cannot be combined with a positional source")
@@ -1079,10 +1050,12 @@ async fn rejects_extension_combined_with_other_targets() {
 #[tokio::test]
 async fn rejects_a_positional_source_combined_with_flags() {
     let mut rig = CliRig::new();
-    let args = CliRig::args(&["update", "crate:some-package", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "crate:some-package", "--self"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(rig.stderr_text().contains(
         "positional update targets cannot be combined with --self, --extensions, or --all"
     ));
@@ -1100,10 +1073,12 @@ async fn updates_the_named_package_through_the_extension_option() {
         &json!({ "packages": ["crate:pi-formatter"] }).to_string(),
     );
 
-    let args = CliRig::args(&["update", "--extension", "crate:pi-formatter"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(
+        &mut rig,
+        &["update", "--extension", "crate:pi-formatter"],
+        CommandExit::OK,
+    )
+    .await;
     assert!(rig.stdout_text().contains("Updated crate:pi-formatter"));
 }
 
@@ -1111,10 +1086,7 @@ async fn updates_the_named_package_through_the_extension_option() {
 async fn maps_the_pi_alias_to_the_self_target() {
     let mut rig = CliRig::new().with_env(&[("PI_OFFLINE", "1")]);
 
-    let args = CliRig::args(&["update", "pi"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "pi"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text()
             .contains("Could not determine latest pi version.")
@@ -1126,10 +1098,12 @@ async fn maps_the_pi_alias_to_the_self_target() {
 async fn combines_the_pi_alias_with_the_extensions_target() {
     let mut rig = CliRig::new().with_env(&[("PI_OFFLINE", "1")]);
 
-    let args = CliRig::args(&["update", "pi", "--extensions"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["update", "pi", "--extensions"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(rig.stdout_text().contains("Updated packages"));
     assert!(
         rig.stderr_text()
@@ -1141,10 +1115,7 @@ async fn combines_the_pi_alias_with_the_extensions_target() {
 async fn updates_the_extensions_target() {
     let mut rig = CliRig::new().with_env(&[("PI_OFFLINE", "1")]);
 
-    let args = CliRig::args(&["update", "--extensions"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["update", "--extensions"], CommandExit::OK).await;
     assert!(rig.stdout_text().contains("Updated packages"));
     assert!(!rig.stderr_text().contains("Error"));
 }
@@ -1153,10 +1124,7 @@ async fn updates_the_extensions_target() {
 async fn maps_the_bare_update_to_self_and_notes_the_extensions_skip() {
     let mut rig = CliRig::new().with_env(&[("PI_OFFLINE", "1")]);
 
-    let args = CliRig::args(&["update"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update"], CommandExit::FAIL).await;
     assert!(
         rig.stdout_text()
             .contains("Extensions are skipped. Run pi update --extensions to update extensions.")
@@ -1171,10 +1139,7 @@ async fn maps_the_bare_update_to_self_and_notes_the_extensions_skip() {
 async fn updates_everything_with_all() {
     let mut rig = CliRig::new().with_env(&[("PI_OFFLINE", "1")]);
 
-    let args = CliRig::args(&["update", "--all"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--all"], CommandExit::FAIL).await;
     assert!(rig.stdout_text().contains("Updated packages"));
     assert!(
         rig.stderr_text()
@@ -1185,16 +1150,9 @@ async fn updates_everything_with_all() {
 #[tokio::test]
 async fn reads_saved_trust_only_for_update_commands() {
     let mut rig = CliRig::new().with_env(&[("PI_OFFLINE", "1")]);
-    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
-    rig.write(
-        "project/.pi/settings.json",
-        &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
-    );
+    write_project_packages(&rig, &json!(["crate:@project/pkg"]));
 
-    let args = CliRig::args(&["update", "--extensions"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["update", "--extensions"], CommandExit::OK).await;
     assert!(rig.stdout_text().contains("Updated packages"));
 }
 
@@ -1216,21 +1174,10 @@ async fn lists_user_and_project_packages_with_filters_and_install_paths() {
         ] })
         .to_string(),
     );
-    std::fs::create_dir_all(rig.project_dir.join(".pi")).expect(".pi dir");
-    rig.write(
-        "project/.pi/settings.json",
-        &json!({ "packages": ["crate:@project/pkg"] }).to_string(),
-    );
-    let trust_store =
-        pi_coding_agent::trust_manager::ProjectTrustStore::new(&rig.agent_dir.to_string_lossy());
-    trust_store
-        .set(&rig.project_dir.to_string_lossy(), Some(true))
-        .expect("trust set");
+    write_project_packages(&rig, &json!(["crate:@project/pkg"]));
+    remember_project_trust(&rig, true);
 
-    let args = CliRig::args(&["list"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list"], CommandExit::OK).await;
     let stdout = rig.stdout_text();
     assert!(stdout.contains("User packages:"));
     assert!(stdout.contains("crate:@user/pkg"));
@@ -1248,10 +1195,7 @@ async fn surfaces_settings_load_warnings_for_the_package_commands() {
     rig.write("agent/settings.json", "{oops");
     rig.write("project/.pi/settings.json", "{oops");
 
-    let args = CliRig::args(&["list"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["list"], CommandExit::OK).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("Warning (package command, global settings):"));
     assert!(stderr.contains("Warning (package command, project settings):"));
@@ -1261,10 +1205,12 @@ async fn surfaces_settings_load_warnings_for_the_package_commands() {
 async fn reports_no_matching_package_for_remove() {
     let mut rig = CliRig::new();
 
-    let args = CliRig::args(&["remove", "crate:@never/installed"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(
+        &mut rig,
+        &["remove", "crate:@never/installed"],
+        CommandExit::FAIL,
+    )
+    .await;
     assert!(
         rig.stderr_text()
             .contains("No matching package found for crate:@never/installed")
@@ -1281,10 +1227,7 @@ async fn rejects_a_managed_root_with_a_missing_marker() {
     let managed_root = stage_managed_layout(&mut rig);
     std::fs::remove_file(managed_root.join("managed-install.json")).expect("drop marker");
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text()
             .contains("Managed install marker is missing or invalid")
@@ -1297,10 +1240,7 @@ async fn rejects_a_managed_root_with_an_invalid_marker() {
     let _managed_root = stage_managed_layout(&mut rig);
     rig.write("agent/install/managed-install.json", "{oops");
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text()
             .contains("Managed install marker is missing or invalid")
@@ -1316,10 +1256,7 @@ async fn rejects_a_managed_root_with_a_wrong_marker_kind() {
         &json!({"kind": "other", "schemaVersion": 1, "layout": "releases-v1"}).to_string(),
     );
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text()
             .contains("Managed install marker is missing or invalid")
@@ -1336,14 +1273,9 @@ async fn ignores_a_managed_root_when_the_package_dir_sits_outside_it() {
         rig.temp_dir.join("install").to_string_lossy().into_owned(),
     ));
     let target = newer_patch_version();
-    let mock = pi_ai::http::MockHttpClient::new();
-    route_latest_version(&mock, &json!({ "version": target }));
-    rig.client.replace(Arc::new(mock));
+    client_with_latest_version(&mut rig, &target);
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text()
             .contains("error: pi cannot self-update this installation.")
@@ -1354,14 +1286,9 @@ async fn ignores_a_managed_root_when_the_package_dir_sits_outside_it() {
 async fn reports_self_update_unavailable_for_an_unknown_install() {
     let mut rig = CliRig::new();
     let target = newer_patch_version();
-    let mock = pi_ai::http::MockHttpClient::new();
-    route_latest_version(&mock, &json!({ "version": target }));
-    rig.client.replace(Arc::new(mock));
+    client_with_latest_version(&mut rig, &target);
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     let stderr = rig.stderr_text();
     assert!(stderr.contains("error: pi cannot self-update this installation."));
     assert!(stderr.contains("Update pi-coding-agent@"));
@@ -1386,10 +1313,7 @@ async fn rejects_a_managed_release_version_that_is_not_semver() {
     );
     rig.client.replace(Arc::new(mock));
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stdout_text()
             .contains("Updating managed pi installation...")
@@ -1407,17 +1331,12 @@ async fn fails_the_managed_update_when_the_update_lock_cannot_be_created() {
     let mut rig = CliRig::new();
     let managed_root = stage_managed_layout(&mut rig);
     let target = newer_patch_version();
-    let mock = pi_ai::http::MockHttpClient::new();
-    route_latest_version(&mock, &json!({ "version": target }));
-    rig.client.replace(Arc::new(mock));
+    client_with_latest_version(&mut rig, &target);
     // The read-only root rejects the update lock's directory creation.
     std::fs::set_permissions(&managed_root, std::fs::Permissions::from_mode(0o555))
         .expect("read-only root");
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains("Permission denied"));
 }
 
@@ -1432,8 +1351,7 @@ async fn activates_an_existing_managed_release_without_downloading() {
     let (consumed, exit) = run(&mut rig, &args).await;
     assert!(consumed);
     assert_eq!(exit, CommandExit::OK, "stderr: {}", rig.stderr_text());
-    let current = std::fs::read_to_string(install.managed_root.join("current-version"))
-        .expect("current version");
+    let current = managed_current_version(&install.managed_root);
     assert_eq!(current, format!("{target}\n"));
     assert!(
         rig.stdout_text()
@@ -1447,16 +1365,9 @@ async fn fails_the_managed_update_when_the_smoke_test_reports_another_version() 
     let target = newer_patch_version();
     let artifact = rig.temp_dir.join("wrong-version.tar.gz");
     write_release_tarball(&artifact, "9.9.9", 0);
-    let managed_root = prepare_managed_update(
-        &mut rig,
-        &json!({ "packageName": "pi-coding-agent", "version": target }),
-        &artifact,
-    );
+    let managed_root = prepare_managed_update(&mut rig, &managed_latest_body(&target), &artifact);
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains(&format!(
         "Managed pi smoke test returned version 9.9.9; expected {target}."
     )));
@@ -1470,18 +1381,14 @@ async fn fails_the_managed_update_when_the_smoke_test_reports_another_version() 
 async fn fails_the_managed_update_when_the_smoke_test_is_killed() {
     let mut rig = CliRig::new();
     let target = newer_patch_version();
-    let artifact = rig.temp_dir.join("killed-smoke.tar.gz");
-    write_tarball_with_pi_script(&artifact, "#!/bin/sh\nkill -TERM $$\n");
-    let _managed_root = prepare_managed_update(
+    let _managed_root = stage_managed_update(
         &mut rig,
-        &json!({ "packageName": "pi-coding-agent", "version": target }),
-        &artifact,
+        "killed-smoke.tar.gz",
+        "#!/bin/sh\nkill -TERM $$\n",
+        &managed_latest_body(&target),
     );
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains("unknown exit status"));
 }
 
@@ -1501,10 +1408,7 @@ async fn fails_the_managed_update_when_the_release_download_fails() {
     .respond(pi_ai::http::MockResponse::status(404).with_body(Vec::new()));
     rig.client.replace(Arc::new(mock));
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains("HTTP 404"));
     assert!(
         !managed_root.join("releases").join(&target).exists(),
@@ -1577,10 +1481,7 @@ async fn fails_the_managed_update_when_the_version_pointer_cannot_be_renamed() {
     std::fs::remove_file(install.managed_root.join("current-version")).expect("drop pointer");
     std::fs::create_dir(install.managed_root.join("current-version")).expect("pointer dir");
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains("Error:"));
     assert!(
         install.managed_root.join("releases").join(&target).exists(),
@@ -1631,10 +1532,7 @@ fn sweeps_stale_staging_through_the_cleanup_helpers() {
 async fn refreshes_model_catalogs_with_update_models() {
     let mut rig = CliRig::new();
 
-    let args = CliRig::args(&["update", "--models"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::OK);
+    run_command(&mut rig, &["update", "--models"], CommandExit::OK).await;
     assert!(rig.stdout_text().contains("Model catalogs refreshed"));
     assert!(!rig.stderr_text().contains("Error"));
 }
@@ -1793,10 +1691,7 @@ async fn prints_the_help_for_the_other_package_commands() {
 async fn reports_a_failed_version_check_for_self_update() {
     let mut rig = CliRig::new();
     // No mock route: the version check exhausts its immediate retries.
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(
         rig.stderr_text()
             .contains("Could not determine latest pi version:")
@@ -1814,14 +1709,9 @@ async fn fails_the_managed_update_when_the_release_download_transport_fails() {
     let managed_root = stage_managed_layout(&mut rig);
     // The latest-version route answers; the download route is absent, so
     // the artifact fetch fails at transport.
-    let mock = pi_ai::http::MockHttpClient::new();
-    route_latest_version(&mock, &json!({ "version": target.clone() }));
-    rig.client.replace(Arc::new(mock));
+    client_with_latest_version(&mut rig, &target);
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains("Error:"));
     assert!(
         !managed_root.join("releases").join(&target).exists(),
@@ -1833,18 +1723,14 @@ async fn fails_the_managed_update_when_the_release_download_transport_fails() {
 async fn fails_the_managed_update_when_the_smoke_test_reports_an_error() {
     let mut rig = CliRig::new();
     let target = newer_patch_version();
-    let artifact = rig.temp_dir.join("stderr-smoke.tar.gz");
-    write_tarball_with_pi_script(&artifact, "#!/bin/sh\necho boom >&2\nexit 7\n");
-    let _managed_root = prepare_managed_update(
+    let _managed_root = stage_managed_update(
         &mut rig,
-        &json!({ "packageName": "pi-coding-agent", "version": target }),
-        &artifact,
+        "stderr-smoke.tar.gz",
+        "#!/bin/sh\necho boom >&2\nexit 7\n",
+        &managed_latest_body(&target),
     );
 
-    let args = CliRig::args(&["update", "--self"]);
-    let (consumed, exit) = run(&mut rig, &args).await;
-    assert!(consumed);
-    assert_eq!(exit, CommandExit::FAIL);
+    run_command(&mut rig, &["update", "--self"], CommandExit::FAIL).await;
     assert!(rig.stderr_text().contains("Could not verify managed pi"));
     assert!(rig.stderr_text().contains("boom"));
 }
@@ -1861,32 +1747,13 @@ async fn percent_encodes_the_release_url_version() {
     route_latest_version(&mock, &json!({ "version": version }));
     let encoded = "1.2.3%2Bmeta.1";
     let served_bytes = std::fs::read(&artifact).expect("artifact bytes");
-    mock.on(move |request| {
-        request
-            .url
-            .ends_with(&format!("/api/installer/releases/{encoded}/download"))
-    })
-    .respond_fn({
-        let served = Arc::new(Mutex::new(served_bytes));
-        move |_request| {
-            let bytes = served
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            Box::pin(async move {
-                Ok(pi_ai::http::MockResponse::status(200)
-                    .with_header("content-type", "application/gzip")
-                    .with_body(bytes))
-            })
-        }
-    });
+    route_release_download(&mock, encoded, served_bytes);
     rig.client.replace(Arc::new(mock));
 
     let args = CliRig::args(&["update", "--self"]);
     let (consumed, exit) = run(&mut rig, &args).await;
     assert!(consumed);
     assert_eq!(exit, CommandExit::OK, "stderr: {}", rig.stderr_text());
-    let current =
-        std::fs::read_to_string(managed_root.join("current-version")).expect("current version");
+    let current = managed_current_version(&managed_root);
     assert_eq!(current, format!("{version}\n"));
 }
