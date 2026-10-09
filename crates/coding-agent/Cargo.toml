@@ -87,6 +87,11 @@ notify = "8"
 # default set lacks).
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
+# The manifest-entry globs the package manager's collectors expand,
+# upstream's npm `glob` (`globSync`). The ignore rules the collectors walk
+# under restate npm `ignore` through the workspace's single restatement,
+# pi-agent-core's IgnoreMatcher.
+glob = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 # The process-tree kill the shell belt performs on shutdown, upstream's

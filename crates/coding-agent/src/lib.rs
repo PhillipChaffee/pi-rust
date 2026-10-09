@@ -15,11 +15,14 @@
 //! effort (map ticket "Decide the Rust stack").
 #![forbid(unsafe_code)]
 
+pub mod auth_guidance;
 pub mod auth_storage;
 pub mod config;
 pub mod defaults;
+pub mod diagnostics;
 pub mod export_html;
 pub mod file_lock;
+pub mod footer_data_provider;
 pub mod messages;
 pub mod migrations;
 pub mod model_config;
@@ -27,11 +30,15 @@ pub mod model_registry;
 pub mod model_resolver;
 pub mod model_runtime;
 pub mod models_store;
+pub mod package_manager;
+pub mod pi_manifest;
 pub mod project_trust;
+pub mod prompt_templates;
 pub mod provider_composer;
 pub mod radius;
 pub mod remote_catalog_provider;
 pub mod resolve_config_value;
+pub mod resource_loader;
 pub mod runtime_credentials;
 pub mod session_cwd;
 pub mod session_export;
@@ -39,5 +46,8 @@ pub mod session_manager;
 pub mod session_share;
 pub mod settings_diagnostics;
 pub mod settings_manager;
+pub mod skills;
+pub mod source_info;
+pub mod system_prompt;
 pub mod trust_manager;
 pub mod utils;
