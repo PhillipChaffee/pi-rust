@@ -87,18 +87,23 @@ notify = "8"
 # default set lacks).
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
-# The byte-stream adapter the probe client wraps reqwest's chunk stream in,
-# the same futures-util the pi-ai seam's stream impls ride.
+# The managed-install and tarball channel's gzip layer, upstream's npm
+# tarballs (moved up from dev, where only the PNG fixture builder used it).
+flate2 = "1"
+# The concurrent check/update pool's stream driving and the tools manager's
+# probe client's chunk stream, the same futures-util slice pi-ai's seam
+# rides.
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-# The manifest-entry globs the package manager's collectors expand,
-# upstream's npm `glob` (`globSync`). The ignore rules the collectors walk
-# under restate npm `ignore` through the workspace's single restatement,
-# pi-agent-core's IgnoreMatcher.
+# The manifest-entry globs the package manager's collectors expand and the
+# package sources' pattern machinery consumes, upstream's npm `glob`
+# (`globSync`). The ignore rules the collectors walk under restate npm
+# `ignore` through this crate's matcher (the skills loader's substitution).
 glob = "0.3"
 # The find/grep tools' native walk: fd's hierarchical `.gitignore` handling
 # and ripgrep's file-walk defaults restated on the ignore crate's walker,
 # with globset carrying fd's glob semantics (the recorded restatement the
-# 3302/3303 regressions pin).
+# 3302/3303 regressions pin); the package-sources discovery walk rides the
+# same crate, upstream's npm `ignore`.
 ignore = "0.4"
 globset = "0.4"
 # The tools manager's no-redirect version probe, upstream's
@@ -114,6 +119,15 @@ reqwest = { version = "0.12.28", default-features = false, features = [
   "deflate",
   "stream",
 ] }
+# The semver compare the version-check belt and the `crate:` package channel
+# ride (upstream npm `semver`'s `valid`/`compare`/`gt`).
+semver = "1"
+# The sha256 the temporary-dir hash and the install receipts carry
+# (upstream's `node:crypto.createHash("sha256")`).
+sha2 = "0.10"
+# The tarball channel's unpack, upstream's npm package tarballs; the safety
+# rules (traversal/symlink rejection, size caps) wrap it in this crate.
+tar = "0.4"
 # The read tool's macOS NFD path variant, upstream's `String.normalize("NFD")`
 # (the same crate pi-agent-core's path-variant ladder rides).
 unicode-normalization = "0.1"
@@ -122,8 +136,9 @@ unicode-normalization = "0.1"
 # The process-tree kill the shell belt performs on shutdown, upstream's
 # `process.kill(-pid, "SIGKILL")`: the workspace forbids the unsafe raw
 # libc/libuv-equivalent calls, so the signal rides nix's safe wrapper,
-# matching the agent and tui crates' signal handling.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+# matching the agent and tui crates' signal handling. The fs feature adds
+# the `access` W_OK probe the self-update writability check rides.
+nix = { version = "0.31", default-features = false, features = ["signal", "fs"] }
 
 [dev-dependencies]
 # Scratch directories the session-cwd suites probe for existence.

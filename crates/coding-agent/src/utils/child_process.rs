@@ -20,6 +20,9 @@ use tokio::process::Child;
 /// upstream's `EXIT_STDIO_GRACE_MS`.
 const EXIT_STDIO_GRACE_MS: u64 = 100;
 
+/// The buffer and reader thread a synchronous drain leaves behind.
+type DrainedPipe = (Arc<Mutex<Vec<u8>>>, std::thread::JoinHandle<()>);
+
 /// The spawn-sync options upstream passes per call site.
 ///
 /// Whether output is captured (the `which` probes) or discarded (the
@@ -29,6 +32,10 @@ const EXIT_STDIO_GRACE_MS: u64 = 100;
 pub struct SpawnSyncOptions {
     /// Capture stdout as UTF-8; `false` is upstream's `stdio: "ignore"`.
     pub capture_output: bool,
+    /// Capture stderr as UTF-8; `false` is upstream's `stdio: "ignore"` on
+    /// the error pipe. Capturing both is the package manager's sync runner,
+    /// whose failure message prefers stderr.
+    pub capture_stderr: bool,
     /// Kill the child when it runs longer, upstream's `timeout` option.
     pub timeout_ms: Option<u64>,
 }
@@ -38,6 +45,15 @@ impl SpawnSyncOptions {
     /// encoding.
     pub const IGNORE_OUTPUT: Self = Self {
         capture_output: false,
+        capture_stderr: false,
+        timeout_ms: None,
+    };
+
+    /// Capture stdout and stderr, upstream's `stdio: ["ignore", "pipe",
+    /// "pipe"]` spawn with UTF-8 encoding.
+    pub const CAPTURE_BOTH: Self = Self {
+        capture_output: true,
+        capture_stderr: true,
         timeout_ms: None,
     };
 }
@@ -53,6 +69,9 @@ pub struct SpawnSyncOutcome {
     pub status: Option<i32>,
     /// The captured stdout, UTF-8 decoded like upstream's `encoding`.
     pub stdout: String,
+    /// The captured stderr, UTF-8 decoded like upstream's `encoding`; empty
+    /// unless [`SpawnSyncOptions::capture_stderr`] was set.
+    pub stderr: String,
 }
 
 /// Run one child to completion synchronously, upstream's `spawnProcessSync`
@@ -78,27 +97,21 @@ pub fn spawn_process_sync(
     } else {
         cmd.stdout(std::process::Stdio::null());
     }
-    cmd.stderr(std::process::Stdio::null());
+    if options.capture_stderr {
+        cmd.stderr(std::process::Stdio::piped());
+    } else {
+        cmd.stderr(std::process::Stdio::null());
+    }
     cmd.stdin(std::process::Stdio::null());
     let Ok(mut child) = cmd.spawn() else {
         return SpawnSyncOutcome::default();
     };
 
-    // The reader thread runs the drain concurrently with the exit wait.
+    // The reader threads run the drains concurrently with the exit wait.
     let stdout_pipe = child.stdout.take().filter(|_| options.capture_output);
-    let drained = stdout_pipe.map(|mut pipe| {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let reader_buffer = Arc::clone(&buffer);
-        let reader = std::thread::spawn(move || {
-            // A poisoned lock means a previous read panicked mid-drain; the
-            // partial tail still reads.
-            let mut sink = reader_buffer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let _ignored = std::io::Read::read_to_end(&mut pipe, &mut sink);
-        });
-        (buffer, reader)
-    });
+    let stderr_pipe = child.stderr.take().filter(|_| options.capture_stderr);
+    let drained_stdout = stdout_pipe.map(drain_pipe_sync);
+    let drained_stderr = stderr_pipe.map(drain_pipe_sync);
 
     let timeout = options.timeout_ms.map(Duration::from_millis);
     let started = Instant::now();
@@ -116,22 +129,43 @@ pub fn spawn_process_sync(
             Err(_) => break None,
         }
     };
-    if let Some((buffer, reader)) = drained {
-        let _joined = reader.join();
-        let stdout = buffer
-            .lock()
-            .map(|sink| String::from_utf8_lossy(&sink).into_owned())
-            .unwrap_or_default();
-        SpawnSyncOutcome {
-            status: status.and_then(|status| status.code()),
-            stdout,
+    let read_drained = |drained: Option<DrainedPipe>| -> String {
+        match drained {
+            Some((buffer, reader)) => {
+                let _joined = reader.join();
+                buffer
+                    .lock()
+                    .map(|sink| String::from_utf8_lossy(&sink).into_owned())
+                    .unwrap_or_default()
+            }
+            None => String::new(),
         }
-    } else {
-        SpawnSyncOutcome {
-            status: status.and_then(|status| status.code()),
-            stdout: String::new(),
-        }
+    };
+    SpawnSyncOutcome {
+        status: status.and_then(|status| status.code()),
+        stdout: read_drained(drained_stdout),
+        stderr: read_drained(drained_stderr),
     }
+}
+
+/// Drain one pipe to EOF on its own thread into a shared buffer, the
+/// spawn-sync reader the stdout and stderr pipes share; the caller maps
+/// it over the `Option`al pipe.
+fn drain_pipe_sync<R>(mut pipe: R) -> DrainedPipe
+where
+    R: std::io::Read + Send + 'static,
+{
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let reader_buffer = Arc::clone(&buffer);
+    let reader = std::thread::spawn(move || {
+        // A poisoned lock means a previous read panicked mid-drain; the
+        // partial tail still reads.
+        let mut sink = reader_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ignored = std::io::Read::read_to_end(&mut pipe, &mut sink);
+    });
+    (buffer, reader)
 }
 
 /// Which pipe a drain event arrived on.

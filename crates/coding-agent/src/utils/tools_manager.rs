@@ -205,6 +205,7 @@ fn command_exists(cmd: &str) -> bool {
         &["--version"],
         &SpawnSyncOptions {
             capture_output: true,
+            capture_stderr: false,
             timeout_ms: Some(5_000),
         },
     );
@@ -363,6 +364,7 @@ fn run_extraction_command(command: &str, args: &[&str]) -> Option<String> {
         args,
         &SpawnSyncOptions {
             capture_output: true,
+            capture_stderr: false,
             timeout_ms: None,
         },
     );

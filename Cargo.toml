@@ -29,6 +29,8 @@ repository = "https://github.com/PhillipChaffee/pi-rust"
 readme = "README.md"
 keywords = ["coding-agent", "ai", "terminal", "tui", "llm"]
 categories = ["development-tools", "command-line-utilities"]
+# ADR 0008: the root aggregate carries no library surface and does not publish.
+publish = false
 
 [dependencies]
 

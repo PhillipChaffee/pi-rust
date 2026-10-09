@@ -92,6 +92,7 @@ fn find_executable_on_path(executable: &str) -> Option<String> {
         &[executable],
         &super::child_process::SpawnSyncOptions {
             capture_output: true,
+            capture_stderr: false,
             timeout_ms: Some(5000),
         },
     );

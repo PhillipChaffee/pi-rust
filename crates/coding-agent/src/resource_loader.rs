@@ -9,21 +9,20 @@
 //! with the linked-worktree dedup), and the `SYSTEM.md` /
 //! `APPEND_SYSTEM.md` prompts, each stamped with its provenance.
 //!
-//! Three seams ride later tickets and stand in behind closures here:
+//! Two seams ride later tickets and stand in behind closures here:
 //! extension loading (the out-of-process runtime and its cache, the
 //! conflict diagnostics over its registrations, and the inline factories —
-//! ticket #128), the theme parser (the schema-validating loader; the
+//! ticket #128), and the theme parser (the schema-validating loader; the
 //! stand-in reads only the theme's name, what the loader dedupes on —
-//! ticket #132), and the npm/git arm of package resolution (ticket #129).
-//! Upstream's `resetTimings` instrumentation and its timings module have
-//! no counterpart: this port displays no number no provider or session
-//! backend sends.
+//! ticket #132). Upstream's `resetTimings` instrumentation and its timings
+//! module have no counterpart: this port displays no number no provider or
+//! session backend sends.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 
@@ -33,7 +32,7 @@ use crate::diagnostics::{
 };
 use crate::footer_data_provider::{GitPaths, find_git_paths};
 use crate::package_manager::{
-    DefaultPackageManager, DefaultPackageManagerOptions, PathMetadata, ResolvedResource,
+    DefaultPackageManager, PackageManagerOptions, PathMetadata, ResolvedResource,
 };
 use crate::prompt_templates::{PromptTemplate, load_prompt_templates};
 use crate::settings_manager::{FileSettingsStorage, SettingsManager, SettingsStorage};
@@ -575,8 +574,10 @@ pub fn load_project_context_files(cwd: &str, agent_dir: &str) -> Vec<ContextFile
 pub struct DefaultResourceLoader<S: SettingsStorage> {
     cwd: String,
     agent_dir: String,
-    settings_manager: SettingsManager<S>,
-    package_manager: DefaultPackageManager,
+    // The manager and the loader share one settings manager, upstream's
+    // constructor passing the same instance to both.
+    settings_manager: Arc<Mutex<SettingsManager<S>>>,
+    package_manager: DefaultPackageManager<S>,
     additional_extension_paths: Vec<String>,
     additional_skill_paths: Vec<String>,
     additional_prompt_template_paths: Vec<String>,
@@ -618,7 +619,7 @@ pub struct DefaultResourceLoader<S: SettingsStorage> {
     last_theme_paths: Vec<String>,
 }
 
-impl<S: SettingsStorage> DefaultResourceLoader<S> {
+impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
     /// The loader over an injected settings manager, the seam the in-memory
     /// tests and non-file storages ride.
     #[must_use]
@@ -628,9 +629,14 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
     ) -> Self {
         let cwd = resolve_default(&options.cwd);
         let agent_dir = resolve_default(&options.agent_dir);
-        let package_manager = DefaultPackageManager::new(&DefaultPackageManagerOptions {
+        let settings_manager = Arc::new(Mutex::new(settings_manager));
+        let package_manager = DefaultPackageManager::new(PackageManagerOptions {
             cwd: cwd.clone(),
             agent_dir: agent_dir.clone(),
+            settings: Arc::clone(&settings_manager),
+            command_runner: None,
+            env: None,
+            http_client: None,
         });
         Self {
             additional_extension_paths: options.additional_extension_paths,
@@ -820,8 +826,14 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
     /// project-local extensions and packages out while still loading
     /// user/global and temporary CLI extensions.
     pub async fn load_project_trust_extensions(&mut self) -> ExtensionLoadResult {
-        self.settings_manager.set_project_trusted(false);
-        self.settings_manager.reload();
+        {
+            let mut manager = self
+                .settings_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            manager.set_project_trusted(false);
+            manager.reload();
+        }
         self.load_current_extension_set().await
     }
 
@@ -831,9 +843,19 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
     /// loads the untrusted extension set first, the callback decides, and
     /// the trusted reload follows. Project trust otherwise rides the
     /// settings manager's current state.
+    ///
+    /// # Panics
+    /// A package-manager resolution failure panics with the manager's
+    /// message: upstream's loader awaits `resolve()` and lets the
+    /// rejection propagate, and this reload keeps its infallible
+    /// signature — the session integration picks the catch policy.
     #[expect(
         clippy::too_many_lines,
         reason = "the 1:1 restatement of upstream's reload reads as one block per resource family"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "the reload is infallible by signature; see # Panics for the trade-off"
     )]
     pub async fn reload(&mut self, options: Option<ResourceLoaderReloadOptions>) {
         // Upstream clears the extension module cache between reloads; the
@@ -845,7 +867,10 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
         let pre_trust_extensions = if let Some(resolve_project_trust) = resolve_project_trust {
             let pre_trust = self.load_project_trust_extensions().await;
             let project_trusted = resolve_project_trust(pre_trust.clone()).await;
-            self.settings_manager.set_project_trusted(project_trusted);
+            self.settings_manager
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_project_trusted(project_trusted);
             Some(pre_trust)
         } else {
             None
@@ -853,11 +878,20 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
 
         // reload() preserves SettingsManager.projectTrusted and reloads
         // settings for that trust state.
-        self.settings_manager.reload();
-        let resolved_paths = self.package_manager.resolve(&self.settings_manager);
+        self.settings_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reload();
+        let resolved_paths = self
+            .package_manager
+            .resolve(None)
+            .await
+            .expect("package-manager resolve failed");
         let cli_extension_paths = self
             .package_manager
-            .resolve_extension_sources(&self.additional_extension_paths);
+            .resolve_extension_sources(&self.additional_extension_paths, false, true)
+            .await
+            .expect("package-manager resolve_extension_sources failed");
         // Kept on the instance so post-reload passes (extendResources) can
         // still resolve package metadata.
         self.resource_metadata_by_path = HashMap::new();
@@ -1125,11 +1159,25 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
 
     /// The extension set for the pre-trust bootstrap, upstream's
     /// `loadCurrentExtensionSet` with the inline-factory arm riding #128.
+    ///
+    /// # Panics
+    /// A package-manager resolution failure panics, the same
+    /// infallible-signature restatement as [`Self::reload`].
+    #[expect(
+        clippy::expect_used,
+        reason = "the bootstrap pass is reload's own failure surface; see Self::reload's # Panics"
+    )]
     async fn load_current_extension_set(&self) -> ExtensionLoadResult {
-        let resolved_paths = self.package_manager.resolve(&self.settings_manager);
+        let resolved_paths = self
+            .package_manager
+            .resolve(None)
+            .await
+            .expect("package-manager resolve failed");
         let cli_extension_paths = self
             .package_manager
-            .resolve_extension_sources(&self.additional_extension_paths);
+            .resolve_extension_sources(&self.additional_extension_paths, false, true)
+            .await
+            .expect("package-manager resolve_extension_sources failed");
         let enabled_extensions: Vec<String> = resolved_paths
             .extensions
             .iter()
@@ -1719,7 +1767,12 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
     /// `.pi/SYSTEM.md` wins, else the global `SYSTEM.md`.
     fn discover_system_prompt_file(&self) -> Option<String> {
         let project_path = Path::new(&self.cwd).join(CONFIG_DIR_NAME).join("SYSTEM.md");
-        if self.settings_manager.is_project_trusted() && project_path.exists() {
+        let project_trusted = self
+            .settings_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_project_trusted();
+        if project_trusted && project_path.exists() {
             return Some(project_path.to_string_lossy().into_owned());
         }
 
@@ -1738,7 +1791,12 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
         let project_path = Path::new(&self.cwd)
             .join(CONFIG_DIR_NAME)
             .join("APPEND_SYSTEM.md");
-        if self.settings_manager.is_project_trusted() && project_path.exists() {
+        let project_trusted = self
+            .settings_manager
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_project_trusted();
+        if project_trusted && project_path.exists() {
             return Some(project_path.to_string_lossy().into_owned());
         }
 
@@ -1751,7 +1809,7 @@ impl<S: SettingsStorage> DefaultResourceLoader<S> {
     }
 }
 
-impl<S: SettingsStorage> DefaultResourceLoader<S> {
+impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
     /// The loader with the file-backed settings manager built from the
     /// cwd and agent dir, upstream's `SettingsManager.create` default in
     /// the options object.

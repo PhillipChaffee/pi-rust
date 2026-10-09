@@ -44,6 +44,10 @@ unparseable = "unparseable"
 # against "calf"; the accent is the fixture's point (APFS normalization
 # insensitivity), so the escape stays.
 caf = "caf"
+# The auth-command unknown-option fixture carries upstream's own
+# "--credentails" misspelling verbatim (credential-print.test.ts pins the
+# exact stderr text); the option name is the fixture, not a spelling.
+credentails = "credentails"
 
 # The export template's vendored third-party assets ship byte-verbatim from
 # the upstream pin (upstream's vendor/marked.min.js and
