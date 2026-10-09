@@ -4,12 +4,16 @@
 //!
 //! Porting restatement: the matcher compiles a glob into a `regex` pattern
 //! with minimatch's default `noglobstar`-off semantics — `*` and `?` never
-//! cross `/`, a lone `**` segment matches any number of segments, `{a,b}`
-//! braces expand (nested braces included), `[...]` classes carry ranges and
-//! `!` negation, and `nocase` lowercases both sides before matching. The
-//! extglob forms (`?(...)`, `*(...)`, `+(...)`, `@(...)`, `!(...)`) are not
-//! part of the subset the ported callers use and compile as literals; a
-//! pattern carrying them fails to match rather than guessing.
+//! cross `/`, a lone `**` segment matches any number of segments (a
+//! non-trailing globstar swallows its own separator, so `**/c` also matches
+//! the bare `c`), `{a,b}` braces expand (nested braces included), `[...]`
+//! classes carry ranges and `!` negation, and `nocase` lowercases both sides
+//! before matching. Segments match dot-leading names — minimatch's `dot`
+//! option stays off in the ported callers and the file tools need fd's
+//! dot-blind `--hidden` behavior, so `*` matches `.env`. The extglob forms
+//! (`?(...)`, `*(...)`, `+(...)`, `@(...)`, `!(...)`) are not part of the
+//! subset the ported callers use and compile as literals; a pattern carrying
+//! them fails to match rather than guessing.
 
 use regex::Regex;
 
@@ -136,29 +140,38 @@ fn compile_segment(segment: &str) -> String {
 }
 
 /// Compile a whole glob into an anchored regex, upstream's pattern
-/// compilation: a lone `**` segment matches any number of segments.
+/// compilation: a lone `**` segment matches any number of segments. A
+/// non-trailing globstar compiles to `(?:[^/]*/)*` — zero or more
+/// segment-and-separator groups, the segment itself allowed empty so the
+/// doubled-slash spelling matches too — so `**/c` matches the bare `c` the
+/// way minimatch's globstar does; a trailing one keeps the separator
+/// optional so `a/**` matches both `a` and `a/b`.
 fn compile_glob(pattern: &str) -> Option<Regex> {
     let segments: Vec<&str> = pattern.split('/').collect();
-    let mut parts = Vec::new();
-    let mut trailing_globstar = false;
-    let mut index = 0usize;
-    while index < segments.len() {
-        if segments[index] == "**" {
-            // `**` matches zero or more segments; a trailing globstar
-            // swallows the separator.
-            if index + 1 == segments.len() {
-                trailing_globstar = true;
-                break;
+    let mut regex = String::from("^(?:");
+    for (index, segment) in segments.iter().enumerate() {
+        let is_last = index + 1 == segments.len();
+        if *segment == "**" {
+            if is_last {
+                if index == 0 {
+                    regex.push_str(".*");
+                } else {
+                    regex.push_str("(?:/.*)?");
+                }
+            } else {
+                regex.push_str("(?:[^/]*/)*");
             }
-            parts.push("(?:(?:[^/]*(?:/[^/]*)*))".to_owned());
-            index += 1;
             continue;
         }
-        parts.push(compile_segment(segments[index]));
-        index += 1;
+        regex.push_str(&compile_segment(segment));
+        let next_is_trailing_globstar =
+            !is_last && segments[index + 1] == "**" && index + 2 == segments.len();
+        if !is_last && !next_is_trailing_globstar {
+            regex.push('/');
+        }
     }
-    let tail = if trailing_globstar { "(?:/.*)?" } else { "" };
-    Regex::new(&format!("^(?:{}){tail}$", parts.join("/"))).ok()
+    regex.push_str(")$");
+    Regex::new(&regex).ok()
 }
 
 /// Whether the candidate matches the glob, upstream's
@@ -200,6 +213,30 @@ mod tests {
         assert!(matches("anthropic/a/b", "anthropic/**", true));
         assert!(matches("anthropic", "anthropic/**", true));
         assert!(matches("a/b/c", "**/c", true));
+        // A non-trailing globstar also matches zero segments, separator
+        // included, so a bare name matches a `**/`-prefixed pattern.
+        assert!(matches("root.txt", "**/*.txt", true));
+        assert!(matches("c", "**/c", true));
+        assert!(matches(
+            "src/foo/bar/example.spec.ts",
+            "src/**/*.spec.ts",
+            true
+        ));
+        assert!(!matches(
+            "some/parent/child/test.spec.ts",
+            "src/**/*.spec.ts",
+            true
+        ));
+    }
+
+    #[test]
+    fn segments_match_dot_leading_names() {
+        // The ported callers need fd's dot-blind `--hidden` behavior, so a
+        // `*` segment matches a dot-leading name (minimatch's `dot` option
+        // would refuse; it stays off here).
+        assert!(matches(".env", "*", false));
+        assert!(matches(".secret/hidden.txt", "**/*.txt", false));
+        assert!(matches("a/.b/c", "a/**/c", false));
     }
 
     #[test]
@@ -230,5 +267,25 @@ mod tests {
     fn nocase_lowercases_both_sides() {
         assert!(matches("MiniMax-M2.7", "minimax*", true));
         assert!(!matches("MiniMax-M2.7", "minimax*", false));
+    }
+}
+
+#[cfg(test)]
+mod matches_any_tests {
+    use super::matches_any;
+
+    #[test]
+    fn any_pattern_list_matches_on_the_first_hit() {
+        assert!(matches_any(
+            "openai/gpt",
+            &["anthropic/*".to_owned(), "openai/*".to_owned()],
+            false
+        ));
+        assert!(!matches_any(
+            "google/gemini",
+            &["anthropic/*".to_owned(), "openai/*".to_owned()],
+            false
+        ));
+        assert!(matches_any("OPENAI/GPT", &["openai/*".to_owned()], true));
     }
 }

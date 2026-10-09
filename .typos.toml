@@ -39,6 +39,11 @@ hom = "hom"
 # upstream's tolerance of malformed entry lines); typos' dictionary only
 # knows "unparsable".
 unparseable = "unparseable"
+# The path-utils suite's NFD fixture spells "café" as the source literal
+# "caf\u{e9}", so typos sees only the bare "caf" fragment and flags it
+# against "calf"; the accent is the fixture's point (APFS normalization
+# insensitivity), so the escape stays.
+caf = "caf"
 # The auth-command unknown-option fixture carries upstream's own
 # "--credentails" misspelling verbatim (credential-print.test.ts pins the
 # exact stderr text); the option name is the fixture, not a spelling.
