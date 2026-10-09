@@ -15,11 +15,14 @@
 //! effort (map ticket "Decide the Rust stack").
 #![forbid(unsafe_code)]
 
+pub mod auth_guidance;
 pub mod auth_storage;
+pub mod cli;
 pub mod config;
 pub mod defaults;
 pub mod export_html;
 pub mod file_lock;
+pub mod http_dispatcher;
 pub mod messages;
 pub mod migrations;
 pub mod model_config;
@@ -27,6 +30,9 @@ pub mod model_registry;
 pub mod model_resolver;
 pub mod model_runtime;
 pub mod models_store;
+pub mod package_manager;
+pub mod package_manager_cli;
+pub mod pi_manifest;
 pub mod project_trust;
 pub mod provider_composer;
 pub mod radius;

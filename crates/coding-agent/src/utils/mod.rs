@@ -7,8 +7,7 @@
 //! The WASM `photon` loader upstream carries (`photon.ts`) has no module —
 //! the `image` crate compiles in — and the bun/Node machinery around it
 //! (`image-resize-worker.ts`'s worker entry, the `readFileSync` patching)
-//! rides the bun runtime upstream alone. The `tools-manager`,
-//! `changelog`/`management-http`/`version-check`, and
+//! rides the bun runtime upstream alone. The `tools-manager` and
 //! `windows-self-update` modules ride their own tickets.
 //!
 //! The environment seam mirrors the config foundation's: the `_with`
@@ -17,6 +16,7 @@
 
 pub mod abort;
 pub mod ansi;
+pub mod changelog;
 pub mod child_process;
 pub mod clipboard;
 pub mod clipboard_command;
@@ -42,5 +42,9 @@ pub mod sleep;
 pub mod syntax_highlight;
 pub mod text;
 pub mod tool_result_images;
+pub mod version_check;
 
 pub mod minimatch;
+
+#[cfg(test)]
+pub mod test_env;

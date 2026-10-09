@@ -327,6 +327,7 @@ fn spawn_process_sync_captures_output_and_status() {
         &["-c", "printf out"],
         &SpawnSyncOptions {
             capture_output: true,
+            capture_stderr: false,
             timeout_ms: None,
         },
     );
@@ -353,6 +354,7 @@ fn spawn_process_sync_kills_past_the_timeout() {
         &["-c", "sleep 30"],
         &SpawnSyncOptions {
             capture_output: false,
+            capture_stderr: false,
             timeout_ms: Some(200),
         },
     );

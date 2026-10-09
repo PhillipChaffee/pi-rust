@@ -9,9 +9,11 @@
 //! fork can rename the app and the config directory at runtime; the Rust
 //! crate has no manifest to read there, so the values are build-time
 //! constants — the fork-rename mechanism has no runtime counterpart. The
-//! self-update machinery this module also carries upstream (the
-//! npm/pnpm/yarn/bun command builders and their install-method probes)
-//! rides its own ticket.
+//! self-update surface redesigns upstream's npm/pnpm/yarn/bun command
+//! builders for the single native binary: cargo's install is the one
+//! managed method, the installer-managed layout rides the package-manager
+//! CLI, and the detection probes take the executable path and environment
+//! through `_with` seams.
 //!
 //! The environment seam mirrors the tui crate's: Rust cannot mutate the
 //! process environment without the `unsafe` this workspace forbids, so the
@@ -244,6 +246,392 @@ pub fn get_package_dir_with(env: &EnvLookup) -> PathBuf {
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
         .unwrap_or_default()
+}
+
+/// The docs directory, upstream's `getDocsPath()`.
+#[must_use]
+pub fn get_docs_path() -> PathBuf {
+    get_package_dir().join("docs")
+}
+
+/// The changelog file, upstream's `getChangelogPath()`.
+#[must_use]
+pub fn get_changelog_path() -> PathBuf {
+    get_package_dir().join("CHANGELOG.md")
+}
+
+// =============================================================================
+// Self-update surface, redesigned for the single native binary
+// =============================================================================
+
+/// The install method, upstream's `InstallMethod`.
+///
+/// Upstream detects npm/pnpm/yarn/bun installs from path shapes and builds
+/// their package-manager commands; the Rust binary is a single native
+/// executable whose only managed install method is a cargo install, so the
+/// method set collapses to [`InstallMethod::Cargo`] and
+/// [`InstallMethod::Unknown`]. The installer-managed layout is not a method
+/// here — the package-manager CLI detects it separately through
+/// `PI_MANAGED_INSTALL_ROOT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMethod {
+    /// Installed by `cargo install` into cargo's bin directory.
+    Cargo,
+    /// A wrapper, source checkout, or unrecognized layout: no
+    /// self-update command exists.
+    Unknown,
+}
+
+impl InstallMethod {
+    /// The lowercase name upstream's instruction strings interpolate, the
+    /// `method` branch of `getSelfUpdateUnavailableInstruction`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// One self-update command step, upstream's `SelfUpdateCommandStep`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdateCommandStep {
+    /// The executable, upstream's `command`.
+    pub command: String,
+    /// The arguments, upstream's `args`.
+    pub args: Vec<String>,
+    /// The printable rendering, upstream's `display`: whitespace-bearing
+    /// arguments double-quoted, the rest joined with single spaces.
+    pub display: String,
+}
+
+/// The self-update command, upstream's `SelfUpdateCommand`.
+///
+/// A renamed package updates in two steps (uninstall the old name, install
+/// the new one); the top-level fields carry the install step so a caller
+/// that only renders `display` sees the composed command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdateCommand {
+    /// The primary (install) step's executable, upstream's `command`.
+    pub command: String,
+    /// The primary (install) step's arguments, upstream's `args`.
+    pub args: Vec<String>,
+    /// The composed display, upstream's `display` — the uninstall step's
+    /// display, ` && `, then the install step's, when a rename is involved.
+    pub display: String,
+    /// The two steps in order, upstream's `steps?`; `None` when no rename
+    /// is involved.
+    pub steps: Option<Vec<SelfUpdateCommandStep>>,
+}
+
+/// The update target, upstream's `SelfUpdatePackageTarget`.
+///
+/// Upstream's string-or-object union restates as the struct both forms
+/// normalize to: a bare package name is its own install spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelfUpdatePackageTarget {
+    /// The package being installed, upstream's `packageName`.
+    pub package_name: String,
+    /// The spec to install, upstream's `installSpec` — a bare name when
+    /// absent, else `name@version`.
+    pub install_spec: String,
+}
+
+impl SelfUpdatePackageTarget {
+    /// The bare-name form, upstream's string target.
+    #[must_use]
+    pub fn from_package_name(package_name: &str) -> Self {
+        Self {
+            package_name: package_name.to_string(),
+            install_spec: package_name.to_string(),
+        }
+    }
+
+    /// The named-fields form, upstream's object target with its
+    /// `installSpec ?? packageName` fallback.
+    #[must_use]
+    pub fn new(package_name: &str, install_spec: Option<&str>) -> Self {
+        Self {
+            package_name: package_name.to_string(),
+            install_spec: install_spec.unwrap_or(package_name).to_string(),
+        }
+    }
+}
+
+fn make_self_update_command_step(command: &str, args: &[String]) -> SelfUpdateCommandStep {
+    SelfUpdateCommandStep {
+        command: command.to_string(),
+        args: args.to_vec(),
+        display: args
+            .iter()
+            .map(|arg| {
+                if arg.chars().any(char::is_whitespace) {
+                    format!("\"{arg}\"")
+                } else {
+                    arg.clone()
+                }
+            })
+            .fold(command.to_string(), |joined, arg| format!("{joined} {arg}")),
+    }
+}
+
+fn make_self_update_command(
+    install_step: SelfUpdateCommandStep,
+    uninstall_step: Option<SelfUpdateCommandStep>,
+) -> SelfUpdateCommand {
+    match uninstall_step {
+        None => SelfUpdateCommand {
+            command: install_step.command,
+            args: install_step.args,
+            display: install_step.display,
+            steps: None,
+        },
+        Some(uninstall_step) => {
+            let steps = vec![uninstall_step, install_step];
+            let install_step = &steps[1];
+            SelfUpdateCommand {
+                command: install_step.command.clone(),
+                args: install_step.args.clone(),
+                display: format!("{} && {}", steps[0].display, install_step.display),
+                steps: Some(steps),
+            }
+        }
+    }
+}
+
+/// The installed cargo crate name, the `installedPackageName` input.
+///
+/// A cargo-installed binary carries no crate metadata, so the package name
+/// rides the caller — [`PACKAGE_NAME`] for the running build.
+fn self_update_command_for_method(
+    method: InstallMethod,
+    installed_package_name: &str,
+    update_package_target: &SelfUpdatePackageTarget,
+) -> Option<SelfUpdateCommand> {
+    match method {
+        InstallMethod::Unknown => None,
+        InstallMethod::Cargo => {
+            // The `crate:` channel's compile flag; the spec's `@version`
+            // suffix pins the build when the target carries one — crate
+            // names cannot contain `@`, so the suffix is always a version.
+            let mut args = vec!["install".to_string(), "--locked".to_string()];
+            match update_package_target
+                .install_spec
+                .rsplit_once('@')
+                .filter(|(_, version)| semver::Version::parse(version).is_ok())
+            {
+                Some((name, version)) => {
+                    args.push(name.to_string());
+                    args.push("--version".to_string());
+                    args.push(version.to_string());
+                }
+                None => args.push(update_package_target.install_spec.clone()),
+            }
+            let install_step = make_self_update_command_step("cargo", &args);
+            let uninstall_step = (update_package_target.package_name != installed_package_name)
+                .then(|| {
+                    make_self_update_command_step(
+                        "cargo",
+                        &["uninstall".to_string(), installed_package_name.to_string()],
+                    )
+                });
+            Some(make_self_update_command(install_step, uninstall_step))
+        }
+    }
+}
+
+/// The executable path, upstream's `process.execPath`/`process.argv[1]`
+/// pair collapsed to the one input a native binary has.
+pub(crate) fn current_exe_path() -> PathBuf {
+    std::env::current_exe().unwrap_or_default()
+}
+
+/// The cargo bin directory, the managed install method's probe target:
+/// `$CARGO_HOME/bin`, else `~/.cargo/bin`.
+fn cargo_bin_dir_with(env: &EnvLookup) -> PathBuf {
+    match env("CARGO_HOME") {
+        Some(cargo_home) if !cargo_home.is_empty() => Path::new(&cargo_home).join("bin"),
+        // Cargo itself resolves its home from $HOME when CARGO_HOME is
+        // unset, so the probe follows the same ladder.
+        _ => {
+            let home = env("HOME")
+                .filter(|home| !home.is_empty())
+                .unwrap_or_else(home_dir);
+            Path::new(&home).join(".cargo").join("bin")
+        }
+    }
+}
+
+/// Detect how the running binary was installed, upstream's
+/// `detectInstallMethod`.
+///
+/// The single native binary recognizes one managed layout: the executable
+/// living under cargo's bin directory. Everything else is
+/// [`InstallMethod::Unknown`] — wrappers and source checkouts update
+/// through whatever provides them.
+#[must_use]
+pub fn detect_install_method() -> InstallMethod {
+    detect_install_method_with(&current_exe_path(), &default_env_lookup())
+}
+
+/// [`detect_install_method`] over an injected executable path and
+/// environment, the test seam for the layout probes.
+#[must_use]
+pub fn detect_install_method_with(exe_path: &Path, env: &EnvLookup) -> InstallMethod {
+    let bin_dir = cargo_bin_dir_with(env);
+    if exe_path.starts_with(&bin_dir) {
+        return InstallMethod::Cargo;
+    }
+    InstallMethod::Unknown
+}
+
+/// Whether the install path accepts writes, upstream's
+/// `isSelfUpdatePathWritable`: `W_OK` on the package directory and its
+/// parent.
+fn is_self_update_path_writable(package_dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use nix::unistd::AccessFlags;
+        let parent = package_dir.parent().unwrap_or(package_dir);
+        nix::unistd::access(package_dir, AccessFlags::W_OK).is_ok()
+            && nix::unistd::access(parent, AccessFlags::W_OK).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        !package_dir
+            .metadata()
+            .map(|meta| meta.permissions().readonly())
+            .unwrap_or(true)
+    }
+}
+
+/// Whether the executable sits inside the install method's managed root,
+/// upstream's `isManagedByGlobalPackageManager` reduced to the cargo
+/// branch: the exe directory must be cargo's bin directory itself.
+fn is_managed_by_global_package_manager_with(exe_path: &Path, env: &EnvLookup) -> bool {
+    matches!(
+        detect_install_method_with(exe_path, env),
+        InstallMethod::Cargo
+    )
+}
+
+/// The self-update command for this installation, upstream's
+/// `getSelfUpdateCommand`.
+///
+/// The method's command when the installation is managed by its global
+/// package manager and the install path is writable, else `None`.
+#[must_use]
+pub fn get_self_update_command(
+    installed_package_name: &str,
+    update_package_target: &SelfUpdatePackageTarget,
+) -> Option<SelfUpdateCommand> {
+    get_self_update_command_with(
+        installed_package_name,
+        update_package_target,
+        &current_exe_path(),
+        &default_env_lookup(),
+    )
+}
+
+/// [`get_self_update_command`] over an injected executable path and
+/// environment, the test seam.
+#[must_use]
+pub fn get_self_update_command_with(
+    installed_package_name: &str,
+    update_package_target: &SelfUpdatePackageTarget,
+    exe_path: &Path,
+    env: &EnvLookup,
+) -> Option<SelfUpdateCommand> {
+    let method = detect_install_method_with(exe_path, env);
+    let command =
+        self_update_command_for_method(method, installed_package_name, update_package_target)?;
+    if !is_managed_by_global_package_manager_with(exe_path, env) {
+        return None;
+    }
+    let package_dir = get_package_dir_with(env);
+    if !is_self_update_path_writable(&package_dir) {
+        return None;
+    }
+    Some(command)
+}
+
+/// The instruction shown when self-update cannot run, upstream's
+/// `getSelfUpdateUnavailableInstruction`.
+#[must_use]
+pub fn get_self_update_unavailable_instruction(
+    installed_package_name: &str,
+    update_package_target: &SelfUpdatePackageTarget,
+) -> String {
+    get_self_update_unavailable_instruction_with(
+        installed_package_name,
+        update_package_target,
+        &current_exe_path(),
+        &default_env_lookup(),
+    )
+}
+
+/// [`get_self_update_unavailable_instruction`] over an injected executable
+/// path and environment, the test seam.
+#[must_use]
+pub fn get_self_update_unavailable_instruction_with(
+    installed_package_name: &str,
+    update_package_target: &SelfUpdatePackageTarget,
+    exe_path: &Path,
+    env: &EnvLookup,
+) -> String {
+    let method = detect_install_method_with(exe_path, env);
+    let command =
+        self_update_command_for_method(method, installed_package_name, update_package_target);
+    match command {
+        Some(command) => {
+            if is_managed_by_global_package_manager_with(exe_path, env)
+                && !is_self_update_path_writable(&get_package_dir_with(env))
+            {
+                format!(
+                    "This installation is managed by a global {} install, but the install path is not writable. Update it yourself with: {}",
+                    method.name(),
+                    command.display
+                )
+            } else {
+                format!(
+                    "This installation is not managed by a global {} install. Update it with the package manager, wrapper, or source checkout that provides it.",
+                    method.name()
+                )
+            }
+        }
+        None => format!(
+            "Update {} using the package manager, wrapper, or source checkout that provides this installation.",
+            update_package_target.install_spec
+        ),
+    }
+}
+
+/// The instruction for updating the given package, upstream's
+/// `getUpdateInstruction`.
+#[must_use]
+pub fn get_update_instruction(package_name: &str) -> String {
+    get_update_instruction_with(package_name, &current_exe_path(), &default_env_lookup())
+}
+
+/// [`get_update_instruction`] over an injected executable path and
+/// environment, the test seam.
+#[must_use]
+pub fn get_update_instruction_with(package_name: &str, exe_path: &Path, env: &EnvLookup) -> String {
+    let method = detect_install_method_with(exe_path, env);
+    match self_update_command_for_method(
+        method,
+        package_name,
+        &SelfUpdatePackageTarget::from_package_name(package_name),
+    ) {
+        Some(command) => format!("Run: {}", command.display),
+        None => get_self_update_unavailable_instruction_with(
+            package_name,
+            &SelfUpdatePackageTarget::from_package_name(package_name),
+            exe_path,
+            env,
+        ),
+    }
 }
 
 // =============================================================================

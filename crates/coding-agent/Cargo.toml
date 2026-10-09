@@ -87,13 +87,34 @@ notify = "8"
 # default set lacks).
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
+# The semver compare the version-check belt and the `crate:` package channel
+# ride (upstream npm `semver`'s `valid`/`compare`/`gt`).
+semver = "1"
+# The sha256 the temporary-dir hash and the install receipts carry
+# (upstream's `node:crypto.createHash("sha256")`).
+sha2 = "0.10"
+# The manifest glob expansion, upstream's `globSync` over package entries.
+glob = "0.3"
+# The managed-install and tarball channel's gzip layer, upstream's npm
+# tarballs (moved up from dev, where only the PNG fixture builder used it).
+flate2 = "1"
+# The tarball channel's unpack, upstream's npm package tarballs; the safety
+# rules (traversal/symlink rejection, size caps) wrap it in this crate.
+tar = "0.4"
+# The concurrent check/update pool's stream driving, the same futures-util
+# slice pi-ai's seam rides.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+# The discovery walk's ignore-file matcher, upstream's npm `ignore` — the
+# same substitution the skills loader made.
+ignore = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # The process-tree kill the shell belt performs on shutdown, upstream's
 # `process.kill(-pid, "SIGKILL")`: the workspace forbids the unsafe raw
 # libc/libuv-equivalent calls, so the signal rides nix's safe wrapper,
-# matching the agent and tui crates' signal handling.
-nix = { version = "0.31", default-features = false, features = ["signal"] }
+# matching the agent and tui crates' signal handling. The fs feature adds
+# the `access` W_OK probe the self-update writability check rides.
+nix = { version = "0.31", default-features = false, features = ["signal", "fs"] }
 
 [dev-dependencies]
 # Scratch directories the session-cwd suites probe for existence.
