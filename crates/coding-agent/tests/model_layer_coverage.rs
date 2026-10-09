@@ -20,10 +20,6 @@
     reason = "the composition-error helper reports an Ok side the layers cannot return"
 )]
 
-#[expect(
-    dead_code,
-    reason = "every test binary recompiles the shared fixture module and consumes only its own helpers"
-)]
 mod common;
 
 use std::collections::BTreeMap;

@@ -36,10 +36,6 @@
     reason = "a wrong error variant is reported by panicking"
 )]
 
-#[expect(
-    dead_code,
-    reason = "the fixture module's env helpers serve the config suites; this suite drives only model_layer"
-)]
 mod common;
 
 use std::future::Future;

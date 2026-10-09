@@ -196,6 +196,36 @@ pub fn get_debug_log_path() -> PathBuf {
     get_agent_dir().join(format!("{APP_NAME}-debug.log"))
 }
 
+/// The README path shipped next to the binary, upstream's
+/// `getReadmePath()`.
+#[must_use]
+pub fn get_readme_path() -> String {
+    get_package_dir()
+        .join("README.md")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The docs directory shipped next to the binary, upstream's
+/// `getDocsPath()`.
+#[must_use]
+pub fn get_docs_path() -> String {
+    get_package_dir()
+        .join("docs")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The examples directory shipped next to the binary, upstream's
+/// `getExamplesPath()`.
+#[must_use]
+pub fn get_examples_path() -> String {
+    get_package_dir()
+        .join("examples")
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// The share viewer base URL override, upstream's `PI_SHARE_VIEWER_URL`.
 pub const ENV_SHARE_VIEWER_URL: &str = "PI_SHARE_VIEWER_URL";
 
