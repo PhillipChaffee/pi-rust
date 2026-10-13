@@ -194,4 +194,23 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn bus_and_controller_debug_the_channel_names() {
+        let bus = EventBusController::new();
+        let noop: EventHandler = Arc::new(|_| Box::pin(async {}));
+        let _ = bus.on("a", noop);
+        assert!(format!("{:?}", bus.bus).contains('a'));
+        assert!(format!("{bus:?}").contains('a'));
+    }
+
+    #[test]
+    fn unsubscribe_twice_is_harmless() {
+        let bus = EventBusController::new();
+        let noop: EventHandler = Arc::new(|_| Box::pin(async {}));
+        let unsubscribe = bus.on("a", noop);
+        unsubscribe();
+        // The channel is gone; the second call finds no listeners.
+        unsubscribe();
+    }
 }
