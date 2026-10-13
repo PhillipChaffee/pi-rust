@@ -3,4 +3,8 @@
 //! tools").
 
 pub mod bash_executor;
+pub mod event_bus;
 pub mod exec;
+pub mod output_guard;
+pub mod slash_commands;
+pub mod timings;
