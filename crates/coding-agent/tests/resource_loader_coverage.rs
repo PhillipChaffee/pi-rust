@@ -108,6 +108,7 @@ fn extension_entry(path: &str) -> ExtensionEntry {
         resolved_path: path.to_string(),
         hidden: false,
         source_info: None,
+        record: None,
     }
 }
 
@@ -201,6 +202,7 @@ async fn extension_seam_results_flow_through_preload_and_remaining_paths() {
                             resolved_path: "<inline:1>".to_string(),
                             hidden: true,
                             source_info: None,
+                            record: None,
                         },
                     ],
                     errors: vec![ExtensionLoadError {
@@ -635,4 +637,64 @@ async fn extend_resources_merge_into_the_loader_and_stamp_metadata() {
         theme.source_info.as_ref().expect("stamped").source,
         "ext-package"
     );
+}
+
+// === inline extension factories =============================================
+
+#[tokio::test]
+async fn inline_extension_factories_load_commit_and_fail_satellite() {
+    let env = LoaderEnv::new();
+    let mut options = env.options();
+    options.extension_factories = vec![
+        pi_coding_agent::extensions::api::InlineExtension {
+            name: Some("demo".to_string()),
+            hidden: true,
+            factory: Arc::new(|api: Arc<pi_coding_agent::extensions::api::ExtensionApi>| {
+                Box::pin(async move {
+                    api.register_flag(
+                        "demo_flag".to_string(),
+                        None,
+                        pi_coding_agent::extensions::runtime::FlagType::Boolean,
+                        Some(pi_coding_agent::extensions::runtime::FlagValue::Bool(true)),
+                    )?;
+                    api.register_command("demo".to_string(), None, {
+                        Arc::new(|_args: String, _ctx| Box::pin(async {}))
+                    })?;
+                    Ok(())
+                })
+            }),
+        },
+        pi_coding_agent::extensions::api::InlineExtension {
+            name: None,
+            hidden: false,
+            factory: Arc::new(|_api| Box::pin(async { Err("boom".to_string()) })),
+        },
+    ];
+    let mut loader = DefaultResourceLoader::new(options, in_memory_manager());
+    loader.reload(None).await;
+    let result = loader.get_extensions();
+
+    let demo = result
+        .extensions
+        .iter()
+        .find(|entry| entry.path == "<inline:demo>")
+        .expect("the named factory loaded");
+    assert!(demo.hidden, "the named factory hid itself");
+    let record = demo.record.as_ref().expect("the record rides the entry");
+    assert!(record.has_flag("demo_flag"));
+    assert_eq!(
+        record
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len(),
+        1
+    );
+
+    let error = result
+        .errors
+        .iter()
+        .find(|error| error.path == "<inline:2>")
+        .expect("the bare factory failed");
+    assert_eq!(error.error, "boom");
 }
