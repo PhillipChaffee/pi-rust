@@ -4,6 +4,10 @@
 //! with the tools slice; the extension loading, event dispatch, and
 //! registration machinery ride the extension-system ticket.
 
+pub mod events;
+pub mod reasons;
+pub mod results;
+pub mod runtime;
 pub mod types;
 
 pub use types::{

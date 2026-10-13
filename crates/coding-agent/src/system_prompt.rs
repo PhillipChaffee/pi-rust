@@ -5,7 +5,7 @@ use crate::config::{get_docs_path, get_examples_path, get_readme_path};
 use crate::skills::{Skill, format_skills_for_prompt};
 
 /// The system-prompt options, upstream's `BuildSystemPromptOptions`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct BuildSystemPromptOptions {
     /// A custom system prompt that replaces the default.
     pub custom_prompt: Option<String>,
