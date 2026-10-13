@@ -130,6 +130,11 @@ pub enum ExtensionEvent {
         /// Whether an extension supplied the summary; absent without one.
         from_extension: Option<bool>,
     },
+    /// `context` — the messages before each LLM call; handlers may replace.
+    Context {
+        /// The messages being sent.
+        messages: Vec<AgentMessage>,
+    },
     /// `before_provider_request` — the raw request payload before send.
     BeforeProviderRequest {
         /// The provider request payload.
@@ -311,6 +316,7 @@ impl ExtensionEvent {
             Self::SessionShutdown { .. } => "session_shutdown",
             Self::SessionBeforeTree { .. } => "session_before_tree",
             Self::SessionTree { .. } => "session_tree",
+            Self::Context { .. } => "context",
             Self::BeforeProviderRequest { .. } => "before_provider_request",
             Self::BeforeProviderHeaders { .. } => "before_provider_headers",
             Self::AfterProviderResponse { .. } => "after_provider_response",
@@ -511,6 +517,9 @@ mod tests {
                 summary_entry: None,
                 from_extension: Some(false),
             },
+            ExtensionEvent::Context {
+                messages: vec![assistant_message()],
+            },
             ExtensionEvent::BeforeProviderRequest {
                 payload: json!({ "model": "gpt-test" }),
             },
@@ -646,6 +655,7 @@ mod tests {
             "session_shutdown",
             "session_before_tree",
             "session_tree",
+            "context",
             "before_provider_request",
             "before_provider_headers",
             "after_provider_response",

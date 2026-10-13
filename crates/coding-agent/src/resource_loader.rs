@@ -57,13 +57,13 @@ pub type BoxedTrustDecision = BoxedFuture<bool>;
 // Extension seam types, upstream's extensions/loader.ts surface (#128)
 // =============================================================================
 
-/// One loaded extension entry, upstream's `Extension` reduced to the
-/// fields the loader layer reads and stamps.
+/// One loaded extension entry, upstream's `Extension`.
 ///
 /// Its declared path, the resolved path, the hidden flag, and the
-/// provenance the loader applies. The registration maps (commands,
-/// tools, flags) and the runtime state ride #128.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// provenance the loader applies. The dispatch-able record carries the
+/// registration maps (handlers, tools, flags, commands): the inline
+/// factory arm fills it, and #128 fills it for file-path loads.
+#[derive(Clone)]
 pub struct ExtensionEntry {
     /// The path the extension was requested by — a file path or an
     /// `<inline:N>` factory label.
@@ -75,7 +75,35 @@ pub struct ExtensionEntry {
     pub hidden: bool,
     /// The provenance the loader stamped, upstream's `sourceInfo`.
     pub source_info: Option<SourceInfo>,
+    /// The dispatch-able record, upstream's full `Extension` shape.
+    pub record: Option<Arc<crate::extensions::runtime::Extension>>,
 }
+
+impl std::fmt::Debug for ExtensionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtensionEntry")
+            .field("path", &self.path)
+            .field("resolved_path", &self.resolved_path)
+            .field("hidden", &self.hidden)
+            .field("source_info", &self.source_info)
+            .field("record", &self.record.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ExtensionEntry {
+    fn eq(&self, other: &Self) -> bool {
+        // The record carries handler closures that never compare; the
+        // loader-observable metadata does.
+        self.path == other.path
+            && self.resolved_path == other.resolved_path
+            && self.hidden == other.hidden
+            && self.source_info == other.source_info
+            && self.record.is_some() == other.record.is_some()
+    }
+}
+
+impl Eq for ExtensionEntry {}
 
 /// One extension load failure, upstream's `{ path, error }`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,6 +255,9 @@ pub struct DefaultResourceLoaderOptions {
     pub additional_theme_paths: Vec<String>,
     /// Skip extension discovery, upstream's `noExtensions`.
     pub no_extensions: bool,
+    /// Inline extension factories, upstream's `extensionFactories`; a bare
+    /// list with no names labels as `<inline:N>`.
+    pub extension_factories: Vec<crate::extensions::api::InlineExtension>,
     /// Skip skill discovery, upstream's `noSkills`.
     pub no_skills: bool,
     /// Skip prompt template discovery, upstream's `noPromptTemplates`.
@@ -275,6 +306,7 @@ impl std::fmt::Debug for DefaultResourceLoaderOptions {
             )
             .field("additional_theme_paths", &self.additional_theme_paths)
             .field("no_extensions", &self.no_extensions)
+            .field("extension_factories", &self.extension_factories.len())
             .field("no_skills", &self.no_skills)
             .field("no_prompt_templates", &self.no_prompt_templates)
             .field("no_themes", &self.no_themes)
@@ -583,6 +615,7 @@ pub struct DefaultResourceLoader<S: SettingsStorage> {
     additional_prompt_template_paths: Vec<String>,
     additional_theme_paths: Vec<String>,
     no_extensions: bool,
+    extension_factories: Vec<crate::extensions::api::InlineExtension>,
     no_skills: bool,
     no_prompt_templates: bool,
     no_themes: bool,
@@ -644,6 +677,7 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             additional_prompt_template_paths: options.additional_prompt_template_paths,
             additional_theme_paths: options.additional_theme_paths,
             no_extensions: options.no_extensions,
+            extension_factories: options.extension_factories,
             no_skills: options.no_skills,
             no_prompt_templates: options.no_prompt_templates,
             no_themes: options.no_themes,
@@ -1195,7 +1229,58 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
         } else {
             self.merge_paths(&cli_enabled_extensions, &enabled_extensions)
         };
-        self.call_load_extensions(&extension_paths).await
+        let mut result = self.call_load_extensions(&extension_paths).await;
+        let (inline_extensions, inline_errors) = self.load_extension_factories().await;
+        result.extensions.extend(inline_extensions);
+        result.errors.extend(inline_errors);
+        result
+    }
+
+    /// The inline-factory arm, upstream's `loadExtensionFactories`: one
+    /// unnamed factory labels `<inline:N>`, a named one `<inline:name>`;
+    /// named factories can hide themselves.
+    async fn load_extension_factories(&self) -> (Vec<ExtensionEntry>, Vec<ExtensionLoadError>) {
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        let mut extensions: Vec<ExtensionEntry> = Vec::new();
+        let mut errors: Vec<ExtensionLoadError> = Vec::new();
+        for (index, input) in self.extension_factories.iter().enumerate() {
+            let is_named = input.name.is_some();
+            let label = input.name.as_ref().map_or_else(
+                || format!("<inline:{}>", index + 1),
+                |name| format!("<inline:{name}>"),
+            );
+            match crate::extensions::api::load_extension_from_factory(
+                &input.factory,
+                &runtime,
+                &self.cwd,
+                &label,
+            )
+            .await
+            {
+                Ok(extension) => {
+                    extension.set_hidden(is_named && input.hidden);
+                    extensions.push(ExtensionEntry {
+                        path: label.clone(),
+                        resolved_path: label,
+                        hidden: extension.hidden(),
+                        source_info: Some(extension.source_info.clone()),
+                        record: Some(extension),
+                    });
+                }
+                Err(factory_error) => {
+                    let message = if factory_error.is_empty() {
+                        "failed to load extension".to_string()
+                    } else {
+                        factory_error
+                    };
+                    errors.push(ExtensionLoadError {
+                        path: label,
+                        error: message,
+                    });
+                }
+            }
+        }
+        (extensions, errors)
     }
 
     /// The final extension set, upstream's `loadFinalExtensionSet`: with a
@@ -1208,7 +1293,11 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
         pre_trust_extensions: Option<&ExtensionLoadResult>,
     ) -> ExtensionLoadResult {
         let Some(pre_trust) = pre_trust_extensions else {
-            return self.call_load_extensions(&extension_paths).await;
+            let mut result = self.call_load_extensions(&extension_paths).await;
+            let (inline_extensions, inline_errors) = self.load_extension_factories().await;
+            result.extensions.extend(inline_extensions);
+            result.errors.extend(inline_errors);
+            return result;
         };
 
         let mut preloaded_by_path: HashMap<String, ExtensionEntry> = pre_trust

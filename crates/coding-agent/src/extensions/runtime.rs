@@ -7,6 +7,7 @@
 //! the out-of-process loader (#128) hand the runner for dispatch.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pi_ai::types::BoxedFuture;
@@ -101,8 +102,10 @@ pub struct Extension {
     pub path: String,
     /// The resolved load path.
     pub resolved_path: String,
-    /// Whether the extension stays out of user-facing lists.
-    pub hidden: bool,
+    /// Whether the extension stays out of user-facing lists; the inline
+    /// loader marks named factories after their factory runs, so the flag
+    /// is an atomic the loader writes post-construction.
+    hidden: AtomicBool,
     /// The provenance the loader stamped.
     pub source_info: SourceInfo,
     /// The event handlers, upstream's `handlers: Map<string, HandlerFn[]>`.
@@ -111,6 +114,8 @@ pub struct Extension {
     pub tools: Mutex<Vec<RegisteredTool>>,
     /// The registered commands, upstream's `commands: Map`.
     pub commands: Mutex<Vec<ResolvedCommand>>,
+    /// The registered flags, upstream's `flags: Map` in registration order.
+    flags: Mutex<Vec<ExtensionFlag>>,
 }
 
 impl Extension {
@@ -120,12 +125,49 @@ impl Extension {
         Self {
             path,
             resolved_path,
-            hidden,
+            hidden: AtomicBool::new(hidden),
             source_info,
             handlers: Mutex::new(HashMap::new()),
             tools: Mutex::new(Vec::new()),
             commands: Mutex::new(Vec::new()),
+            flags: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Whether the extension stays out of user-facing lists.
+    #[must_use]
+    pub fn hidden(&self) -> bool {
+        self.hidden.load(Ordering::Relaxed)
+    }
+
+    /// Mark the extension hidden, upstream's inline-factory loader
+    /// `extension.hidden = ...` write after the factory ran.
+    pub fn set_hidden(&self, hidden: bool) {
+        self.hidden.store(hidden, Ordering::Relaxed);
+    }
+
+    /// Register one flag, upstream's `pi.registerFlag`; the first
+    /// registration of a name wins.
+    pub fn register_flag(&self, flag: ExtensionFlag) {
+        let mut flags = self
+            .flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if flags.iter().any(|listed| listed.name == flag.name) {
+            return;
+        }
+        flags.push(flag);
+    }
+
+    /// Whether the extension registered one flag name, upstream's
+    /// `extension.flags.has(name)`.
+    #[must_use]
+    pub fn has_flag(&self, name: &str) -> bool {
+        self.flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|flag| flag.name == name)
     }
 
     /// Register one event handler, upstream's `pi.on`.
@@ -470,14 +512,22 @@ impl std::fmt::Debug for Extension {
             .commands
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let flags = self
+            .flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f.debug_struct("Extension")
             .field("path", &self.path)
             .field("resolved_path", &self.resolved_path)
-            .field("hidden", &self.hidden)
+            .field("hidden", &self.hidden())
             .field("source_info", &self.source_info)
             .field("handlers", &handlers.keys().collect::<Vec<_>>())
             .field("tools", &tools.len())
             .field("commands", &commands.len())
+            .field(
+                "flags",
+                &flags.iter().map(|flag| &flag.name).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
