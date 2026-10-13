@@ -194,15 +194,16 @@ mod tests {
         assert_eq!(BUILTIN_SLASH_COMMANDS.len(), 23);
         let model = BUILTIN_SLASH_COMMANDS
             .iter()
-            .find(|command| command.name == "model")
-            .unwrap();
-        assert_eq!(model.argument_hint, Some("<provider/model>"));
+            .find(|command| command.name == "model");
+        assert_eq!(
+            model.map(|command| command.argument_hint),
+            Some(Some("<provider/model>"))
+        );
         let quit = BUILTIN_SLASH_COMMANDS
             .iter()
-            .find(|command| command.name == "quit")
-            .unwrap();
+            .find(|command| command.name == "quit");
+        assert_eq!(quit.map(|command| command.description), Some("Quit pi"));
         assert_eq!(quit_command_description(), format!("Quit {APP_NAME}"));
-        assert_eq!(quit.description, "Quit pi");
     }
 
     #[test]

@@ -156,7 +156,7 @@ mod tests {
                 Box::pin(async move {
                     sink.lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push(json!(data).to_string())
+                        .push(json!(data).to_string());
                 })
             }),
         );
@@ -183,10 +183,8 @@ mod tests {
     #[test]
     fn clear_drops_every_listener() {
         let bus = EventBusController::new();
-        let _ = bus.on(
-            "a",
-            Arc::new(|_| Box::pin(async {}) as BoxedFuture<'static, ()>),
-        );
+        let noop: EventHandler = Arc::new(|_| Box::pin(async {}));
+        let _ = bus.on("a", noop);
         bus.clear();
         assert!(
             bus.state
