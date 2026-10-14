@@ -12,16 +12,24 @@
 //! value reads as [`HandlerResult::None`], and a panicking handler aborts
 //! the run rather than being swallowed.
 //!
-//! The interactive surfaces (the UI context, keybinding reservation,
-//! command context, and session-handler binding) ride their consumers on
-//! the sibling tickets and are not re-stated here.
+//! The interactive surfaces (the UI context wrap and keybinding
+//! reservation) ride their consumers on the sibling tickets and are not
+//! re-stated here; the command context and session-handler binding land
+//! here (`bind_command_context`/`command_context`), with the UI-context
+//! half of `setUIContext` staying with #132.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use pi_agent_core::types::AgentMessage;
-use pi_ai::types::{ImageContent, ProviderHeaders};
+use pi_agent_core::types::ThinkingLevel;
+use pi_ai::types::{BoxedFuture, ImageContent, Model, ProviderHeaders, UserContent};
 use serde_json::Value;
+
+use crate::core::slash_commands::SlashCommandInfo;
+use crate::diagnostics::ResourceDiagnostic;
+use crate::provider_composer::ProviderConfigInput;
 
 use crate::extensions::events::ExtensionEvent;
 use crate::extensions::reasons::{
@@ -38,6 +46,345 @@ use crate::extensions::runtime::{
 /// A listener the runner reports dispatch errors to, upstream's
 /// `ExtensionErrorListener`.
 pub type ExtensionErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
+
+/// The session-replacement outcome the session handlers report, upstream's
+/// resolved `{ cancelled: boolean }`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionReplaceOutcome {
+    /// Whether the replacement was refused.
+    pub cancelled: bool,
+}
+
+impl SessionReplaceOutcome {
+    /// The `not cancelled` outcome, upstream's `{ cancelled: false }`.
+    #[must_use]
+    pub const fn proceeded() -> Self {
+        Self { cancelled: false }
+    }
+}
+
+/// The session-replacement handler's setup callback, upstream's
+/// `options.setup`: runs against the replacement session manager.
+pub type SetupSessionFn =
+    Arc<dyn Fn(crate::session_manager::SessionManager) -> BoxedFuture<'static, ()> + Send + Sync>;
+
+/// The session-replacement handler's post-replacement callback,
+/// upstream's `options.withSession`: runs with the replacement's context.
+pub type WithSessionFn = Arc<dyn Fn(HandlerContext) -> BoxedFuture<'static, ()> + Send + Sync>;
+
+/// The options `ctx.newSession()` re-arms its handler with, upstream's
+/// `newSession` options.
+#[derive(Clone, Default)]
+pub struct NewSessionOptions {
+    /// The parent session to fork from, upstream's `parentSession`.
+    pub parent_session: Option<String>,
+    /// The setup run against the replacement session manager.
+    pub setup: Option<SetupSessionFn>,
+    /// The callback run post-replacement with the replacement context.
+    pub with_session: Option<WithSessionFn>,
+}
+
+impl std::fmt::Debug for NewSessionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures do not debug; the slots' presence carries the shape.
+        f.debug_struct("NewSessionOptions")
+            .field("parent_session", &self.parent_session)
+            .field("setup", &self.setup.is_some())
+            .field("with_session", &self.with_session.is_some())
+            .finish()
+    }
+}
+
+/// Where a fork entry positions the replacement, upstream's
+/// `"before" | "at"`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForkPosition {
+    /// The replacement reads the entry before position.
+    Before,
+    /// The replacement reads the entry at position.
+    At,
+}
+
+/// The options `ctx.fork()` re-arms its handler with, upstream's `fork`
+/// options.
+#[derive(Clone, Default)]
+pub struct ForkOptions {
+    /// Where the replacement entry positions, upstream's `position`.
+    pub position: Option<ForkPosition>,
+    /// The callback run post-replacement with the replacement context.
+    pub with_session: Option<WithSessionFn>,
+}
+
+impl std::fmt::Debug for ForkOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures do not debug; the slots' presence carries the shape.
+        f.debug_struct("ForkOptions")
+            .field("position", &self.position)
+            .field("with_session", &self.with_session.is_some())
+            .finish()
+    }
+}
+
+/// The options `ctx.navigateTree()` re-arms its handler with, upstream's
+/// `navigateTree` options.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NavigateTreeOptions {
+    /// Whether the tree navigation captures a summary.
+    pub summarize: bool,
+    /// The compact instructions the summarize reports.
+    pub custom_instructions: Option<String>,
+    /// Whether the instructions replace the template instead of joining.
+    pub replace_instructions: bool,
+    /// The session label to set.
+    pub label: Option<String>,
+}
+
+/// The options `ctx.switchSession()` re-arms its handler with, upstream's
+/// `switchSession` options.
+#[derive(Clone, Default)]
+pub struct SwitchSessionOptions {
+    /// The callback run post-replacement with the replacement context.
+    pub with_session: Option<WithSessionFn>,
+}
+
+impl std::fmt::Debug for SwitchSessionOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures do not debug; the slots' presence carries the shape.
+        f.debug_struct("SwitchSessionOptions")
+            .field("with_session", &self.with_session.is_some())
+            .finish()
+    }
+}
+
+/// The handler `ctx.newSession()` invokes, upstream's `NewSessionHandler`
+/// with its options collapsed to the owned type.
+pub type NewSessionHandler =
+    Arc<dyn Fn(NewSessionOptions) -> BoxedFuture<'static, SessionReplaceOutcome> + Send + Sync>;
+
+/// The handler `ctx.fork()` invokes, upstream's `ForkHandler`.
+pub type ForkHandler =
+    Arc<dyn Fn(String, ForkOptions) -> BoxedFuture<'static, SessionReplaceOutcome> + Send + Sync>;
+
+/// The handler `ctx.navigateTree()` invokes, upstream's
+/// `NavigateTreeHandler`.
+pub type NavigateTreeHandler = Arc<
+    dyn Fn(String, NavigateTreeOptions) -> BoxedFuture<'static, SessionReplaceOutcome>
+        + Send
+        + Sync,
+>;
+
+/// The handler `ctx.switchSession()` invokes, upstream's
+/// `SwitchSessionHandler`.
+pub type SwitchSessionHandler = Arc<
+    dyn Fn(String, SwitchSessionOptions) -> BoxedFuture<'static, SessionReplaceOutcome>
+        + Send
+        + Sync,
+>;
+
+/// The handler `ctx.reload()` invokes, upstream's `ReloadHandler`.
+pub type ReloadHandler = Arc<dyn Fn() -> BoxedFuture<'static, ()> + Send + Sync>;
+
+/// The idle-wait the command context resolves, upstream's
+/// `waitForIdle`.
+pub type WaitForIdleHandler = Arc<dyn Fn() -> BoxedFuture<'static, ()> + Send + Sync>;
+
+/// The command-context handler bundle, upstream's
+/// `ExtensionCommandContextActions`: the six replace/reload actions the
+/// session core arms in interactive mode.
+#[derive(Clone)]
+pub struct CommandContextActions {
+    /// The idle wait, upstream's `waitForIdle`.
+    pub wait_for_idle: WaitForIdleHandler,
+    /// The session replacement, upstream's `newSession`.
+    pub new_session: NewSessionHandler,
+    /// The entry fork, upstream's `fork`.
+    pub fork: ForkHandler,
+    /// The tree navigation, upstream's `navigateTree`.
+    pub navigate_tree: NavigateTreeHandler,
+    /// The session switch, upstream's `switchSession`.
+    pub switch_session: SwitchSessionHandler,
+    /// The extension reload, upstream's `reload`.
+    pub reload: ReloadHandler,
+}
+
+impl std::fmt::Debug for CommandContextActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures do not debug; the bound slot count carries the shape.
+        f.debug_struct("CommandContextActions")
+            .field("bound_actions", &6usize)
+            .finish()
+    }
+}
+
+/// Where a sent message lands relative to the current run, upstream's
+/// `deliverAs: "steer" | "followUp" | "nextTurn"`.
+///
+/// `steer` and `followUp` are also the only two values `sendUserMessage`
+/// takes upstream; the enum carries all three borrowers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliverAs {
+    /// Steer the active run.
+    Steer,
+    /// Queue a follow-up turn.
+    FollowUp,
+    /// Queue for the next turn.
+    NextTurn,
+}
+
+/// The options `pi.sendMessage` re-arms its handler with, upstream's
+/// `{ triggerTurn?, deliverAs? }`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SendMessageOptions {
+    /// Whether the sent message triggers a turn.
+    pub trigger_turn: Option<bool>,
+    /// Where the message lands relative to the current run.
+    pub deliver_as: Option<DeliverAs>,
+}
+
+/// The options `pi.sendUserMessage` re-arms its handler with, upstream's
+/// `{ deliverAs?, expandPromptTemplates? }`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SendUserMessageOptions {
+    /// Where the message lands relative to the current run.
+    pub deliver_as: Option<DeliverAs>,
+    /// Whether prompt templates expand, upstream's `expandPromptTemplates`.
+    pub expand_prompt_templates: Option<bool>,
+}
+
+/// The tool read the session reports to extensions, upstream's
+/// `ToolInfo`: the wire fields the system prompt and selectors read plus
+/// the provenance.
+#[derive(Clone, Debug)]
+pub struct ToolInfo {
+    /// The tool name, upstream's `name`.
+    pub name: String,
+    /// The description the model reads.
+    pub description: String,
+    /// The parameter schema.
+    pub parameters: Value,
+    /// The guideline bullets appended to the system prompt.
+    pub prompt_guidelines: Option<Vec<String>>,
+    /// The tool's provenance.
+    pub source_info: crate::source_info::SourceInfo,
+}
+
+/// The sendMessage bind, upstream's `SendMessageHandler`.
+pub type SendMessageHandler =
+    Arc<dyn Fn(CustomMessagePayload, Option<SendMessageOptions>) + Send + Sync>;
+
+/// The sendUserMessage bind, upstream's `SendUserMessageHandler`.
+pub type SendUserMessageHandler =
+    Arc<dyn Fn(UserContent, Option<SendUserMessageOptions>) + Send + Sync>;
+
+/// The appendEntry bind, upstream's `AppendEntryHandler<T>`.
+pub type AppendEntryHandler = Arc<dyn Fn(String, Option<Value>) + Send + Sync>;
+
+/// The setSessionName bind, upstream's `SetSessionNameHandler`.
+pub type SetSessionNameHandler = Arc<dyn Fn(String) + Send + Sync>;
+
+/// The getSessionName bind, upstream's `GetSessionNameHandler`.
+pub type GetSessionNameHandler = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// The setLabel bind, upstream's `SetLabelHandler`.
+pub type SetLabelHandler = Arc<dyn Fn(String, Option<String>) + Send + Sync>;
+
+/// The getActiveTools bind, upstream's `GetActiveToolsHandler`.
+pub type GetActiveToolsHandler = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// The getAllTools bind, upstream's `GetAllToolsHandler`.
+pub type GetAllToolsHandler = Arc<dyn Fn() -> Vec<ToolInfo> + Send + Sync>;
+
+/// The setActiveTools bind, upstream's `SetActiveToolsHandler`.
+pub type SetActiveToolsHandler = Arc<dyn Fn(Vec<String>) + Send + Sync>;
+
+/// The refreshTools bind, upstream's `RefreshToolsHandler`.
+pub type RefreshToolsHandler = Arc<dyn Fn() + Send + Sync>;
+
+/// The getCommands bind, upstream's `GetCommandsHandler`.
+pub type GetCommandsHandler = Arc<dyn Fn() -> Vec<SlashCommandInfo> + Send + Sync>;
+
+/// The setModel bind, upstream's `SetModelHandler` (async ack).
+pub type SetModelHandler = Arc<dyn Fn(Model) -> BoxedFuture<'static, bool> + Send + Sync>;
+
+/// The getThinkingLevel bind, upstream's `GetThinkingLevelHandler`.
+pub type GetThinkingLevelHandler = Arc<dyn Fn() -> ThinkingLevel + Send + Sync>;
+
+/// The setThinkingLevel bind, upstream's `SetThinkingLevelHandler`.
+pub type SetThinkingLevelHandler = Arc<dyn Fn(ThinkingLevel) + Send + Sync>;
+
+/// The post-bind message/entry/session actions the runner dispatches to,
+/// upstream's `ExtensionActions` bundle handed to `bindCore`.
+///
+/// The extension API reads the bound bundle after the bind pass; the
+/// loader phase never runs these (upstream's throwing stubs).
+#[derive(Clone)]
+pub struct ExtensionActions {
+    /// Send a custom message, upstream's `sendMessage`.
+    pub send_message: SendMessageHandler,
+    /// Send a buildable user message, upstream's `sendUserMessage`.
+    pub send_user_message: SendUserMessageHandler,
+    /// Append a custom entry, upstream's `appendEntry`.
+    pub append_entry: AppendEntryHandler,
+    /// Set the session name, upstream's `setSessionName`.
+    pub set_session_name: SetSessionNameHandler,
+    /// Read the session name, upstream's `getSessionName`.
+    pub get_session_name: GetSessionNameHandler,
+    /// Set an entry label, upstream's `setLabel`.
+    pub set_label: SetLabelHandler,
+    /// Read the active tool names, upstream's `getActiveTools`.
+    pub get_active_tools: GetActiveToolsHandler,
+    /// Read every tool, upstream's `getAllTools`.
+    pub get_all_tools: GetAllToolsHandler,
+    /// Restate the active tools, upstream's `setActiveTools`.
+    pub set_active_tools: SetActiveToolsHandler,
+    /// Refresh the tool registry, upstream's `refreshTools`.
+    pub refresh_tools: RefreshToolsHandler,
+    /// Read the slash commands, upstream's `getCommands`.
+    pub get_commands: GetCommandsHandler,
+    /// Set the model, upstream's `setModel`.
+    pub set_model: SetModelHandler,
+    /// Read the thinking level, upstream's `getThinkingLevel`.
+    pub get_thinking_level: GetThinkingLevelHandler,
+    /// Set the thinking level, upstream's `setThinkingLevel`.
+    pub set_thinking_level: SetThinkingLevelHandler,
+}
+
+impl std::fmt::Debug for ExtensionActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures do not debug; the bound slot count carries the shape.
+        f.debug_struct("ExtensionActions")
+            .field("bound_actions", &14usize)
+            .finish()
+    }
+}
+
+/// The provider-registration actions the bind pass flushes through,
+/// upstream's anonymous `providerActions`. The native-provider slot stays
+/// with the composer's native-provider ticket.
+#[derive(Clone)]
+pub struct ProviderActions {
+    /// Register a named provider, upstream's `registerProvider`.
+    pub register_provider:
+        Arc<dyn Fn(String, ProviderConfigInput) -> Result<(), String> + Send + Sync>,
+    /// Remove a provider registration, upstream's `unregisterProvider`.
+    pub unregister_provider: Arc<dyn Fn(String) -> Result<(), String> + Send + Sync>,
+}
+
+impl std::fmt::Debug for ProviderActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The closures do not debug; the slots' presence names the bind.
+        f.debug_struct("ProviderActions")
+            .field(
+                "register_provider",
+                &Arc::strong_count(&self.register_provider),
+            )
+            .field(
+                "unregister_provider",
+                &Arc::strong_count(&self.unregister_provider),
+            )
+            .finish()
+    }
+}
 
 /// The combined `before_agent_start` result, upstream's
 /// `BeforeAgentStartEventResult` accumulator.
@@ -123,6 +470,9 @@ const fn cancels(result: &SessionBeforeResult) -> bool {
 
 /// The extension dispatch runner, upstream's `ExtensionRunner`: the loaded
 /// extensions plus the context ingredients the handlers resolve through.
+///
+/// The runner also carries the loader-runtime handle and the post-bind
+/// action bundle the session core arms.
 pub struct ExtensionRunner {
     extensions: Vec<Arc<Extension>>,
     assert_active: AssertActiveFn,
@@ -132,10 +482,62 @@ pub struct ExtensionRunner {
     ui: Option<Arc<dyn std::any::Any + Send + Sync>>,
     session_manager: crate::session_manager::SessionManager,
     model_registry: crate::model_registry::ModelRegistry,
+    /// The loader runtime handle, upstream's constructor `runtime` arg: the
+    /// flag values, the provider queue, and the session-replacement
+    /// staleness the extension APIs wrote at load time.
+    runtime: crate::extensions::api::ExtensionRuntime,
+    /// The first staleness message this runner accepted, shared with the
+    /// assert wrapper, upstream's `staleMessage`.
+    stale_message: Arc<Mutex<Option<String>>>,
+    /// The bound message/entry/session actions, upstream's `bindCore`
+    /// action copy landing on the runtime; absent until the bind pass.
+    bound_actions: Option<Arc<ExtensionActions>>,
+    /// The command-context handlers with the no-op defaults, upstream's
+    /// runner fields plus `bindCommandContext`.
+    command: CommandHandlers,
+    /// The command diagnostics, reset per registered-commands read,
+    /// upstream's `commandDiagnostics`.
+    command_diagnostics: Mutex<Vec<ResourceDiagnostic>>,
     /// The active-tool names the registered-tool wrapper diffs, upstream's
     /// `runtime.getActiveTools` read the wrapper wraps.
     active_tools: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     error_listeners: Arc<Mutex<Vec<ExtensionErrorListener>>>,
+}
+
+/// The runner's command-handler set, upstream's runner fields with their
+/// no-op defaults. Crate-private: the session core binds through
+/// [`ExtensionRunner::bind_command_context`], the command context reads
+/// through [`ExtensionRunner::command_context`].
+#[derive(Clone)]
+struct CommandHandlers {
+    wait_for_idle: WaitForIdleHandler,
+    new_session: NewSessionHandler,
+    fork: ForkHandler,
+    navigate_tree: NavigateTreeHandler,
+    switch_session: SwitchSessionHandler,
+    reload: ReloadHandler,
+}
+
+impl CommandHandlers {
+    /// The no-op defaults, upstream's runner field initializers.
+    fn no_ops() -> Self {
+        Self {
+            wait_for_idle: Arc::new(|| Box::pin(async {})),
+            new_session: Arc::new(|_options: NewSessionOptions| {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            }),
+            fork: Arc::new(|_entry_id: String, _options: ForkOptions| {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            }),
+            navigate_tree: Arc::new(|_target_id: String, _options: NavigateTreeOptions| {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            }),
+            switch_session: Arc::new(|_session_path: String, _options: SwitchSessionOptions| {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            }),
+            reload: Arc::new(|| Box::pin(async {})),
+        }
+    }
 }
 
 impl ExtensionRunner {
@@ -155,7 +557,26 @@ impl ExtensionRunner {
         ui: Option<Arc<dyn std::any::Any + Send + Sync>>,
         session_manager: crate::session_manager::SessionManager,
         model_registry: crate::model_registry::ModelRegistry,
+        runtime: crate::extensions::api::ExtensionRuntime,
     ) -> Self {
+        // The caller's assert guard reads as the seam; the runner's own
+        // first-wins staleness layer sits in front of it so a post-bind
+        // `invalidate` fails reads without the caller re-binding.
+        let stale_message: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let assert_active = {
+            let given = assert_active;
+            let stale_message = Arc::clone(&stale_message);
+            Arc::new(move || -> Result<(), String> {
+                if let Some(message) = stale_message
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_deref()
+                {
+                    return Err(message.to_string());
+                }
+                given()
+            })
+        };
         Self {
             extensions,
             assert_active,
@@ -165,6 +586,11 @@ impl ExtensionRunner {
             ui,
             session_manager,
             model_registry,
+            runtime,
+            stale_message,
+            bound_actions: None,
+            command: CommandHandlers::no_ops(),
+            command_diagnostics: Mutex::new(Vec::new()),
             active_tools: Arc::new(Vec::new),
             error_listeners: Arc::new(Mutex::new(Vec::new())),
         }
@@ -176,6 +602,142 @@ impl ExtensionRunner {
         self.active_tools = active_tools;
     }
 
+    /// THE bind pass, upstream's `bindCore`: carry the message/entry/tool-set
+    /// and thinking-level binds onto the runner for the extension API's
+    /// post-bind reads, flush the queued provider registrations into the
+    /// model registry (or the caller's provider actions), and switch
+    /// provider registration over to immediate effect.
+    ///
+    /// The active-tool bind also arms the registered-tool wrapper's diff
+    /// reader, replacing any standalone [`Self::bind_active_tools`] bind.
+    ///
+    /// The `session_before_*` and `bindUI` surfaces are bound per their
+    /// consumers; the context actions arrive at construction.
+    pub fn bind_core(
+        &mut self,
+        actions: ExtensionActions,
+        provider_actions: Option<ProviderActions>,
+    ) {
+        self.active_tools = Arc::clone(&actions.get_active_tools);
+        self.bound_actions = Some(Arc::new(actions));
+
+        let flush: Option<&ProviderActions> = provider_actions.as_ref();
+        for registration in self.runtime.take_pending_provider_registrations() {
+            let registered = match flush {
+                Some(provider_actions) => (provider_actions.register_provider)(
+                    registration.name.clone(),
+                    registration.config.clone(),
+                ),
+                None => self
+                    .model_registry
+                    .register_provider_config(&registration.name, registration.config.clone()),
+            };
+            if let Err(error) = registered {
+                self.emit_error(&ExtensionError {
+                    extension_path: registration.extension_path.clone(),
+                    event: "register_provider".to_string(),
+                    error,
+                    stack: None,
+                });
+            }
+        }
+        // The runtime registrations switch over to the immediate path, the
+        // consumer-side write half of the flush.
+        // shortcut: the pending native-provider queue stays queued, when the
+        // composer's native-provider ticket lands its Provider type
+        self.runtime
+            .bind_provider_actions(provider_actions.map(Arc::new));
+    }
+
+    /// The bound message/entry/session bundle, absent until
+    /// [`Self::bind_core`] lands, stale-checked like the wrapper's reads.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub fn bound_actions(&self) -> Result<Arc<ExtensionActions>, String> {
+        (self.assert_active)()?;
+        self.bound_actions
+            .clone()
+            .ok_or_else(|| "the runtime actions are not bound".to_string())
+    }
+
+    /// Rebind the cwd the contexts read, upstream's call-time `ctx.cwd`
+    /// resolution when the session replacement moves it.
+    pub fn set_cwd(&mut self, cwd: String) {
+        self.cwd = cwd;
+    }
+
+    /// Rebind the mode the contexts read, upstream's mode half of
+    /// `setUIContext` (the UI half rides #132).
+    pub const fn set_mode(&mut self, mode: ExtensionMode) {
+        self.mode = mode;
+    }
+
+    /// The extension-registered flags, the first registration of a name
+    /// wins across extensions, upstream's `getFlags`. Extensions read in
+    /// load order and flags in registration order.
+    #[must_use]
+    pub fn get_flags(&self) -> Vec<crate::extensions::runtime::ExtensionFlag> {
+        let mut seen: Vec<String> = Vec::new();
+        let mut all_flags: Vec<crate::extensions::runtime::ExtensionFlag> = Vec::new();
+        for extension in &self.extensions {
+            for flag in extension.flags() {
+                if seen.contains(&flag.name) {
+                    continue;
+                }
+                seen.push(flag.name.clone());
+                all_flags.push(flag);
+            }
+        }
+        all_flags
+    }
+
+    /// Write one flag value into the loader runtime, upstream's
+    /// `setFlagValue`.
+    pub fn set_flag_value(&self, name: &str, value: crate::extensions::runtime::FlagValue) {
+        self.runtime.set_flag_value(name, value);
+    }
+
+    /// The runtime flag values, upstream's `getFlagValues`.
+    #[must_use]
+    pub fn get_flag_values(&self) -> BTreeMap<String, crate::extensions::runtime::FlagValue> {
+        self.runtime.flag_values()
+    }
+
+    /// Mark the runtime stale, upstream's `invalidate`: the first message
+    /// wins, and the loader runtime's staleness joins the first-wins gate
+    /// so the extension APIs' reads fail the same way. Without a message
+    /// the runner restates upstream's guidance sentence.
+    pub fn invalidate(&self, message: Option<String>) {
+        let resolved = message.unwrap_or_else(|| {
+            "This extension ctx is stale after session replacement or reload. Do not use a \
+             captured pi or command ctx after ctx.newSession(), ctx.fork(), \
+             ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, \
+             move post-replacement work into withSession and use the ctx passed to \
+             withSession. For reload, do not use the old ctx after await ctx.reload()."
+                .to_string()
+        });
+        {
+            let mut stale = self
+                .stale_message
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if stale.is_none() {
+                stale.replace(resolved.clone());
+            }
+        }
+        self.runtime.invalidate(Some(resolved));
+    }
+
+    /// The load-ordered extension paths, upstream's `getExtensionPaths`.
+    #[must_use]
+    pub fn get_extension_paths(&self) -> Vec<String> {
+        self.extensions
+            .iter()
+            .map(|extension| extension.path.clone())
+            .collect()
+    }
+
     /// The active-tool names, stale-checked for the wrapper's diff, upstream's
     /// `getActiveTools`.
     ///
@@ -185,7 +747,6 @@ impl ExtensionRunner {
         (self.assert_active)()?;
         Ok((self.active_tools)())
     }
-
     /// The context handlers and commands resolve through, upstream's
     /// `createContext`: values resolve at call time through the bound
     /// actions, and every accessor asserts the runtime is current first.
@@ -217,8 +778,9 @@ impl ExtensionRunner {
     }
 
     /// Subscribe a dispatch-error listener, upstream's `onError`; the
-    /// returned closure unsubscribes the same listener.
-    pub fn on_error(&self, listener: ExtensionErrorListener) -> impl Fn() + Send {
+    /// returned closure unsubscribes the same listener. The empty capture
+    /// list keeps the returned guard from immobilizing the runner.
+    pub fn on_error(&self, listener: ExtensionErrorListener) -> impl Fn() + Send + use<> {
         let listeners = Arc::clone(&self.error_listeners);
         listeners
             .lock()
@@ -240,6 +802,147 @@ impl ExtensionRunner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for listener in listeners.iter() {
             listener(error);
+        }
+    }
+}
+
+impl ExtensionRunner {
+    /// Assert the runtime is current, upstream's `assertActive` — the
+    /// wrapped stale-then-seam gate.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    fn assert_current(&self) -> Result<(), String> {
+        (self.assert_active)()
+    }
+
+    /// The registered tools, the first registration of a name wins across
+    /// extensions, upstream's `getAllRegisteredTools`. Extensions read in
+    /// load order and a name reads at its first registration.
+    #[must_use]
+    pub fn get_all_registered_tools(&self) -> Vec<crate::extensions::runtime::RegisteredTool> {
+        let mut seen: Vec<String> = Vec::new();
+        let mut registered: Vec<crate::extensions::runtime::RegisteredTool> = Vec::new();
+        for extension in &self.extensions {
+            for tool in extension
+                .tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+            {
+                if seen.contains(&tool.definition.name) {
+                    continue;
+                }
+                seen.push(tool.definition.name.clone());
+                registered.push(tool.clone());
+            }
+        }
+        registered
+    }
+
+    /// The tool definition a name reads at, upstream's `getToolDefinition`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub fn get_tool_definition(
+        &self,
+        tool_name: &str,
+    ) -> Result<Option<crate::extensions::types::ToolDefinition>, String> {
+        self.assert_current()?;
+
+        Ok(self
+            .get_all_registered_tools()
+            .into_iter()
+            .find(|tool| tool.definition.name == tool_name)
+            .map(|tool| tool.definition))
+    }
+
+    /// The collision-renamed command list, upstream's
+    /// `resolveRegisteredCommands`: a name registered more than once reads
+    /// as `name:occurrence`, and an evicted invocation name walks the
+    /// suffixes until it lands on a free one. Commands read in extension
+    /// load order and per-extension registration order.
+    fn resolve_registered_commands(&self) -> Vec<crate::extensions::runtime::ResolvedCommand> {
+        let mut registered: Vec<crate::extensions::runtime::ResolvedCommand> = Vec::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for extension in &self.extensions {
+            for command in extension
+                .commands
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+            {
+                *counts.entry(command.name.clone()).or_insert(0) += 1;
+                registered.push(command.clone());
+            }
+        }
+
+        let mut occurrences: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+        registered
+            .into_iter()
+            .map(|command| {
+                let occurrence = occurrences.entry(command.name.clone()).or_insert(0);
+                *occurrence += 1;
+                let occurrence = *occurrence;
+                let mut invocation_name = match counts.get(&command.name) {
+                    Some(count) if *count > 1 => format!("{}:{}", command.name, occurrence),
+                    _ => command.name.clone(),
+                };
+                if taken.contains(&invocation_name) {
+                    let mut suffix = occurrence;
+                    loop {
+                        suffix += 1;
+                        invocation_name = format!("{}:{}", command.name, suffix);
+                        if !taken.contains(&invocation_name) {
+                            break;
+                        }
+                    }
+                }
+                taken.insert(invocation_name.clone());
+                crate::extensions::runtime::ResolvedCommand {
+                    invocation_name,
+                    ..command
+                }
+            })
+            .collect()
+    }
+
+    /// The command list with fresh diagnostics, upstream's
+    /// `getRegisteredCommands`: the read resets the diagnostics.
+    #[must_use]
+    pub fn get_registered_commands(&self) -> Vec<crate::extensions::runtime::ResolvedCommand> {
+        self.command_diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.resolve_registered_commands()
+    }
+
+    /// The command diagnostics the last registered-commands read recorded,
+    /// upstream's `getCommandDiagnostics`.
+    #[must_use]
+    pub fn get_command_diagnostics(&self) -> Vec<ResourceDiagnostic> {
+        self.command_diagnostics
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// One command by invocation name, upstream's `getCommand`.
+    #[must_use]
+    pub fn get_command(&self, name: &str) -> Option<crate::extensions::runtime::ResolvedCommand> {
+        self.resolve_registered_commands()
+            .into_iter()
+            .find(|command| command.invocation_name == name)
+    }
+
+    /// Request a graceful shutdown, upstream's `shutdown`: the bound
+    /// actions carry the behavior; unbound reads as no-op.
+    pub fn shutdown(&self) {
+        if let Some(shutdown) = self.actions.shutdown.as_ref() {
+            shutdown();
         }
     }
 }
@@ -313,6 +1016,148 @@ pub async fn emit_project_trust_event(
         }
     }
     outcome
+}
+
+/// The command context, upstream's `ExtensionCommandContext`:
+/// `createContext()` plus the idle wait and the replace/reload handlers.
+///
+/// Every call asserts the runtime is current first; values resolve at
+/// call time so a bind lands on later calls too.
+pub struct ExtensionCommandContext {
+    context: HandlerContext,
+    wait_for_idle: WaitForIdleHandler,
+    new_session: NewSessionHandler,
+    fork: ForkHandler,
+    navigate_tree: NavigateTreeHandler,
+    switch_session: SwitchSessionHandler,
+    reload: ReloadHandler,
+}
+
+impl std::fmt::Debug for ExtensionCommandContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The handler closures do not debug; the carried context does.
+        f.debug_struct("ExtensionCommandContext")
+            .field("context", &self.context)
+            .field("bound_handlers", &6usize)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The command context carries the handler context's whole surface;
+/// deref passes the ctx reads through, upstream's context spread.
+impl std::ops::Deref for ExtensionCommandContext {
+    type Target = HandlerContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl ExtensionCommandContext {
+    /// Wait until the session is idle, upstream's `ctx.waitForIdle()`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub async fn wait_for_idle(&self) -> Result<(), String> {
+        self.context.assert_active()?;
+        (self.wait_for_idle)().await;
+        Ok(())
+    }
+
+    /// Replace the session, upstream's `ctx.newSession()`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub async fn new_session(
+        &self,
+        options: NewSessionOptions,
+    ) -> Result<SessionReplaceOutcome, String> {
+        self.context.assert_active()?;
+        Ok((self.new_session)(options).await)
+    }
+
+    /// Fork at or before an entry, upstream's `ctx.fork()`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub async fn fork(
+        &self,
+        entry_id: String,
+        options: ForkOptions,
+    ) -> Result<SessionReplaceOutcome, String> {
+        self.context.assert_active()?;
+        Ok((self.fork)(entry_id, options).await)
+    }
+
+    /// Navigate the branch tree, upstream's `ctx.navigateTree()`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub async fn navigate_tree(
+        &self,
+        target_id: String,
+        options: NavigateTreeOptions,
+    ) -> Result<SessionReplaceOutcome, String> {
+        self.context.assert_active()?;
+        Ok((self.navigate_tree)(target_id, options).await)
+    }
+
+    /// Switch to another session file, upstream's `ctx.switchSession()`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub async fn switch_session(
+        &self,
+        session_path: String,
+        options: SwitchSessionOptions,
+    ) -> Result<SessionReplaceOutcome, String> {
+        self.context.assert_active()?;
+        Ok((self.switch_session)(session_path, options).await)
+    }
+
+    /// Reload the extensions, upstream's `ctx.reload()`.
+    ///
+    /// # Errors
+    /// When the runtime was invalidated by session replacement or reload.
+    pub async fn reload(&self) -> Result<(), String> {
+        self.context.assert_active()?;
+        (self.reload)().await;
+        Ok(())
+    }
+}
+
+impl ExtensionRunner {
+    /// Arm or reset the command-context handlers, upstream's
+    /// `bindCommandContext`: a bundle binds all six; `None` resets the
+    /// no-op defaults.
+    pub fn bind_command_context(&mut self, actions: Option<CommandContextActions>) {
+        self.command = actions.map_or_else(CommandHandlers::no_ops, |actions| CommandHandlers {
+            wait_for_idle: actions.wait_for_idle,
+            new_session: actions.new_session,
+            fork: actions.fork,
+            navigate_tree: actions.navigate_tree,
+            switch_session: actions.switch_session,
+            reload: actions.reload,
+        });
+    }
+
+    /// Build the command context over the runner's current state and
+    /// handlers, upstream's `createCommandContext`. Upstream restates
+    /// `getSystemPromptOptions` on this context separately because its own
+    /// plain context lacks it; the port's handler context already carries
+    /// it, so the deref passes it through.
+    #[must_use]
+    pub fn command_context(&self) -> ExtensionCommandContext {
+        ExtensionCommandContext {
+            context: self.context(),
+            wait_for_idle: Arc::clone(&self.command.wait_for_idle),
+            new_session: Arc::clone(&self.command.new_session),
+            fork: Arc::clone(&self.command.fork),
+            navigate_tree: Arc::clone(&self.command.navigate_tree),
+            switch_session: Arc::clone(&self.command.switch_session),
+            reload: Arc::clone(&self.command.reload),
+        }
+    }
 }
 
 impl std::fmt::Debug for ExtensionRunner {
@@ -861,17 +1706,24 @@ mod tests {
         SessionBeforeResult, ToolCallResult, ToolResultResult,
     };
     use crate::extensions::runner::{
-        ExtensionRunner, ProjectTrustOutcome, emit_project_trust_event, emit_session_shutdown_event,
+        CommandContextActions, DeliverAs, ExtensionActions, ExtensionRunner, ForkOptions,
+        ForkPosition, NavigateTreeOptions, NewSessionOptions, ProjectTrustOutcome, ProviderActions,
+        SendMessageOptions, SendUserMessageOptions, SessionReplaceOutcome, SwitchSessionOptions,
+        emit_project_trust_event, emit_session_shutdown_event,
     };
     use crate::extensions::runtime::{
-        AssertActiveFn, ContextActions, Extension, ExtensionError, ExtensionHandler, HandlerContext,
+        AssertActiveFn, ContextActions, Extension, ExtensionError, ExtensionFlag, ExtensionHandler,
+        FlagType, FlagValue, HandlerContext,
     };
     use crate::model_registry::ModelRegistry;
     use crate::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
+    use crate::provider_composer::ProviderConfigInput;
     use crate::session_manager::SessionManager;
     use crate::source_info::{SourceInfo, SourceOrigin, SourceScope, SyntheticSourceOptions};
+    use crate::tools::bash::create_bash_tool_definition;
+    use pi_agent_core::types::ThinkingLevel;
     use pi_ai::auth::credential_store::InMemoryCredentialStore;
-    use pi_ai::types::{Api, ProviderId, Usage, UserContent};
+    use pi_ai::types::{Api, Model, ProviderId, Usage, UserContent};
 
     type EventLog = Arc<Mutex<Vec<&'static str>>>;
 
@@ -918,6 +1770,7 @@ mod tests {
             None,
             plain_manager(),
             offline_registry().await,
+            crate::extensions::api::ExtensionRuntime::new(),
         )
     }
 
@@ -1629,5 +2482,703 @@ mod tests {
 
     fn always_active() -> AssertActiveFn {
         Arc::new(|| Ok(()))
+    }
+
+    /// The bind-core bundle with inert handlers, the base tests re-arm
+    /// individual slots over.
+    fn trivial_actions() -> ExtensionActions {
+        ExtensionActions {
+            send_message: Arc::new(
+                |_message: CustomMessagePayload, _options: Option<SendMessageOptions>| {},
+            ),
+            send_user_message: Arc::new(
+                |_content: UserContent, _options: Option<SendUserMessageOptions>| {},
+            ),
+            append_entry: Arc::new(|_custom_type: String, _data: Option<Value>| {}),
+            set_session_name: Arc::new(|_name: String| {}),
+            get_session_name: Arc::new(|| None),
+            set_label: Arc::new(|_entry_id: String, _label: Option<String>| {}),
+            get_active_tools: Arc::new(Vec::new),
+            get_all_tools: Arc::new(Vec::new),
+            set_active_tools: Arc::new(|_tool_names: Vec<String>| {}),
+            refresh_tools: Arc::new(|| {}),
+            get_commands: Arc::new(Vec::new),
+            set_model: Arc::new(|_model: Model| Box::pin(async { false })),
+            get_thinking_level: Arc::new(|| ThinkingLevel::Off),
+            set_thinking_level: Arc::new(|_level: ThinkingLevel| {}),
+        }
+    }
+
+    type ProviderRecords = (
+        ProviderActions,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    fn inert_provider_actions() -> ProviderRecords {
+        let registered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let unregistered: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        (
+            ProviderActions {
+                register_provider: {
+                    let registered = Arc::clone(&registered);
+                    Arc::new(move |name: String, _config: ProviderConfigInput| {
+                        registered
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(name);
+                        Ok(())
+                    })
+                },
+                unregister_provider: {
+                    let unregistered = Arc::clone(&unregistered);
+                    Arc::new(move |name: String| {
+                        unregistered
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push(name);
+                        Ok(())
+                    })
+                },
+            },
+            registered,
+            unregistered,
+        )
+    }
+
+    /// An empty registered-flag table, the tests' first-wins aggregate over.
+    fn plain_flag(name: &str) -> ExtensionFlag {
+        ExtensionFlag {
+            name: name.to_string(),
+            description: None,
+            flag_type: FlagType::String,
+            default: None,
+            extension_path: "/ext/test.ts".to_string(),
+        }
+    }
+
+    fn runtime_with_flag(name: &str, value: FlagValue) -> crate::extensions::api::ExtensionRuntime {
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        runtime.set_flag_value(name, value);
+        runtime
+    }
+
+    /// A runner over the given extensions and runtime, the
+    /// non-default-runtime boundary tests read through.
+    async fn runner_with_runtime(
+        extensions: &[Arc<Extension>],
+        runtime: crate::extensions::api::ExtensionRuntime,
+    ) -> ExtensionRunner {
+        ExtensionRunner::new(
+            extensions.to_vec(),
+            plain_actions(),
+            always_active(),
+            "/tmp/project".to_string(),
+            ExtensionMode::Print,
+            None,
+            plain_manager(),
+            offline_registry().await,
+            runtime,
+        )
+    }
+
+    #[tokio::test]
+    async fn bound_actions_read_after_bind_and_fail_before() {
+        let runner = runner_with(&[extension_with(Vec::new())], plain_actions()).await;
+        assert!(
+            runner
+                .bound_actions()
+                .expect_err("the unbound bundle fails")
+                .contains("not bound")
+        );
+
+        let mut runner = runner_with(&[extension_with(Vec::new())], plain_actions()).await;
+        runner.bind_core(trivial_actions(), None);
+        let bundle = runner.bound_actions().expect("the bound bundle reads back");
+        (bundle.send_message)(
+            CustomMessagePayload {
+                custom_type: "note".to_string(),
+                content: vec![text_block("blog")],
+                display: true,
+                details: None,
+            },
+            Some(SendMessageOptions {
+                trigger_turn: Some(true),
+                deliver_as: Some(DeliverAs::FollowUp),
+            }),
+        );
+        (bundle.send_user_message)(
+            UserContent::Text("ping".to_string()),
+            Some(SendUserMessageOptions {
+                deliver_as: Some(DeliverAs::Steer),
+                expand_prompt_templates: Some(true),
+            }),
+        );
+        (bundle.append_entry)("entries".to_string(), Some(json!({ "kind": 1 })));
+        (bundle.set_session_name)("session-name".to_string());
+        assert!((bundle.get_session_name)().is_none());
+        (bundle.set_label)("entry-1".to_string(), Some("label".to_string()));
+        assert!((bundle.get_active_tools)().is_empty());
+        assert!((bundle.get_all_tools)().is_empty());
+        (bundle.set_active_tools)(vec!["read".to_string()]);
+        (bundle.refresh_tools)();
+        assert!((bundle.get_commands)().is_empty());
+        let refused = (bundle.set_model)(trivial_model()).await;
+        assert!(!refused);
+        assert_eq!((bundle.get_thinking_level)(), ThinkingLevel::Off);
+        (bundle.set_thinking_level)(ThinkingLevel::High);
+        assert!(
+            runner.active_tools().expect("the bound reader").is_empty(),
+            "the bind arms the wrapper's reader too"
+        );
+    }
+
+    /// The model literal the set-model bind exercises; no registry lookup.
+    fn trivial_model() -> Model {
+        Model {
+            id: "gpt-test".to_string(),
+            name: "GPT Test".to_string(),
+            api: Api::from("openai"),
+            provider: ProviderId::from("openai"),
+            base_url: "https://example.invalid".to_string(),
+            reasoning: false,
+            thinking_level_map: None,
+            input: Vec::new(),
+            cost: pi_ai::types::ModelCost::default(),
+            context_window: 0,
+            max_tokens: 0,
+            sampling_params: None,
+            headers: None,
+            compat: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_core_flushes_the_provider_queue() {
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        runtime.register_provider(crate::extensions::api::PendingProviderRegistration {
+            name: "queued-provider".to_string(),
+            config: ProviderConfigInput::default(),
+            extension_path: "/ext/test.ts".to_string(),
+        });
+
+        // The actions flush through the caller's provider actions.
+        let (provider_actions, registered, _unregistered) = inert_provider_actions();
+        let rendered = format!("{provider_actions:?}");
+        assert!(rendered.contains("ProviderActions"));
+        let mut runner = ExtensionRunner::new(
+            Vec::new(),
+            plain_actions(),
+            always_active(),
+            "/tmp/project".to_string(),
+            ExtensionMode::Print,
+            None,
+            plain_manager(),
+            offline_registry().await,
+            runtime.clone(),
+        );
+        runner.bind_core(trivial_actions(), Some(provider_actions));
+        let armed = runtime
+            .bound_provider_actions()
+            .expect("the flush arms the immediate path");
+        (armed.unregister_provider)("queued-provider".to_string())
+            .expect("the armed unregister reads through");
+        assert_eq!(
+            *registered
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec!["queued-provider".to_string()]
+        );
+        assert!(
+            runtime.take_pending_provider_registrations().is_empty(),
+            "the queue drains flush-first"
+        );
+
+        // Without provider actions the flush lands on the model registry.
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        runtime.register_provider(crate::extensions::api::PendingProviderRegistration {
+            name: "registered-provider".to_string(),
+            config: ProviderConfigInput::default(),
+            extension_path: "/ext/test.ts".to_string(),
+        });
+        let mut runner = ExtensionRunner::new(
+            Vec::new(),
+            plain_actions(),
+            always_active(),
+            "/tmp/project".to_string(),
+            ExtensionMode::Print,
+            None,
+            plain_manager(),
+            offline_registry().await,
+            runtime.clone(),
+        );
+        runner.bind_core(trivial_actions(), None);
+        assert!(
+            runner
+                .model_registry
+                .get_registered_provider_config("registered-provider")
+                .is_some(),
+            "the queue flushed into the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_errors_report_to_the_listeners() {
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        let runtime_for_armed = runtime.clone();
+        runtime.register_provider(crate::extensions::api::PendingProviderRegistration {
+            name: "failing-provider".to_string(),
+            config: ProviderConfigInput::default(),
+            extension_path: "/ext/failing.ts".to_string(),
+        });
+        let mut runner = ExtensionRunner::new(
+            Vec::new(),
+            plain_actions(),
+            always_active(),
+            "/tmp/project".to_string(),
+            ExtensionMode::Print,
+            None,
+            plain_manager(),
+            offline_registry().await,
+            runtime,
+        );
+        let failed: Arc<Mutex<Vec<ExtensionError>>> = Arc::new(Mutex::new(Vec::new()));
+        let _unsubscribe = runner.on_error(Arc::new({
+            let failed = Arc::clone(&failed);
+            move |error: &ExtensionError| {
+                failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(error.clone());
+            }
+        }));
+        runner.bind_core(
+            trivial_actions(),
+            Some(ProviderActions {
+                register_provider: Arc::new(|name: String, _config: ProviderConfigInput| {
+                    Err(format!("cannot register {name}"))
+                }),
+                unregister_provider: Arc::new(|_name: String| Ok(())),
+            }),
+        );
+        // The armed actions read through the runtime too.
+        let armed = runtime_for_armed.bound_provider_actions().expect("armed");
+        (armed.unregister_provider)("failing-provider".to_string()).expect("the armed unregister");
+        let failed = failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].extension_path, "/ext/failing.ts");
+        assert_eq!(failed[0].event, "register_provider");
+        assert_eq!(failed[0].error, "cannot register failing-provider");
+    }
+
+    #[tokio::test]
+    async fn flags_aggregate_first_registration_wins_and_values_roundtrip() {
+        let first = extension_with(Vec::new());
+        first.register_flag(plain_flag("alpha"));
+        let second = extension_with(Vec::new());
+        second.register_flag(plain_flag("alpha"));
+        second.register_flag(plain_flag("beta"));
+        let runtime = runtime_with_flag("alpha", FlagValue::Bool(true));
+        let runner = runner_with_runtime(&[first, second], runtime).await;
+        let names = runner
+            .get_flags()
+            .into_iter()
+            .map(|flag| flag.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["alpha", "beta"],
+            "first per name wins in load order"
+        );
+
+        runner.set_flag_value("alpha", FlagValue::Text("late".to_string()));
+        assert_eq!(
+            runner.get_flag_values().get("alpha"),
+            Some(&FlagValue::Text("late".to_string()))
+        );
+    }
+
+    fn command(name: &str) -> crate::extensions::runtime::ResolvedCommand {
+        crate::extensions::runtime::ResolvedCommand {
+            name: name.to_string(),
+            invocation_name: name.to_string(),
+            description: None,
+            source_info: source_info(),
+            handler: Arc::new(|_args: String, _ctx| Box::pin(async {})),
+        }
+    }
+
+    #[tokio::test]
+    async fn registered_commands_rename_collisions_and_land_free_names() {
+        let first = extension_with(Vec::new());
+        first.register_command(command("ship"));
+        first.register_command(command("alpha"));
+        let second = extension_with(Vec::new());
+        second.register_command(command("ship"));
+        second.register_command(command("ship:1"));
+        let runner = runner_with(&[first, second], plain_actions()).await;
+
+        let names = runner
+            .get_registered_commands()
+            .into_iter()
+            .map(|resolved| resolved.invocation_name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "ship:1".to_string(),
+                "alpha".to_string(),
+                "ship:2".to_string(),
+                "ship:1:2".to_string(),
+            ],
+            "collisions take name:occurrence and evicted invocations walk the suffixes"
+        );
+
+        let found = runner
+            .get_command("ship:2")
+            .expect("the second ship resolves by its renamed invocation");
+        assert_eq!(found.name, "ship");
+        (found.handler)("args".to_string(), runner.context()).await;
+        assert!(runner.get_command("ship").is_none());
+
+        // A unique name keeps its bare name and the reads reset diagnostics.
+        let single = extension_with(Vec::new());
+        single.register_command(command("only"));
+        let runner = runner_with(&[single], plain_actions()).await;
+        assert_eq!(
+            runner.get_command("only").expect("bare name").name,
+            "only".to_string()
+        );
+        assert!(runner.get_command_diagnostics().is_empty());
+        let _ = runner.get_registered_commands();
+        assert!(
+            runner.get_command_diagnostics().is_empty(),
+            "the read resets"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_registered_tools_keep_the_first_registration() {
+        let renamed = |name: &str| {
+            let mut definition = create_bash_tool_definition(".", None);
+            definition.name = name.to_string();
+            definition.label = name.to_string();
+            crate::extensions::runtime::RegisteredTool {
+                definition,
+                source_info: source_info(),
+            }
+        };
+        let first = extension_with(Vec::new());
+        first.register_tool(renamed("shared"));
+        first.register_tool(renamed("first-only"));
+        let second = extension_with(Vec::new());
+        second.register_tool(renamed("shared"));
+        let runner = runner_with(&[first, second], plain_actions()).await;
+
+        let names = runner
+            .get_all_registered_tools()
+            .into_iter()
+            .map(|tool| tool.definition.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["shared".to_string(), "first-only".to_string()]);
+
+        let resolved = runner
+            .get_tool_definition("shared")
+            .expect("the tool read resolves")
+            .expect("the first registration wins");
+        assert_eq!(resolved.name, "shared".to_string());
+        assert!(
+            runner
+                .get_tool_definition("missing")
+                .expect("the tool read resolves")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the bound/default/reset ladder walks every command-context handler"
+    )]
+    async fn command_context_defaults_and_bound_handlers_route() {
+        let runner = runner_with(&[extension_with(Vec::new())], plain_actions()).await;
+        assert_eq!(
+            runner.get_extension_paths(),
+            vec!["/ext/test.ts".to_string()]
+        );
+
+        // The unbound defaults answer the no-op contracts for all six.
+        let context = runner.command_context();
+        let rendered = format!("{context:?}");
+        assert!(rendered.contains("ExtensionCommandContext"));
+        assert!(
+            !context
+                .new_session(NewSessionOptions::default())
+                .await
+                .expect("the default replacement")
+                .cancelled
+        );
+        context
+            .wait_for_idle()
+            .await
+            .expect("the default idle wait");
+        assert!(
+            !context
+                .fork("entry-0".to_string(), ForkOptions::default())
+                .await
+                .expect("the default fork")
+                .cancelled
+        );
+        assert!(
+            !context
+                .navigate_tree("target-0".to_string(), NavigateTreeOptions::default())
+                .await
+                .expect("the default navigation")
+                .cancelled
+        );
+        assert!(
+            !context
+                .switch_session("/session.json".to_string(), SwitchSessionOptions::default(),)
+                .await
+                .expect("the default switch")
+                .cancelled
+        );
+        context.reload().await.expect("the default reload");
+        assert_eq!(
+            context.get_system_prompt_options().expect("options").cwd,
+            "/tmp/project".to_string()
+        );
+        let rendered = format!("{runner:?}");
+        assert!(rendered.contains("ExtensionRunner"));
+
+        // The bound handlers route with their arguments.
+        let mut runner = runner_with(&[extension_with(Vec::new())], plain_actions()).await;
+        let command_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let hold_idle = Arc::clone(&command_log);
+        let hold_fork = Arc::clone(&command_log);
+        let hold_nav = Arc::clone(&command_log);
+        let hold_switch = Arc::clone(&command_log);
+        let hold_reload = Arc::clone(&command_log);
+        let waitlog = Arc::clone(&command_log);
+        let fork_entry: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let entry_read = Arc::clone(&fork_entry);
+        let position_read: Arc<Mutex<Option<ForkPosition>>> = Arc::new(Mutex::new(None));
+        let position_read2 = Arc::clone(&position_read);
+        runner.bind_command_context(Some(CommandContextActions {
+            wait_for_idle: Arc::new(move || {
+                let log = Arc::clone(&waitlog);
+                Box::pin(async move {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("idle".to_string());
+                })
+            }),
+            new_session: Arc::new(move |_options: NewSessionOptions| {
+                let log = Arc::clone(&hold_idle);
+                Box::pin(async move {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("new-session".to_string());
+                    SessionReplaceOutcome::proceeded()
+                })
+            }),
+            fork: Arc::new(move |entry_id: String, options: ForkOptions| {
+                let log = Arc::clone(&hold_fork);
+                *entry_read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(entry_id);
+                *position_read
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = options.position;
+                Box::pin(async move {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("fork".to_string());
+                    SessionReplaceOutcome { cancelled: true }
+                })
+            }),
+            navigate_tree: Arc::new(move |_target_id: String, _options: NavigateTreeOptions| {
+                let log = Arc::clone(&hold_nav);
+                Box::pin(async move {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("navigate".to_string());
+                    SessionReplaceOutcome::proceeded()
+                })
+            }),
+            switch_session: Arc::new(
+                move |_session_path: String, _options: SwitchSessionOptions| {
+                    let log = Arc::clone(&hold_switch);
+                    Box::pin(async move {
+                        log.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push("switch".to_string());
+                        SessionReplaceOutcome::proceeded()
+                    })
+                },
+            ),
+            reload: Arc::new(move || {
+                let log = Arc::clone(&hold_reload);
+                Box::pin(async move {
+                    log.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push("reload".to_string());
+                })
+            }),
+        }));
+
+        let context = runner.command_context();
+        let outcome = context
+            .new_session(NewSessionOptions {
+                parent_session: Some("/parent".to_string()),
+                ..NewSessionOptions::default()
+            })
+            .await
+            .expect("the bound replacement");
+        assert!(!outcome.cancelled);
+        context.wait_for_idle().await.expect("the bound idle wait");
+        let outcome = context
+            .fork(
+                "entry-1".to_string(),
+                ForkOptions {
+                    position: Some(ForkPosition::Before),
+                    ..ForkOptions::default()
+                },
+            )
+            .await
+            .expect("the bound fork");
+        assert!(outcome.cancelled);
+        context
+            .navigate_tree("target-1".to_string(), NavigateTreeOptions::default())
+            .await
+            .expect("the bound navigation");
+        context
+            .switch_session("/session.json".to_string(), SwitchSessionOptions::default())
+            .await
+            .expect("the bound switch");
+        context.reload().await.expect("the bound reload");
+        assert_eq!(
+            *fork_entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("entry-1".to_string())
+        );
+        assert_eq!(
+            *position_read2
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(ForkPosition::Before)
+        );
+        assert_eq!(
+            *command_log
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![
+                "new-session".to_string(),
+                "idle".to_string(),
+                "fork".to_string(),
+                "navigate".to_string(),
+                "switch".to_string(),
+                "reload".to_string()
+            ]
+        );
+
+        // Unbinding resets to the no-op defaults.
+        runner.bind_command_context(None);
+        let context = runner.command_context();
+        assert!(
+            !context
+                .new_session(NewSessionOptions::default())
+                .await
+                .expect("the reset replacement")
+                .cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidate_first_message_wins_and_fails_the_runner_reads() {
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        let runner = runner_with_runtime(&[extension_with(Vec::new())], runtime.clone()).await;
+        assert!(runner.active_tools().is_ok());
+
+        runner.invalidate(Some("first replacement".to_string()));
+        runner.invalidate(Some("second replacement".to_string()));
+        assert_eq!(
+            runner
+                .active_tools()
+                .expect_err("the invalidated runner read fails"),
+            "first replacement".to_string()
+        );
+
+        // The loader runtime's staleness carries the same message so the
+        // extension APIs fail closed too.
+        let api = crate::extensions::api::ExtensionApi::new(
+            Arc::new(Extension::new(
+                "<inline:stale-check>".to_string(),
+                "<inline:stale-check>".to_string(),
+                false,
+                source_info(),
+            )),
+            runtime,
+            "/tmp/project".to_string(),
+        );
+        assert!(
+            api.assert_active()
+                .expect_err("the stale runtime fails the API reads")
+                .contains("first replacement")
+        );
+
+        // The none-call restates upstream's guidance sentence.
+        let runtime = crate::extensions::api::ExtensionRuntime::new();
+        let runner = runner_with_runtime(&[extension_with(Vec::new())], runtime.clone()).await;
+        runner.invalidate(None);
+        let message = runner
+            .active_tools()
+            .expect_err("the invalidated runner read fails");
+        assert!(
+            message.contains("session replacement or reload"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rebinds_land_on_the_contexts_and_the_bound_shutdown() {
+        let shut: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+        let hold = Arc::clone(&shut);
+        let actions = Arc::new(ContextActions {
+            shutdown: Some(Arc::new(move || {
+                *hold
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            })),
+            ..ContextActions::default()
+        });
+        let runner = runner_with(&[extension_with(Vec::new())], actions).await;
+        runner.shutdown();
+        assert!(
+            *shut
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "shutdown runs the bound actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rebindings_land_on_the_next_context() {
+        let mut runner = runner_with(&[extension_with(Vec::new())], plain_actions()).await;
+        runner.set_cwd("/elsewhere".to_string());
+        runner.set_mode(ExtensionMode::Rpc);
+        let context = runner.command_context();
+        assert_eq!(
+            context.cwd().expect("the rebound cwd"),
+            "/elsewhere".to_string()
+        );
+        assert_eq!(
+            context.mode().expect("the rebound mode"),
+            ExtensionMode::Rpc
+        );
     }
 }
