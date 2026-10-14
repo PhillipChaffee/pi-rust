@@ -239,6 +239,57 @@ pub fn canonicalize_path(path: &str) -> String {
     )
 }
 
+/// Whether `target` is `root` itself or below it, upstream's
+/// `isUnderPath` closure (the skills, prompt-templates, and
+/// resource-loader modules each re-declare it).
+///
+/// Equality, or a `root`-prefixed target with the separator kept.
+#[must_use]
+pub fn is_under_path(target: &str, root: &str) -> bool {
+    let normalized_root = root.trim_end_matches('/').to_string();
+    if target == normalized_root {
+        return true;
+    }
+    let prefix = format!("{normalized_root}/");
+    target.starts_with(&prefix)
+}
+
+/// The kind a listed entry resolves to through a symlink, upstream's
+/// `statSync(fullPath)` fallback in the fs walkers.
+///
+/// Returns `(is directory, is file)`, or `None` when the link is broken
+/// and the walker skips the entry, upstream's `catch { continue }`.
+#[must_use]
+pub fn symlink_resolved_kind(path: &std::path::Path) -> Option<(bool, bool)> {
+    let stats = std::fs::metadata(path).ok()?;
+    Some((stats.is_dir(), stats.is_file()))
+}
+
+/// Node's POSIX `path.basename`: the last separator-bounded segment,
+/// trailing separators ignored, the whole path when none.
+#[must_use]
+pub fn basename_posix(p: &str) -> String {
+    let trimmed = p.trim_end_matches(['/', '\\']);
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+/// Node's POSIX `path.dirname`: everything before the last separator
+/// (trailing separators ignored), `/` when the separator is the leading
+/// character, `.` when there is none.
+#[must_use]
+pub fn dirname_posix(p: &str) -> String {
+    let trimmed = p.trim_end_matches(['/', '\\']);
+    match trimmed.rfind(['/', '\\']) {
+        Some(0) => "/".to_string(),
+        Some(at) => trimmed[..at].to_string(),
+        None => ".".to_string(),
+    }
+}
+
 /// The filesystem revision stamp upstream's `getFileRevision` builds:
 /// `dev:ino:size:mtimeNs:ctimeNs`, absent when the file cannot be statted.
 #[must_use]
@@ -385,7 +436,14 @@ pub fn mark_path_ignored_by_cloud_sync(path: &str) {
 /// Node's POSIX `path.relative` over two resolved absolute paths: the
 /// common segment prefix drops, the rest of `from` climbs as `..` chains,
 /// and identical paths yield an empty string.
-fn relative_posix(from: &str, to: &str) -> String {
+///
+/// Public for the skills, prompt-templates, and package-manager loaders
+/// upstream reaches Node's built-in from directly.
+///
+/// Inputs are the resolver's normalized absolute paths, so segment
+/// filtering never matters.
+#[must_use]
+pub fn relative_posix(from: &str, to: &str) -> String {
     let from_segments: Vec<&str> = from.split('/').collect();
     let to_segments: Vec<&str> = to.split('/').collect();
     let mut shared = 0usize;

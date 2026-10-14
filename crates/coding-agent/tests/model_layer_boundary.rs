@@ -877,24 +877,24 @@ mod minimatch_vectors {
     use super::*;
 
     /// A mid-pattern globstar matches any number of segments between its
-    /// fixed neighbors — and the port's globstar carries its own separators,
-    /// so the zero-segment spelling is the doubled slash. npm minimatch
-    /// 10.2.6 also matches the single-slash `a/c` here.
+    /// fixed neighbors, zero included, and the segment may be empty (npm
+    /// minimatch 10.2.6 matches both the single-slash and the doubled-slash
+    /// spellings the same way).
     #[test]
     fn a_mid_pattern_globstar_matches_any_number_of_segments() {
         assert!(matches("a/b/c", "a/**/c", false));
         assert!(!matches("a/x", "a/**/c", false));
-        assert!(!matches("a/c", "a/**/c", false));
+        assert!(matches("a/c", "a/**/c", false));
         assert!(matches("a//c", "a/**/c", false));
     }
 
-    /// A leading globstar spans any number of leading segments — but cannot
-    /// drop its separator. npm minimatch 10.2.6 also matches the bare `c`.
+    /// A leading globstar spans any number of leading segments, zero
+    /// included — npm minimatch 10.2.6 matches the bare `c` the same way.
     #[test]
     fn a_leading_globstar_matches_any_number_of_leading_segments() {
         assert!(matches("a/b/c", "**/c", false));
         assert!(matches("x/c", "**/c", false));
-        assert!(!matches("c", "**/c", false));
+        assert!(matches("c", "**/c", false));
     }
 
     /// Escaped metacharacters match their literal spellings only. The

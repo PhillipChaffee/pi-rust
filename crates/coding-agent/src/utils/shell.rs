@@ -92,6 +92,7 @@ fn find_executable_on_path(executable: &str) -> Option<String> {
         &[executable],
         &super::child_process::SpawnSyncOptions {
             capture_output: true,
+            capture_stderr: false,
             timeout_ms: Some(5000),
         },
     );
@@ -184,6 +185,31 @@ pub fn get_shell_env_path_update(env: &EnvLookup) -> (String, String) {
             .join(DELIMITER)
     };
     (path_key, updated_path)
+}
+
+/// The full spawn environment the shell tools run, upstream's
+/// `getShellEnv`.
+///
+/// The process environment with the managed-bin dir prepended to the PATH
+/// entry. Non-UTF-8 entries drop, node's string map has no counterpart for
+/// them.
+#[must_use]
+pub fn get_shell_env() -> std::collections::BTreeMap<String, String> {
+    let mut map: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect();
+    let lookup: EnvLookup = {
+        let snapshot = map.clone();
+        Box::new(move |key| snapshot.get(key).cloned())
+    };
+    let (path_key, updated_path) = get_shell_env_path_update(&lookup);
+    map.insert(path_key, updated_path);
+    map
 }
 
 fn find_path_key(env: &EnvLookup) -> Option<String> {

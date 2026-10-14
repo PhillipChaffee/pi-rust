@@ -147,6 +147,7 @@ fn spawn_process_sync_reads_a_large_output_without_deadlock() {
         &["-c", "yes | head -c 200000"],
         &SpawnSyncOptions {
             capture_output: true,
+            capture_stderr: false,
             timeout_ms: Some(30_000),
         },
     );
