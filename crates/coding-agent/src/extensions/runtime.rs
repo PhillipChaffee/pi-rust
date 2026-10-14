@@ -180,6 +180,16 @@ impl Extension {
             .push(handler);
     }
 
+    /// The registered flags snapshot in registration order, the read the
+    /// runner's `getFlags` walks.
+    #[must_use]
+    pub fn flags(&self) -> Vec<ExtensionFlag> {
+        self.flags
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     /// Register one tool, upstream's `pi.registerTool`.
     pub fn register_tool(&self, tool: RegisteredTool) {
         self.tools

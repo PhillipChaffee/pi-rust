@@ -74,6 +74,11 @@ pub struct PendingProviderRegistration {
     pub extension_path: String,
 }
 
+/// The post-bind provider registration the runtime routes registrations
+/// to directly, upstream's `runtime.registerProvider` replacement after
+/// `bindCore` flushes the queue.
+pub type BoundProviderActions = Arc<crate::extensions::runner::ProviderActions>;
+
 /// The loader runtime shared by every extension API in one load pass,
 /// upstream's `ExtensionRuntime`.
 ///
@@ -90,6 +95,9 @@ pub struct ExtensionRuntime {
     /// Provider registrations queued until the bind pass, upstream's
     /// `pendingProviderRegistrations`.
     pending_provider_registrations: Arc<Mutex<Vec<Arc<PendingProviderRegistration>>>>,
+    /// The post-bind provider registration, upstream's bindCore
+    /// `runtime.registerProvider` replacement; absent pre-bind.
+    bound_provider_actions: Arc<Mutex<Option<BoundProviderActions>>>,
 }
 
 impl ExtensionRuntime {
@@ -126,8 +134,9 @@ impl ExtensionRuntime {
         *stale = Some(message.unwrap_or_else(|| {
             "This extension ctx is stale after session replacement or reload. Do not use a \
              captured pi or command ctx after ctx.newSession(), ctx.fork(), \
-             ctx.switchSession(), or ctx.reload(). For reload, do not use the old ctx after \
-             awaiting ctx.reload()."
+             ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, \
+             move post-replacement work into withSession and use the ctx passed to \
+             withSession. For reload, do not use the old ctx after await ctx.reload()."
                 .to_string()
         }));
     }
@@ -149,6 +158,39 @@ impl ExtensionRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
             .cloned()
+    }
+
+    /// The whole flag-value snapshot, the runner's `getFlagValues` read;
+    /// alphabetical because the port flattens upstream's insertion map.
+    #[must_use]
+    pub fn flag_values(&self) -> std::collections::BTreeMap<String, FlagValue> {
+        let map = self
+            .flag_values
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+
+    /// Arm the post-bind provider registration, upstream's bindCore
+    /// replacing `runtime.registerProvider`; `None` clears the armed
+    /// actions and re-queues registrations.
+    pub fn bind_provider_actions(&self, actions: Option<BoundProviderActions>) {
+        *self
+            .bound_provider_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = actions;
+    }
+
+    /// The armed post-bind provider registration, the branch the API's
+    /// register/unregister reads.
+    #[must_use]
+    pub fn bound_provider_actions(&self) -> Option<BoundProviderActions> {
+        self.bound_provider_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Queue one provider registration until the bind pass, upstream's
@@ -197,10 +239,16 @@ impl std::fmt::Debug for ExtensionRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
+        let bound = self
+            .bound_provider_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         f.debug_struct("ExtensionRuntime")
             .field("stale", &stale)
             .field("flag_values", &flags)
             .field("pending_provider_registrations", &queued)
+            .field("bound_provider_actions", &bound)
             .finish()
     }
 }
@@ -599,16 +647,20 @@ impl ExtensionApi {
     }
 
     /// Queue one provider registration for the bind pass, upstream's
-    /// `pi.registerProvider` named branch.
+    /// `pi.registerProvider` named branch. Post-bind the registration
+    /// registers directly through the armed provider actions.
     ///
     /// # Errors
-    /// When the API may not act.
+    /// When the API may not act, or the post-bind registration fails.
     pub fn register_provider(
         &self,
         name: String,
         config: ProviderConfigInput,
     ) -> Result<(), String> {
         self.assert_active()?;
+        if let Some(provider_actions) = self.runtime.bound_provider_actions() {
+            return (provider_actions.register_provider)(name, config);
+        }
         self.runtime.register_provider(PendingProviderRegistration {
             name,
             config,
@@ -618,12 +670,16 @@ impl ExtensionApi {
     }
 
     /// Drop every queued registration for the name, upstream's
-    /// `pi.unregisterProvider`.
+    /// `pi.unregisterProvider`. Post-bind the removal registers directly
+    /// through the armed provider actions.
     ///
     /// # Errors
-    /// When the API may not act.
+    /// When the API may not act, or the post-bind removal fails.
     pub fn unregister_provider(&self, name: &str) -> Result<(), String> {
         self.assert_active()?;
+        if let Some(provider_actions) = self.runtime.bound_provider_actions() {
+            return (provider_actions.unregister_provider)(name.to_string());
+        }
         self.runtime.unregister_provider(name);
         Ok(())
     }
@@ -835,6 +891,63 @@ mod tests {
         Arc::new(|_api: Arc<ExtensionApi>| Box::pin(async { Ok(()) }))
     }
 
+    #[tokio::test]
+    async fn registered_callables_execute_through_the_record() {
+        let runtime = ExtensionRuntime::new();
+        let api = api_with("/ext/dispatch.ts", &runtime);
+        assert_eq!(api.path(), "/ext/dispatch.ts");
+        assert_eq!(api.cwd(), "/tmp/project");
+        api.on("session_start", noop_handler())
+            .expect("the handler registers");
+        api.register_command("demo".to_string(), None, noop_command())
+            .expect("the command registers");
+        api.register_tool(simple_tool(
+            "probe",
+            serde_json::json!({ "type": "object" }),
+        ))
+        .expect("the tool registers");
+        let record = api.extension();
+
+        let handler = record
+            .handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)["session_start"][0]
+            .clone();
+        let handler_outcome = (handler)(ExtensionEvent::AgentStart, dispatch_context().await).await;
+        assert!(matches!(handler_outcome, HandlerResult::None));
+
+        let command = record
+            .commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .clone();
+        (command.handler)("args".to_string(), dispatch_context().await).await;
+
+        let tool = record
+            .tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
+            .clone();
+        let executed = (tool.definition.execute)(
+            "call-1",
+            &serde_json::json!({}),
+            None,
+            None,
+            Some(&crate::extensions::types::CwdContext {
+                cwd: "/tmp".to_string(),
+            }),
+        )
+        .await;
+        assert!(executed.is_ok(), "the tool executes through its record");
+
+        // The factory runs through its load pass lookalike.
+        let factory = api_factory_noop();
+        let fresh = api_with("/ext/fresh.ts", &runtime);
+        (factory)(Arc::clone(&fresh))
+            .await
+            .expect("the factory runs");
+    }
+
     #[test]
     fn stale_runtime_marks_every_api_inactive() {
         let runtime = ExtensionRuntime::new();
@@ -851,6 +964,38 @@ mod tests {
             .on("session_start", noop_handler())
             .expect_err("still stale");
         assert!(!error.contains("custom"));
+    }
+
+    async fn dispatch_context() -> crate::extensions::runtime::HandlerContext {
+        use crate::extensions::runtime::{ContextActions, HandlerContext};
+        use crate::model_registry::ModelRegistry;
+        use crate::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
+        use crate::session_manager::SessionManager;
+        use pi_agent_core::types::ThinkingLevel;
+        use pi_ai::auth::credential_store::InMemoryCredentialStore;
+        let manager = SessionManager::new("/tmp/project", "/tmp/sessions", None, false, None, None)
+            .expect("the in-memory manager constructs");
+        let registry_runtime = ModelRuntime::create(CreateModelRuntimeOptions {
+            credentials: Some(Arc::new(InMemoryCredentialStore::default())),
+            models_path: Some(None),
+            allow_model_network: false,
+            refresh_on_create: Some(false),
+            ..CreateModelRuntimeOptions::default()
+        })
+        .await
+        .expect("the runtime constructs offline");
+        HandlerContext::new(
+            "/tmp/project".to_string(),
+            crate::extensions::reasons::ExtensionMode::Print,
+            None,
+            manager,
+            ModelRegistry::new(registry_runtime),
+            Arc::new(|| Ok(())),
+            Arc::new(ContextActions {
+                get_thinking_level: Some(Arc::new(|| ThinkingLevel::Off)),
+                ..ContextActions::default()
+            }),
+        )
     }
 
     #[test]
@@ -954,5 +1099,76 @@ mod tests {
         .await
         .expect_err("the stale runtime fails the commit");
         assert!(error.contains("stale"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn post_bind_provider_registration_registers_directly() {
+        let runtime = ExtensionRuntime::new();
+        let extension = crate::extensions::runtime::Extension::new(
+            "/ext/post-bind.ts".to_string(),
+            "/ext/post-bind.ts".to_string(),
+            false,
+            source_info("/ext/post-bind.ts"),
+        );
+
+        // Pre-bind the registration queues.
+        let api = Arc::new(ExtensionApi::new(
+            {
+                let extension = Arc::new(extension);
+                Arc::clone(&extension)
+            },
+            runtime.clone(),
+            "/tmp/project".to_string(),
+        ));
+        api.register_provider("queued".to_string(), ProviderConfigInput::default())
+            .expect("the queue accepts");
+        assert_eq!(
+            runtime.take_pending_provider_registrations().len(),
+            1,
+            "the pre-bind path queues"
+        );
+
+        // Post-bind the registrations route through the armed actions and
+        // return their failures; the queue stays drained.
+        runtime.bind_provider_actions(Some(Arc::new(crate::extensions::runner::ProviderActions {
+            register_provider: Arc::new(|name: String, _config: ProviderConfigInput| {
+                Err(format!("cannot register {name}"))
+            }),
+            unregister_provider: Arc::new(|_name: String| Ok(())),
+        })));
+        assert_eq!(
+            api.register_provider("bound".to_string(), ProviderConfigInput::default())
+                .expect_err("the post-bind failure propagates"),
+            "cannot register bound".to_string()
+        );
+        assert!(runtime.take_pending_provider_registrations().is_empty());
+        assert_eq!(
+            api.unregister_provider("queued")
+                .expect("the post-bind drop"),
+            ()
+        );
+
+        // Unarming re-queues: the reset returns the immediate path.
+        runtime.bind_provider_actions(None);
+        api.register_provider("after-reset".to_string(), ProviderConfigInput::default())
+            .expect("the reset path queues");
+        assert_eq!(runtime.take_pending_provider_registrations().len(), 1);
+        assert!(
+            format!("{runtime:?}").contains("bound_provider_actions: false"),
+            "{}",
+            format!("{runtime:?}")
+        );
+    }
+
+    #[test]
+    fn flag_values_snapshot_reads_alphabetically() {
+        let runtime = ExtensionRuntime::new();
+        runtime.set_flag_value("zeta", FlagValue::Bool(true));
+        runtime.set_flag_value("alpha", FlagValue::Text("1".to_string()));
+        let values = runtime.flag_values();
+        assert_eq!(
+            values.keys().cloned().collect::<Vec<_>>(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
     }
 }

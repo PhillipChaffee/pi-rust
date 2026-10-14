@@ -216,6 +216,7 @@ mod tests {
             SessionManager::new("/tmp/project", "/tmp/sessions", None, false, None, None)
                 .expect("the in-memory manager constructs"),
             ModelRegistry::new(runtime),
+            crate::extensions::api::ExtensionRuntime::new(),
         );
         let reader = Arc::clone(shared);
         runner.bind_active_tools(Arc::new(move || {
