@@ -124,7 +124,7 @@ jobs:
       # (measured + 62, same rule that made 718 + 62 = 780): 738 + 62 = 800.
       # The floors 95/95 stay (both states measure ~96%).
       - name: Coverage gate (lines, regions — 95 each; uncovered functions — 99990 diagnostics max)
-        run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 99990 --lcov --output-path lcov.info
+        run: xvfb-run -a cargo llvm-cov nextest --workspace --verbose --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 99990 --lcov --output-path lcov.info
       # Diagnostic: print the lcov-recorded totals so `--fail-under-regions`' /
       # `--fail-under-lines`' Linux ground truth is visible instead of silent.
       # Removed after the floors/cap are re-tuned from it.
