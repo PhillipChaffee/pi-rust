@@ -129,6 +129,9 @@ async fn replay_handoff(
 /// `aborted` stop reason must not 400 on the orphaned reasoning item.
 #[tokio::test]
 async fn skips_reasoning_only_history_after_an_aborted_turn() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|key| !key.trim().is_empty())
@@ -206,6 +209,9 @@ async fn skips_reasoning_only_history_after_an_aborted_turn() {
 /// function call replay through gpt-5.5 without an orphaned-reasoning 400.
 #[tokio::test]
 async fn handles_same_provider_different_model_handoff_with_tool_calls() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|key| !key.trim().is_empty())
@@ -242,6 +248,9 @@ async fn handles_same_provider_different_model_handoff_with_tool_calls() {
 /// through an OpenAI Responses model without a pairing-history 400.
 #[tokio::test]
 async fn handles_cross_provider_handoff_from_anthropic_to_openai() {
+    if common::skip_live() {
+        return;
+    }
     let Some(anthropic_api_key) =
         get_env_api_key("anthropic", None).filter(|key| !key.trim().is_empty())
     else {

@@ -25,7 +25,12 @@ add() {
 add "format" "cargo fmt --all -- --check"
 add "lint" "cargo clippy --workspace --all-targets -- -D warnings"
 add "doc" "RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps"
-add "tests" "cargo test --workspace"
+# The gate mirrors the CI test carriers: nextest runs the suite (libtest's
+# threaded harness races process-global tests that nextest's one process
+# per test never sees — measured twice on this gate's content), and the doc
+# step carries the doctests nextest does not run. --no-fail-fast: one
+# failure must not strand the remaining suites un-run; the gate fails anyway.
+add "tests" "cargo nextest run --workspace --no-fail-fast && cargo test --doc --workspace"
 # The functions metric counts compiler-emitted instances, not source
 # functions: async-fn wrappers and cross-CGU inlined copies land in the
 # denominator with counters no test can reach (the call sites use the

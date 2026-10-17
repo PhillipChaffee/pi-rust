@@ -259,6 +259,9 @@ struct CachedContext {
 /// The sync credential check the suite gates with, upstream's `hasApiKey`:
 /// env vars only, with the azure and cloudflare deployments' multi-var gates.
 fn has_api_key(pair: &ProviderModelPair) -> bool {
+    if common::skip_live() {
+        return false;
+    }
     if pair.provider == "azure-openai-responses" {
         return common::live::has_azure_openai_credentials();
     }

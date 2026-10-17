@@ -33,6 +33,9 @@ fn openai_codex_catalog_carries_the_affinity_probe_model() {
 /// with the requested text.
 #[tokio::test]
 async fn sse_requests_with_aligned_cache_affinity_identifiers() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = get_env_api_key("openai-codex", None).filter(|key| !key.trim().is_empty())
     else {
         return;
