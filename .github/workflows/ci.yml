@@ -115,15 +115,16 @@ jobs:
       # gate's test-code charges are excluded by cargo-llvm-cov's file-name
       # default ignore; `--ignore-filename-regex '(^|/)tests\.rs$'` pins that
       # exclusion to the shape instead of relying on the defaults surviving
-      # upstream changes. #156 before/after on macOS (full 7,843-test sweep,
-      # pre/post the inline→sibling move): lines 96.23% -> 96.10%
-      # (131,665/136,822 -> 125,203/130,286 — the pool shrinks by the moved
-      # test lines); uncovered functions 774 -> 739 (−35, the test-module
-      # closures/async instances leaving the budget). The cap follows that
-      # measured delta 780 -> 745 under the same cross-platform headroom; the
-      # floors 95/95 stay (both tree states measure at or above 96%).
-      - name: Coverage gate (lines, regions — 95 each; uncovered functions — 745 max)
-        run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 745 --lcov --output-path lcov.info
+      # upstream changes. #156 before/after under the gate's own build regime
+      # (`-Cdebuginfo=0`, full 7,843-test sweep, pre/post the inline→sibling
+      # move): lines 96.24% -> 96.11% (131,674/136,822 -> 125,216/130,286 —
+      # the pool shrinks by the moved test lines; Linux agrees, Coveralls
+      # reads 96.11% on the first post-move run); uncovered functions
+      # 775 -> 738 (−37). The cap follows the budget's own headroom rule
+      # (measured + 62, same rule that made 718 + 62 = 780): 738 + 62 = 800.
+      # The floors 95/95 stay (both states measure ~96%).
+      - name: Coverage gate (lines, regions — 95 each; uncovered functions — 800 max)
+        run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 800 --lcov --output-path lcov.info
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.

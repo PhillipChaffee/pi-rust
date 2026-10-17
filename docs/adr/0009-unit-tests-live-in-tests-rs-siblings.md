@@ -28,8 +28,7 @@ asked for library-only counting in 2021 and remains open and blocked, and
 ([rust-lang/rust#134672](https://github.com/rust-lang/rust/pull/134672)). The
 file layout is the stable mechanism available to us.
 
-Moved tests are pure copy-paste,
-[verified by scripts/verify_test_move.py](https://github.com/PhillipChaffee/pi-rust/blob/main/scripts/verify_test_move.py):
+Moved tests are pure copy-paste, verified by `scripts/verify_test_move.py`:
 the parent must equal the old text with the block swapped for the decl byte
 for byte, and the sibling must equal the moved block minus one indent level or
 the canonical rustfmt rendering of exactly that content.
