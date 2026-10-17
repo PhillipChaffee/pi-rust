@@ -33,6 +33,19 @@ use pi_ai::types::{
 };
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 
+/// Whether the live probes are switched off locally: `PI_TEST_SKIP_LIVE`
+/// forces every env-gated live probe through its credential-skip path,
+/// upstream's `describe.skipIf` semantics, for a shell whose provider
+/// credentials resolve but whose network cannot reach the provider (the
+/// probes would each pay a multi-second failure). CI never sets the
+/// variable, so what CI runs is untouched; the harness reads it in
+/// [`live::env`] and [`live::resolve_api_key`], and the suites that read
+/// their credential directly call this at the gate.
+#[must_use]
+pub fn skip_live() -> bool {
+    std::env::var_os("PI_TEST_SKIP_LIVE").is_some()
+}
+
 /// A provider-shaped usage block with the given total.
 #[must_use]
 pub fn usage(total_tokens: u64) -> Usage {

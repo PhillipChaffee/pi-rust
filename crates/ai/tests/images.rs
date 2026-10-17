@@ -4,7 +4,9 @@
 //!
 //! The E2E block gates on `OPENROUTER_API_KEY` exactly like upstream's
 //! `describe.skipIf`: a probe without its provider credential returns early,
-//! and the registry behavior assertions always run. The `red-circle.png`
+//! and the registry behavior assertions always run; a set
+//! `PI_TEST_SKIP_LIVE` (`common::skip_live`) forces that branch for a shell
+//! whose network cannot reach the provider. The `red-circle.png`
 //! fixture is the suite's only fixture, carried from upstream's `test/data`.
 //!
 //! The registry boundary tests go past upstream's file: the image-API
@@ -16,6 +18,8 @@
     reason = "the tests pin outcomes; an unexpected shape panics the test by design"
 )]
 use std::sync::Arc;
+
+mod common;
 
 use pi_ai::image_models::get_image_model;
 use pi_ai::images::generate_images;
@@ -193,6 +197,9 @@ fn handle_image_input(model: &ImagesModel) -> BoxedFuture<'_, ()> {
 /// The live probes, upstream's `Images E2E Tests` describe block.
 #[tokio::test]
 async fn live_images_e2e() {
+    if common::skip_live() {
+        return;
+    }
     let Ok(key) = std::env::var("OPENROUTER_API_KEY") else {
         // Without the provider credential the probes skip, upstream's
         // `describe.skipIf`.
