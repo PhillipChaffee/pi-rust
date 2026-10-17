@@ -12,7 +12,12 @@ on:
   pull_request:
 
 env:
-  RUSTFLAGS: -D warnings
+  # debuginfo=0 in the coverage build: the coverage map rides
+  # `-C instrument-coverage` (`__llvm_covmap` sections), not DWARF, and the
+  # full-debuginfo instrumented tree overflowed the runner volume mid-link
+  # with SIGBUS on the sccache-miss cold build (#153). Panic source locations
+  # come from std's own location metadata, so failures stay readable.
+  RUSTFLAGS: -D warnings -Cdebuginfo=0
 
 # Workflow-level (not job-level): the three jobs below would queue and cancel
 # each other inside one run if they shared one job-level concurrency group

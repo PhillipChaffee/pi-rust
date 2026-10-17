@@ -69,6 +69,25 @@ reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only ca
 [[IgnoredVulns]]
 id = "GHSA-xgp8-3hg3-c2mh"
 reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only carrier as RUSTSEC-2026-0098"
+
+# The rustls 0.21 line rides the same AWS legacy-connector-only stack as the
+# h2 0.3 entries above (the lockfile's rustls 0.21.12 reverse edges are
+# hyper-rustls/tokio-rustls through aws-smithy-http-client's legacy
+# connector), and pi-ai never routes through it. RUSTSEC-2026-0346
+# (derived Debug impls that could expose session-key material in log output)
+# needs a custom ClientSessionStore that Debug-formats those values, and the
+# belt writes none; RUSTSEC-2026-0349 (ServerHello-driven key-group
+# prediction downgrading later connections to classical key exchange) rides
+# session-store state the adapter never populates. Both fixes land in the
+# 0.23.46 line hyper 0.14 cannot consume (modern line already moved to
+# 0.23.46); the ignores come off when the AWS SDK drops the legacy stack. See #153.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0346"
+reason = "rustls 0.21.12 rides only the AWS SDK's legacy hyper-0.14 connector, which the Bedrock adapter never selects, and the belt Debug-formats no session-store values; fixed in the 0.23.46 line hyper 0.14 cannot consume"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0349"
+reason = "rustls 0.21.12 rides only the AWS SDK's legacy hyper-0.14 connector, which the Bedrock adapter never selects, and the belt populates no session-store key-group prediction; fixed in the 0.23.46 line hyper 0.14 cannot consume"
 # RUSTSEC-2023-0071 (Marvin Attack) is a decryption side channel against RSA
 # implementations; pi-ai only signs (the RS256 service-account JWT for the
 # Vertex ADC exchange through jsonwebtoken) and never decrypts

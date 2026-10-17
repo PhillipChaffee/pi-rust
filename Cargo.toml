@@ -37,6 +37,30 @@ publish = false
 [lints]
 workspace = true
 
+[profile.dev.package.num-bigint-dig]
+# Bignum keygen math under the RSA keygen suites; 96-107 s per test at 0.0,
+# 0.08-0.11 s at 3 (#153).
+opt-level = 3
+
+[profile.dev.package.rsa]
+# The prime-generation loop of `RsaPrivateKey::new` runs inside this crate.
+opt-level = 3
+
+[profile.dev.package.image]
+# The oversized-image resize suite decodes and downscales a 2400x4800 buffer;
+# 122 s at 0.0, 1.8 s at 3 (#153).
+opt-level = 3
+
+[profile.dev.package.syntect]
+# The highlight-engine suite loads the full syntax set once per test process;
+# 32 s at 0.0, 1.2 s at 3 (#153).
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+# `syntect` compiles every loaded syntax through this regex backend during
+# the same per-process init as the syntect entry above.
+opt-level = 3
+
 # The lint-bearing skeleton of a strict Rust workspace, merged from
 # Cargo.toml.example (kept beside this file as documentation of the table's
 # shape). Rule of the house: every non-default setting carries its reason. An
