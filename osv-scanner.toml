@@ -70,6 +70,10 @@ reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only ca
 id = "GHSA-xgp8-3hg3-c2mh"
 reason = "the rustls-webpki 0.101 advisory family; same legacy-connector-only carrier as RUSTSEC-2026-0098"
 
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0382"
+reason = "the rustls-webpki 0.101 advisory family (0.101.7 rides the AWS SDK's legacy hyper-0.14 connector the Bedrock adapter never selects); fixed only in the 0.103.16 line rustls 0.21 cannot consume"
+
 # The rustls 0.21 line rides the same AWS legacy-connector-only stack as the
 # h2 0.3 entries above (the lockfile's rustls 0.21.12 reverse edges are
 # hyper-rustls/tokio-rustls through aws-smithy-http-client's legacy
