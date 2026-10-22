@@ -16,7 +16,10 @@
 //! (Anthropic thinking knobs, Azure deployment names, the Google thinking
 //! control, Bedrock interleaving and request metadata) through the owning
 //! adapter directly. Upstream resolves OAuth tokens once at module load; the
-//! port resolves per test, the skipIf semantics preserved.
+//! port resolves per test, the skipIf semantics preserved. Port-local: the
+//! `PI_TEST_SKIP_LIVE` skip switch (see [`super::skip_live`]) forces the
+//! "no credential" branch for a shell whose network cannot reach the
+//! providers; upstream needs no equivalent because skipIf alone gates it.
 
 #![expect(
     clippy::expect_used,
@@ -78,8 +81,13 @@ use tokio_util::sync::CancellationToken;
 
 use super::auth_guards;
 
-/// The process environment as the guard signature reads it.
+/// The process environment as the guard signature reads it. The skip
+/// seam reports no credential when `PI_TEST_SKIP_LIVE` is set, so every
+/// guard and probe falls through to its upstream-skipIf return.
 fn env(name: &str) -> Option<String> {
+    if super::skip_live() {
+        return None;
+    }
     std::env::var(name).ok()
 }
 
@@ -134,6 +142,9 @@ fn auth_store() -> PathBuf {
 /// pi credential store first — refreshing an expired OAuth token and saving
 /// it back — then the provider's env vars.
 pub async fn resolve_api_key(provider: &str) -> Option<String> {
+    if super::skip_live() {
+        return None;
+    }
     let path = auth_store();
     let storage = load_credentials(&path.to_string_lossy());
     let stored = match storage.get(provider) {

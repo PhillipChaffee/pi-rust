@@ -5,7 +5,9 @@
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
 //! Like upstream's `it.skipIf`, a probe without its provider credential
-//! returns early; the catalog-coverage assertions always run.
+//! returns early; the catalog-coverage assertions always run. A set
+//! `PI_TEST_SKIP_LIVE` (`common::skip_live`) forces that branch for a shell
+//! whose network cannot reach the provider.
 
 #![expect(
     clippy::expect_used,
@@ -121,6 +123,9 @@ fn anthropic_messages_catalog_covers_the_builtin_registry() {
 /// cheapest route.
 #[tokio::test]
 async fn eager_tool_input_probes_accept_configured_tool_streaming() {
+    if common::skip_live() {
+        return;
+    }
     let echo = Tool {
         name: "echo_value".to_owned(),
         description: "Echo a string value".to_owned(),
@@ -166,6 +171,9 @@ async fn eager_tool_input_probes_accept_configured_tool_streaming() {
 /// probe loop.
 #[tokio::test]
 async fn forced_eager_input_streaming_probes_accept_the_forced_flag() {
+    if common::skip_live() {
+        return;
+    }
     let echo = Tool {
         name: "echo_value".to_owned(),
         description: "Echo a string value".to_owned(),
@@ -218,6 +226,9 @@ async fn forced_eager_input_streaming_probes_accept_the_forced_flag() {
 /// anthropic provider.
 #[tokio::test]
 async fn long_cache_retention_probe_accepts_the_forced_retention() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = get_env_api_key("anthropic", None) else {
         return;
     };
@@ -260,6 +271,9 @@ async fn long_cache_retention_probe_accepts_the_forced_retention() {
 /// required by signed Fable thinking, and the replay fails without them.
 #[tokio::test]
 async fn thinking_binding_replays_managed_effort_markers() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = std::env::var(ANTHROPIC_API_KEY_ENV)
         .ok()
         .filter(|key| !key.trim().is_empty())
@@ -366,6 +380,9 @@ async fn thinking_binding_replays_managed_effort_markers() {
 /// The Opus 4.8 smoke probe, upstream `anthropic-opus-4-8-smoke.test.ts`.
 #[tokio::test]
 async fn opus_4_8_smoke_streams_with_reasoning_enabled() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = std::env::var(ANTHROPIC_API_KEY_ENV)
         .ok()
         .filter(|key| !key.trim().is_empty())
@@ -418,6 +435,9 @@ async fn opus_4_8_smoke_streams_with_reasoning_enabled() {
 /// off emits no thinking events.
 #[tokio::test]
 async fn thinking_disable_emits_no_thinking_events() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = std::env::var(ANTHROPIC_API_KEY_ENV)
         .ok()
         .filter(|key| !key.trim().is_empty())

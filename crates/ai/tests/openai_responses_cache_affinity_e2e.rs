@@ -25,6 +25,9 @@ fn openai_responses_catalog_carries_the_affinity_probe_model() {
 /// cache-affinity routing and answers with the requested text.
 #[tokio::test]
 async fn direct_openai_responses_requests_with_aligned_cache_affinity_identifiers() {
+    if common::skip_live() {
+        return;
+    }
     let Some(api_key) = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|key| !key.trim().is_empty())

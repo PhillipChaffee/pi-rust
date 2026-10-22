@@ -1,17 +1,33 @@
-# nextest configuration: the OAuth login tests bind well-known callback
-# ports (53692/1455/1456), so parallel processes race the listener and a
-# losing login waits forever for its authorize URL — the in-process
-# port locks the auth port added cannot see across nextest's
-# process-per-test boundaries. The group pins every OAuth-touching
-# binary to one process at a time; every other test keeps the default
-# concurrency.
-[test-groups.oauth-ports]
+# The OAuth tests that drive a loopback callback login bind the provider
+# -registered callback port: 53692/1455 in the manual-flow suite, 1456 in
+# the Radius flow suite (radius_oauth.rs mounts the device routes only,
+# but a PKCE-arm case added there binds 1456 and belongs in its group).
+# A losing process waits forever for its authorize URL, and the tests'
+# in-process port locks cannot see across nextest's process-per-test
+# boundaries — one max-threads = 1 group per port set serializes only the
+# binaries that share a port, so the manual and Radius groups still run
+# concurrently and every other OAuth-touching binary (xai, github_copilot,
+# device_code, adapters, which drive a MockHttpClient and bind nothing)
+# keeps the default concurrency.
+[test-groups.oauth-manual]
+max-threads = 1
+
+[test-groups.oauth-radius]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = """
-binary(oauth_flows_manual) or binary(oauth_flows_radius) or
-binary(radius_oauth) or binary(xai_oauth) or
-binary(github_copilot_oauth) or binary(oauth_device_code) or
-binary(oauth_adapters)"""
-test-group = "oauth-ports"
+filter = "binary(oauth_flows_manual)"
+test-group = "oauth-manual"
+
+[[profile.default.overrides]]
+filter = "binary(oauth_flows_radius) or binary(radius_oauth)"
+test-group = "oauth-radius"
+
+# Two timing-threshold tests trip when the gate battery stacks 21 gates on
+# one machine (measured: chord's ops-count linearity probe and the
+# agent-core shell-process cleanup both pass solo and red once per battery).
+# Retry them; the override limits the retry budget to these and leaves
+# the rest of the suite fail-fast.
+[[profile.default.overrides]]
+filter = "test(is_linear_in_the_number_of_ops) or test(cleanup_terminates_active_shell_processes)"
+retries = 2
