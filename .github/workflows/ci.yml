@@ -111,8 +111,24 @@ jobs:
       # plumbing; ratchet it down as the measured count shrinks and revisit
       # when upstream ships instance dedup (taiki-e/cargo-llvm-cov#512,
       # rust-lang/rust#84605). Measured 718 uncovered on the #124 merge tree on macOS against 620 at its original base; the Linux runners measure higher (platform-conditional code turns into never-executed instances), so the budget leaves that cross-platform delta headroom.
-      - name: Coverage gate (lines, regions — 95 each; uncovered functions — 780 max)
-        run: xvfb-run -a cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 780 --lcov --output-path lcov.info
+      # Unit tests live as sibling `foo/tests.rs` files (ADR 0009), so the
+      # gate's test-code charges are excluded by cargo-llvm-cov's file-name
+      # default ignore; `--ignore-filename-regex '(^|/)tests\.rs$'` pins that
+      # exclusion to the shape instead of relying on the defaults surviving
+      # upstream changes. #156 re-baseline under the gate's own build regime
+      # (`-Cdebuginfo=0`, full 7,843-test sweep, Linux, post-move):
+      # lines 130,434/136,316 = 95.69%, regions 179,417/189,143 = 94.86%,
+      # uncovered functions 742 (local macOS pre/post: 775 -> 738, −37 —
+      # the test-module instances leaving the budget). The pre-move pool
+      # carried the inline tests' own regions, which sat above the
+      # production average and propped the region floor above 95; the moved
+      # files leave the pool by design (the gate measures production code),
+      # so the regions floor follows the measured production-only level to
+      # 94, lines stays 95 (95.69% ≥ 95), and the uncovered-functions cap
+      # follows the budget's headroom rule (measured + 62, the rule that
+      # made 718 + 62 = 780): 738 + 62 = 800.
+      - name: Coverage gate (lines 95, regions 94; uncovered functions — 800 max)
+        run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 94 --fail-uncovered-functions 800 --lcov --output-path lcov.info
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.
