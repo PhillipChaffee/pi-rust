@@ -5,6 +5,7 @@
 //! interactive surfaces ride their tickets.
 
 pub mod api;
+pub mod built_in;
 pub mod events;
 pub mod reasons;
 pub mod results;
