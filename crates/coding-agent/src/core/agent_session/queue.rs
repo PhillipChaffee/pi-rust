@@ -76,7 +76,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         let (skill_name, args) = rest
             .split_once(' ')
             .map_or((rest, ""), |(name, args)| (name, args.trim()));
-        let skills = lock(&self.resource_loader).get_skills().skills;
+        let skills = self.with_loader(|loader| loader.get_skills().skills);
         let Some(skill) = skills.iter().find(|skill| skill.name == skill_name) else {
             return text.to_owned();
         };
@@ -102,6 +102,14 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
 }
 
 impl<S: SettingsStorage + 'static> super::AgentSession<S> {
+    pub(crate) fn sync_queue_modes_from_settings(&self) {
+        let settings = lock(&self.settings_manager);
+        self.agent
+            .set_steering_mode(agent_queue_mode(settings.get_steering_mode()));
+        self.agent
+            .set_follow_up_mode(agent_queue_mode(settings.get_follow_up_mode()));
+    }
+
     /// The current steering queue mode.
     #[must_use]
     pub fn steering_mode(&self) -> pi_agent_core::types::QueueMode {
@@ -124,6 +132,17 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
     pub fn set_follow_up_mode(&self, mode: pi_agent_core::types::QueueMode) {
         self.agent.set_follow_up_mode(mode);
         lock(&self.settings_manager).set_follow_up_mode(settings_queue_mode(mode));
+    }
+}
+
+const fn agent_queue_mode(
+    mode: crate::settings_manager::QueueMode,
+) -> pi_agent_core::types::QueueMode {
+    match mode {
+        crate::settings_manager::QueueMode::All => pi_agent_core::types::QueueMode::All,
+        crate::settings_manager::QueueMode::OneAtATime => {
+            pi_agent_core::types::QueueMode::OneAtATime
+        }
     }
 }
 

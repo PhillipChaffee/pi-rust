@@ -59,13 +59,12 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             };
         *lock(&self.base_tool_definitions) = base_definitions;
 
-        let extensions: Vec<Arc<crate::extensions::runtime::Extension>> =
-            lock(&self.resource_loader)
-                .get_extensions()
-                .extensions
-                .into_iter()
-                .filter_map(|entry| entry.record)
-                .collect();
+        let extensions: Vec<Arc<crate::extensions::runtime::Extension>> = self
+            .with_loader(crate::resource_loader::DefaultResourceLoader::get_extensions)
+            .extensions
+            .into_iter()
+            .filter_map(|entry| entry.record)
+            .collect();
         let mode = *lock(&self.extension_mode);
         let mut runner = ExtensionRunner::new(
             extensions,
@@ -156,7 +155,9 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             prompt_paths: resource_paths(&paths.prompt_paths),
             theme_paths: resource_paths(&paths.theme_paths),
         };
-        lock(&self.resource_loader).extend_resources(&extension_paths);
+        if let Some(loader) = lock(&self.resource_loader).as_mut() {
+            loader.extend_resources(&extension_paths);
+        }
         let active = self.active_tool_names();
         let prompt = self.rebuild_system_prompt(&active);
         (*lock(&self.base_system_prompt)).clone_from(&prompt);

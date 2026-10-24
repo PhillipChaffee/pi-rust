@@ -329,3 +329,45 @@ async fn custom_messages_append_and_trigger_turns() {
             ))
     );
 }
+
+#[tokio::test]
+async fn lifecycle_reads_forks_reloads_and_exports_html() {
+    let root = "/tmp/pi-session-surfaces-lifecycle";
+    let session_dir = format!("{root}/sessions");
+    let mut manager = SessionManager::create(root, Some(&session_dir), None).expect("session");
+    manager
+        .append_message(AgentMessage::Standard(Message::User(UserMessage {
+            content: UserContent::Text("first".to_owned()),
+            timestamp: 0,
+        })))
+        .expect("append");
+    manager
+        .append_message(AgentMessage::Standard(Message::User(UserMessage {
+            content: UserContent::Text("second".to_owned()),
+            timestamp: 1,
+        })))
+        .expect("append");
+    manager
+        .append_message(AgentMessage::Standard(Message::Assistant(assistant(
+            "reply",
+        ))))
+        .expect("append");
+    let session = build_session(root, manager).await;
+    let forks = session.user_messages_for_forking();
+    assert_eq!(forks.len(), 2);
+    assert_eq!(forks[0].1, "first");
+    let context = session.create_replaced_session_context();
+    assert!(context.get_model().expect("model").is_some());
+    let html_path = format!("{root}/export.html");
+    let written = session
+        .export_to_html(
+            Some(html_path.clone()),
+            None,
+            &pi_coding_agent::export_html::NoThemeSource,
+        )
+        .expect("html");
+    assert_eq!(written, html_path);
+    assert!(std::path::Path::new(&html_path).exists());
+    session.reload(None).await;
+    assert!(session.get_tool_definition("read").is_some());
+}

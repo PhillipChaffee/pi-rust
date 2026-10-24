@@ -180,28 +180,28 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                 guidelines.extend(tool_guidelines.iter().cloned());
             }
         }
-        let loader = lock(&self.resource_loader);
-        let append = loader.get_append_system_prompt();
-        let options = crate::system_prompt::BuildSystemPromptOptions {
-            cwd: self.cwd.clone(),
-            skills: Some(loader.get_skills().skills),
-            context_files: Some(
-                loader
-                    .get_agents_files()
-                    .into_iter()
-                    .map(|file| crate::system_prompt::ContextFile {
-                        path: file.path,
-                        content: file.content,
-                    })
-                    .collect(),
-            ),
-            custom_prompt: loader.get_system_prompt(),
-            append_system_prompt: (!append.is_empty()).then(|| append.join("\n\n")),
-            selected_tools: Some(valid),
-            tool_snippets: Some(snippets),
-            prompt_guidelines: Some(guidelines),
-        };
-        drop(loader);
+        let options = self.with_loader(|loader| {
+            let append = loader.get_append_system_prompt();
+            crate::system_prompt::BuildSystemPromptOptions {
+                cwd: self.cwd.clone(),
+                skills: Some(loader.get_skills().skills),
+                context_files: Some(
+                    loader
+                        .get_agents_files()
+                        .into_iter()
+                        .map(|file| crate::system_prompt::ContextFile {
+                            path: file.path,
+                            content: file.content,
+                        })
+                        .collect(),
+                ),
+                custom_prompt: loader.get_system_prompt(),
+                append_system_prompt: (!append.is_empty()).then(|| append.join("\n\n")),
+                selected_tools: Some(valid),
+                tool_snippets: Some(snippets),
+                prompt_guidelines: Some(guidelines),
+            }
+        });
         let prompt = crate::system_prompt::build_system_prompt(&options);
         *lock(&self.base_system_prompt_options) = options;
         prompt

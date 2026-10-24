@@ -53,7 +53,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             agent,
             session_manager: Mutex::new(session_manager),
             settings_manager,
-            resource_loader: Mutex::new(resource_loader),
+            resource_loader: Mutex::new(Some(resource_loader)),
             cwd,
             model_runtime,
             scoped_models: Mutex::new(scoped_models.unwrap_or_default()),

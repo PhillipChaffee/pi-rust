@@ -171,7 +171,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                     source_info: template.source_info,
                 }),
         );
-        let skills = lock(&self.resource_loader).get_skills().skills;
+        let skills = self.with_loader(|loader| loader.get_skills().skills);
         commands.extend(skills.into_iter().map(|skill| SlashCommandInfo {
             name: format!("skill:{}", skill.name),
             description: Some(skill.description),

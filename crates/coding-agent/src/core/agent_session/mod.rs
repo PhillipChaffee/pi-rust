@@ -28,6 +28,7 @@ mod dispatch;
 mod extension_actions;
 mod helpers;
 mod hooks;
+mod lifecycle;
 mod messages;
 mod model;
 mod prompt;
@@ -95,7 +96,7 @@ pub struct AgentSession<S: SettingsStorage + 'static> {
     pub(crate) agent: pi_agent_core::Agent,
     pub(crate) session_manager: Mutex<SessionManager>,
     pub(crate) settings_manager: Arc<Mutex<SettingsManager<S>>>,
-    pub(crate) resource_loader: Mutex<DefaultResourceLoader<S>>,
+    pub(crate) resource_loader: Mutex<Option<DefaultResourceLoader<S>>>,
     pub(crate) cwd: String,
     pub(crate) model_runtime: ModelRuntime,
     pub(crate) scoped_models: Mutex<Vec<ScopedModel>>,
@@ -176,15 +177,29 @@ impl<S: SettingsStorage + 'static> AgentSession<S> {
         Arc::clone(&self.settings_manager)
     }
 
+    /// Read the resource loader. Absent only while a reload swaps it.
+    #[expect(
+        clippy::expect_used,
+        clippy::significant_drop_tightening,
+        reason = "the guard is held for the closure's read; a missing loader only appears during reload"
+    )]
+    pub(crate) fn with_loader<R>(&self, f: impl FnOnce(&DefaultResourceLoader<S>) -> R) -> R {
+        let guard = lock(&self.resource_loader);
+        let loader = guard
+            .as_ref()
+            .expect("the resource loader is present outside reload");
+        f(loader)
+    }
+
     /// Read the resource loader.
     pub fn with_resource_loader<R>(&self, f: impl FnOnce(&DefaultResourceLoader<S>) -> R) -> R {
-        f(&lock(&self.resource_loader))
+        self.with_loader(f)
     }
 
     /// The loaded prompt templates.
     #[must_use]
     pub fn prompt_templates(&self) -> Vec<crate::prompt_templates::PromptTemplate> {
-        lock(&self.resource_loader).get_prompts().prompts
+        self.with_loader(|loader| loader.get_prompts().prompts)
     }
 
     /// The working directory.
