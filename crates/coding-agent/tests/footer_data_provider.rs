@@ -377,3 +377,34 @@ fn dispose_cancels_a_pending_refresh() {
     provider.run_pending_refresh();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn real_reftable_watch_refreshes_the_branch() {
+    let temp = TempDir::new().expect("tempdir");
+    let (worktree, reftable) = create_reftable_worktree(&temp);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runner: GitBranchRunner = {
+        let calls = Arc::clone(&calls);
+        Arc::new(move |_repo: &str| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("main".to_owned())
+        })
+    };
+    let provider = FooterDataProvider::with_options(
+        &worktree,
+        FooterDataProviderOptions {
+            manual_timers: false,
+            resolve_branch: Some(runner),
+            env: None,
+        },
+    );
+    assert_eq!(provider.get_git_branch().as_deref(), Some("main"));
+    let baseline = calls.load(Ordering::SeqCst);
+    write(&Path::new(&reftable).join("tables.list"), "2\n");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while calls.load(Ordering::SeqCst) == baseline && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(calls.load(Ordering::SeqCst) > baseline);
+    provider.dispose();
+}

@@ -435,3 +435,54 @@ async fn session_only_model_changes_stay_out_of_scope() {
         Some(vec!["faux/faux-1".to_owned()])
     );
 }
+
+#[tokio::test]
+async fn restores_a_stored_thinking_level() {
+    let fixture = fixture();
+    let registry = fixture_registry().await;
+    let mut manager =
+        SessionManager::in_memory(Some("/tmp/pi-sdk-thinking"), None, None).expect("session");
+    manager
+        .append_thinking_level_change("high")
+        .expect("thinking change");
+    manager
+        .append_model_change("faux", "faux-1")
+        .expect("model change");
+    manager
+        .append_message(pi_agent_core::types::AgentMessage::Standard(
+            pi_ai::types::Message::User(pi_ai::types::UserMessage {
+                content: pi_ai::types::UserContent::Text("hello".to_owned()),
+                timestamp: 1,
+            }),
+        ))
+        .expect("message");
+    let result = create(
+        &fixture,
+        &registry,
+        Settings::new(),
+        Some(manager),
+        |options| {
+            options.model = None;
+        },
+    )
+    .await;
+    assert_eq!(
+        result.session.thinking_level(),
+        pi_agent_core::types::ThinkingLevel::High
+    );
+}
+
+#[tokio::test]
+async fn applies_the_per_model_thinking_override() {
+    let fixture = fixture();
+    let registry = fixture_registry().await;
+    let settings = Settings::from_iter([(
+        "modelThinkingLevels".to_owned(),
+        json!({"faux/faux-1": "low"}),
+    )]);
+    let result = create(&fixture, &registry, settings, None, |_| {}).await;
+    assert_eq!(
+        result.session.thinking_level(),
+        pi_agent_core::types::ThinkingLevel::Low
+    );
+}

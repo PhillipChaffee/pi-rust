@@ -588,6 +588,13 @@ async fn import_copies_the_file_and_reports_missing_sources() {
         "/{}",
         pi_coding_agent::utils::paths::basename_posix(&source_file)
     )));
+    let again = harness
+        .runtime
+        .import_from_jsonl(&imported, None)
+        .await
+        .expect("already-stored import");
+    assert!(!again.cancelled);
+    assert_eq!(harness.runtime.services().cwd, harness.cwd);
     harness.runtime.dispose().await;
 }
 
@@ -793,5 +800,73 @@ async fn before_session_invalidate_and_trust_factory_run() {
     assert!(trusted.load(Ordering::SeqCst));
     assert_eq!(harness.runtime.cwd(), harness.cwd);
     assert!(harness.runtime.model_fallback_message().is_none());
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn persisted_fork_before_a_root_message_starts_a_new_session() {
+    let entry_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&entry_slot);
+    let mut harness = harness_with(move |cwd| {
+        let mut manager = SessionManager::create(cwd, None, None).expect("manager");
+        let id = manager
+            .append_message(user_message("hello"))
+            .expect("user message");
+        manager
+            .append_message(assistant_message("ok"))
+            .expect("assistant message");
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
+        manager
+    })
+    .await;
+    let entry_id = entry_slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .expect("entry id");
+    let original_file = harness.runtime.session().session_file();
+    let outcome = harness
+        .runtime
+        .fork(
+            &entry_id,
+            ForkOptions {
+                position: Some(ForkPosition::Before),
+                with_session: None,
+            },
+        )
+        .await
+        .expect("fork");
+    assert!(!outcome.cancelled);
+    assert_eq!(outcome.selected_text.as_deref(), Some("hello"));
+    assert!(harness.runtime.session().session_file().is_some());
+    assert_ne!(harness.runtime.session().session_file(), original_file);
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn switch_reports_a_missing_stored_cwd() {
+    let mut harness = harness(in_memory_manager("/tmp/pi-runtime-missing-cwd")).await;
+    let directory = TempDir::new().expect("tempdir");
+    let file = directory.path().join("stale.jsonl");
+    let mut manager = SessionManager::create(
+        "/tmp/pi-runtime-gone",
+        Some(&directory.path().display().to_string()),
+        None,
+    )
+    .expect("manager");
+    manager
+        .append_message(assistant_message("ok"))
+        .expect("flush");
+    std::fs::copy(manager.session_file().expect("file"), &file).expect("copy");
+    let error = harness
+        .runtime
+        .switch_session(&file.display().to_string(), SwitchSessionOptions::default())
+        .await
+        .expect_err("missing cwd");
+    assert!(matches!(
+        error,
+        AgentSessionRuntimeError::MissingSessionCwd(_)
+    ));
+    assert!(error.to_string().contains("does not exist"));
     harness.runtime.dispose().await;
 }

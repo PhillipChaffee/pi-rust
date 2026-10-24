@@ -608,3 +608,66 @@ fn block_images_filters_tool_result_images() {
             if text.text == "Image reading is disabled."
     ));
 }
+
+#[tokio::test]
+async fn request_websocket_and_retry_values_override_settings() {
+    let capture = capture_stream_options(
+        Settings::from_iter([
+            ("websocketConnectTimeoutMs".to_owned(), json!(1234)),
+            (
+                "retry".to_owned(),
+                json!({"provider": {"maxRetries": 2, "maxRetryDelayMs": 3000}}),
+            ),
+        ]),
+        Some(SimpleStreamOptions {
+            websocket_connect_timeout_ms: Some(0),
+            max_retries: Some(5),
+            max_retry_delay_ms: Some(10),
+            ..SimpleStreamOptions::default()
+        }),
+        Vec::new(),
+    )
+    .await;
+    let options = capture.options.expect("captured");
+    assert_eq!(options.websocket_connect_timeout_ms, Some(0));
+    assert_eq!(options.max_retries, Some(5));
+    assert_eq!(options.max_retry_delay_ms, Some(10));
+    capture.session.dispose();
+}
+
+#[tokio::test]
+async fn negative_retry_settings_fall_back_to_request_values() {
+    let capture = capture_stream_options(
+        Settings::from_iter([(
+            "retry".to_owned(),
+            json!({"provider": {"maxRetries": -1, "maxRetryDelayMs": -1, "timeoutMs": -1}}),
+        )]),
+        None,
+        Vec::new(),
+    )
+    .await;
+    let options = capture.options.expect("captured");
+    assert_eq!(options.max_retries, None);
+    capture.session.dispose();
+}
+
+#[test]
+fn block_images_leaves_plain_text_content_alone() {
+    let settings = Settings::from_iter([("images".to_owned(), json!({"blockImages": true}))]);
+    let manager = SettingsManager::in_memory(&settings, SettingsManagerCreateOptions::default());
+    let user = pi_ai::types::UserMessage {
+        content: pi_ai::types::UserContent::Text("plain".to_owned()),
+        timestamp: 1,
+    };
+    let converted = pi_coding_agent::core::sdk::convert_to_llm_with_block_images(
+        &[pi_agent_core::types::AgentMessage::Standard(
+            pi_ai::types::Message::User(user),
+        )],
+        &manager,
+    );
+    assert!(matches!(
+        &converted[0],
+        pi_ai::types::Message::User(user)
+            if matches!(&user.content, pi_ai::types::UserContent::Text(text) if text == "plain")
+    ));
+}
