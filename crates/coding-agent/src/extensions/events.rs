@@ -289,7 +289,7 @@ pub enum ExtensionEvent {
         /// The raw arguments.
         input: Value,
         /// The result content.
-        content: Vec<pi_ai::types::AssistantBlock>,
+        content: Vec<pi_ai::types::ToolResultBlock>,
         /// The result details.
         details: Value,
         /// Whether the execution failed.

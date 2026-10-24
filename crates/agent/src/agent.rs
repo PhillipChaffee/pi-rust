@@ -339,15 +339,18 @@ struct AgentInner {
 
     convert_to_llm: ConvertToLlm,
     transform_context: Option<TransformContext>,
-    stream_function: Option<StreamFn>,
+    /// Reassignable after construction, upstream's writable
+    /// `agent.streamFunction`; the product session installs its stream
+    /// function and hooks after the `Agent` exists.
+    stream_function: Mutex<Option<StreamFn>>,
     get_api_key: Option<GetApiKey>,
     on_payload: Option<OnPayload>,
     on_response: Option<OnResponse>,
-    before_tool_call: Option<BeforeToolCall>,
-    after_tool_call: Option<AfterToolCall>,
+    before_tool_call: Mutex<Option<BeforeToolCall>>,
+    after_tool_call: Mutex<Option<AfterToolCall>>,
     should_stop_after_turn: Option<AgentShouldStopAfterTurn>,
-    prepare_next_turn: Option<AgentPrepareNextTurn>,
-    prepare_next_turn_with_context: Option<AgentPrepareNextTurnWithContext>,
+    prepare_next_turn: Mutex<Option<AgentPrepareNextTurn>>,
+    prepare_next_turn_with_context: Mutex<Option<AgentPrepareNextTurnWithContext>>,
     thinking_budgets: Option<ThinkingBudgets>,
     transport: Transport,
     max_retry_delay_ms: Option<u64>,
@@ -407,15 +410,15 @@ impl Agent {
                 Arc::new(|messages| Box::pin(async move { default_convert_to_llm(messages) }))
             }),
             transform_context: options.transform_context,
-            stream_function: options.stream_fn,
+            stream_function: Mutex::new(options.stream_fn),
             get_api_key: options.get_api_key,
             on_payload: options.on_payload,
             on_response: options.on_response,
-            before_tool_call: options.before_tool_call,
-            after_tool_call: options.after_tool_call,
+            before_tool_call: Mutex::new(options.before_tool_call),
+            after_tool_call: Mutex::new(options.after_tool_call),
             should_stop_after_turn: options.should_stop_after_turn,
-            prepare_next_turn: options.prepare_next_turn,
-            prepare_next_turn_with_context: options.prepare_next_turn_with_context,
+            prepare_next_turn: Mutex::new(options.prepare_next_turn),
+            prepare_next_turn_with_context: Mutex::new(options.prepare_next_turn_with_context),
             thinking_budgets: options.thinking_budgets,
             transport: options.transport.unwrap_or(Transport::Auto),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -432,7 +435,7 @@ impl Agent {
     /// run's cancellation token. `agent_end` is the final emitted event for
     /// a run, but the agent does not become idle until all awaited listeners
     /// for that event have settled. Returns the unsubscribe closure.
-    pub fn subscribe(&self, listener: AgentListener) -> impl FnOnce() {
+    pub fn subscribe(&self, listener: AgentListener) -> impl FnOnce() + use<> {
         let token = Arc::new(());
         self.0
             .listeners
@@ -504,6 +507,90 @@ impl Agent {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .messages = messages.to_vec();
+    }
+
+    /// Replace the stream function used by future runs, upstream's writable
+    /// `Agent.streamFunction`.
+    pub fn set_stream_function(&self, stream_function: Option<StreamFn>) {
+        *self
+            .0
+            .stream_function
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = stream_function;
+    }
+
+    /// The configured stream function, absent when the process-global
+    /// default applies.
+    #[must_use]
+    pub fn stream_function(&self) -> Option<StreamFn> {
+        self.0
+            .stream_function
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the pre-execution tool-call gate, upstream's writable
+    /// `Agent.beforeToolCall`.
+    pub fn set_before_tool_call(&self, hook: Option<BeforeToolCall>) {
+        *self
+            .0
+            .before_tool_call
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Install the post-execution tool-result override pass, upstream's
+    /// writable `Agent.afterToolCall`.
+    pub fn set_after_tool_call(&self, hook: Option<AfterToolCall>) {
+        *self
+            .0
+            .after_tool_call
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// Install the signal-only turn-preparation hook, upstream's writable
+    /// `Agent.prepareNextTurn`.
+    pub fn set_prepare_next_turn(&self, hook: Option<AgentPrepareNextTurn>) {
+        *self
+            .0
+            .prepare_next_turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// The configured signal-only turn-preparation hook.
+    #[must_use]
+    pub fn prepare_next_turn(&self) -> Option<AgentPrepareNextTurn> {
+        self.0
+            .prepare_next_turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the context-aware turn-preparation hook, upstream's writable
+    /// `Agent.prepareNextTurnWithContext`.
+    pub fn set_prepare_next_turn_with_context(
+        &self,
+        hook: Option<AgentPrepareNextTurnWithContext>,
+    ) {
+        *self
+            .0
+            .prepare_next_turn_with_context
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = hook;
+    }
+
+    /// The configured context-aware turn-preparation hook.
+    #[must_use]
+    pub fn prepare_next_turn_with_context(&self) -> Option<AgentPrepareNextTurnWithContext> {
+        self.0
+            .prepare_next_turn_with_context
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Controls how queued steering messages drain.
@@ -969,8 +1056,16 @@ impl AgentInner {
             get_steering_messages: Some(get_steering_messages),
             get_follow_up_messages: Some(get_follow_up_messages),
             tool_execution: Some(self.tool_execution),
-            before_tool_call: self.before_tool_call.clone(),
-            after_tool_call: self.after_tool_call.clone(),
+            before_tool_call: self
+                .before_tool_call
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            after_tool_call: self
+                .after_tool_call
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         }
     }
 
@@ -1043,9 +1138,16 @@ impl AgentInner {
     /// wins when both are set, upstream-verbatim; the signal-only shape gets
     /// the run's token in place of the context.
     fn prepare_next_turn_hook(self: &Arc<Self>) -> Option<PrepareNextTurn> {
-        self.prepare_next_turn_with_context.clone().map_or_else(
+        let with_context = self
+            .prepare_next_turn_with_context
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        with_context.map_or_else(
             || {
                 self.prepare_next_turn
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
                     .clone()
                     .map(|hook| -> PrepareNextTurn {
                         let inner = Arc::clone(self);
@@ -1203,7 +1305,11 @@ async fn run_executor(
     let context = inner.create_context_snapshot();
     let config = inner.create_loop_config(skip_initial_steering_poll);
     let sink = inner.event_sink();
-    let stream_fn = inner.stream_function.clone();
+    let stream_fn = inner
+        .stream_function
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     match run {
         RunKind::Prompt(messages, _) => {
             run_agent_loop(messages, context, config, sink, Some(token), stream_fn)

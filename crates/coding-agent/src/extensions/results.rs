@@ -85,7 +85,7 @@ pub struct ToolCallResult {
 #[derive(Clone, Debug, Default)]
 pub struct ToolResultResult {
     /// Replacement content.
-    pub content: Option<Vec<pi_ai::types::AssistantBlock>>,
+    pub content: Option<Vec<pi_ai::types::ToolResultBlock>>,
     /// Replacement details.
     pub details: Option<Value>,
     /// Replacement error flag.
