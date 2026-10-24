@@ -77,7 +77,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             ModelRegistry::new(self.model_runtime.clone()),
             ExtensionRuntime::new(),
         );
-        runner.bind_core(self.extension_actions(), None);
+        runner.bind_core(self.extension_actions(), Some(self.provider_actions()));
         runner.bind_command_context(lock(&self.extension_command_context_actions).clone());
         runner.set_mode(mode);
         let error_listener = lock(&self.extension_error_listener).clone();

@@ -17,7 +17,10 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         clippy::suspicious_operation_groupings,
         reason = "the assistant carries `model`, not `id`; the comparison is upstream's"
     )]
-    pub(crate) async fn check_compaction(
+    /// The post-turn compaction ladder, upstream's `_checkCompaction`.
+    /// Hidden from docs; the auto-compaction suite drives it directly.
+    #[doc(hidden)]
+    pub async fn check_compaction(
         &self,
         message: &pi_ai::types::AssistantMessage,
         skip_aborted_check: bool,
@@ -37,6 +40,10 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             return false;
         }
         let same_model = model.provider.0 == message.provider.0 && model.id == message.model;
+        let compaction_timestamp = self.latest_compaction_timestamp();
+        if compaction_timestamp.is_some_and(|timestamp| message.timestamp <= timestamp) {
+            return false;
+        }
         let overflow = same_model
             && pi_ai::utils::overflow::is_context_overflow(message, Some(model.context_window));
         let recoverable =
@@ -48,14 +55,17 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                     .await;
             }
             if self.overflow_recovery_attempted.load(Ordering::Relaxed) {
+                let error_message = if overflow {
+                    "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
+                } else {
+                    "Truncated response recovery failed after one compact-and-retry attempt."
+                };
                 self.emit(AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Overflow,
                     result: None,
                     aborted: false,
                     will_retry: false,
-                    error_message: Some(
-                        "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model.".to_owned(),
-                    ),
+                    error_message: Some(error_message.to_owned()),
                 });
                 return false;
             }
@@ -66,11 +76,31 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                 .run_auto_compaction(CompactionReason::Overflow, true)
                 .await;
         }
-        let tokens = if message.stop_reason == pi_ai::types::StopReason::Error {
-            crate::compaction::estimate_context_tokens(&self.agent.state().messages).tokens
-        } else {
-            crate::compaction::calculate_context_tokens(&message.usage)
-        };
+        let direct_tokens = crate::compaction::calculate_context_tokens(&message.usage);
+        let tokens =
+            if message.stop_reason == pi_ai::types::StopReason::Error || direct_tokens == 0 {
+                let estimate =
+                    crate::compaction::estimate_context_tokens(&self.agent.state().messages);
+                if let Some(index) = estimate.last_usage_index
+                    && let Some(timestamp) = compaction_timestamp
+                {
+                    let stale =
+                        self.agent.state().messages.get(index).is_some_and(
+                            |message| match message {
+                                pi_agent_core::types::AgentMessage::Standard(
+                                    pi_ai::types::Message::Assistant(assistant),
+                                ) => assistant.timestamp <= timestamp,
+                                _ => false,
+                            },
+                        );
+                    if stale {
+                        return false;
+                    }
+                }
+                estimate.tokens
+            } else {
+                direct_tokens
+            };
         if crate::compaction::should_compact(tokens, model.context_window, &settings) {
             return self
                 .run_auto_compaction(CompactionReason::Threshold, false)
@@ -79,11 +109,30 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         false
     }
 
-    pub(crate) async fn run_auto_compaction(
-        &self,
-        reason: CompactionReason,
-        will_retry: bool,
-    ) -> bool {
+    /// The latest compaction boundary's timestamp, in epoch milliseconds.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the branch borrows the manager guard, so the guard lives to the end of the scan"
+    )]
+    fn latest_compaction_timestamp(&self) -> Option<i64> {
+        let timestamp = {
+            let manager = lock(&self.session_manager);
+            let branch = manager.get_branch(None);
+            branch.iter().rev().find_map(|entry| match entry {
+                FileEntry::Entry(SessionEntry::Compaction(compaction)) => {
+                    Some(compaction.base.timestamp.clone())
+                }
+                _ => None,
+            })
+        }?;
+        pi_agent_core::harness::session::jsonl::codec::parse_iso8601_millis(&timestamp)
+    }
+
+    /// Execute threshold or overflow compaction, upstream's
+    /// `_runAutoCompaction`. Hidden from docs; the auto-compaction suite
+    /// drives it directly.
+    #[doc(hidden)]
+    pub async fn run_auto_compaction(&self, reason: CompactionReason, will_retry: bool) -> bool {
         let token = CancellationToken::new();
         *lock(&self.auto_compaction_abort) = Some(token.clone());
         self.emit(AgentSessionEvent::CompactionStart { reason });

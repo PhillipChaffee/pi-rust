@@ -14,6 +14,11 @@ use pi_coding_agent::config::EnvLookup;
     unused,
     reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
 )]
+pub mod agent_session;
+#[allow(
+    unused,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
 pub mod compaction;
 #[allow(
     unused,
