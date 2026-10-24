@@ -51,7 +51,7 @@ pub fn usage_with_cost(total: u64, cost: f64) -> Usage {
         input: total,
         total_tokens: total,
         cost: UsageCost {
-            input: cost,
+            total: cost,
             ..UsageCost::default()
         },
         ..Usage::default()
