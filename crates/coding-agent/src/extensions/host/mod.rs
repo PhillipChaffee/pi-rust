@@ -2,8 +2,9 @@
 //!
 //! A third-party extension is a child process whose stdin/stdout carry
 //! pi-protocol's framed CBOR; this module owns the frame vocabulary, the
-//! codec, and the integer-preserving JSON bridge. Spawning and dispatch are
-//! later slices (#170, #171); the domain-shape serialization is #169.
+//! codec, the integer-preserving JSON bridge, and the payload mappings for
+//! the domain shapes (#169). Spawning and dispatch are later slices
+//! (#170, #171).
 //!
 //! [ADR 0010]: ../../../../../docs/adr/0010-extension-host-wire-protocol.md
 
@@ -15,6 +16,7 @@ mod bridge;
 mod codec;
 mod decode;
 mod frame;
+mod payload;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +24,14 @@ pub use bridge::{cbor_to_json, json_to_cbor};
 pub use codec::encode_frame;
 pub use decode::decode_frame;
 pub use frame::{EXTENSION_PROTOCOL_VERSION, ExtensionIdentity, Frame};
+pub use payload::descriptors::{
+    CommandDeclaration, ContextSnapshot, FlagDeclaration, ToolDeclaration,
+    command_declaration_from_wire, command_to_wire, context_snapshot_from_wire,
+    context_snapshot_to_wire, flag_declaration_from_wire, flag_to_wire, provider_from_wire,
+    provider_to_wire, tool_declaration_from_wire, tool_definition_to_wire,
+};
+pub use payload::events::{EVENT_CHANNELS, event_from_wire, event_to_wire};
+pub use payload::results::{RESULT_CHANNELS, result_from_wire, result_to_wire};
 
 /// A wire-level failure: a malformed or unknown frame, or a payload the
 /// JSON bridge cannot represent.
