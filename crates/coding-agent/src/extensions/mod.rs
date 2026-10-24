@@ -7,6 +7,7 @@
 pub mod api;
 pub mod built_in;
 pub mod events;
+pub mod host;
 pub mod reasons;
 pub mod results;
 pub mod runner;

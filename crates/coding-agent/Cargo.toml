@@ -11,10 +11,11 @@ categories = ["development-tools", "command-line-utilities"]
 
 [dependencies]
 # The defaults module's `ThinkingLevel`, upstream's import from
-# `@earendil-works/pi-agent-core`. The remaining ADR 0003 runtime edges
-# (pi-tui, chord, pi-client, pi-protocol, pi-server) land with the
-# tickets that first consume them.
+# `@earendil-works/pi-agent-core`.
 pi-agent-core = { path = "../agent" }
+# The extension host's wire substrate (ADR 0010): pi-protocol's
+# length-prefixed CBOR framing and codec.
+pi-protocol = { path = "../protocol" }
 # The base64 payloads the image and clipboard belts trade, upstream's
 # Buffer.prototype.toString("base64").
 base64 = "0.22"

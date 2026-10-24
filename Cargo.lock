@@ -2637,6 +2637,7 @@ dependencies = [
  "notify",
  "pi-agent-core",
  "pi-ai",
+ "pi-protocol",
  "pi-tui",
  "rand 0.9.5",
  "regex",
