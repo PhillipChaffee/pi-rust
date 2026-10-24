@@ -408,3 +408,25 @@ fn real_reftable_watch_refreshes_the_branch() {
     assert!(calls.load(Ordering::SeqCst) > baseline);
     provider.dispose();
 }
+
+#[test]
+fn a_non_ref_head_reads_as_detached() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = create_plain_repo(&temp);
+    write(&Path::new(&repo).join(".git").join("HEAD"), "not-a-ref\n");
+    let (runner, _) = counter_runner("main");
+    let provider = FooterDataProvider::with_options(&repo, manual_options(runner));
+    assert_eq!(provider.get_git_branch().as_deref(), Some("detached"));
+    provider.dispose();
+}
+
+#[test]
+fn a_missing_head_reads_as_absent() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = create_plain_repo(&temp);
+    let (runner, _) = counter_runner("main");
+    let provider = FooterDataProvider::with_options(&repo, manual_options(runner));
+    std::fs::remove_file(Path::new(&repo).join(".git").join("HEAD")).expect("remove head");
+    assert_eq!(provider.get_git_branch(), None);
+    provider.dispose();
+}

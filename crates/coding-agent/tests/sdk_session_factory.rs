@@ -11,117 +11,21 @@
 
 mod common;
 
-use pi_ai::types::Api;
-use pi_ai::types::Modality;
-use pi_ai::types::Model;
-use pi_ai::types::ProviderId;
+use std::sync::Arc;
+
 use pi_coding_agent::core::sdk::CreateAgentSessionOptions;
 use pi_coding_agent::core::sdk::NoTools;
 use pi_coding_agent::core::sdk::create_agent_session;
 use pi_coding_agent::model_registry::ModelRegistry;
-use pi_coding_agent::provider_composer::ProviderConfigInput;
-use pi_coding_agent::provider_composer::ProviderModelInput;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use pi_coding_agent::settings_manager::Settings;
 use pi_coding_agent::settings_manager::SettingsManager;
 use pi_coding_agent::settings_manager::SettingsManagerCreateOptions;
 use serde_json::json;
-use tempfile::TempDir;
-
-fn fixture_model() -> Model {
-    Model {
-        id: "faux-1".to_owned(),
-        name: "Faux 1".to_owned(),
-        api: Api::from("openai-completions"),
-        provider: ProviderId("faux".to_owned()),
-        base_url: "https://faux.invalid/v1".to_owned(),
-        reasoning: true,
-        thinking_level_map: None,
-        input: vec![Modality::Text, Modality::Image],
-        cost: common::model_layer::zero_cost(),
-        context_window: 128_000,
-        max_tokens: 4096,
-        sampling_params: None,
-        headers: None,
-        compat: None,
-    }
-}
-
-/// A registry with the fixture provider registered and its key configured.
-async fn fixture_registry() -> ModelRegistry {
-    let registry = common::model_layer::create_in_memory_model_registry(
-        common::model_layer::empty_auth_storage(),
-    )
-    .await;
-    registry
-        .runtime()
-        .register_provider(
-            "faux",
-            ProviderConfigInput {
-                base_url: Some("https://faux.invalid/v1".to_owned()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("faux-key".to_owned()),
-                models: Some(vec![
-                    ProviderModelInput {
-                        id: "faux-1".to_owned(),
-                        name: "Faux 1".to_owned(),
-                        api: Some(Api::from("openai-completions")),
-                        base_url: None,
-                        reasoning: true,
-                        thinking_level_map: None,
-                        input: vec![Modality::Text, Modality::Image],
-                        cost: common::model_layer::zero_cost(),
-                        context_window: 128_000,
-                        max_tokens: 4096,
-                        sampling_params: None,
-                        headers: None,
-                        compat: None,
-                    },
-                    ProviderModelInput {
-                        id: "faux-2".to_owned(),
-                        name: "Faux 2".to_owned(),
-                        api: Some(Api::from("openai-completions")),
-                        base_url: None,
-                        reasoning: true,
-                        thinking_level_map: None,
-                        input: vec![Modality::Text],
-                        cost: common::model_layer::zero_cost(),
-                        context_window: 128_000,
-                        max_tokens: 4096,
-                        sampling_params: None,
-                        headers: None,
-                        compat: None,
-                    },
-                ]),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the provider registers");
-    registry
-}
-
-struct Fixture {
-    _temp: TempDir,
-    cwd: String,
-    agent_dir: String,
-}
-
-fn fixture() -> Fixture {
-    let temp = TempDir::new().expect("tempdir");
-    let cwd = temp.path().join("project");
-    let agent_dir = temp.path().join("agent");
-    std::fs::create_dir_all(&cwd).expect("cwd");
-    std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    Fixture {
-        cwd: cwd.display().to_string(),
-        agent_dir: agent_dir.display().to_string(),
-        _temp: temp,
-    }
-}
 
 async fn create(
-    fixture: &Fixture,
+    fixture: &common::sdk_fixture::Fixture,
     registry: &ModelRegistry,
     settings: Settings,
     session_manager: Option<SessionManager>,
@@ -131,7 +35,7 @@ async fn create(
         cwd: Some(fixture.cwd.clone()),
         agent_dir: Some(fixture.agent_dir.clone()),
         model_runtime: Some(registry.runtime().clone()),
-        model: Some(fixture_model()),
+        model: Some(common::sdk_fixture::faux_model()),
         thinking_level: None,
         scoped_models: None,
         no_tools: None,
@@ -154,8 +58,8 @@ async fn create(
 
 #[tokio::test]
 async fn default_session_path_lives_under_the_agent_dir() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let result = create(&fixture, &registry, Settings::new(), None, |_| {}).await;
     let session_file = result.session.session_file().expect("persisted path");
     assert!(
@@ -166,8 +70,8 @@ async fn default_session_path_lives_under_the_agent_dir() {
 
 #[tokio::test]
 async fn explicit_session_manager_is_kept() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let manager =
         SessionManager::in_memory(Some(&fixture.cwd), None, None).expect("session manager");
     let result = create(&fixture, &registry, Settings::new(), Some(manager), |_| {}).await;
@@ -176,8 +80,8 @@ async fn explicit_session_manager_is_kept() {
 
 #[tokio::test]
 async fn cwd_derives_from_an_explicit_session_manager() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let manager =
         SessionManager::in_memory(Some(&fixture.cwd), None, None).expect("session manager");
     let result = create(
@@ -201,8 +105,8 @@ fn tool_names(
 
 #[tokio::test]
 async fn default_tools_setting_selects_the_initial_builtins() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let settings = Settings::from_iter([("defaultTools".to_owned(), json!(["read", "edit"]))]);
     let result = create(&fixture, &registry, settings, None, |_| {}).await;
     assert_eq!(
@@ -213,8 +117,8 @@ async fn default_tools_setting_selects_the_initial_builtins() {
 
 #[tokio::test]
 async fn explicit_tools_override_the_setting() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let settings = Settings::from_iter([("defaultTools".to_owned(), json!(["read", "edit"]))]);
     let result = create(&fixture, &registry, settings, None, |options| {
         options.tools = Some(vec!["bash".to_owned()]);
@@ -225,8 +129,8 @@ async fn explicit_tools_override_the_setting() {
 
 #[tokio::test]
 async fn exclude_tools_applies_after_the_allowlist() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let result = create(&fixture, &registry, Settings::new(), None, |options| {
         options.tools = Some(vec!["read".to_owned(), "bash".to_owned()]);
         options.exclude_tools = Some(vec!["bash".to_owned()]);
@@ -237,8 +141,8 @@ async fn exclude_tools_applies_after_the_allowlist() {
 
 #[tokio::test]
 async fn no_tools_all_disables_every_builtin() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let result = create(&fixture, &registry, Settings::new(), None, |options| {
         options.no_tools = Some(NoTools::All);
     })
@@ -266,8 +170,8 @@ fn seed_restorable_session(registry: &ModelRegistry) -> SessionManager {
 
 #[tokio::test]
 async fn restores_the_saved_model_and_thinking_level() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let manager = seed_restorable_session(&registry);
     let result = create(
         &fixture,
@@ -286,8 +190,8 @@ async fn restores_the_saved_model_and_thinking_level() {
 
 #[tokio::test]
 async fn reports_the_unrestorable_saved_model() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let mut manager = SessionManager::in_memory(Some("/tmp/pi-sdk-restore-missing"), None, None)
         .expect("session");
     manager
@@ -319,7 +223,7 @@ async fn reports_the_unrestorable_saved_model() {
 }
 
 async fn scoped_session(
-    fixture: &Fixture,
+    fixture: &common::sdk_fixture::Fixture,
     registry: &ModelRegistry,
     scoped: bool,
     persisted_scope: Option<&[String]>,
@@ -328,7 +232,7 @@ async fn scoped_session(
     if let Some(scope) = persisted_scope {
         settings.insert("enabledModels".to_owned(), json!(scope));
     }
-    let sonnet = fixture_model();
+    let sonnet = common::sdk_fixture::faux_model();
     create(fixture, registry, settings, None, |options| {
         if scoped {
             options.scoped_models = Some(vec![pi_coding_agent::model_resolver::ScopedModel {
@@ -364,8 +268,8 @@ fn enabled_models(
 
 #[tokio::test]
 async fn persisted_default_model_joins_an_existing_scope() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let persisted = vec!["faux/faux-1".to_owned()];
     let result = scoped_session(&fixture, &registry, true, Some(&persisted)).await;
     let next = registry
@@ -392,8 +296,8 @@ async fn persisted_default_model_joins_an_existing_scope() {
 
 #[tokio::test]
 async fn persisted_default_model_does_not_create_a_scope() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let result = scoped_session(&fixture, &registry, false, None).await;
     let next = registry
         .runtime()
@@ -413,8 +317,8 @@ async fn persisted_default_model_does_not_create_a_scope() {
 
 #[tokio::test]
 async fn session_only_model_changes_stay_out_of_scope() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let persisted = vec!["faux/faux-1".to_owned()];
     let result = scoped_session(&fixture, &registry, true, Some(&persisted)).await;
     let next = registry
@@ -438,8 +342,8 @@ async fn session_only_model_changes_stay_out_of_scope() {
 
 #[tokio::test]
 async fn restores_a_stored_thinking_level() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let mut manager =
         SessionManager::in_memory(Some("/tmp/pi-sdk-thinking"), None, None).expect("session");
     manager
@@ -474,8 +378,8 @@ async fn restores_a_stored_thinking_level() {
 
 #[tokio::test]
 async fn applies_the_per_model_thinking_override() {
-    let fixture = fixture();
-    let registry = fixture_registry().await;
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
     let settings = Settings::from_iter([(
         "modelThinkingLevels".to_owned(),
         json!({"faux/faux-1": "low"}),
@@ -485,4 +389,55 @@ async fn applies_the_per_model_thinking_override() {
         result.session.thinking_level(),
         pi_agent_core::types::ThinkingLevel::Low
     );
+}
+
+fn custom_tool(name: &str) -> pi_coding_agent::extensions::types::ToolDefinition {
+    let name = name.to_owned();
+    pi_coding_agent::extensions::types::ToolDefinition {
+        name: name.clone(),
+        label: name,
+        description: "custom".to_owned(),
+        prompt_snippet: None,
+        prompt_guidelines: None,
+        parameters: json!({"type": "object", "properties": {}}),
+        constrained_sampling: None,
+        render_shell: None,
+        prepare_arguments: None,
+        execution_mode: None,
+        execute: Arc::new(|_id, _args, _signal, _update, _ctx| {
+            Box::pin(async {
+                Ok(pi_agent_core::types::AgentToolResult {
+                    content: Vec::new(),
+                    details: serde_json::Value::Null,
+                    usage: None,
+                    added_tool_names: None,
+                    terminate: None,
+                })
+            })
+        }),
+    }
+}
+
+#[tokio::test]
+async fn no_tools_builtin_keeps_custom_tools_enabled() {
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
+    let result = create(&fixture, &registry, Settings::new(), None, |options| {
+        options.no_tools = Some(NoTools::Builtin);
+        options.custom_tools = Some(vec![custom_tool("custom_tool")]);
+    })
+    .await;
+    assert_eq!(tool_names(&result), vec!["custom_tool".to_owned()]);
+}
+
+#[tokio::test]
+async fn explicit_thinking_level_is_clamped_to_the_model() {
+    let fixture = common::sdk_fixture::Fixture::new();
+    let registry = common::sdk_fixture::registry_with_faux().await;
+    let result = create(&fixture, &registry, Settings::new(), None, |options| {
+        options.thinking_level = Some(pi_agent_core::types::ThinkingLevel::Max);
+    })
+    .await;
+    let level = result.session.thinking_level();
+    assert_ne!(level, pi_agent_core::types::ThinkingLevel::Off);
 }

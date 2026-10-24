@@ -32,7 +32,6 @@ use pi_coding_agent::extensions::api::InlineExtension;
 use pi_coding_agent::extensions::events::ExtensionEvent;
 use pi_coding_agent::extensions::results::HandlerResult;
 use pi_coding_agent::provider_composer::ProviderConfigInput;
-use pi_coding_agent::provider_composer::ProviderModelInput;
 use pi_coding_agent::resource_loader::DefaultResourceLoader;
 use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::session_manager::SessionManager;
@@ -187,21 +186,11 @@ async fn capture_stream_options(
                     });
                     stream
                 })),
-                models: Some(vec![ProviderModelInput {
-                    id: "capture-model".to_owned(),
-                    name: "Capture Model".to_owned(),
-                    api: Some(Api::from("openai-completions")),
-                    base_url: None,
-                    reasoning: false,
-                    thinking_level_map: None,
-                    input: vec![Modality::Text],
-                    cost: common::model_layer::zero_cost(),
-                    context_window: 128_000,
-                    max_tokens: 4096,
-                    sampling_params: None,
-                    headers: None,
-                    compat: None,
-                }]),
+                models: Some(vec![common::sdk_fixture::provider_model(
+                    "capture-model",
+                    false,
+                    vec![Modality::Text],
+                )]),
                 ..ProviderConfigInput::default()
             },
         )

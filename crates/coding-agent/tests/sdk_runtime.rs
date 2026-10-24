@@ -16,11 +16,6 @@ use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use pi_agent_core::types::AgentMessage;
-use pi_ai::types::Api;
-use pi_ai::types::Modality;
-use pi_ai::types::Model;
-use pi_ai::types::ProviderId;
 use pi_coding_agent::core::agent_session::ExtensionBindings;
 use pi_coding_agent::core::agent_session_runtime::AgentSessionRuntimeError;
 use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeFactory;
@@ -42,97 +37,10 @@ use pi_coding_agent::extensions::reasons::ForkPosition;
 use pi_coding_agent::extensions::results::HandlerResult;
 use pi_coding_agent::extensions::results::SessionBeforeResult;
 use pi_coding_agent::extensions::runtime::FlagType;
-use pi_coding_agent::model_registry::ModelRegistry;
-use pi_coding_agent::provider_composer::ProviderConfigInput;
-use pi_coding_agent::provider_composer::ProviderModelInput;
 use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use tempfile::TempDir;
-
-fn fixture_model() -> Model {
-    Model {
-        id: "faux-1".to_owned(),
-        name: "Faux 1".to_owned(),
-        api: Api::from("openai-completions"),
-        provider: ProviderId("faux".to_owned()),
-        base_url: "https://faux.invalid/v1".to_owned(),
-        reasoning: true,
-        thinking_level_map: None,
-        input: vec![Modality::Text],
-        cost: common::model_layer::zero_cost(),
-        context_window: 128_000,
-        max_tokens: 4096,
-        sampling_params: None,
-        headers: None,
-        compat: None,
-    }
-}
-
-async fn fixture_registry() -> ModelRegistry {
-    let registry = common::model_layer::create_in_memory_model_registry(
-        common::model_layer::empty_auth_storage(),
-    )
-    .await;
-    registry
-        .runtime()
-        .register_provider(
-            "faux",
-            ProviderConfigInput {
-                base_url: Some("https://faux.invalid/v1".to_owned()),
-                api: Some(Api::from("openai-completions")),
-                api_key: Some("faux-key".to_owned()),
-                stream_simple: Some(Arc::new(|_model, _context, _options| {
-                    let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
-                    let message = pi_ai::types::AssistantMessage {
-                        content: vec![pi_ai::types::AssistantBlock::Text(
-                            pi_ai::types::TextContent {
-                                text: "ok".to_owned(),
-                                text_signature: None,
-                            },
-                        )],
-                        api: Api::from("openai-completions"),
-                        provider: ProviderId("faux".to_owned()),
-                        model: "faux-1".to_owned(),
-                        response_model: None,
-                        response_id: None,
-                        provider_thinking_level: None,
-                        diagnostics: None,
-                        usage: pi_ai::types::Usage::default(),
-                        stop_reason: pi_ai::types::StopReason::Stop,
-                        deferred: None,
-                        error_message: None,
-                        raw_stop_reason: None,
-                        end_turn: None,
-                        timestamp: 1,
-                    };
-                    stream.push(pi_ai::types::AssistantMessageEvent::Done {
-                        reason: pi_ai::types::StopReason::Stop,
-                        message,
-                    });
-                    stream
-                })),
-                models: Some(vec![ProviderModelInput {
-                    id: "faux-1".to_owned(),
-                    name: "Faux 1".to_owned(),
-                    api: Some(Api::from("openai-completions")),
-                    base_url: None,
-                    reasoning: true,
-                    thinking_level_map: None,
-                    input: vec![Modality::Text],
-                    cost: common::model_layer::zero_cost(),
-                    context_window: 128_000,
-                    max_tokens: 4096,
-                    sampling_params: None,
-                    headers: None,
-                    compat: None,
-                }]),
-                ..ProviderConfigInput::default()
-            },
-        )
-        .expect("the provider registers");
-    registry
-}
 
 #[derive(Default)]
 struct Cancels {
@@ -220,23 +128,12 @@ struct Harness {
     cwd: String,
 }
 
-fn fixture() -> (TempDir, String, String) {
-    let temp = TempDir::new().expect("tempdir");
-    let cwd = temp.path().join("project");
-    let agent_dir = temp.path().join("agent");
-    std::fs::create_dir_all(&cwd).expect("cwd");
-    std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    (
-        temp,
-        cwd.display().to_string(),
-        agent_dir.display().to_string(),
-    )
-}
-
 async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
-    let (temp, cwd, agent_dir) = fixture();
-    let registry = fixture_registry().await;
-    let model = fixture_model();
+    let fixture = common::sdk_fixture::Fixture::new();
+    let cwd = fixture.cwd.clone();
+    let agent_dir = fixture.agent_dir.clone();
+    let registry = common::sdk_fixture::registry_with_faux().await;
+    let model = common::sdk_fixture::faux_model();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cancels = Arc::new(Cancels::default());
     let factory: CreateAgentSessionRuntimeFactory<InMemorySettingsStorage> = {
@@ -320,7 +217,7 @@ async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
         runtime,
         log,
         cancels,
-        _temp: temp,
+        _temp: fixture.temp,
         cwd,
     }
 }
@@ -339,40 +236,6 @@ fn entries_log(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
 
 fn in_memory_manager(cwd: &str) -> SessionManager {
     SessionManager::in_memory(Some(cwd), None, None).expect("session manager")
-}
-
-fn assistant_message(text: &str) -> AgentMessage {
-    AgentMessage::Standard(pi_ai::types::Message::Assistant(
-        pi_ai::types::AssistantMessage {
-            content: vec![pi_ai::types::AssistantBlock::Text(
-                pi_ai::types::TextContent {
-                    text: text.to_owned(),
-                    text_signature: None,
-                },
-            )],
-            api: Api::from("openai-completions"),
-            provider: ProviderId("faux".to_owned()),
-            model: "faux-1".to_owned(),
-            response_model: None,
-            response_id: None,
-            provider_thinking_level: None,
-            diagnostics: None,
-            usage: pi_ai::types::Usage::default(),
-            stop_reason: pi_ai::types::StopReason::Stop,
-            deferred: None,
-            error_message: None,
-            raw_stop_reason: None,
-            end_turn: None,
-            timestamp: 1,
-        },
-    ))
-}
-
-fn user_message(text: &str) -> AgentMessage {
-    AgentMessage::Standard(pi_ai::types::Message::User(pi_ai::types::UserMessage {
-        content: pi_ai::types::UserContent::Text(text.to_owned()),
-        timestamp: 1,
-    }))
 }
 
 fn persisted_manager(cwd: &str) -> SessionManager {
@@ -455,7 +318,7 @@ async fn fork_before_returns_the_user_text_and_at_does_not() {
     let cwd = "/tmp/pi-runtime-fork";
     let mut manager = in_memory_manager(cwd);
     let entry_id = manager
-        .append_message(user_message("hello there"))
+        .append_message(common::sdk_fixture::user_message("hello there"))
         .expect("message");
     let mut first = harness(manager).await;
     let outcome = first
@@ -479,7 +342,7 @@ async fn fork_before_returns_the_user_text_and_at_does_not() {
 
     let mut manager = in_memory_manager(cwd);
     let entry_id = manager
-        .append_message(user_message("hello there"))
+        .append_message(common::sdk_fixture::user_message("hello there"))
         .expect("message");
     let mut second = harness(manager).await;
     let outcome = second
@@ -521,16 +384,22 @@ async fn switch_session_reopens_the_target() {
     let mut harness = harness(in_memory_manager("/tmp/pi-runtime-switch")).await;
     let mut target = persisted_manager(&harness.cwd);
     target
-        .append_message(user_message("other"))
+        .append_message(common::sdk_fixture::user_message("other"))
         .expect("target message");
     target
-        .append_message(assistant_message("ok"))
+        .append_message(common::sdk_fixture::assistant_message("ok"))
         .expect("target flush");
     let target_id = target.session_id().to_owned();
     let target_file = target.session_file().expect("target file").to_owned();
     let outcome = harness
         .runtime
-        .switch_session(&target_file, SwitchSessionOptions::default())
+        .switch_session(
+            &target_file,
+            SwitchSessionOptions {
+                cwd_override: Some(harness.cwd.clone()),
+                ..SwitchSessionOptions::default()
+            },
+        )
         .await
         .expect("switch");
     assert!(!outcome.cancelled);
@@ -567,10 +436,10 @@ async fn import_copies_the_file_and_reports_missing_sources() {
 
     let mut source = persisted_manager(&harness.cwd);
     source
-        .append_message(user_message("imported"))
+        .append_message(common::sdk_fixture::user_message("imported"))
         .expect("source message");
     source
-        .append_message(assistant_message("ok"))
+        .append_message(common::sdk_fixture::assistant_message("ok"))
         .expect("source flush");
     let source_file = source.session_file().expect("source file").to_owned();
     let outcome = harness
@@ -655,10 +524,10 @@ async fn persisted_fork_at_an_entry_creates_a_branched_session() {
     let mut harness = harness_with(move |cwd| {
         let mut manager = SessionManager::create(cwd, None, None).expect("manager");
         let id = manager
-            .append_message(user_message("hello"))
+            .append_message(common::sdk_fixture::user_message("hello"))
             .expect("user message");
         manager
-            .append_message(assistant_message("ok"))
+            .append_message(common::sdk_fixture::assistant_message("ok"))
             .expect("assistant message");
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
         manager
@@ -695,7 +564,7 @@ async fn persisted_fork_reports_an_unflushed_session() {
     let mut harness = harness_with(move |cwd| {
         let mut manager = SessionManager::create(cwd, None, None).expect("manager");
         let id = manager
-            .append_message(user_message("hello"))
+            .append_message(common::sdk_fixture::user_message("hello"))
             .expect("user message");
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
         manager
@@ -776,7 +645,7 @@ async fn before_session_invalidate_and_trust_factory_run() {
         })));
     let mut target = persisted_manager(&harness.cwd);
     target
-        .append_message(assistant_message("ok"))
+        .append_message(common::sdk_fixture::assistant_message("ok"))
         .expect("target flush");
     let target_file = target.session_file().expect("target file").to_owned();
     let trusted = Arc::new(AtomicBool::new(false));
@@ -810,10 +679,10 @@ async fn persisted_fork_before_a_root_message_starts_a_new_session() {
     let mut harness = harness_with(move |cwd| {
         let mut manager = SessionManager::create(cwd, None, None).expect("manager");
         let id = manager
-            .append_message(user_message("hello"))
+            .append_message(common::sdk_fixture::user_message("hello"))
             .expect("user message");
         manager
-            .append_message(assistant_message("ok"))
+            .append_message(common::sdk_fixture::assistant_message("ok"))
             .expect("assistant message");
         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
         manager
@@ -855,7 +724,7 @@ async fn switch_reports_a_missing_stored_cwd() {
     )
     .expect("manager");
     manager
-        .append_message(assistant_message("ok"))
+        .append_message(common::sdk_fixture::assistant_message("ok"))
         .expect("flush");
     std::fs::copy(manager.session_file().expect("file"), &file).expect("copy");
     let error = harness
@@ -868,5 +737,48 @@ async fn switch_reports_a_missing_stored_cwd() {
         AgentSessionRuntimeError::MissingSessionCwd(_)
     ));
     assert!(error.to_string().contains("does not exist"));
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn new_session_carries_the_parent_session() {
+    let mut harness = persisted_harness().await;
+    let parent = harness
+        .runtime
+        .session()
+        .session_file()
+        .expect("parent file");
+    let outcome = harness
+        .runtime
+        .new_session(NewSessionRequest {
+            parent_session: Some(parent),
+            setup: None,
+            with_session: None,
+        })
+        .await
+        .expect("new session");
+    assert!(!outcome.cancelled);
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn fork_rejects_a_non_user_entry_before_position() {
+    let mut manager = in_memory_manager("/tmp/pi-runtime-fork-assistant");
+    let entry_id = manager
+        .append_message(common::sdk_fixture::assistant_message("ok"))
+        .expect("assistant message");
+    let mut harness = harness(manager).await;
+    let error = harness
+        .runtime
+        .fork(
+            &entry_id,
+            ForkOptions {
+                position: Some(ForkPosition::Before),
+                with_session: None,
+            },
+        )
+        .await
+        .expect_err("assistant entry");
+    assert!(error.to_string().contains("Invalid entry ID for forking"));
     harness.runtime.dispose().await;
 }

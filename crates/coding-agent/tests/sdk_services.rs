@@ -21,23 +21,8 @@ use pi_coding_agent::extensions::api::InlineExtension;
 use pi_coding_agent::extensions::runtime::FlagType;
 use pi_coding_agent::extensions::runtime::FlagValue;
 use pi_coding_agent::provider_composer::ProviderConfigInput;
-use pi_coding_agent::provider_composer::ProviderModelInput;
 use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
-use tempfile::TempDir;
-
-fn fixture() -> (TempDir, String, String) {
-    let temp = TempDir::new().expect("tempdir");
-    let cwd = temp.path().join("project");
-    let agent_dir = temp.path().join("agent");
-    std::fs::create_dir_all(&cwd).expect("cwd");
-    std::fs::create_dir_all(&agent_dir).expect("agent dir");
-    (
-        temp,
-        cwd.display().to_string(),
-        agent_dir.display().to_string(),
-    )
-}
 
 fn bare_loader_options() -> DefaultResourceLoaderOptions {
     DefaultResourceLoaderOptions {
@@ -67,7 +52,9 @@ fn flag_factory() -> InlineExtension {
 
 #[tokio::test]
 async fn applies_extension_flag_values_and_reports_bad_ones() {
-    let (_temp, cwd, agent_dir) = fixture();
+    let fixture = common::sdk_fixture::Fixture::new();
+    let cwd = fixture.cwd.clone();
+    let agent_dir = fixture.agent_dir.clone();
     let registry = common::model_layer::create_in_memory_model_registry(
         common::model_layer::empty_auth_storage(),
     )
@@ -128,21 +115,11 @@ fn provider_factory() -> InlineExtension {
                         base_url: Some("https://ext.invalid/v1".to_owned()),
                         api: Some(Api::from("openai-completions")),
                         api_key: Some("ext-key".to_owned()),
-                        models: Some(vec![ProviderModelInput {
-                            id: "ext-model".to_owned(),
-                            name: "Ext Model".to_owned(),
-                            api: Some(Api::from("openai-completions")),
-                            base_url: None,
-                            reasoning: false,
-                            thinking_level_map: None,
-                            input: vec![Modality::Text],
-                            cost: common::model_layer::zero_cost(),
-                            context_window: 1000,
-                            max_tokens: 100,
-                            sampling_params: None,
-                            headers: None,
-                            compat: None,
-                        }]),
+                        models: Some(vec![common::sdk_fixture::provider_model(
+                            "ext-model",
+                            false,
+                            vec![Modality::Text],
+                        )]),
                         ..ProviderConfigInput::default()
                     },
                 )
@@ -155,7 +132,9 @@ fn provider_factory() -> InlineExtension {
 
 #[tokio::test]
 async fn flushes_queued_provider_registrations_into_the_runtime() {
-    let (_temp, cwd, agent_dir) = fixture();
+    let fixture = common::sdk_fixture::Fixture::new();
+    let cwd = fixture.cwd.clone();
+    let agent_dir = fixture.agent_dir.clone();
     let registry = common::model_layer::create_in_memory_model_registry(
         common::model_layer::empty_auth_storage(),
     )
