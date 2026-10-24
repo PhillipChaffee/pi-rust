@@ -996,7 +996,9 @@ pub fn prepare_compaction(
     );
 
     // Get UUID of first kept entry.
-    let first_kept_entry = &path_entries[cut_point.first_kept_entry_index];
+    let Some(first_kept_entry) = path_entries.get(cut_point.first_kept_entry_index) else {
+        return None; // Too few entries to keep; nothing to compact.
+    };
     let Some(first_kept_entry_id) = first_kept_entry.base().id.clone() else {
         return None; // Session needs migration
     };

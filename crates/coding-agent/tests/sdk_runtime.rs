@@ -1,6 +1,7 @@
-//! The session runtime's replacement flows, upstream's
-//! `test/suite/agent-session-runtime.test.ts` and
-//! `test/suite/regressions/2860-replaced-session-context.test.ts` at pin
+//! The session runtime's replacement flows and lifecycle events, upstream's
+//! `test/suite/agent-session-runtime.test.ts`,
+//! `test/suite/regressions/2860-replaced-session-context.test.ts`, and
+//! `test/agent-session-runtime-events.test.ts` at pin
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 
 #![expect(
@@ -18,26 +19,20 @@ use std::sync::atomic::Ordering;
 
 use pi_coding_agent::core::agent_session::ExtensionBindings;
 use pi_coding_agent::core::agent_session_runtime::AgentSessionRuntimeError;
-use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeFactory;
 use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeOptions;
-use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeResult;
 use pi_coding_agent::core::agent_session_runtime::ForkOptions;
 use pi_coding_agent::core::agent_session_runtime::NewSessionRequest;
 use pi_coding_agent::core::agent_session_runtime::SwitchSessionOptions;
 use pi_coding_agent::core::agent_session_runtime::create_agent_session_runtime;
-use pi_coding_agent::core::agent_session_services::CreateAgentSessionFromServicesOptions;
-use pi_coding_agent::core::agent_session_services::CreateAgentSessionServicesOptions;
-use pi_coding_agent::core::agent_session_services::create_agent_session_from_services;
-use pi_coding_agent::core::agent_session_services::create_agent_session_services;
-use pi_coding_agent::core::sdk::CreateAgentSessionError;
 use pi_coding_agent::extensions::api::ExtensionApi;
 use pi_coding_agent::extensions::api::InlineExtension;
 use pi_coding_agent::extensions::events::ExtensionEvent;
 use pi_coding_agent::extensions::reasons::ForkPosition;
+use pi_coding_agent::extensions::reasons::SessionShutdownReason;
+use pi_coding_agent::extensions::reasons::SessionStartReason;
 use pi_coding_agent::extensions::results::HandlerResult;
 use pi_coding_agent::extensions::results::SessionBeforeResult;
 use pi_coding_agent::extensions::runtime::FlagType;
-use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use tempfile::TempDir;
@@ -48,23 +43,67 @@ struct Cancels {
     fork: AtomicBool,
 }
 
-fn event_factory(log: Arc<Mutex<Vec<String>>>, cancels: Arc<Cancels>) -> InlineExtension {
+/// The event payloads the runtime-lifecycle suite asserts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Recorded {
+    Start {
+        reason: SessionStartReason,
+        previous: Option<String>,
+    },
+    Shutdown {
+        reason: SessionShutdownReason,
+        target: Option<String>,
+    },
+    BeforeSwitch {
+        reason: SessionShutdownReason,
+        target: Option<String>,
+    },
+    BeforeFork {
+        entry_id: String,
+        position: ForkPosition,
+    },
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the harness registers every lifecycle channel in one factory, upstream's inline extension"
+)]
+fn event_factory(
+    log: Arc<Mutex<Vec<String>>>,
+    cancels: Arc<Cancels>,
+    detail: Arc<Mutex<Vec<Recorded>>>,
+) -> InlineExtension {
     InlineExtension {
         name: None,
         hidden: false,
         factory: Arc::new(move |api: Arc<ExtensionApi>| {
             let log = Arc::clone(&log);
             let cancels = Arc::clone(&cancels);
+            let detail = Arc::clone(&detail);
             Box::pin(async move {
                 let switch_log = Arc::clone(&log);
                 let switch_cancels = Arc::clone(&cancels);
+                let switch_detail = Arc::clone(&detail);
                 api.on(
                     "session_before_switch",
-                    Arc::new(move |_event, _ctx| {
+                    Arc::new(move |event, _ctx| {
                         switch_log
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .push("before_switch".to_owned());
+                        if let ExtensionEvent::SessionBeforeSwitch {
+                            reason,
+                            target_session_file,
+                        } = event
+                        {
+                            switch_detail
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push(Recorded::BeforeSwitch {
+                                    reason,
+                                    target: target_session_file,
+                                });
+                        }
                         let cancel = switch_cancels.switch.load(Ordering::SeqCst);
                         Box::pin(async move {
                             HandlerResult::SessionBefore(SessionBeforeResult::Switch { cancel })
@@ -74,13 +113,20 @@ fn event_factory(log: Arc<Mutex<Vec<String>>>, cancels: Arc<Cancels>) -> InlineE
                 .expect("switch handler");
                 let fork_log = Arc::clone(&log);
                 let fork_cancels = Arc::clone(&cancels);
+                let fork_detail = Arc::clone(&detail);
                 api.on(
                     "session_before_fork",
-                    Arc::new(move |_event, _ctx| {
+                    Arc::new(move |event, _ctx| {
                         fork_log
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .push("before_fork".to_owned());
+                        if let ExtensionEvent::SessionBeforeFork { entry_id, position } = event {
+                            fork_detail
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push(Recorded::BeforeFork { entry_id, position });
+                        }
                         let cancel = fork_cancels.fork.load(Ordering::SeqCst);
                         Box::pin(async move {
                             HandlerResult::SessionBefore(SessionBeforeResult::Fork {
@@ -94,10 +140,11 @@ fn event_factory(log: Arc<Mutex<Vec<String>>>, cancels: Arc<Cancels>) -> InlineE
                 for channel in ["session_start", "session_shutdown"] {
                     let label = channel.to_owned();
                     let log = Arc::clone(&log);
+                    let detail = Arc::clone(&detail);
                     api.on(
                         channel,
                         Arc::new(move |event: ExtensionEvent, _ctx| {
-                            let name = match event {
+                            let name = match &event {
                                 ExtensionEvent::SessionStart { .. } => "start",
                                 ExtensionEvent::SessionShutdown { .. } => "shutdown",
                                 _ => "other",
@@ -106,6 +153,27 @@ fn event_factory(log: Arc<Mutex<Vec<String>>>, cancels: Arc<Cancels>) -> InlineE
                                 .unwrap_or_else(PoisonError::into_inner)
                                 .push(name.to_owned());
                             let _ = &label;
+                            match event {
+                                ExtensionEvent::SessionStart {
+                                    reason,
+                                    previous_session_file,
+                                } => detail.lock().unwrap_or_else(PoisonError::into_inner).push(
+                                    Recorded::Start {
+                                        reason,
+                                        previous: previous_session_file,
+                                    },
+                                ),
+                                ExtensionEvent::SessionShutdown {
+                                    reason,
+                                    target_session_file,
+                                } => detail.lock().unwrap_or_else(PoisonError::into_inner).push(
+                                    Recorded::Shutdown {
+                                        reason,
+                                        target: target_session_file,
+                                    },
+                                ),
+                                _ => {}
+                            }
                             Box::pin(async { HandlerResult::None })
                         }),
                     )
@@ -123,6 +191,7 @@ struct Harness {
     runtime:
         pi_coding_agent::core::agent_session_runtime::AgentSessionRuntime<InMemorySettingsStorage>,
     log: Arc<Mutex<Vec<String>>>,
+    detail: Arc<Mutex<Vec<Recorded>>>,
     cancels: Arc<Cancels>,
     _temp: TempDir,
     cwd: String,
@@ -135,66 +204,25 @@ async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
     let registry = common::sdk_fixture::registry_with_faux().await;
     let model = common::sdk_fixture::faux_model();
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let detail: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
     let cancels = Arc::new(Cancels::default());
-    let factory: CreateAgentSessionRuntimeFactory<InMemorySettingsStorage> = {
-        let runtime = registry.runtime().clone();
-        let model = model.clone();
-        let log = Arc::clone(&log);
-        let cancels = Arc::clone(&cancels);
-        Arc::new(move |options: CreateAgentSessionRuntimeOptions| {
-            let runtime = runtime.clone();
-            let model = model.clone();
-            let factory = event_factory(Arc::clone(&log), Arc::clone(&cancels));
-            Box::pin(async move {
-                let services = create_agent_session_services::<InMemorySettingsStorage>(
-                    CreateAgentSessionServicesOptions {
-                        cwd: options.cwd.clone(),
-                        agent_dir: Some(options.agent_dir.clone()),
-                        settings_manager: None,
-                        model_runtime: Some(runtime),
-                        model_runtime_signal: None,
-                        extension_flag_values: None,
-                        resource_loader_options: Some(DefaultResourceLoaderOptions {
-                            cwd: options.cwd.clone(),
-                            agent_dir: options.agent_dir.clone(),
-                            extension_factories: vec![factory],
-                            no_skills: true,
-                            no_prompt_templates: true,
-                            no_themes: true,
-                            no_context_files: true,
-                            ..DefaultResourceLoaderOptions::default()
-                        }),
-                        resource_loader_reload_options: None,
-                    },
-                )
-                .await
-                .map_err(CreateAgentSessionError::ModelRuntime)?;
-                let services_for_result = services.clone();
-                let diagnostics = services.diagnostics.clone();
-                let result =
-                    create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
-                        services,
-                        session_manager: options.session_manager,
-                        session_start_event: options.session_start_event,
-                        model: Some(model),
-                        thinking_level: None,
-                        scoped_models: None,
-                        tools: None,
-                        exclude_tools: None,
-                        no_tools: None,
-                        custom_tools: None,
-                    })
-                    .await?;
-                Ok(CreateAgentSessionRuntimeResult {
-                    session: result.session,
-                    extensions_result: result.extensions_result,
-                    model_fallback_message: result.model_fallback_message,
-                    services: services_for_result,
-                    diagnostics,
-                })
-            })
-        })
-    };
+    let log_for_factory = Arc::clone(&log);
+    let detail_for_factory = Arc::clone(&detail);
+    let cancels_for_factory = Arc::clone(&cancels);
+    let factory =
+        common::agent_session::runtime_factory(common::agent_session::RuntimeFactoryOptions {
+            runtime: registry.runtime().clone(),
+            model,
+            extensions: Arc::new(move || {
+                vec![event_factory(
+                    Arc::clone(&log_for_factory),
+                    Arc::clone(&cancels_for_factory),
+                    Arc::clone(&detail_for_factory),
+                )]
+            }),
+            no_extensions: true,
+            tools: None,
+        });
     let runtime = create_agent_session_runtime(
         factory,
         CreateAgentSessionRuntimeOptions {
@@ -216,6 +244,7 @@ async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
     Harness {
         runtime,
         log,
+        detail,
         cancels,
         _temp: fixture.temp,
         cwd,
@@ -274,7 +303,13 @@ async fn new_session_replaces_the_session_and_emits_events() {
 async fn new_session_honors_before_switch_cancellation() {
     let mut harness = persisted_harness().await;
     let original = harness.runtime.session().session_id();
+    let original_file = harness.runtime.session().session_file();
     harness.cancels.switch.store(true, Ordering::SeqCst);
+    harness
+        .detail
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     let outcome = harness
         .runtime
         .new_session(NewSessionRequest::default())
@@ -282,7 +317,19 @@ async fn new_session_honors_before_switch_cancellation() {
         .expect("new session");
     assert!(outcome.cancelled);
     assert_eq!(original, harness.runtime.session().session_id());
+    assert_eq!(harness.runtime.session().session_file(), original_file);
     assert_eq!(entries_log(&harness.log), vec!["before_switch".to_owned()]);
+    assert_eq!(
+        harness
+            .detail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        vec![Recorded::BeforeSwitch {
+            reason: SessionShutdownReason::New,
+            target: None,
+        }]
+    );
     harness.runtime.dispose().await;
 }
 
@@ -780,5 +827,290 @@ async fn fork_rejects_a_non_user_entry_before_position() {
         .await
         .expect_err("assistant entry");
     assert!(error.to_string().contains("Invalid entry ID for forking"));
+    harness.runtime.dispose().await;
+}
+
+fn detail_log(harness: &Harness) -> Vec<Recorded> {
+    harness
+        .detail
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
+fn clear_detail(harness: &Harness) {
+    harness
+        .detail
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
+#[tokio::test]
+async fn emits_the_runtime_lifecycle_events_for_new_and_resume() {
+    let mut harness = persisted_harness().await;
+    assert_eq!(
+        detail_log(&harness),
+        vec![Recorded::Start {
+            reason: SessionStartReason::Startup,
+            previous: None,
+        }]
+    );
+    clear_detail(&harness);
+
+    harness
+        .runtime
+        .session()
+        .prompt("hello".to_owned(), None)
+        .await
+        .expect("prompt");
+    let original_file = harness
+        .runtime
+        .session()
+        .session_file()
+        .expect("session file");
+
+    let outcome = harness
+        .runtime
+        .new_session(NewSessionRequest::default())
+        .await
+        .expect("new session");
+    assert!(!outcome.cancelled);
+    harness
+        .runtime
+        .session()
+        .bind_extensions(ExtensionBindings::default())
+        .await
+        .expect("bindings");
+    let second_file = harness
+        .runtime
+        .session()
+        .session_file()
+        .expect("second session file");
+    assert_eq!(
+        detail_log(&harness),
+        vec![
+            Recorded::BeforeSwitch {
+                reason: SessionShutdownReason::New,
+                target: None,
+            },
+            Recorded::Shutdown {
+                reason: SessionShutdownReason::New,
+                target: Some(second_file.clone()),
+            },
+            Recorded::Start {
+                reason: SessionStartReason::New,
+                previous: Some(original_file.clone()),
+            },
+        ]
+    );
+    clear_detail(&harness);
+
+    let outcome = harness
+        .runtime
+        .switch_session(
+            &original_file,
+            SwitchSessionOptions {
+                cwd_override: Some(harness.cwd.clone()),
+                ..SwitchSessionOptions::default()
+            },
+        )
+        .await
+        .expect("switch");
+    assert!(!outcome.cancelled);
+    harness
+        .runtime
+        .session()
+        .bind_extensions(ExtensionBindings::default())
+        .await
+        .expect("bindings");
+    assert_eq!(
+        detail_log(&harness),
+        vec![
+            Recorded::BeforeSwitch {
+                reason: SessionShutdownReason::Resume,
+                target: Some(original_file.clone()),
+            },
+            Recorded::Shutdown {
+                reason: SessionShutdownReason::Resume,
+                target: Some(original_file),
+            },
+            Recorded::Start {
+                reason: SessionStartReason::Resume,
+                previous: Some(second_file),
+            },
+        ]
+    );
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn runs_before_session_invalidate_after_shutdown_and_before_rebind() {
+    let mut harness = persisted_harness().await;
+    let phases: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let old_session = Arc::clone(harness.runtime.session());
+    let cwd = harness.cwd.clone();
+    let before_phases = Arc::clone(&phases);
+    let before_session = Arc::clone(&old_session);
+    let before_cwd = cwd.clone();
+    harness
+        .runtime
+        .set_before_session_invalidate(Some(Box::new(move || {
+            before_phases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push("beforeSessionInvalidate".to_owned());
+            assert_eq!(
+                before_session
+                    .extension_runner()
+                    .context()
+                    .cwd()
+                    .expect("live context"),
+                before_cwd
+            );
+        })));
+    let rebind_phases = Arc::clone(&phases);
+    harness.runtime.set_rebind_session(Some(Arc::new(
+        move |_session: &Arc<
+            pi_coding_agent::core::agent_session::AgentSession<InMemorySettingsStorage>,
+        >| {
+            let rebind_phases = Arc::clone(&rebind_phases);
+            Box::pin(async move {
+                rebind_phases
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push("rebindSession".to_owned());
+            })
+        },
+    )));
+
+    harness
+        .runtime
+        .new_session(NewSessionRequest::default())
+        .await
+        .expect("new session");
+
+    assert_eq!(
+        phases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
+        vec![
+            "beforeSessionInvalidate".to_owned(),
+            "rebindSession".to_owned()
+        ]
+    );
+    let error = old_session
+        .extension_runner()
+        .context()
+        .cwd()
+        .expect_err("the old context is stale");
+    assert_eq!(
+        error,
+        "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload()."
+    );
+    harness.runtime.set_before_session_invalidate(None);
+    harness.runtime.set_rebind_session(None);
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn emits_session_before_fork_and_honors_cancellation() {
+    let mut harness = persisted_harness().await;
+    harness
+        .runtime
+        .session()
+        .prompt("hello".to_owned(), None)
+        .await
+        .expect("prompt");
+    let entry_id = harness
+        .runtime
+        .session()
+        .user_messages_for_forking()
+        .first()
+        .map(|(id, _)| id.clone())
+        .expect("user message");
+    let previous_file = harness.runtime.session().session_file();
+    clear_detail(&harness);
+
+    let outcome = harness
+        .runtime
+        .fork(
+            &entry_id,
+            ForkOptions {
+                position: Some(ForkPosition::Before),
+                with_session: None,
+            },
+        )
+        .await
+        .expect("fork");
+    assert!(!outcome.cancelled);
+    assert_eq!(outcome.selected_text.as_deref(), Some("hello"));
+    harness
+        .runtime
+        .session()
+        .bind_extensions(ExtensionBindings::default())
+        .await
+        .expect("bindings");
+    assert_eq!(
+        detail_log(&harness),
+        vec![
+            Recorded::BeforeFork {
+                entry_id: entry_id.clone(),
+                position: ForkPosition::Before,
+            },
+            Recorded::Shutdown {
+                reason: SessionShutdownReason::Fork,
+                target: harness.runtime.session().session_file(),
+            },
+            Recorded::Start {
+                reason: SessionStartReason::Fork,
+                previous: previous_file,
+            },
+        ]
+    );
+    clear_detail(&harness);
+
+    harness.cancels.fork.store(true, Ordering::SeqCst);
+    let outcome = harness
+        .runtime
+        .fork(
+            &entry_id,
+            ForkOptions {
+                position: Some(ForkPosition::Before),
+                with_session: None,
+            },
+        )
+        .await
+        .expect("cancelled fork");
+    assert!(outcome.cancelled);
+    assert_eq!(
+        detail_log(&harness),
+        vec![Recorded::BeforeFork {
+            entry_id: entry_id.clone(),
+            position: ForkPosition::Before,
+        }]
+    );
+    clear_detail(&harness);
+
+    let outcome = harness
+        .runtime
+        .fork(
+            "missing-entry",
+            ForkOptions {
+                position: Some(ForkPosition::At),
+                with_session: None,
+            },
+        )
+        .await
+        .expect("cancelled fork");
+    assert!(outcome.cancelled);
+    assert_eq!(
+        detail_log(&harness),
+        vec![Recorded::BeforeFork {
+            entry_id: "missing-entry".to_owned(),
+            position: ForkPosition::At,
+        }]
+    );
     harness.runtime.dispose().await;
 }

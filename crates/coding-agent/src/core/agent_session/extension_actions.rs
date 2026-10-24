@@ -194,3 +194,30 @@ fn extension_error(
         stack: None,
     }
 }
+
+impl<S: SettingsStorage + 'static> super::AgentSession<S> {
+    /// The provider actions the runner binds, upstream's extension `bindCore`
+    /// provider half.
+    pub(crate) fn provider_actions(&self) -> crate::extensions::runner::ProviderActions {
+        let weak = self.self_weak();
+        let weak_unregister = weak.clone();
+        crate::extensions::runner::ProviderActions {
+            register_provider: Arc::new(move |name, config| {
+                let Some(session) = weak.upgrade() else {
+                    return Err("the session is gone".to_owned());
+                };
+                session.model_runtime.register_provider(&name, config)?;
+                session.refresh_current_model_from_registry();
+                Ok(())
+            }),
+            unregister_provider: Arc::new(move |name| {
+                let Some(session) = weak_unregister.upgrade() else {
+                    return Err("the session is gone".to_owned());
+                };
+                session.model_runtime.unregister_provider(&name);
+                session.refresh_current_model_from_registry();
+                Ok(())
+            }),
+        }
+    }
+}

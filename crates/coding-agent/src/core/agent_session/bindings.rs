@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::lock;
-use crate::extensions::api::ExtensionRuntime;
 use crate::extensions::events::ExtensionEvent;
 use crate::extensions::reasons::SessionStartReason;
 use crate::extensions::runner::ExtensionRunner;
@@ -59,11 +58,12 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             };
         *lock(&self.base_tool_definitions) = base_definitions;
 
-        let extensions: Vec<Arc<crate::extensions::runtime::Extension>> = self
-            .with_loader(crate::resource_loader::DefaultResourceLoader::get_extensions)
+        let extensions_result =
+            self.with_loader(crate::resource_loader::DefaultResourceLoader::get_extensions);
+        let extensions: Vec<Arc<crate::extensions::runtime::Extension>> = extensions_result
             .extensions
-            .into_iter()
-            .filter_map(|entry| entry.record)
+            .iter()
+            .filter_map(|entry| entry.record.clone())
             .collect();
         let mode = *lock(&self.extension_mode);
         let mut runner = ExtensionRunner::new(
@@ -75,9 +75,9 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             None,
             lock(&self.session_manager).clone(),
             ModelRegistry::new(self.model_runtime.clone()),
-            ExtensionRuntime::new(),
+            extensions_result.runtime,
         );
-        runner.bind_core(self.extension_actions(), None);
+        runner.bind_core(self.extension_actions(), Some(self.provider_actions()));
         runner.bind_command_context(lock(&self.extension_command_context_actions).clone());
         runner.set_mode(mode);
         let error_listener = lock(&self.extension_error_listener).clone();

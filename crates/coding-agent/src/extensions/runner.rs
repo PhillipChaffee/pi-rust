@@ -619,8 +619,9 @@ impl ExtensionRunner {
         provider_actions: Option<ProviderActions>,
     ) {
         self.active_tools = Arc::clone(&actions.get_active_tools);
+        self.runtime
+            .bind_refresh_tools(Arc::clone(&actions.refresh_tools));
         self.bound_actions = Some(Arc::new(actions));
-
         let flush: Option<&ProviderActions> = provider_actions.as_ref();
         for registration in self.runtime.take_pending_provider_registrations() {
             let registered = match flush {

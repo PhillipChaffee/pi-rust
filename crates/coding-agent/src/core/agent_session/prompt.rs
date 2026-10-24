@@ -175,6 +175,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         }
         self.is_agent_run_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.bump_idle();
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
         self.emit(AgentSessionEvent::AgentSettled);

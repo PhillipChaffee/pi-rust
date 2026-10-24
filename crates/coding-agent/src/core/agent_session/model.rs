@@ -165,3 +165,23 @@ const fn step_index(index: usize, len: usize, direction: CycleDirection) -> usiz
         CycleDirection::Backward => (index + len - 1) % len,
     }
 }
+
+impl<S: SettingsStorage + 'static> super::AgentSession<S> {
+    /// Re-read the active model from the runtime after a provider
+    /// registration, upstream's `_refreshCurrentModelFromRegistry`.
+    pub(crate) fn refresh_current_model_from_registry(&self) {
+        let Some(current) = self.model() else {
+            return;
+        };
+        let Some(refreshed) = self
+            .model_runtime
+            .get_model(&current.provider.0, &current.id)
+        else {
+            return;
+        };
+        if refreshed == current {
+            return;
+        }
+        self.agent.state().model = refreshed;
+    }
+}
