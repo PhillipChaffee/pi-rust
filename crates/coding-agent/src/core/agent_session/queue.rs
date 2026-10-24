@@ -5,6 +5,7 @@ use pi_ai::types::ImageContent;
 use super::helpers::user_message;
 use super::lock;
 use super::types::AgentSessionEvent;
+use crate::extensions::reasons::StreamingBehavior;
 use crate::settings_manager::SettingsStorage;
 
 impl<S: SettingsStorage + 'static> super::AgentSession<S> {
@@ -13,44 +14,63 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
     /// # Errors
     /// Slice 1 refuses nothing here; the extension-command refusal lands
     /// with the extension slice.
-    #[expect(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        reason = "upstream's steer/followUp are async; the extension input handlers land here"
-    )]
     pub async fn steer(
         &self,
         text: String,
         images: Option<Vec<ImageContent>>,
         source: Option<crate::extensions::reasons::InputSource>,
     ) -> Result<(), String> {
-        let _ = source;
-        let text = self.expand_skill_command(&text);
-        let text = crate::prompt_templates::expand_prompt_template(&text, &self.prompt_templates());
-        self.queue_steer(text, images);
-        Ok(())
+        self.queue_user_input(text, images, source, StreamingBehavior::Steer)
+            .await
     }
 
     /// Queue a follow-up message for after the run settles.
     ///
     /// # Errors
-    /// Slice 1 refuses nothing here; the extension-command refusal lands
-    /// with the extension slice.
-    #[expect(
-        clippy::unused_async,
-        clippy::unused_async_trait_impl,
-        reason = "upstream's steer/followUp are async; the extension input handlers land here"
-    )]
+    /// When the text names an extension command, which must run through
+    /// `prompt()`.
     pub async fn follow_up(
         &self,
         text: String,
         images: Option<Vec<ImageContent>>,
         source: Option<crate::extensions::reasons::InputSource>,
     ) -> Result<(), String> {
-        let _ = source;
+        self.queue_user_input(text, images, source, StreamingBehavior::FollowUp)
+            .await
+    }
+
+    async fn queue_user_input(
+        &self,
+        text: String,
+        images: Option<Vec<ImageContent>>,
+        source: Option<crate::extensions::reasons::InputSource>,
+        behavior: StreamingBehavior,
+    ) -> Result<(), String> {
+        if text.starts_with('/') {
+            self.throw_if_extension_command(&text)?;
+        }
+        let Some((text, images)) = self
+            .run_input_handlers(
+                text,
+                images,
+                source.unwrap_or_default(),
+                if self.is_streaming() {
+                    Some(behavior)
+                } else {
+                    None
+                },
+            )
+            .await
+        else {
+            return Ok(());
+        };
         let text = self.expand_skill_command(&text);
         let text = crate::prompt_templates::expand_prompt_template(&text, &self.prompt_templates());
-        self.queue_follow_up(text, images);
+        if behavior == StreamingBehavior::Steer {
+            self.queue_steer(text, images);
+        } else {
+            self.queue_follow_up(text, images);
+        }
         Ok(())
     }
 

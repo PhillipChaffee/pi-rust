@@ -51,6 +51,27 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         expand: bool,
         preflight: Option<&(dyn Fn(bool) + Send + Sync)>,
     ) -> Result<(), String> {
+        if expand && text.starts_with('/') && self.try_execute_extension_command(&text).await {
+            notify_preflight(preflight, true);
+            return Ok(());
+        }
+        let source = options.source.unwrap_or_default();
+        let Some((text, images)) = self
+            .run_input_handlers(
+                text,
+                options.images,
+                source,
+                if self.is_streaming() {
+                    options.streaming_behavior
+                } else {
+                    None
+                },
+            )
+            .await
+        else {
+            notify_preflight(preflight, true);
+            return Ok(());
+        };
         let mut expanded = text;
         if expand {
             expanded = self.expand_skill_command(&expanded);
@@ -65,9 +86,9 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                 return Err("Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.".to_owned());
             };
             if behavior == StreamingBehavior::FollowUp {
-                self.queue_follow_up(expanded, options.images);
+                self.queue_follow_up(expanded, images);
             } else {
-                self.queue_steer(expanded, options.images);
+                self.queue_steer(expanded, images);
             }
             notify_preflight(preflight, true);
             return Ok(());
@@ -83,7 +104,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             text: expanded,
             text_signature: None,
         })];
-        if let Some(images) = options.images {
+        if let Some(images) = images {
             content.extend(images.into_iter().map(UserBlock::Image));
         }
         let mut messages = vec![AgentMessage::Standard(Message::User(UserMessage {
@@ -94,6 +115,54 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
 
         notify_preflight(preflight, true);
         self.run_agent_prompt(messages).await;
+        Ok(())
+    }
+
+    pub(crate) async fn run_input_handlers(
+        &self,
+        text: String,
+        images: Option<Vec<pi_ai::types::ImageContent>>,
+        source: crate::extensions::reasons::InputSource,
+        streaming_behavior: Option<StreamingBehavior>,
+    ) -> Option<(String, Option<Vec<pi_ai::types::ImageContent>>)> {
+        let runner = self.extension_runner();
+        if !runner.has_handlers("input") {
+            return Some((text, images));
+        }
+        match runner
+            .emit_input(text.clone(), images.clone(), source, streaming_behavior)
+            .await
+        {
+            crate::extensions::results::InputResult::Handled => None,
+            crate::extensions::results::InputResult::Transform {
+                text: transformed,
+                images: replaced,
+            } => Some((transformed, replaced.or(images))),
+            crate::extensions::results::InputResult::Continue => Some((text, images)),
+        }
+    }
+
+    async fn try_execute_extension_command(&self, text: &str) -> bool {
+        let (command_name, args) = text
+            .split_once(' ')
+            .map_or((&text[1..], ""), |(name, args)| (&name[1..], args));
+        let runner = self.extension_runner();
+        let Some(command) = runner.get_command(command_name) else {
+            return false;
+        };
+        (command.handler)(args.to_owned(), runner.context()).await;
+        true
+    }
+
+    pub(crate) fn throw_if_extension_command(&self, text: &str) -> Result<(), String> {
+        let (command_name, _) = text
+            .split_once(' ')
+            .map_or((&text[1..], ""), |(name, args)| (&name[1..], args));
+        if self.extension_runner().get_command(command_name).is_some() {
+            return Err(format!(
+                "Extension command \"/{command_name}\" cannot be queued. Use prompt() or execute the command when not streaming."
+            ));
+        }
         Ok(())
     }
 
