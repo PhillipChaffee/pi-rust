@@ -90,7 +90,10 @@ fn user_texts(context: &pi_ai::types::Context) -> Vec<String> {
 }
 
 fn abortable_stream() -> StreamFn {
-    Arc::new(|_model, _context, options| {
+    Arc::new(|_model, context, options| {
+        if user_texts(context).len() > 1 {
+            return common::agent_session::terminal_stream(assistant_message("queued", 0));
+        }
         let stream: AssistantMessageEventStream = assistant_message_event_stream();
         stream.push(start(assistant_message("", 0)));
         let token = options.and_then(|options| options.transport_options.signal.clone());
