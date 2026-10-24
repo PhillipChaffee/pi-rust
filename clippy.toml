@@ -11,7 +11,7 @@
 # its module docs carry bare, and the protocol port #19 adds the canonical
 # UUID spelling its ServerId schema docs carry bare.
 doc-valid-idents = ["AcpClient", "OpenTUI", "OpenCode", "WKWebView", "XTVersion", "WezTerm", "OpenAI", "OpenRouter",
-    "MiniMax", "MiMo", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR",
+    "MiniMax", "MiMo", "DeepSeek", "SigV4", "vLLM", "SGLang", "ZDR", "TypeBox",
     "AbortSignal", "UUIDv7", "UUIDv4", "HttpClient", "WeakMap", "serde_json",
     "CancellableLoader", "TruncatedText", "CommonMark", "ChatGPT",
 "White_Space", "before_run", "before_drive",
