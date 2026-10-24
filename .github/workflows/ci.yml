@@ -129,6 +129,22 @@ jobs:
       # made 718 + 62 = 780): 738 + 62 = 800.
       - name: Coverage gate (lines 95, regions 94; uncovered functions — 800 max)
         run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 94 --fail-uncovered-functions 800 --lcov --output-path lcov.info
+      # The gate's thresholds are the only failure signal, and --lcov
+      # suppresses the per-file table. Print the totals and the uncovered
+      # function count on every run, pass or fail, so a red gate names the
+      # metric that missed.
+      - name: Coverage summary
+        if: always()
+        run: |
+          cargo llvm-cov report --json --summary-only --ignore-filename-regex '(^|/)tests\.rs$' > coverage.json
+          python3 - <<'PY'
+          import json
+          totals = json.load(open("coverage.json"))["data"][0]["totals"]
+          for name in ("lines", "regions", "functions"):
+              item = totals[name]
+              print(f"{name}: {item['covered']}/{item['count']} ({100 * item['covered'] / item['count']:.2f}%)")
+          print(f"uncovered functions: {totals['functions']['count'] - totals['functions']['covered']}")
+          PY
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.
