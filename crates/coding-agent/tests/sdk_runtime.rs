@@ -640,3 +640,158 @@ async fn dispose_emits_the_quit_shutdown() {
     harness.runtime.dispose().await;
     assert_eq!(entries_log(&harness.log), vec!["shutdown".to_owned()]);
 }
+
+#[tokio::test]
+async fn persisted_fork_at_an_entry_creates_a_branched_session() {
+    let entry_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&entry_slot);
+    let mut harness = harness_with(move |cwd| {
+        let mut manager = SessionManager::create(cwd, None, None).expect("manager");
+        let id = manager
+            .append_message(user_message("hello"))
+            .expect("user message");
+        manager
+            .append_message(assistant_message("ok"))
+            .expect("assistant message");
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
+        manager
+    })
+    .await;
+    let entry_id = entry_slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .expect("entry id");
+    let original_file = harness.runtime.session().session_file();
+    let outcome = harness
+        .runtime
+        .fork(
+            &entry_id,
+            ForkOptions {
+                position: Some(ForkPosition::At),
+                with_session: None,
+            },
+        )
+        .await
+        .expect("fork");
+    assert!(!outcome.cancelled);
+    let forked_file = harness.runtime.session().session_file();
+    assert!(forked_file.is_some());
+    assert_ne!(forked_file, original_file);
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn persisted_fork_reports_an_unflushed_session() {
+    let entry_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let slot = Arc::clone(&entry_slot);
+    let mut harness = harness_with(move |cwd| {
+        let mut manager = SessionManager::create(cwd, None, None).expect("manager");
+        let id = manager
+            .append_message(user_message("hello"))
+            .expect("user message");
+        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(id);
+        manager
+    })
+    .await;
+    let entry_id = entry_slot
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+        .expect("entry id");
+    let error = harness
+        .runtime
+        .fork(
+            &entry_id,
+            ForkOptions {
+                position: Some(ForkPosition::At),
+                with_session: None,
+            },
+        )
+        .await
+        .expect_err("unflushed session");
+    assert!(
+        error
+            .to_string()
+            .contains("This session has not been saved yet"),
+        "{error}"
+    );
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn import_renames_a_colliding_destination() {
+    let mut harness = persisted_harness().await;
+    let directory = TempDir::new().expect("tempdir");
+    let source_file = directory.path().join("dup.jsonl");
+    let source_manager = SessionManager::create(
+        &directory.path().display().to_string(),
+        Some(&directory.path().display().to_string()),
+        None,
+    )
+    .expect("source manager");
+    drop(source_manager);
+    std::fs::write(
+        &source_file,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n",
+    )
+    .expect("write");
+    let first = harness
+        .runtime
+        .import_from_jsonl(&source_file.display().to_string(), None)
+        .await
+        .expect("first import");
+    assert!(!first.cancelled);
+    let second = harness
+        .runtime
+        .import_from_jsonl(&source_file.display().to_string(), None)
+        .await
+        .expect("second import");
+    assert!(!second.cancelled);
+    let imported = harness
+        .runtime
+        .session()
+        .session_file()
+        .expect("imported file");
+    assert!(imported.ends_with("dup-1.jsonl"), "{imported}");
+    harness.runtime.dispose().await;
+}
+
+#[tokio::test]
+async fn before_session_invalidate_and_trust_factory_run() {
+    let mut harness = persisted_harness().await;
+    let invalidated = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&invalidated);
+    harness
+        .runtime
+        .set_before_session_invalidate(Some(Box::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        })));
+    let mut target = persisted_manager(&harness.cwd);
+    target
+        .append_message(assistant_message("ok"))
+        .expect("target flush");
+    let target_file = target.session_file().expect("target file").to_owned();
+    let trusted = Arc::new(AtomicBool::new(false));
+    let trust_flag = Arc::clone(&trusted);
+    harness
+        .runtime
+        .switch_session(
+            &target_file,
+            SwitchSessionOptions {
+                cwd_override: None,
+                with_session: None,
+                project_trust_context_factory: Some(Arc::new(move |_cwd| {
+                    trust_flag.store(true, Ordering::SeqCst);
+                    None
+                })),
+            },
+        )
+        .await
+        .expect("switch");
+    assert!(invalidated.load(Ordering::SeqCst));
+    assert!(trusted.load(Ordering::SeqCst));
+    assert_eq!(harness.runtime.cwd(), harness.cwd);
+    assert!(harness.runtime.model_fallback_message().is_none());
+    harness.runtime.dispose().await;
+}

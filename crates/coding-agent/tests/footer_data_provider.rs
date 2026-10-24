@@ -311,3 +311,69 @@ fn unsubscribe_stops_branch_notifications() {
     assert_eq!(notified.load(Ordering::SeqCst), 0);
     provider.dispose();
 }
+
+#[test]
+fn real_head_watch_updates_the_cached_branch() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = create_plain_repo(&temp);
+    let (runner, _) = counter_runner("ignored");
+    let provider = FooterDataProvider::with_options(
+        &repo,
+        FooterDataProviderOptions {
+            manual_timers: false,
+            resolve_branch: Some(runner),
+            env: None,
+        },
+    );
+    assert_eq!(provider.get_git_branch().as_deref(), Some("main"));
+    write(
+        &Path::new(&repo).join(".git").join("HEAD"),
+        "ref: refs/heads/feature\n",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while provider.get_git_branch().as_deref() != Some("feature")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(provider.get_git_branch().as_deref(), Some("feature"));
+    provider.dispose();
+}
+
+#[test]
+fn real_retry_rearms_the_watcher() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = create_plain_repo(&temp);
+    let (runner, _) = counter_runner("main");
+    let provider = FooterDataProvider::with_options(
+        &repo,
+        FooterDataProviderOptions {
+            manual_timers: false,
+            resolve_branch: Some(runner),
+            env: None,
+        },
+    );
+    assert!(provider.has_head_watcher());
+    provider.simulate_watcher_error();
+    assert!(!provider.has_head_watcher());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    while !provider.has_head_watcher() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(provider.has_head_watcher());
+    provider.dispose();
+}
+
+#[test]
+fn dispose_cancels_a_pending_refresh() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo = create_plain_repo(&temp);
+    let (runner, calls) = counter_runner("main");
+    let provider = FooterDataProvider::with_options(&repo, manual_options(runner));
+    assert_eq!(provider.get_git_branch().as_deref(), Some("main"));
+    calls.store(0, Ordering::SeqCst);
+    provider.request_refresh();
+    provider.dispose();
+    provider.run_pending_refresh();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

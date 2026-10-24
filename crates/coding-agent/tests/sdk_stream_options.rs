@@ -20,11 +20,12 @@ use pi_ai::types::AssistantMessageEvent;
 use pi_ai::types::Modality;
 use pi_ai::types::Model;
 use pi_ai::types::ProviderId;
+use pi_ai::types::ProviderResponse;
 use pi_ai::types::SimpleStreamOptions;
 use pi_ai::types::StopReason;
 use pi_ai::types::TextContent;
-use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use pi_ai::utils::event_stream::assistant_message_event_stream;
+use pi_coding_agent::core::agent_session::AgentSession;
 use pi_coding_agent::core::sdk::CreateAgentSessionOptions;
 use pi_coding_agent::core::sdk::create_agent_session;
 use pi_coding_agent::extensions::api::InlineExtension;
@@ -64,9 +65,8 @@ fn capture_model() -> Model {
     }
 }
 
-fn done_stream(api: &Api) -> AssistantMessageEventStream {
-    let stream = assistant_message_event_stream();
-    let message = AssistantMessage {
+fn done_message(api: &Api) -> AssistantMessage {
+    AssistantMessage {
         content: vec![AssistantBlock::Text(TextContent {
             text: "ok".to_owned(),
             text_signature: None,
@@ -85,12 +85,7 @@ fn done_stream(api: &Api) -> AssistantMessageEventStream {
         raw_stop_reason: None,
         end_turn: None,
         timestamp: 1,
-    };
-    stream.push(AssistantMessageEvent::Done {
-        reason: StopReason::Stop,
-        message,
-    });
-    stream
+    }
 }
 
 fn header_hook() -> InlineExtension {
@@ -133,8 +128,8 @@ fn header_hook() -> InlineExtension {
 async fn capture_stream_options(
     settings: Settings,
     request: Option<SimpleStreamOptions>,
-    with_hook: bool,
-) -> Option<SimpleStreamOptions> {
+    extensions: Vec<InlineExtension>,
+) -> Capture {
     let temp = TempDir::new().expect("tempdir");
     let cwd = temp.path().join("project");
     let agent_dir = temp.path().join("agent");
@@ -160,10 +155,37 @@ async fn capture_stream_options(
                     "x-provider".to_owned(),
                     "provider".to_owned(),
                 )])),
-                stream_simple: Some(Arc::new(move |_model, _context, options| {
+                stream_simple: Some(Arc::new(move |model, _context, options| {
                     *captured_cell.lock().unwrap_or_else(PoisonError::into_inner) =
                         options.cloned();
-                    done_stream(&Api::from("openai-completions"))
+                    let stream = assistant_message_event_stream();
+                    let sink = stream.clone();
+                    let model = model.clone();
+                    let on_payload =
+                        options.and_then(|options| options.transport_options.on_payload.clone());
+                    let on_response =
+                        options.and_then(|options| options.transport_options.on_response.clone());
+                    tokio::spawn(async move {
+                        if let Some(on_payload) = on_payload {
+                            let _ = on_payload.call(json!({"probe": true}), model.clone()).await;
+                        }
+                        if let Some(on_response) = on_response {
+                            on_response
+                                .call(
+                                    ProviderResponse {
+                                        status: 200,
+                                        headers: std::collections::BTreeMap::new(),
+                                    },
+                                    model,
+                                )
+                                .await;
+                        }
+                        sink.push(AssistantMessageEvent::Done {
+                            reason: StopReason::Stop,
+                            message: done_message(&Api::from("openai-completions")),
+                        });
+                    });
+                    stream
                 })),
                 models: Some(vec![ProviderModelInput {
                     id: "capture-model".to_owned(),
@@ -191,11 +213,7 @@ async fn capture_stream_options(
         DefaultResourceLoaderOptions {
             cwd: cwd.display().to_string(),
             agent_dir: agent_dir.display().to_string(),
-            extension_factories: if with_hook {
-                vec![header_hook()]
-            } else {
-                Vec::new()
-            },
+            extension_factories: extensions,
             ..DefaultResourceLoaderOptions::default()
         },
         settings_manager,
@@ -233,13 +251,22 @@ async fn capture_stream_options(
         &common::model_layer::empty_context(),
         request.as_ref(),
     );
-    let _ = stream.result().await;
+    let result = stream.result().await;
     let options = captured
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    session.dispose();
-    options
+    Capture {
+        session,
+        options,
+        result,
+    }
+}
+
+struct Capture {
+    session: Arc<AgentSession<InMemorySettingsStorage>>,
+    options: Option<SimpleStreamOptions>,
+    result: AssistantMessage,
 }
 
 #[tokio::test]
@@ -247,10 +274,12 @@ async fn forwards_http_idle_timeout_as_timeout() {
     let options = capture_stream_options(
         Settings::from_iter([("httpIdleTimeoutMs".to_owned(), json!(1234))]),
         None,
-        false,
+        Vec::new(),
     )
     .await;
-    assert_eq!(options.expect("captured").timeout_ms, Some(1234));
+    let capture = options;
+    assert_eq!(capture.options.expect("captured").timeout_ms, Some(1234));
+    capture.session.dispose();
 }
 
 #[tokio::test]
@@ -261,10 +290,12 @@ async fn request_timeout_overrides_the_setting() {
             timeout_ms: Some(0),
             ..SimpleStreamOptions::default()
         }),
-        false,
+        Vec::new(),
     )
     .await;
-    assert_eq!(options.expect("captured").timeout_ms, Some(0));
+    let capture = options;
+    assert_eq!(capture.options.expect("captured").timeout_ms, Some(0));
+    capture.session.dispose();
 }
 
 #[tokio::test]
@@ -272,13 +303,18 @@ async fn forwards_the_websocket_connect_timeout() {
     let options = capture_stream_options(
         Settings::from_iter([("websocketConnectTimeoutMs".to_owned(), json!(1234))]),
         None,
-        false,
+        Vec::new(),
     )
     .await;
+    let capture = options;
     assert_eq!(
-        options.expect("captured").websocket_connect_timeout_ms,
+        capture
+            .options
+            .expect("captured")
+            .websocket_connect_timeout_ms,
         Some(1234)
     );
+    capture.session.dispose();
 }
 
 #[tokio::test]
@@ -289,12 +325,14 @@ async fn forwards_provider_retry_settings() {
             json!({"provider": {"maxRetries": 2, "maxRetryDelayMs": 3000}}),
         )]),
         None,
-        false,
+        Vec::new(),
     )
     .await;
-    let options = options.expect("captured");
+    let capture = options;
+    let options = capture.options.expect("captured");
     assert_eq!(options.max_retries, Some(2));
     assert_eq!(options.max_retry_delay_ms, Some(3000));
+    capture.session.dispose();
 }
 
 #[tokio::test]
@@ -308,10 +346,11 @@ async fn runs_before_provider_headers_on_assembled_headers() {
             )])),
             ..SimpleStreamOptions::default()
         }),
-        true,
+        vec![header_hook()],
     )
     .await;
-    let headers = options.expect("captured").headers.expect("headers");
+    let capture = options;
+    let headers = capture.options.expect("captured").headers.expect("headers");
     assert_eq!(
         headers.get("x-provider"),
         Some(&Some("provider".to_owned()))
@@ -325,6 +364,7 @@ async fn runs_before_provider_headers_on_assembled_headers() {
         headers.get("x-hook"),
         Some(&Some("provider:model:explicit".to_owned()))
     );
+    capture.session.dispose();
 }
 
 #[test]
@@ -389,5 +429,182 @@ fn block_images_off_keeps_images() {
         &user.content,
         pi_ai::types::UserContent::Blocks(blocks)
             if matches!(&blocks[0], pi_ai::types::UserBlock::Image(_))
+    ));
+}
+
+fn hooks_factory(log: Arc<Mutex<Vec<String>>>) -> InlineExtension {
+    InlineExtension {
+        name: None,
+        hidden: false,
+        factory: Arc::new(
+            move |api: Arc<pi_coding_agent::extensions::api::ExtensionApi>| {
+                let log = Arc::clone(&log);
+                Box::pin(async move {
+                    let payload_log = Arc::clone(&log);
+                    api.on(
+                        "before_provider_request",
+                        Arc::new(move |event, _ctx| {
+                            payload_log
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push("payload".to_owned());
+                            let ExtensionEvent::BeforeProviderRequest { payload } = event else {
+                                return Box::pin(async { HandlerResult::None });
+                            };
+                            Box::pin(async move { HandlerResult::BeforeProviderRequest(payload) })
+                        }),
+                    )
+                    .expect("payload handler");
+                    let response_log = Arc::clone(&log);
+                    api.on(
+                        "after_provider_response",
+                        Arc::new(move |_event, _ctx| {
+                            response_log
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push("response".to_owned());
+                            Box::pin(async { HandlerResult::None })
+                        }),
+                    )
+                    .expect("response handler");
+                    let context_log = Arc::clone(&log);
+                    api.on(
+                        "context",
+                        Arc::new(move |event, _ctx| {
+                            context_log
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .push("context".to_owned());
+                            let ExtensionEvent::Context { messages } = event else {
+                                return Box::pin(async { HandlerResult::None });
+                            };
+                            Box::pin(async move {
+                                HandlerResult::Context(
+                                    pi_coding_agent::extensions::results::ContextResult {
+                                        messages: Some(messages),
+                                    },
+                                )
+                            })
+                        }),
+                    )
+                    .expect("context handler");
+                    Ok(())
+                })
+            },
+        ),
+    }
+}
+
+#[tokio::test]
+async fn runs_the_payload_response_and_context_hooks() {
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let capture =
+        capture_stream_options(Settings::new(), None, vec![hooks_factory(Arc::clone(&log))]).await;
+    capture
+        .session
+        .prompt("hello".to_owned(), None)
+        .await
+        .expect("prompt");
+    capture.session.wait_for_idle().await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !log
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .any(|entry| entry == "response")
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let entries = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    assert!(
+        entries.iter().any(|entry| entry == "payload"),
+        "{entries:?}"
+    );
+    assert!(
+        entries.iter().any(|entry| entry == "response"),
+        "{entries:?}"
+    );
+    assert!(
+        entries.iter().any(|entry| entry == "context"),
+        "{entries:?}"
+    );
+    capture.session.dispose();
+}
+
+#[tokio::test]
+async fn invalid_timeout_settings_fail_the_stream() {
+    let capture = capture_stream_options(
+        Settings::from_iter([("httpIdleTimeoutMs".to_owned(), json!("bogus"))]),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(capture.result.stop_reason, StopReason::Error);
+    assert!(
+        capture
+            .result
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Invalid httpIdleTimeoutMs")
+    );
+    capture.session.dispose();
+
+    let capture = capture_stream_options(
+        Settings::from_iter([("websocketConnectTimeoutMs".to_owned(), json!("bogus"))]),
+        None,
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(capture.result.stop_reason, StopReason::Error);
+    assert!(
+        capture
+            .result
+            .error_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Invalid websocketConnectTimeoutMs")
+    );
+    capture.session.dispose();
+}
+
+#[test]
+fn block_images_filters_tool_result_images() {
+    let settings = Settings::from_iter([("images".to_owned(), json!({"blockImages": true}))]);
+    let manager = SettingsManager::in_memory(&settings, SettingsManagerCreateOptions::default());
+    let message = pi_ai::types::ToolResultMessage {
+        tool_call_id: "call".to_owned(),
+        tool_name: "read".to_owned(),
+        content: vec![
+            pi_ai::types::ToolResultBlock::Image(pi_ai::types::ImageContent {
+                data: "aGk=".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }),
+            pi_ai::types::ToolResultBlock::Image(pi_ai::types::ImageContent {
+                data: "aGk=".to_owned(),
+                mime_type: "image/png".to_owned(),
+            }),
+        ],
+        details: None,
+        usage: None,
+        added_tool_names: None,
+        is_error: false,
+        timestamp: 1,
+    };
+    let converted = pi_coding_agent::core::sdk::convert_to_llm_with_block_images(
+        &[pi_agent_core::types::AgentMessage::Standard(
+            pi_ai::types::Message::ToolResult(message),
+        )],
+        &manager,
+    );
+    let pi_ai::types::Message::ToolResult(message) = &converted[0] else {
+        panic!("tool result message");
+    };
+    assert_eq!(message.content.len(), 1, "consecutive placeholders dedupe");
+    assert!(matches!(
+        &message.content[0],
+        pi_ai::types::ToolResultBlock::Text(text)
+            if text.text == "Image reading is disabled."
     ));
 }
