@@ -56,6 +56,10 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             .map(|entry| entry.definition.clone())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the 1:1 registry rebuild carries the base/custom merge and the selection ladder inline"
+    )]
     pub(crate) fn refresh_tool_registry(
         &self,
         active_tool_names: Option<Vec<String>>,
