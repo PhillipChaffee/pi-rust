@@ -65,7 +65,20 @@ pub(crate) fn get_default_session_dir_path(cwd: &str, agent_dir: &str) -> PathBu
 pub fn get_default_session_dir(
     cwd: &str,
 ) -> Result<PathBuf, super::file_entry::SessionManagerError> {
-    let session_dir = get_default_session_dir_path(cwd, &get_agent_dir().display().to_string());
+    get_default_session_dir_with_agent_dir(cwd, &get_agent_dir().display().to_string())
+}
+
+/// The default session directory for a cwd under an explicit agent dir,
+/// creating it when missing, upstream's `getDefaultSessionDir(cwd, agentDir)`.
+///
+/// # Errors
+/// [`super::file_entry::SessionManagerError::Io`] when the directory cannot
+/// be created.
+pub fn get_default_session_dir_with_agent_dir(
+    cwd: &str,
+    agent_dir: &str,
+) -> Result<PathBuf, super::file_entry::SessionManagerError> {
+    let session_dir = get_default_session_dir_path(cwd, agent_dir);
     if !session_dir.exists() {
         fs::create_dir_all(&session_dir)?;
     }

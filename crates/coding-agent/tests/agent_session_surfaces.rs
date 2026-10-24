@@ -110,7 +110,7 @@ async fn build_session(
     AgentSession::new(AgentSessionConfig {
         agent,
         session_manager: manager,
-        resource_loader: loader,
+        resource_loader: pi_coding_agent::resource_loader::shared_resource_loader(loader),
         cwd: root.to_owned(),
         scoped_models: None,
         model_runtime: runtime,

@@ -108,6 +108,20 @@ const fn to_model_thinking_level(level: ThinkingLevel) -> ModelThinkingLevel {
     }
 }
 
+/// Clamp a thinking level to the model's supported levels, the SDK factory's
+/// clamp before the session exists.
+#[must_use]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "the private submodule's item is re-exported at crate scope"
+)]
+pub(crate) fn clamp_thinking_level_for_model(
+    model: &pi_ai::types::Model,
+    level: ThinkingLevel,
+) -> ThinkingLevel {
+    from_model_thinking_level(clamp_thinking_level(model, to_model_thinking_level(level)))
+}
+
 const fn from_model_thinking_level(level: ModelThinkingLevel) -> ThinkingLevel {
     match level {
         ModelThinkingLevel::Off => ThinkingLevel::Off,

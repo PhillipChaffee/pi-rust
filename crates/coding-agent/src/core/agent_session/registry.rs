@@ -63,7 +63,6 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
     ) {
         let previous_registry_names: BTreeSet<String> =
             lock(&self.tool_registry).keys().cloned().collect();
-        let previous_active = self.active_tool_names();
         let is_allowed = |name: &str| {
             self.allowed_tool_names
                 .as_ref()
@@ -105,6 +104,10 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                 );
             }
         }
+        let custom_names: Vec<String> = custom
+            .iter()
+            .map(|entry| entry.definition.name.clone())
+            .collect();
         for entry in custom {
             definitions.insert(entry.definition.name.clone(), entry);
         }
@@ -137,7 +140,15 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         *lock(&self.tool_registry) = registry;
 
         let include_new = active_tool_names.is_none();
-        let mut next: Vec<String> = active_tool_names.unwrap_or(previous_active);
+        let default_names: Vec<String> = if self.base_tools_override.is_some() {
+            lock(&self.base_tool_definitions).keys().cloned().collect()
+        } else {
+            ["read", "bash", "edit", "write"]
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect()
+        };
+        let mut next: Vec<String> = active_tool_names.unwrap_or(default_names);
         next.retain(|name| is_allowed(name));
         if let Some(allowed) = &self.allowed_tool_names {
             for name in lock(&self.tool_registry).keys() {
@@ -146,7 +157,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
                 }
             }
         } else if include_all_extension_tools {
-            next.extend(definitions.keys().cloned());
+            next.extend(custom_names);
         } else if include_new {
             for name in definitions.keys() {
                 if !previous_registry_names.contains(name) {

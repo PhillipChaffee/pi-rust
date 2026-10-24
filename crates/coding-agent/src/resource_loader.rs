@@ -114,17 +114,25 @@ pub struct ExtensionLoadError {
     pub error: String,
 }
 
-/// The extension runtime handle, upstream's `ExtensionRuntime`.
-///
-/// The registrations and dispatch live with #128's loader; this
-/// placeholder keeps the result shape final so that ticket swaps the seam
-/// without reshaping the loader.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ExtensionRuntimeHandle;
+/// The extension runtime handle, upstream's `ExtensionRuntime`: the flag
+/// values and the provider registrations queued for the bind pass.
+pub type ExtensionRuntimeHandle = crate::extensions::api::ExtensionRuntime;
+
+/// The loader handle the services bundle and the session share, upstream
+/// passing one loader instance to both.
+pub type ResourceLoaderHandle<S> = Arc<Mutex<Option<DefaultResourceLoader<S>>>>;
+
+/// Wrap a loader for sharing between a services bundle and a session.
+#[must_use]
+pub fn shared_resource_loader<S: SettingsStorage>(
+    loader: DefaultResourceLoader<S>,
+) -> ResourceLoaderHandle<S> {
+    Arc::new(Mutex::new(Some(loader)))
+}
 
 /// The result of one extension load pass, upstream's
 /// `LoadExtensionsResult`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct ExtensionLoadResult {
     /// The extensions that loaded.
     pub extensions: Vec<ExtensionEntry>,
@@ -142,7 +150,8 @@ pub type LoadExtensionsFn = Arc<dyn Fn(Vec<String>, String) -> BoxedExtensionLoa
 /// The pre-trust decision callback, upstream's `resolveProjectTrust`
 /// reload option: given the extensions loaded before project trust
 /// resolved, decide whether the project is trusted.
-pub type ResolveProjectTrustFn = Box<dyn Fn(ExtensionLoadResult) -> BoxedTrustDecision + Send>;
+pub type ResolveProjectTrustFn =
+    Box<dyn Fn(ExtensionLoadResult) -> BoxedTrustDecision + Send + Sync>;
 
 /// The reload options, upstream's `ResourceLoaderReloadOptions`.
 #[derive(Default)]
@@ -1238,7 +1247,8 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             self.merge_paths(&cli_enabled_extensions, &enabled_extensions)
         };
         let mut result = self.call_load_extensions(&extension_paths).await;
-        let (inline_extensions, inline_errors) = self.load_extension_factories().await;
+        let (inline_extensions, inline_errors) =
+            self.load_extension_factories(&result.runtime).await;
         result.extensions.extend(inline_extensions);
         result.errors.extend(inline_errors);
         result
@@ -1247,8 +1257,10 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
     /// The inline-factory arm, upstream's `loadExtensionFactories`: one
     /// unnamed factory labels `<inline:N>`, a named one `<inline:name>`;
     /// named factories can hide themselves.
-    async fn load_extension_factories(&self) -> (Vec<ExtensionEntry>, Vec<ExtensionLoadError>) {
-        let runtime = crate::extensions::api::ExtensionRuntime::new();
+    async fn load_extension_factories(
+        &self,
+        runtime: &crate::extensions::api::ExtensionRuntime,
+    ) -> (Vec<ExtensionEntry>, Vec<ExtensionLoadError>) {
         let mut extensions: Vec<ExtensionEntry> = Vec::new();
         let mut errors: Vec<ExtensionLoadError> = Vec::new();
         for (index, input) in self.extension_factories.iter().enumerate() {
@@ -1259,7 +1271,7 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             );
             match crate::extensions::api::load_extension_from_factory(
                 &input.factory,
-                &runtime,
+                runtime,
                 &self.cwd,
                 &label,
             )
@@ -1302,7 +1314,8 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
     ) -> ExtensionLoadResult {
         let Some(pre_trust) = pre_trust_extensions else {
             let mut result = self.call_load_extensions(&extension_paths).await;
-            let (inline_extensions, inline_errors) = self.load_extension_factories().await;
+            let (inline_extensions, inline_errors) =
+                self.load_extension_factories(&result.runtime).await;
             result.extensions.extend(inline_extensions);
             result.errors.extend(inline_errors);
             return result;

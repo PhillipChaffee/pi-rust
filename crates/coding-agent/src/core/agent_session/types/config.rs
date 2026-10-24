@@ -26,7 +26,7 @@ pub struct AgentSessionConfig<S: crate::settings_manager::SettingsStorage + 'sta
     /// The session manager.
     pub session_manager: crate::session_manager::SessionManager,
     /// The resource loader, whose settings manager the session shares.
-    pub resource_loader: crate::resource_loader::DefaultResourceLoader<S>,
+    pub resource_loader: crate::resource_loader::ResourceLoaderHandle<S>,
     /// The working directory.
     pub cwd: String,
     /// Models to cycle through with Ctrl+P.

@@ -40,6 +40,7 @@ pub use context::{
 };
 pub use discovery::{
     SessionInfo, SessionListProgress, find_most_recent_session, get_default_session_dir,
+    get_default_session_dir_with_agent_dir,
 };
 pub use entries::{
     BranchSummaryEntry, CompactionEntry, CustomEntry, CustomMessageEntry, LabelEntry, MessageEntry,

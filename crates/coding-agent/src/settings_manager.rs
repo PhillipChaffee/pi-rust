@@ -2382,3 +2382,38 @@ fn process_cwd() -> String {
 /// The nested-key tracking's ordered key set type, exposed for the manager's
 /// modified-field bookkeeping.
 pub type NestedKeys = BTreeSet<String>;
+
+/// The storage kinds the factories can default-construct.
+///
+/// Upstream has one `SettingsManager`; the port splits it by storage, so the
+/// SDK factory needs a way to build the default manager for whichever storage
+/// its caller selected.
+pub trait SettingsStorageKind: SettingsStorage + Sized + 'static {
+    /// Build the default manager for `cwd`/`agent_dir`, upstream's
+    /// `SettingsManager.create(cwd, agentDir)`.
+    fn default_manager(
+        cwd: &str,
+        agent_dir: &str,
+        options: SettingsManagerCreateOptions,
+    ) -> SettingsManager<Self>;
+}
+
+impl SettingsStorageKind for FileSettingsStorage {
+    fn default_manager(
+        cwd: &str,
+        agent_dir: &str,
+        options: SettingsManagerCreateOptions,
+    ) -> SettingsManager<Self> {
+        SettingsManager::create(cwd, agent_dir, options)
+    }
+}
+
+impl SettingsStorageKind for InMemorySettingsStorage {
+    fn default_manager(
+        _cwd: &str,
+        _agent_dir: &str,
+        options: SettingsManagerCreateOptions,
+    ) -> SettingsManager<Self> {
+        SettingsManager::in_memory(&Settings::new(), options)
+    }
+}

@@ -48,6 +48,8 @@ pub use types::{
     SessionTokens, SummarizationSource, parse_skill_block,
 };
 
+pub(crate) use thinking::clamp_thinking_level_for_model;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -96,7 +98,7 @@ pub struct AgentSession<S: SettingsStorage + 'static> {
     pub(crate) agent: pi_agent_core::Agent,
     pub(crate) session_manager: Mutex<SessionManager>,
     pub(crate) settings_manager: Arc<Mutex<SettingsManager<S>>>,
-    pub(crate) resource_loader: Mutex<Option<DefaultResourceLoader<S>>>,
+    pub(crate) resource_loader: crate::resource_loader::ResourceLoaderHandle<S>,
     pub(crate) cwd: String,
     pub(crate) model_runtime: ModelRuntime,
     pub(crate) scoped_models: Mutex<Vec<ScopedModel>>,
