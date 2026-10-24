@@ -144,6 +144,14 @@ jobs:
               item = totals[name]
               print(f"{name}: {item['covered']}/{item['count']} ({100 * item['covered'] / item['count']:.2f}%)")
           print(f"uncovered functions: {totals['functions']['count'] - totals['functions']['covered']}")
+          rows = []
+          for item in json.load(open("coverage.json"))["data"][0]["files"]:
+              functions = item["summary"]["functions"]
+              missing = functions["count"] - functions["covered"]
+              if missing:
+                  rows.append((missing, item["filename"]))
+          for missing, filename in sorted(rows, reverse=True)[:40]:
+              print(f"uncovered functions {missing:3}  {filename}")
           PY
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
