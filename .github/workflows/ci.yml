@@ -136,7 +136,7 @@ jobs:
       - name: Coverage summary
         if: always()
         run: |
-          cargo llvm-cov report --json --summary-only --ignore-filename-regex '(^|/)tests\.rs$' > coverage.json
+          cargo llvm-cov report --workspace --json --summary-only --ignore-filename-regex '(^|/)tests\.rs$' > coverage.json
           python3 - <<'PY'
           import json
           totals = json.load(open("coverage.json"))["data"][0]["totals"]
