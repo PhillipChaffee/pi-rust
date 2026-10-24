@@ -98,6 +98,9 @@ pub struct ExtensionRuntime {
     /// The post-bind provider registration, upstream's bindCore
     /// `runtime.registerProvider` replacement; absent pre-bind.
     bound_provider_actions: Arc<Mutex<Option<BoundProviderActions>>>,
+    /// The post-bind tool-registry refresh, upstream's bindCore
+    /// `runtime.refreshTools` replacement; absent pre-bind.
+    bound_refresh_tools: Arc<Mutex<Option<crate::extensions::runner::RefreshToolsHandler>>>,
 }
 
 impl ExtensionRuntime {
@@ -120,6 +123,27 @@ impl ExtensionRuntime {
             .as_ref()
             .map_or(Ok(()), |message| Err(message.clone()))
     }
+    /// Bind the tool-registry refresh the post-bind `registerTool` calls,
+    /// upstream's bindCore replacement.
+    pub fn bind_refresh_tools(&self, handler: crate::extensions::runner::RefreshToolsHandler) {
+        *self
+            .bound_refresh_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
+    }
+
+    /// Run the bound refresh, a no-op during extension load.
+    pub fn refresh_tools(&self) {
+        let handler = self
+            .bound_refresh_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(handler) = handler {
+            handler();
+        }
+    }
+
     /// Mark the runtime stale, upstream's `invalidate`; the first message
     /// wins and later calls are no-ops. Without a message the port carries
     /// upstream's guidance sentence.
@@ -244,11 +268,17 @@ impl std::fmt::Debug for ExtensionRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
+        let refresh_bound = self
+            .bound_refresh_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         f.debug_struct("ExtensionRuntime")
             .field("stale", &stale)
             .field("flag_values", &flags)
             .field("pending_provider_registrations", &queued)
             .field("bound_provider_actions", &bound)
+            .field("bound_refresh_tools", &refresh_bound)
             .finish()
     }
 }
@@ -555,6 +585,7 @@ impl ExtensionApi {
             definition: tool,
             source_info: self.extension.source_info.clone(),
         });
+        self.runtime.refresh_tools();
         Ok(())
     }
     /// Register one command, upstream's `pi.registerCommand`; the
