@@ -3,9 +3,12 @@
 //! tools").
 
 pub mod agent_session;
+pub mod agent_session_runtime;
+pub mod agent_session_services;
 pub mod bash_executor;
 pub mod event_bus;
 pub mod exec;
 pub mod output_guard;
+pub mod sdk;
 pub mod slash_commands;
 pub mod timings;

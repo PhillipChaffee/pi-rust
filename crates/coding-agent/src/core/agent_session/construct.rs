@@ -19,7 +19,16 @@ use crate::settings_manager::SettingsStorage;
 
 impl<S: SettingsStorage + 'static> super::AgentSession<S> {
     /// Build the session over `config`.
+    ///
+    /// # Panics
+    /// When the shared loader slot is empty, which only a concurrent reload
+    /// can cause.
     #[must_use]
+    #[expect(
+        clippy::expect_used,
+        clippy::too_many_lines,
+        reason = "the loader is present outside the reload window; the 1:1 constructor runs just past the line budget"
+    )]
     pub fn new(config: AgentSessionConfig<S>) -> Arc<Self> {
         let AgentSessionConfig {
             agent,
@@ -36,7 +45,10 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             extension_runner_ref,
             session_start_event,
         } = config;
-        let settings_manager = resource_loader.settings_manager();
+        let settings_manager = lock(&resource_loader)
+            .as_ref()
+            .map(crate::resource_loader::DefaultResourceLoader::settings_manager)
+            .expect("the loader is present at construction");
         let (idle_tx, _) = tokio::sync::watch::channel(0);
         let placeholder = ExtensionRunner::new(
             Vec::new(),
@@ -53,7 +65,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             agent,
             session_manager: Mutex::new(session_manager),
             settings_manager,
-            resource_loader: Mutex::new(Some(resource_loader)),
+            resource_loader,
             cwd,
             model_runtime,
             scoped_models: Mutex::new(scoped_models.unwrap_or_default()),

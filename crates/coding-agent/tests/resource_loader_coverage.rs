@@ -209,14 +209,14 @@ async fn extension_seam_results_flow_through_preload_and_remaining_paths() {
                         path: path_b.clone(),
                         error: "boom".to_string(),
                     }],
-                    runtime: ExtensionRuntimeHandle,
+                    runtime: ExtensionRuntimeHandle::new(),
                 }
             } else {
                 // The trusted pass loads the remaining path.
                 ExtensionLoadResult {
                     extensions: vec![extension_entry(&path_c)],
                     errors: vec![],
-                    runtime: ExtensionRuntimeHandle,
+                    runtime: ExtensionRuntimeHandle::new(),
                 }
             }
         })
@@ -314,7 +314,7 @@ async fn package_skill_and_extension_resources_stamp_their_package_metadata() {
                     .map(|path| extension_entry(path))
                     .collect(),
                 errors: vec![],
-                runtime: ExtensionRuntimeHandle,
+                runtime: ExtensionRuntimeHandle::new(),
             }
         })
     }));
