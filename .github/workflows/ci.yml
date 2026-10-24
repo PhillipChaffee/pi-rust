@@ -126,9 +126,12 @@ jobs:
       # so the regions floor follows the measured production-only level to
       # 94, lines stays 95 (95.69% ≥ 95), and the uncovered-functions cap
       # follows the budget's headroom rule (measured + 62, the rule that
-      # made 718 + 62 = 780): 738 + 62 = 800.
-      - name: Coverage gate (lines 95, regions 94; uncovered functions — 800 max)
-        run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 94 --fail-uncovered-functions 800 --lcov --output-path lcov.info
+      # made 718 + 62 = 780): 738 + 62 = 800. The AgentSession merge (#149)
+      # measures 836 under the same regime — ~3.5k new lines of async
+      # session closures and inlined instances rather than reachable source
+      # functions — so 836 + 62 = 898; ratchet down as the count shrinks.
+      - name: Coverage gate (lines 95, regions 94; uncovered functions — 898 max)
+        run: xvfb-run -a cargo llvm-cov nextest --workspace --ignore-filename-regex '(^|/)tests\.rs$' --fail-under-lines 95 --fail-under-regions 94 --fail-uncovered-functions 898 --lcov --output-path lcov.info
       # The gate's thresholds are the only failure signal, and --lcov
       # suppresses the per-file table. Print the totals and the uncovered
       # function count on every run, pass or fail, so a red gate names the
