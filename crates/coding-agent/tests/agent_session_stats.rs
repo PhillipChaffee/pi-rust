@@ -108,6 +108,33 @@ fn assert_cost_totals(session: &AgentSession<InMemorySettingsStorage>) {
     assert!((stats.cost - 1.0).abs() < f64::EPSILON);
 }
 
+fn compacted_history(root: &str) -> SessionManager {
+    let mut manager = SessionManager::in_memory(Some(root), None, None).expect("session");
+    manager
+        .append_message(user_message("first", 1))
+        .expect("append");
+    manager
+        .append_message(AgentMessage::Standard(Message::Assistant(
+            assistant_with_usage("response1", create_usage(180_000), 2),
+        )))
+        .expect("append");
+    let kept_user_id = manager
+        .append_message(user_message("second", 3))
+        .expect("append");
+    manager
+        .append_message(AgentMessage::Standard(Message::Assistant(
+            assistant_with_usage("response2", create_usage(195_000), 4),
+        )))
+        .expect("append");
+    manager
+        .append_compaction("summary", &kept_user_id, 195_000, None, None, None)
+        .expect("compaction");
+    manager
+        .append_message(user_message("third", 5))
+        .expect("append");
+    manager
+}
+
 #[tokio::test]
 async fn exposes_the_current_context_usage_alongside_token_totals() {
     let mut manager =
@@ -138,30 +165,7 @@ async fn exposes_the_current_context_usage_alongside_token_totals() {
 
 #[tokio::test]
 async fn reports_unknown_current_context_usage_immediately_after_compaction() {
-    let mut manager =
-        SessionManager::in_memory(Some("/tmp/pi-session-stats"), None, None).expect("session");
-    manager
-        .append_message(user_message("first", 1))
-        .expect("append");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            assistant_with_usage("response1", create_usage(180_000), 2),
-        )))
-        .expect("append");
-    let kept_user_id = manager
-        .append_message(user_message("second", 3))
-        .expect("append");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            assistant_with_usage("response2", create_usage(195_000), 4),
-        )))
-        .expect("append");
-    manager
-        .append_compaction("summary", &kept_user_id, 195_000, None, None, None)
-        .expect("compaction");
-    manager
-        .append_message(user_message("third", 5))
-        .expect("append");
+    let manager = compacted_history("/tmp/pi-session-stats");
     let session = create_session(manager).await;
 
     let stats = session.session_stats();
@@ -173,30 +177,7 @@ async fn reports_unknown_current_context_usage_immediately_after_compaction() {
 
 #[tokio::test]
 async fn uses_post_compaction_usage_for_current_context_instead_of_stale_kept_usage() {
-    let mut manager =
-        SessionManager::in_memory(Some("/tmp/pi-session-stats"), None, None).expect("session");
-    manager
-        .append_message(user_message("first", 1))
-        .expect("append");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            assistant_with_usage("response1", create_usage(180_000), 2),
-        )))
-        .expect("append");
-    let kept_user_id = manager
-        .append_message(user_message("second", 3))
-        .expect("append");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            assistant_with_usage("response2", create_usage(195_000), 4),
-        )))
-        .expect("append");
-    manager
-        .append_compaction("summary", &kept_user_id, 195_000, None, None, None)
-        .expect("compaction");
-    manager
-        .append_message(user_message("third", 5))
-        .expect("append");
+    let mut manager = compacted_history("/tmp/pi-session-stats");
     manager
         .append_message(AgentMessage::Standard(Message::Assistant(
             assistant_with_usage("response3", create_usage(25_000), 6),
@@ -314,30 +295,7 @@ fn groups_tool_and_summary_usage_separately_from_model_attributed_usage() {
 
 #[tokio::test]
 async fn ignores_zero_usage_messages_when_checking_for_post_compaction_context_usage() {
-    let mut manager =
-        SessionManager::in_memory(Some("/tmp/pi-session-stats"), None, None).expect("session");
-    manager
-        .append_message(user_message("first", 1))
-        .expect("append");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            assistant_with_usage("response1", create_usage(180_000), 2),
-        )))
-        .expect("append");
-    let kept_user_id = manager
-        .append_message(user_message("second", 3))
-        .expect("append");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            assistant_with_usage("response2", create_usage(195_000), 4),
-        )))
-        .expect("append");
-    manager
-        .append_compaction("summary", &kept_user_id, 195_000, None, None, None)
-        .expect("compaction");
-    manager
-        .append_message(user_message("third", 5))
-        .expect("append");
+    let mut manager = compacted_history("/tmp/pi-session-stats");
     manager
         .append_message(AgentMessage::Standard(Message::Assistant(
             assistant_with_usage("response3", create_usage(25_000), 6),

@@ -15,7 +15,6 @@ use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use pi_agent_core::types::AgentMessage;
 use pi_agent_core::types::AgentTool;
 use pi_agent_core::types::StreamFn;
 use pi_ai::types::AssistantBlock;
@@ -148,20 +147,22 @@ async fn wait_for_streaming(session: &Session) {
     assert!(session.is_streaming(), "the run never started");
 }
 
-#[tokio::test]
-async fn throws_when_prompt_is_called_while_streaming() {
-    let session = session_with(
-        "/tmp/pi-session-concurrent-guard",
-        abortable_stream(),
-        Vec::new(),
-        false,
-    )
-    .await;
+/// Start the first prompt and wait until its run is streaming.
+async fn start_abortable_prompt(
+    root: &str,
+) -> (Session, tokio::task::JoinHandle<Result<(), String>>) {
+    let session = session_with(root, abortable_stream(), Vec::new(), false).await;
     let first = {
         let session = Arc::clone(&session);
         tokio::spawn(async move { session.prompt("First message".to_owned(), None).await })
     };
     wait_for_streaming(&session).await;
+    (session, first)
+}
+
+#[tokio::test]
+async fn throws_when_prompt_is_called_while_streaming() {
+    let (session, first) = start_abortable_prompt("/tmp/pi-session-concurrent-guard").await;
     assert!(session.is_streaming());
 
     let error = session
@@ -179,18 +180,7 @@ async fn throws_when_prompt_is_called_while_streaming() {
 
 #[tokio::test]
 async fn allows_steer_while_streaming() {
-    let session = session_with(
-        "/tmp/pi-session-concurrent-steer",
-        abortable_stream(),
-        Vec::new(),
-        false,
-    )
-    .await;
-    let first = {
-        let session = Arc::clone(&session);
-        tokio::spawn(async move { session.prompt("First message".to_owned(), None).await })
-    };
-    wait_for_streaming(&session).await;
+    let (session, first) = start_abortable_prompt("/tmp/pi-session-concurrent-steer").await;
 
     session
         .steer("Steering message".to_owned(), None, None)
@@ -204,18 +194,7 @@ async fn allows_steer_while_streaming() {
 
 #[tokio::test]
 async fn allows_follow_up_while_streaming() {
-    let session = session_with(
-        "/tmp/pi-session-concurrent-follow",
-        abortable_stream(),
-        Vec::new(),
-        false,
-    )
-    .await;
-    let first = {
-        let session = Arc::clone(&session);
-        tokio::spawn(async move { session.prompt("First message".to_owned(), None).await })
-    };
-    wait_for_streaming(&session).await;
+    let (session, first) = start_abortable_prompt("/tmp/pi-session-concurrent-follow").await;
 
     session
         .follow_up("Follow-up message".to_owned(), None, None)
@@ -363,57 +342,21 @@ async fn allows_prompt_after_the_previous_one_completes() {
 }
 
 fn dummy_tool(executed: Arc<AtomicUsize>) -> AgentTool {
-    AgentTool {
-        tool: pi_ai::types::Tool {
-            name: "dummy".to_owned(),
-            description: "Dummy tool".to_owned(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": { "q": { "type": "string" } },
-            }),
-            constrained_sampling: None,
-        },
-        label: "dummy".to_owned(),
-        prepare_arguments: None,
-        execute: Arc::new(move |_id, args, _signal, _on_update| {
-            let executed = Arc::clone(&executed);
+    common::agent_session::counting_tool(
+        "dummy",
+        executed,
+        Arc::new(|args| {
             let q = args
                 .get("q")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            Box::pin(async move {
-                executed.fetch_add(1, Ordering::SeqCst);
-                Ok(pi_agent_core::types::AgentToolResult {
-                    content: vec![pi_ai::types::ToolResultBlock::Text(
-                        pi_ai::types::TextContent {
-                            text: format!("result:{q}"),
-                            text_signature: None,
-                        },
-                    )],
-                    details: serde_json::Value::Null,
-                    usage: None,
-                    added_tool_names: None,
-                    terminate: None,
-                })
-            })
+                .unwrap_or_default();
+            format!("result:{q}")
         }),
-        replay: None,
-        execution_mode: None,
-    }
+    )
 }
 
 fn tool_call(id: &str, q: &str) -> AssistantBlock {
-    AssistantBlock::ToolCall(pi_ai::types::ToolCall {
-        id: id.to_owned(),
-        name: "dummy".to_owned(),
-        arguments: serde_json::json!({ "q": q })
-            .as_object()
-            .cloned()
-            .expect("object"),
-        thought_signature: None,
-        namespace: None,
-    })
+    common::agent_session::tool_call_block(id, "dummy", &serde_json::json!({ "q": q }))
 }
 
 fn has_tool_result(context: &pi_ai::types::Context) -> bool {
@@ -425,11 +368,8 @@ fn has_tool_result(context: &pi_ai::types::Context) -> bool {
 
 fn tool_call_stream(rounds: Arc<AtomicUsize>, with_text: bool) -> StreamFn {
     Arc::new(move |_model, context, _options| {
-        let stream = assistant_message_event_stream();
-        stream.push(start(assistant_message("", 0)));
         if has_tool_result(context) {
-            stream.push(done(assistant_message("done", 0)));
-            return stream;
+            return common::agent_session::terminal_stream(assistant_message("done", 0));
         }
         let _ = rounds.fetch_add(1, Ordering::SeqCst);
         let content = if with_text {
@@ -443,12 +383,11 @@ fn tool_call_stream(rounds: Arc<AtomicUsize>, with_text: bool) -> StreamFn {
         } else {
             vec![tool_call("toolu_1", "x"), tool_call("toolu_2", "y")]
         };
-        stream.push(done(AssistantMessage {
+        common::agent_session::terminal_stream(AssistantMessage {
             content,
             stop_reason: StopReason::ToolUse,
             ..assistant_message("", 0)
-        }));
-        stream
+        })
     })
 }
 
@@ -483,32 +422,6 @@ fn capture_extension(
                     }),
                 )
                 .expect("tool_call handler");
-                Ok(())
-            })
-        }),
-    }
-}
-
-fn slow_message_end_extension() -> InlineExtension {
-    InlineExtension {
-        name: None,
-        hidden: false,
-        factory: Arc::new(|api: Arc<ExtensionApi>| {
-            Box::pin(async move {
-                api.on(
-                    "message_end",
-                    Arc::new(|event: ExtensionEvent, _ctx| {
-                        Box::pin(async move {
-                            if let ExtensionEvent::MessageEnd { message } = &event
-                                && matches!(message, AgentMessage::Standard(Message::Assistant(_)))
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                            }
-                            HandlerResult::None
-                        })
-                    }),
-                )
-                .expect("message_end handler");
                 Ok(())
             })
         }),
@@ -567,7 +480,7 @@ async fn persists_message_end_events_in_order_with_slow_extension_handlers() {
     let root = "/tmp/pi-session-concurrent-order";
     let mut setup = SessionSetup::new(root, in_memory_manager(root));
     setup.stream = Some(tool_call_stream(rounds, true));
-    setup.extensions = vec![slow_message_end_extension()];
+    setup.extensions = vec![common::agent_session::slow_message_end_extension()];
     setup.bind_extensions = true;
     setup.base_tools_override = Some(std::collections::BTreeMap::from([(
         "dummy".to_owned(),

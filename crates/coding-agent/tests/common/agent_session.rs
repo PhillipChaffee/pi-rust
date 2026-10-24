@@ -8,20 +8,11 @@ use pi_agent_core::AgentInitialState;
 use pi_agent_core::AgentOptions;
 use pi_agent_core::types::AgentMessage;
 use pi_agent_core::types::StreamFn;
-use pi_ai::types::Api;
-use pi_ai::types::AssistantBlock;
-use pi_ai::types::AssistantMessage;
-use pi_ai::types::AssistantMessageEvent;
-use pi_ai::types::Message;
-use pi_ai::types::ProviderId;
-use pi_ai::types::StopReason;
-use pi_ai::types::TextContent;
-use pi_ai::types::Usage;
-use pi_ai::types::UsageCost;
-use pi_ai::types::UserContent;
-use pi_ai::types::UserMessage;
-use pi_ai::utils::event_stream::AssistantMessageEventStream;
-use pi_ai::utils::event_stream::assistant_message_event_stream;
+use pi_ai::types::{
+    Api, AssistantBlock, AssistantMessage, AssistantMessageEvent, Message, ProviderId, StopReason,
+    TextContent, Usage, UsageCost, UserContent, UserMessage,
+};
+use pi_ai::utils::event_stream::{AssistantMessageEventStream, assistant_message_event_stream};
 use pi_coding_agent::core::agent_session::AgentSession;
 use pi_coding_agent::core::agent_session::AgentSessionConfig;
 use pi_coding_agent::resource_loader::DefaultResourceLoader;
@@ -327,4 +318,234 @@ pub async fn authorize_with(session: &AgentSession<InMemorySettingsStorage>, tok
         .set_runtime_api_key("anthropic", token.to_owned(), None)
         .await
         .expect("runtime key");
+}
+
+/// The services-backed runtime factory the suite hosts share.
+pub struct RuntimeFactoryOptions {
+    /// The model runtime the services carry.
+    pub runtime: pi_coding_agent::model_runtime::ModelRuntime,
+    /// The session model.
+    pub model: pi_ai::types::Model,
+    /// Builds the inline extensions each factory call carries.
+    pub extensions:
+        Arc<dyn Fn() -> Vec<pi_coding_agent::extensions::api::InlineExtension> + Send + Sync>,
+    /// Whether the loader skips on-disk extension discovery.
+    pub no_extensions: bool,
+    /// The active tool names; `None` keeps the SDK default.
+    pub tools: Option<Vec<String>>,
+}
+
+/// Build the runtime factory the SDK hosts share.
+#[must_use]
+pub fn runtime_factory(
+    options: RuntimeFactoryOptions,
+) -> pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeFactory<
+    InMemorySettingsStorage,
+> {
+    use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeOptions;
+    use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeResult;
+    use pi_coding_agent::core::agent_session_services::CreateAgentSessionFromServicesOptions;
+    use pi_coding_agent::core::agent_session_services::CreateAgentSessionServicesOptions;
+    use pi_coding_agent::core::agent_session_services::create_agent_session_from_services;
+    use pi_coding_agent::core::agent_session_services::create_agent_session_services;
+    use pi_coding_agent::core::sdk::CreateAgentSessionError;
+    use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
+
+    let RuntimeFactoryOptions {
+        runtime,
+        model,
+        extensions,
+        no_extensions,
+        tools,
+    } = options;
+    Arc::new(move |options: CreateAgentSessionRuntimeOptions| {
+        let runtime = runtime.clone();
+        let model = model.clone();
+        let extensions = Arc::clone(&extensions);
+        let tools = tools.clone();
+        Box::pin(async move {
+            let services = create_agent_session_services::<InMemorySettingsStorage>(
+                CreateAgentSessionServicesOptions {
+                    cwd: options.cwd.clone(),
+                    agent_dir: Some(options.agent_dir.clone()),
+                    settings_manager: None,
+                    model_runtime: Some(runtime),
+                    model_runtime_signal: None,
+                    extension_flag_values: None,
+                    resource_loader_options: Some(DefaultResourceLoaderOptions {
+                        cwd: options.cwd.clone(),
+                        agent_dir: options.agent_dir.clone(),
+                        extension_factories: extensions(),
+                        no_extensions,
+                        no_skills: true,
+                        no_prompt_templates: true,
+                        no_themes: true,
+                        no_context_files: true,
+                        ..DefaultResourceLoaderOptions::default()
+                    }),
+                    resource_loader_reload_options: None,
+                },
+            )
+            .await
+            .map_err(CreateAgentSessionError::ModelRuntime)?;
+            let services_for_result = services.clone();
+            let diagnostics = services.diagnostics.clone();
+            let result =
+                create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
+                    services,
+                    session_manager: options.session_manager,
+                    session_start_event: options.session_start_event,
+                    model: Some(model),
+                    thinking_level: None,
+                    scoped_models: None,
+                    tools,
+                    exclude_tools: None,
+                    no_tools: None,
+                    custom_tools: None,
+                })
+                .await?;
+            Ok(CreateAgentSessionRuntimeResult {
+                session: result.session,
+                extensions_result: result.extensions_result,
+                model_fallback_message: result.model_fallback_message,
+                services: services_for_result,
+                diagnostics,
+            })
+        })
+    })
+}
+
+/// A tool that counts executions and answers `respond`'s text.
+#[must_use]
+pub fn counting_tool(
+    name: &str,
+    executed: Arc<std::sync::atomic::AtomicUsize>,
+    respond: Arc<dyn Fn(&serde_json::Value) -> String + Send + Sync>,
+) -> pi_agent_core::types::AgentTool {
+    pi_agent_core::types::AgentTool {
+        tool: pi_ai::types::Tool {
+            name: name.to_owned(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" }, "text": { "type": "string" } },
+            }),
+            constrained_sampling: None,
+        },
+        label: name.to_owned(),
+        prepare_arguments: None,
+        execute: Arc::new(move |_id, args, _signal, _on_update| {
+            let executed = Arc::clone(&executed);
+            let respond = Arc::clone(&respond);
+            let text = respond(args);
+            Box::pin(async move {
+                executed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(pi_agent_core::types::AgentToolResult {
+                    content: vec![pi_ai::types::ToolResultBlock::Text(TextContent {
+                        text,
+                        text_signature: None,
+                    })],
+                    details: serde_json::Value::Null,
+                    usage: None,
+                    added_tool_names: None,
+                    terminate: None,
+                })
+            })
+        }),
+        replay: None,
+        execution_mode: None,
+    }
+}
+
+/// Push a terminal event for `message` onto a fresh stream.
+#[must_use]
+pub fn terminal_stream(message: AssistantMessage) -> AssistantMessageEventStream {
+    let stream = assistant_message_event_stream();
+    stream.push(AssistantMessageEvent::Start {
+        partial: AssistantMessage {
+            content: Vec::new(),
+            ..message.clone()
+        },
+    });
+    if message.stop_reason == StopReason::Error {
+        stream.push(AssistantMessageEvent::Error {
+            reason: StopReason::Error,
+            error: message,
+        });
+    } else {
+        stream.push(AssistantMessageEvent::Done {
+            reason: message.stop_reason,
+            message,
+        });
+    }
+    stream
+}
+
+/// A tool-call assistant block.
+#[must_use]
+pub fn tool_call_block(id: &str, name: &str, arguments: &serde_json::Value) -> AssistantBlock {
+    AssistantBlock::ToolCall(pi_ai::types::ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        arguments: arguments.as_object().cloned().unwrap_or_default(),
+        thought_signature: None,
+        namespace: None,
+    })
+}
+
+/// Build the live in-memory session the credentialed suites share.
+///
+/// # Panics
+/// The fixture's own setup failures, which the tests cannot satisfy.
+pub async fn live_session(
+    root: &str,
+    token: &str,
+    in_memory: bool,
+    settings: Settings,
+) -> Arc<AgentSession<InMemorySettingsStorage>> {
+    std::fs::create_dir_all(root).expect("root");
+    let manager = if in_memory {
+        SessionManager::in_memory(Some(root), None, None).expect("session")
+    } else {
+        SessionManager::create(root, Some(&format!("{root}/sessions")), None).expect("session")
+    };
+    let mut setup = SessionSetup::new(root, manager);
+    setup.settings = settings;
+    setup.stream = Some(live_stream(token.to_owned()));
+    let session = build(setup).await;
+    authorize_with(&session, token).await;
+    session
+}
+
+/// A `message_end` handler that sleeps on assistant messages, upstream's
+/// delayed-handling fixture.
+#[must_use]
+pub fn slow_message_end_extension() -> pi_coding_agent::extensions::api::InlineExtension {
+    use pi_coding_agent::extensions::api::ExtensionApi;
+    use pi_coding_agent::extensions::events::ExtensionEvent;
+    use pi_coding_agent::extensions::results::HandlerResult;
+
+    pi_coding_agent::extensions::api::InlineExtension {
+        name: None,
+        hidden: false,
+        factory: Arc::new(|api: Arc<ExtensionApi>| {
+            Box::pin(async move {
+                api.on(
+                    "message_end",
+                    Arc::new(|event: ExtensionEvent, _ctx| {
+                        Box::pin(async move {
+                            if let ExtensionEvent::MessageEnd { message } = &event
+                                && matches!(message, AgentMessage::Standard(Message::Assistant(_)))
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                            }
+                            HandlerResult::None
+                        })
+                    }),
+                )
+                .expect("message_end handler");
+                Ok(())
+            })
+        }),
+    }
 }

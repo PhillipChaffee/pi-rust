@@ -16,17 +16,9 @@ use std::sync::Arc;
 
 use pi_coding_agent::core::agent_session::ExtensionBindings;
 use pi_coding_agent::core::agent_session_runtime::AgentSessionRuntime;
-use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeFactory;
 use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeOptions;
-use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeResult;
 use pi_coding_agent::core::agent_session_runtime::ForkOptions;
 use pi_coding_agent::core::agent_session_runtime::create_agent_session_runtime;
-use pi_coding_agent::core::agent_session_services::CreateAgentSessionFromServicesOptions;
-use pi_coding_agent::core::agent_session_services::CreateAgentSessionServicesOptions;
-use pi_coding_agent::core::agent_session_services::create_agent_session_from_services;
-use pi_coding_agent::core::agent_session_services::create_agent_session_services;
-use pi_coding_agent::core::sdk::CreateAgentSessionError;
-use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use tempfile::TempDir;
@@ -54,67 +46,19 @@ async fn create_runtime(
     } else {
         SessionManager::create(root, Some(&format!("{root}/sessions")), None).expect("manager")
     };
-    let factory: CreateAgentSessionRuntimeFactory<InMemorySettingsStorage> = {
-        let runtime = registry.runtime().clone();
-        let model = model.clone();
-        Arc::new(move |options: CreateAgentSessionRuntimeOptions| {
-            let runtime = runtime.clone();
-            let model = model.clone();
-            Box::pin(async move {
-                let services = create_agent_session_services::<InMemorySettingsStorage>(
-                    CreateAgentSessionServicesOptions {
-                        cwd: options.cwd.clone(),
-                        agent_dir: Some(options.agent_dir.clone()),
-                        settings_manager: None,
-                        model_runtime: Some(runtime),
-                        model_runtime_signal: None,
-                        extension_flag_values: None,
-                        resource_loader_options: Some(DefaultResourceLoaderOptions {
-                            cwd: options.cwd.clone(),
-                            agent_dir: options.agent_dir.clone(),
-                            no_extensions: true,
-                            no_skills: true,
-                            no_prompt_templates: true,
-                            no_themes: true,
-                            no_context_files: true,
-                            ..DefaultResourceLoaderOptions::default()
-                        }),
-                        resource_loader_reload_options: None,
-                    },
-                )
-                .await
-                .map_err(CreateAgentSessionError::ModelRuntime)?;
-                let services_for_result = services.clone();
-                let diagnostics = services.diagnostics.clone();
-                let result =
-                    create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
-                        services,
-                        session_manager: options.session_manager,
-                        session_start_event: options.session_start_event,
-                        model: Some(model),
-                        thinking_level: None,
-                        scoped_models: None,
-                        tools: Some(vec![
-                            "read".to_owned(),
-                            "bash".to_owned(),
-                            "edit".to_owned(),
-                            "write".to_owned(),
-                        ]),
-                        exclude_tools: None,
-                        no_tools: None,
-                        custom_tools: None,
-                    })
-                    .await?;
-                Ok(CreateAgentSessionRuntimeResult {
-                    session: result.session,
-                    extensions_result: result.extensions_result,
-                    model_fallback_message: result.model_fallback_message,
-                    services: services_for_result,
-                    diagnostics,
-                })
-            })
-        })
-    };
+    let factory =
+        common::agent_session::runtime_factory(common::agent_session::RuntimeFactoryOptions {
+            runtime: registry.runtime().clone(),
+            model,
+            extensions: Arc::new(Vec::new),
+            no_extensions: true,
+            tools: Some(vec![
+                "read".to_owned(),
+                "bash".to_owned(),
+                "edit".to_owned(),
+                "write".to_owned(),
+            ]),
+        });
     let runtime = create_agent_session_runtime(
         factory,
         CreateAgentSessionRuntimeOptions {

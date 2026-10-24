@@ -16,14 +16,9 @@ use std::sync::Arc;
 
 use pi_coding_agent::core::agent_session::AgentSession;
 use pi_coding_agent::core::agent_session::NavigateTreeOptions;
-use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use pi_coding_agent::settings_manager::Settings;
 
-use common::agent_session::SessionSetup;
-use common::agent_session::authorize_with;
-use common::agent_session::build;
-use common::agent_session::live_stream;
 use common::agent_session::live_token;
 
 type Session = Arc<AgentSession<InMemorySettingsStorage>>;
@@ -36,18 +31,7 @@ fn keep_recent_one() -> Settings {
 }
 
 async fn create_session(root: &str, token: &str, in_memory: bool) -> Session {
-    std::fs::create_dir_all(root).expect("root");
-    let manager = if in_memory {
-        SessionManager::in_memory(Some(root), None, None).expect("session")
-    } else {
-        SessionManager::create(root, Some(&format!("{root}/sessions")), None).expect("session")
-    };
-    let mut setup = SessionSetup::new(root, manager);
-    setup.settings = keep_recent_one();
-    setup.stream = Some(live_stream(token.to_owned()));
-    let session = build(setup).await;
-    authorize_with(&session, token).await;
-    session
+    common::agent_session::live_session(root, token, in_memory, keep_recent_one()).await
 }
 
 fn exported_entries(session: &Session, root: &str, name: &str) -> Vec<serde_json::Value> {

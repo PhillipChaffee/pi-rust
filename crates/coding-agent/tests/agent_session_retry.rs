@@ -18,16 +18,10 @@ use pi_agent_core::types::AgentTool;
 use pi_agent_core::types::StreamFn;
 use pi_ai::types::AssistantBlock;
 use pi_ai::types::AssistantMessage;
-use pi_ai::types::AssistantMessageEvent;
 use pi_ai::types::StopReason;
-use pi_ai::utils::event_stream::AssistantMessageEventStream;
-use pi_ai::utils::event_stream::assistant_message_event_stream;
 use pi_coding_agent::core::agent_session::AgentSession;
 use pi_coding_agent::core::agent_session::AgentSessionEvent;
-use pi_coding_agent::extensions::api::ExtensionApi;
 use pi_coding_agent::extensions::api::InlineExtension;
-use pi_coding_agent::extensions::events::ExtensionEvent;
-use pi_coding_agent::extensions::results::HandlerResult;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use pi_coding_agent::settings_manager::Settings;
@@ -61,30 +55,12 @@ fn stream_counter() -> Arc<AtomicUsize> {
 fn failing_stream(fail_count: usize, counter: Arc<AtomicUsize>, failure: &'static str) -> StreamFn {
     Arc::new(move |_model, _context, _options| {
         let call = counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let stream: AssistantMessageEventStream = assistant_message_event_stream();
         let message = if call <= fail_count {
             error_message(failure, 0)
         } else {
             assistant_message("Success", 0)
         };
-        stream.push(AssistantMessageEvent::Start {
-            partial: AssistantMessage {
-                content: Vec::new(),
-                ..message.clone()
-            },
-        });
-        if message.stop_reason == StopReason::Error {
-            stream.push(AssistantMessageEvent::Error {
-                reason: StopReason::Error,
-                error: message,
-            });
-        } else {
-            stream.push(AssistantMessageEvent::Done {
-                reason: message.stop_reason,
-                message,
-            });
-        }
-        stream
+        common::agent_session::terminal_stream(message)
     })
 }
 
@@ -107,6 +83,22 @@ fn retry_events() -> (
             _ => {}
         });
     (events, listener)
+}
+
+async fn assert_retries_once(
+    session: &Session,
+    counter: &Arc<AtomicUsize>,
+    events: &Arc<Mutex<Vec<String>>>,
+) {
+    session
+        .prompt("Test".to_owned(), None)
+        .await
+        .expect("prompt");
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        events.lock().expect("lock").clone(),
+        vec!["start:1".to_owned(), "end:success=true".to_owned()]
+    );
 }
 
 fn in_memory_manager() -> SessionManager {
@@ -141,16 +133,7 @@ async fn retries_after_a_transient_error_and_succeeds() {
     let (events, listener) = retry_events();
     let _unsubscribe = session.subscribe(listener);
 
-    session
-        .prompt("Test".to_owned(), None)
-        .await
-        .expect("prompt");
-
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        events.lock().expect("lock").clone(),
-        vec!["start:1".to_owned(), "end:success=true".to_owned()]
-    );
+    assert_retries_once(&session, &counter, &events).await;
     assert!(!session.is_retrying());
 }
 
@@ -193,43 +176,12 @@ async fn caps_the_agent_retry_delay() {
     assert_eq!(delays.lock().expect("lock").clone(), vec![1, 2, 4, 5]);
 }
 
-fn slow_message_end_extension() -> InlineExtension {
-    InlineExtension {
-        name: None,
-        hidden: false,
-        factory: Arc::new(|api: Arc<ExtensionApi>| {
-            Box::pin(async move {
-                api.on(
-                    "message_end",
-                    Arc::new(|event: ExtensionEvent, _ctx| {
-                        Box::pin(async move {
-                            if let ExtensionEvent::MessageEnd { message } = &event
-                                && matches!(
-                                    message,
-                                    pi_agent_core::types::AgentMessage::Standard(
-                                        pi_ai::types::Message::Assistant(_)
-                                    )
-                                )
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                            }
-                            HandlerResult::None
-                        })
-                    }),
-                )
-                .expect("message_end handler");
-                Ok(())
-            })
-        }),
-    }
-}
-
 #[tokio::test]
 async fn prompt_waits_for_retry_completion_when_message_end_handling_is_delayed() {
     let (session, counter) = retry_session(
         1,
         retry_settings(3, 1, 60_000),
-        vec![slow_message_end_extension()],
+        vec![common::agent_session::slow_message_end_extension()],
         true,
     )
     .await;
@@ -258,53 +210,11 @@ async fn retries_provider_network_error_failures() {
     let (events, listener) = retry_events();
     let _unsubscribe = session.subscribe(listener);
 
-    session
-        .prompt("Test".to_owned(), None)
-        .await
-        .expect("prompt");
-
-    assert_eq!(counter.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        events.lock().expect("lock").clone(),
-        vec!["start:1".to_owned(), "end:success=true".to_owned()]
-    );
+    assert_retries_once(&session, &counter, &events).await;
 }
 
 fn echo_tool(executed: Arc<AtomicUsize>) -> AgentTool {
-    AgentTool {
-        tool: pi_ai::types::Tool {
-            name: "echo".to_owned(),
-            description: "Echo text back".to_owned(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": { "text": { "type": "string" } },
-                "required": ["text"],
-            }),
-            constrained_sampling: None,
-        },
-        label: "Echo".to_owned(),
-        prepare_arguments: None,
-        execute: Arc::new(move |_id, _args, _signal, _on_update| {
-            let executed = Arc::clone(&executed);
-            Box::pin(async move {
-                executed.fetch_add(1, Ordering::SeqCst);
-                Ok(pi_agent_core::types::AgentToolResult {
-                    content: vec![pi_ai::types::ToolResultBlock::Text(
-                        pi_ai::types::TextContent {
-                            text: "echoed".to_owned(),
-                            text_signature: None,
-                        },
-                    )],
-                    details: serde_json::Value::Null,
-                    usage: None,
-                    added_tool_names: None,
-                    terminate: None,
-                })
-            })
-        }),
-        replay: None,
-        execution_mode: None,
-    }
+    common::agent_session::counting_tool("echo", executed, Arc::new(|_args| "echoed".to_owned()))
 }
 
 fn tool_call_message() -> AssistantMessage {
@@ -314,16 +224,11 @@ fn tool_call_message() -> AssistantMessage {
                 text: "Looking that up now.".to_owned(),
                 text_signature: None,
             }),
-            AssistantBlock::ToolCall(pi_ai::types::ToolCall {
-                id: "call_1".to_owned(),
-                name: "echo".to_owned(),
-                arguments: serde_json::json!({ "text": "hello" })
-                    .as_object()
-                    .cloned()
-                    .expect("object"),
-                thought_signature: None,
-                namespace: None,
-            }),
+            common::agent_session::tool_call_block(
+                "call_1",
+                "echo",
+                &serde_json::json!({ "text": "hello" }),
+            ),
         ],
         stop_reason: StopReason::ToolUse,
         ..assistant_message("Looking that up now.", 0)
@@ -337,30 +242,12 @@ async fn prompt_waits_for_the_full_agent_loop_when_the_retry_produces_tool_calls
     let stream_counter_ref = Arc::clone(&counter);
     let stream: StreamFn = Arc::new(move |_model, _context, _options| {
         let call = stream_counter_ref.fetch_add(1, Ordering::SeqCst) + 1;
-        let stream = assistant_message_event_stream();
         let message = match call {
             1 => error_message("overloaded_error", 0),
             2 => tool_call_message(),
             _ => assistant_message("Final answer.", 0),
         };
-        stream.push(AssistantMessageEvent::Start {
-            partial: AssistantMessage {
-                content: Vec::new(),
-                ..message.clone()
-            },
-        });
-        if message.stop_reason == StopReason::Error {
-            stream.push(AssistantMessageEvent::Error {
-                reason: StopReason::Error,
-                error: message,
-            });
-        } else {
-            stream.push(AssistantMessageEvent::Done {
-                reason: message.stop_reason,
-                message,
-            });
-        }
-        stream
+        common::agent_session::terminal_stream(message)
     });
     let mut setup = SessionSetup::new("/tmp/pi-session-retry-tools", in_memory_manager());
     setup.settings = retry_settings(3, 1, 60_000);

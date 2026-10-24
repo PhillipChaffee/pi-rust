@@ -19,18 +19,11 @@ use std::sync::atomic::Ordering;
 
 use pi_coding_agent::core::agent_session::ExtensionBindings;
 use pi_coding_agent::core::agent_session_runtime::AgentSessionRuntimeError;
-use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeFactory;
 use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeOptions;
-use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeResult;
 use pi_coding_agent::core::agent_session_runtime::ForkOptions;
 use pi_coding_agent::core::agent_session_runtime::NewSessionRequest;
 use pi_coding_agent::core::agent_session_runtime::SwitchSessionOptions;
 use pi_coding_agent::core::agent_session_runtime::create_agent_session_runtime;
-use pi_coding_agent::core::agent_session_services::CreateAgentSessionFromServicesOptions;
-use pi_coding_agent::core::agent_session_services::CreateAgentSessionServicesOptions;
-use pi_coding_agent::core::agent_session_services::create_agent_session_from_services;
-use pi_coding_agent::core::agent_session_services::create_agent_session_services;
-use pi_coding_agent::core::sdk::CreateAgentSessionError;
 use pi_coding_agent::extensions::api::ExtensionApi;
 use pi_coding_agent::extensions::api::InlineExtension;
 use pi_coding_agent::extensions::events::ExtensionEvent;
@@ -40,7 +33,6 @@ use pi_coding_agent::extensions::reasons::SessionStartReason;
 use pi_coding_agent::extensions::results::HandlerResult;
 use pi_coding_agent::extensions::results::SessionBeforeResult;
 use pi_coding_agent::extensions::runtime::FlagType;
-use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::InMemorySettingsStorage;
 use tempfile::TempDir;
@@ -205,10 +197,6 @@ struct Harness {
     cwd: String,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the runtime fixture builds the services factory inline, mirroring the SDK entry point"
-)]
 async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
     let fixture = common::sdk_fixture::Fixture::new();
     let cwd = fixture.cwd.clone();
@@ -218,67 +206,23 @@ async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
     let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let detail: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
     let cancels = Arc::new(Cancels::default());
-    let factory: CreateAgentSessionRuntimeFactory<InMemorySettingsStorage> = {
-        let runtime = registry.runtime().clone();
-        let model = model.clone();
-        let log = Arc::clone(&log);
-        let detail = Arc::clone(&detail);
-        let cancels = Arc::clone(&cancels);
-        Arc::new(move |options: CreateAgentSessionRuntimeOptions| {
-            let runtime = runtime.clone();
-            let model = model.clone();
-            let factory =
-                event_factory(Arc::clone(&log), Arc::clone(&cancels), Arc::clone(&detail));
-            Box::pin(async move {
-                let services = create_agent_session_services::<InMemorySettingsStorage>(
-                    CreateAgentSessionServicesOptions {
-                        cwd: options.cwd.clone(),
-                        agent_dir: Some(options.agent_dir.clone()),
-                        settings_manager: None,
-                        model_runtime: Some(runtime),
-                        model_runtime_signal: None,
-                        extension_flag_values: None,
-                        resource_loader_options: Some(DefaultResourceLoaderOptions {
-                            cwd: options.cwd.clone(),
-                            agent_dir: options.agent_dir.clone(),
-                            extension_factories: vec![factory],
-                            no_skills: true,
-                            no_prompt_templates: true,
-                            no_themes: true,
-                            no_context_files: true,
-                            ..DefaultResourceLoaderOptions::default()
-                        }),
-                        resource_loader_reload_options: None,
-                    },
-                )
-                .await
-                .map_err(CreateAgentSessionError::ModelRuntime)?;
-                let services_for_result = services.clone();
-                let diagnostics = services.diagnostics.clone();
-                let result =
-                    create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
-                        services,
-                        session_manager: options.session_manager,
-                        session_start_event: options.session_start_event,
-                        model: Some(model),
-                        thinking_level: None,
-                        scoped_models: None,
-                        tools: None,
-                        exclude_tools: None,
-                        no_tools: None,
-                        custom_tools: None,
-                    })
-                    .await?;
-                Ok(CreateAgentSessionRuntimeResult {
-                    session: result.session,
-                    extensions_result: result.extensions_result,
-                    model_fallback_message: result.model_fallback_message,
-                    services: services_for_result,
-                    diagnostics,
-                })
-            })
-        })
-    };
+    let log_for_factory = Arc::clone(&log);
+    let detail_for_factory = Arc::clone(&detail);
+    let cancels_for_factory = Arc::clone(&cancels);
+    let factory =
+        common::agent_session::runtime_factory(common::agent_session::RuntimeFactoryOptions {
+            runtime: registry.runtime().clone(),
+            model,
+            extensions: Arc::new(move || {
+                vec![event_factory(
+                    Arc::clone(&log_for_factory),
+                    Arc::clone(&cancels_for_factory),
+                    Arc::clone(&detail_for_factory),
+                )]
+            }),
+            no_extensions: true,
+            tools: None,
+        });
     let runtime = create_agent_session_runtime(
         factory,
         CreateAgentSessionRuntimeOptions {
