@@ -241,10 +241,6 @@ async fn harness_with(build: impl FnOnce(&str) -> SessionManager) -> Harness {
         .await
         .expect("bindings");
     log.lock().unwrap_or_else(PoisonError::into_inner).clear();
-    detail
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clear();
     Harness {
         runtime,
         log,
