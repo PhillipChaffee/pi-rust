@@ -5,6 +5,10 @@
 # Unpublished workspace crates resolve as UNKNOWN from the lockfile because
 # crates.io has no metadata for them; each member's manifest declares its
 # license. Add one override per new workspace crate.
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+reason = "crypto-bigint 0.5.5 is a stale Cargo.lock entry the workspace graph does not resolve (cargo tree finds no match, so no compiled crate carries it); the 0.7.6 fix sits on a line rsa 0.9 cannot consume"
+
 [[PackageOverrides]]
 name = "pi-telemetry"
 license.override = ["MIT"]

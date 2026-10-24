@@ -58,6 +58,8 @@ pub enum SessionShutdownReason {
     Fork,
     /// The app is quitting.
     Quit,
+    /// Extensions and resources reloaded in place.
+    Reload,
 }
 
 /// Why compaction runs, upstream's `"manual" | "threshold" | "overflow"`.

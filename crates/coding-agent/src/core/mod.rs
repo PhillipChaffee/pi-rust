@@ -2,6 +2,7 @@
 //! modules outside `tools/` (map child "pi-coding-agent: built-in coding
 //! tools").
 
+pub mod agent_session;
 pub mod bash_executor;
 pub mod event_bus;
 pub mod exec;

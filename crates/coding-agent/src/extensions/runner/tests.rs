@@ -146,8 +146,8 @@ fn user_message() -> AgentMessage {
     }))
 }
 
-fn assistant_text(text: &str) -> pi_ai::types::AssistantBlock {
-    pi_ai::types::AssistantBlock::Text(pi_ai::types::TextContent {
+fn tool_result_text(text: &str) -> pi_ai::types::ToolResultBlock {
+    pi_ai::types::ToolResultBlock::Text(pi_ai::types::TextContent {
         text: text.to_string(),
         text_signature: None,
     })
@@ -252,7 +252,7 @@ async fn emit_cancel_short_circuits_the_remaining_handlers() {
 #[tokio::test]
 async fn emit_tool_result_merges_fields_across_handlers() {
     let content_patch = HandlerResult::ToolResult(ToolResultResult {
-        content: Some(vec![assistant_text("patched")]),
+        content: Some(vec![tool_result_text("patched")]),
         ..ToolResultResult::default()
     });
     let error_patch = HandlerResult::ToolResult(ToolResultResult {
@@ -268,7 +268,7 @@ async fn emit_tool_result_merges_fields_across_handlers() {
             tool_name: "read".to_string(),
             tool_call_id: "call-1".to_string(),
             input: json!({ "path": "/x" }),
-            content: vec![assistant_text("original")],
+            content: vec![tool_result_text("original")],
             details: json!({ "ok": true }),
             is_error: false,
             usage: None,
@@ -277,7 +277,7 @@ async fn emit_tool_result_merges_fields_across_handlers() {
     let merged = outcome.expect("a handler modified the result");
     assert_eq!(
         merged.content.as_deref(),
-        Some(&[assistant_text("patched")][..])
+        Some(&[tool_result_text("patched")][..])
     );
     assert_eq!(merged.is_error, Some(true));
     assert_eq!(merged.details, Some(json!({ "ok": true })));

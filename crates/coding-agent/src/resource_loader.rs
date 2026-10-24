@@ -720,6 +720,14 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
         }
     }
 
+    /// The settings manager the loader shares with its consumers, the
+    /// single instance upstream's constructor hands both the loader and the
+    /// session.
+    #[must_use]
+    pub fn settings_manager(&self) -> Arc<Mutex<SettingsManager<S>>> {
+        Arc::clone(&self.settings_manager)
+    }
+
     /// The loaded extensions, upstream's `getExtensions`.
     #[must_use]
     pub fn get_extensions(&self) -> ExtensionLoadResult {

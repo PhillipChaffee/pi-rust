@@ -10,6 +10,14 @@ primary source when porting; this repo is the only place work happens and
 commits land, and `origin` points only at this repo. When a ticket depends on
 exact upstream code, record the pi commit SHA in the ticket.
 
+## Testing
+
+Do not run the test suite locally. `cargo test`, `cargo nextest`,
+`cargo llvm-cov`, and `run-gates.sh` are too resource-intensive for this
+machine; CI is the only test runner. Local verification stops at
+`cargo check`, `cargo fmt --all -- --check`, and
+`cargo clippy --workspace --all-targets`, then push and read CI.
+
 ## Comment and doc-comment rules
 
 The coding agent's global rules own the style basics — "Present state only"
