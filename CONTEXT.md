@@ -11,6 +11,14 @@ _Avoid_: plugin (reserved for the upstream chord-facet plugin system)
 **Extension receipt**:
 The hash-bound record that gates spawning an installed extension — artifact checksum, source inputs, and protocol version, recorded at enable time and re-verified fail-closed at every start. A Rust extension is a reviewed binary, not readable source; the receipt is what makes the review stick.
 
+**Extension host**:
+The pi process's half of an extension conversation: it verifies the receipt, spawns the child, binds the child's declarations into the in-process extension record, and proxies every dispatch. The child-side half is the extension SDK, this crate's `extensions::host` module.
+_Avoid_: plugin host, extension server
+
+**Extension wire**:
+The versioned CBOR-over-stdio conversation between the host and one extension child: framed envelopes, the handshake, registrations, call scopes, and context calls ([ADR 0010](docs/adr/0010-extension-host-wire-protocol.md)).
+_Avoid_: extension protocol session, IPC
+
 **Parity**:
 Behavioral equivalence with upstream pi at the pinned commit. Full parity includes the Rust-native extension mechanism; it never includes executing TS/JS extension files.
 
