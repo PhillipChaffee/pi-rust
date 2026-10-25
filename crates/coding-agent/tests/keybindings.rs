@@ -10,25 +10,15 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
-use pi_coding_agent::config::{EnvLookup, default_env_lookup};
+mod common;
+
+use pi_coding_agent::config::default_env_lookup;
 use pi_coding_agent::core::keybindings::{
     keybindings_with, node_platform, use_windows_keybindings,
 };
 use pi_tui::keybindings::Keybindings;
 
-/// An environment lookup over the supplied pairs.
-fn env_with(pairs: &[(&str, &str)]) -> EnvLookup {
-    let pairs: Vec<(String, String)> = pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect();
-    Box::new(move |key| {
-        pairs
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
-    })
-}
+use common::env_with;
 
 /// The default keys bound to `action`.
 fn default_keys(registry: &Keybindings, action: &str) -> Vec<String> {

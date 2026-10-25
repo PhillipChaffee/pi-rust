@@ -6,9 +6,10 @@
     reason = "the tests pin outcomes; an unexpected result panics the test by design"
 )]
 
+mod common;
+
 use std::fs;
 
-use pi_coding_agent::config::EnvLookup;
 use pi_coding_agent::core::keybindings::{
     AppKeybindingsManager, keybindings_config_from_value, keybindings_with,
     migrate_keybindings_config, use_windows_keybindings,
@@ -16,19 +17,7 @@ use pi_coding_agent::core::keybindings::{
 use pi_tui::keybindings::TUI_KEYBINDINGS;
 use serde_json::json;
 
-/// An environment lookup over the supplied pairs.
-fn env_with(pairs: &[(&str, &str)]) -> EnvLookup {
-    let pairs: Vec<(String, String)> = pairs
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect();
-    Box::new(move |key| {
-        pairs
-            .iter()
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.clone())
-    })
-}
+use common::env_with;
 
 /// The default keys bound to `action`, joined for compact assertions.
 fn keys(registry: &pi_tui::keybindings::Keybindings, action: &str) -> String {
