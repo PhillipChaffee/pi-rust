@@ -1485,3 +1485,30 @@ async fn session_rebindings_land_on_the_next_context() {
         ExtensionMode::Rpc
     );
 }
+
+#[tokio::test]
+async fn no_op_command_actions_decline_every_replacement() {
+    let actions = CommandContextActions::no_ops();
+    (actions.wait_for_idle)().await;
+    assert!(
+        !(actions.new_session)(NewSessionOptions::default())
+            .await
+            .cancelled
+    );
+    assert!(
+        !(actions.fork)("entry".to_string(), ForkOptions::default())
+            .await
+            .cancelled
+    );
+    assert!(
+        !(actions.navigate_tree)("entry".to_string(), NavigateTreeOptions::default())
+            .await
+            .cancelled
+    );
+    assert!(
+        !(actions.switch_session)("path".to_string(), SwitchSessionOptions::default())
+            .await
+            .cancelled
+    );
+    (actions.reload)().await;
+}
