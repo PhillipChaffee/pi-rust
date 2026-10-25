@@ -66,17 +66,6 @@ pub enum UnknownFlagValue {
     Value(String),
 }
 
-impl UnknownFlagValue {
-    /// The value as text, `None` for the bare flag.
-    #[must_use]
-    pub fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Set => None,
-            Self::Value(value) => Some(value),
-        }
-    }
-}
-
 /// The parsed command line, upstream's `Args`.
 #[expect(
     clippy::struct_excessive_bools,
@@ -685,15 +674,18 @@ pub fn help_text(extension_flags: Option<&[ExtensionFlag]>) -> String {
         )
 }
 
-/// Print [`help_text`] to stdout, upstream's `printHelp`.
+/// Print [`help_text`] to the given writer, upstream's `printHelp`.
+///
+/// The writer is injected rather than reaching for stdout, following
+/// `list_models`' seam, so the help path stays testable.
 ///
 /// # Errors
-/// [`std::io::Error`] when stdout cannot be written.
-pub fn print_help(extension_flags: Option<&[ExtensionFlag]>) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    let mut stdout = std::io::stdout().lock();
-    write!(stdout, "{}", help_text(extension_flags))
+/// [`std::io::Error`] when the writer fails.
+pub fn print_help<W: std::io::Write>(
+    mut writer: W,
+    extension_flags: Option<&[ExtensionFlag]>,
+) -> std::io::Result<()> {
+    write!(writer, "{}", help_text(extension_flags))
 }
 
 #[cfg(test)]

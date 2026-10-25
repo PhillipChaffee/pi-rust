@@ -20,3 +20,11 @@ fn only_the_exact_opt_in_value_enables_experimental_features() {
     assert!(!are_experimental_features_enabled_with(&env(Some("0"))));
     assert!(!are_experimental_features_enabled_with(&env(None)));
 }
+
+#[test]
+fn reads_the_process_environment_by_default() {
+    assert_eq!(
+        are_experimental_features_enabled(),
+        are_experimental_features_enabled_with(&default_env_lookup())
+    );
+}

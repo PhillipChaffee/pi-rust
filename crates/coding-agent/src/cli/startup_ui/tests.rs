@@ -85,3 +85,11 @@ fn rejects_a_forked_distribution() {
         CONFIG_DIR_NAME
     ));
 }
+
+#[test]
+fn plain_entry_reads_the_process_environment_and_settings_path() {
+    assert_eq!(
+        should_run_first_time_setup(),
+        should_run_first_time_setup_with(&default_env_lookup(), &get_settings_path())
+    );
+}

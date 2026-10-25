@@ -1,6 +1,11 @@
 //! The `args.test.ts` cases, ported 1:1 at pin
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 
+#![expect(
+    clippy::expect_used,
+    reason = "the help writer case unwraps its in-memory buffer; an unexpected failure should panic the test"
+)]
+
 use super::*;
 
 fn parse(args: &[&str]) -> Args {
@@ -517,4 +522,35 @@ fn help_omits_the_extension_section_without_flags() {
     let text = help_text(None);
     assert!(!text.contains("Extension CLI Flags:"));
     assert!(text.contains("Extensions can register additional flags"));
+}
+
+#[test]
+fn print_help_writes_the_rendered_text() {
+    let mut buffer = Vec::new();
+    print_help(&mut buffer, None).expect("writes");
+    assert_eq!(
+        String::from_utf8(buffer).expect("utf-8 help"),
+        help_text(None)
+    );
+}
+
+#[test]
+fn parses_list_models_search_and_bare_forms() {
+    assert_eq!(
+        parse(&["--list-models", "sonnet"]).list_models,
+        Some(ListModels::Search("sonnet".to_string()))
+    );
+    assert_eq!(
+        parse(&["--list-models", "--verbose"]).list_models,
+        Some(ListModels::All)
+    );
+    assert_eq!(parse(&["--list-models"]).list_models, Some(ListModels::All));
+}
+
+#[test]
+fn ignores_an_invalid_mode_value() {
+    let result = parse(&["--mode", "bogus", "hello"]);
+    assert_eq!(result.mode, None);
+    assert_eq!(result.messages, texts(&["hello"]));
+    assert_eq!(parse(&["--mode"]).mode, None);
 }

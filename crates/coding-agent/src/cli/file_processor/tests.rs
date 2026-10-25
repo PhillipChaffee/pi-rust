@@ -105,3 +105,22 @@ async fn reports_an_unprocessable_image_as_a_file_block() {
         )
     );
 }
+
+#[test]
+fn formats_read_errors() {
+    let error = ProcessFileError::Read {
+        path: PathBuf::from("/tmp/x"),
+        message: "boom".to_string(),
+    };
+    assert_eq!(error.to_string(), "Could not read file /tmp/x: boom");
+}
+
+#[tokio::test]
+async fn reports_path_normalization_failures_as_read_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let error = process_file_arguments(&["file://example.com/x".to_string()], &cwd(&dir), None)
+        .await
+        .expect_err("non-local file URL fails");
+    assert!(matches!(error, ProcessFileError::Read { .. }));
+    assert!(error.to_string().starts_with("Could not read file "));
+}
