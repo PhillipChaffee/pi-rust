@@ -146,7 +146,7 @@ fn fills_optional_tokens_and_decorates_text() {
         theme.get_bg_ansi("searchMatchBg"),
         theme.get_bg_ansi("selectedBg")
     );
-    assert_eq!(theme.fg("accent", "x"), "x\x1b[39m");
+    assert_eq!(theme.fg("accent", "x"), "\x1b[39mx\x1b[39m");
     assert_eq!(theme.bg("selectedBg", "x"), "\x1b[48;2;68;68;68mx\x1b[49m");
     assert_eq!(theme.color_mode(), ColorMode::Truecolor);
     assert_eq!(theme.name(), None);
