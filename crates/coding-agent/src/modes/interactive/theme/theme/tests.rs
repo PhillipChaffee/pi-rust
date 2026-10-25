@@ -151,6 +151,12 @@ fn fills_optional_tokens_and_decorates_text() {
     assert_eq!(theme.color_mode(), ColorMode::Truecolor);
     assert_eq!(theme.name(), None);
     assert_eq!(theme.source_path(), None);
+    assert!(format!("{theme:?}").starts_with("Theme"));
+}
+
+#[test]
+fn drops_an_absent_theme_watcher() {
+    super::drop_theme_watcher();
 }
 
 #[test]

@@ -32,6 +32,9 @@ fn markdown_theme_decorates_and_highlights() {
     assert!(highlighted.len() >= 3);
     assert!(highlighted.join("\n").contains('\u{1b}'));
 
+    let markdown = highlight_code("**strong** and *em*", Some("markdown"));
+    assert!(!markdown.is_empty());
+
     let plain = (theme.highlight_code.as_ref().expect("highlighter"))("text", None);
     assert_eq!(plain.len(), 1);
     assert!(plain[0].starts_with("\x1b[38;2;"));

@@ -26,6 +26,7 @@ fn empty_dirs() -> TempDir {
 #[test]
 fn dynamic_border_fills_the_width_with_an_explicit_color() {
     let border = DynamicBorder::new(Rc::new(|text: &str| format!("<{text}>")));
+    assert!(format!("{border:?}").contains("DynamicBorder"));
     let lines = border.render(4);
     assert_eq!(lines, vec!["<────>".to_string()]);
     assert_eq!(border.render(0), vec!["<─>".to_string()]);
@@ -64,6 +65,7 @@ fn theme_selector_lists_themes_and_previews_selection() {
             Rc::new(move |name: &str| previewed.borrow_mut().push(name.to_string()))
         },
     );
+    assert!(format!("{selector:?}").contains("ThemeSelectorComponent"));
     let lines = selector.render(30);
     assert!(lines.len() >= 3, "border, list, border: {lines:?}");
     assert!(lines[0].contains('─'));

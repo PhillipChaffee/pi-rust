@@ -114,6 +114,7 @@ fn queries_the_terminal_through_the_poll_loop() {
     let tui = tui(QueryTerminal::new(true));
     tui.start();
     let adapter = TuiThemeUi::new(Rc::clone(&tui));
+    assert!(format!("{adapter:?}").contains("TuiThemeUi"));
     assert_eq!(
         adapter.query_terminal_background_color(1_000),
         Ok(Some(RgbColor {

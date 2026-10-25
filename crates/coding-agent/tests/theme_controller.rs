@@ -164,20 +164,19 @@ impl Harness {
         let errors = Rc::clone(&self.errors);
         let changes = Rc::clone(&self.changes);
         let ui: Rc<dyn ThemeUi> = self.ui.clone();
-        InteractiveThemeController::new(
-            ui,
-            ThemeControllerOptions {
-                get_settings_manager: Rc::new(move || {
-                    let manager: Manager = manager.borrow().clone();
-                    manager
-                }),
-                show_error: Rc::new(move |message: &str| {
-                    errors.borrow_mut().push(message.to_string());
-                }),
-                on_changed: Rc::new(move || changes.set(changes.get() + 1)),
-                initial_theme_setting: initial_theme_setting.map(str::to_string),
-            },
-        )
+        let options = ThemeControllerOptions {
+            get_settings_manager: Rc::new(move || {
+                let manager: Manager = manager.borrow().clone();
+                manager
+            }),
+            show_error: Rc::new(move |message: &str| {
+                errors.borrow_mut().push(message.to_string());
+            }),
+            on_changed: Rc::new(move || changes.set(changes.get() + 1)),
+            initial_theme_setting: initial_theme_setting.map(str::to_string),
+        };
+        assert!(format!("{options:?}").contains("ThemeControllerOptions"));
+        InteractiveThemeController::new(ui, options)
     }
 
     fn set_theme_setting(&self, theme_setting: Option<&str>) {
@@ -195,6 +194,7 @@ fn uses_the_initial_theme_without_persisting_it() {
     let harness = harness();
     *harness.manager.borrow_mut() = manager(Some("dark"));
     let controller = harness.controller(Some("light"));
+    assert!(format!("{controller:?}").contains("InteractiveThemeController"));
     assert_eq!(theme().name(), Some("light"));
     assert_eq!(controller.get_theme_selection(), Some("light".to_string()));
     controller.apply_from_settings();

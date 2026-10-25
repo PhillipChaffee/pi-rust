@@ -160,11 +160,15 @@ impl Theme {
         clippy::panic,
         reason = "upstream throws on an unknown token; the validated-theme invariant makes it unreachable"
     )]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the match keeps the panic arm inside the function, where the contract is documented, instead of a closure"
+    )]
     pub fn fg(&self, color: &str, text: &str) -> String {
-        self.fg_colors.get(color).map_or_else(
-            || panic!("Unknown theme color: {color}"),
-            |ansi| format!("{ansi}{text}\x1b[39m"),
-        )
+        match self.fg_colors.get(color) {
+            Some(ansi) => format!("{ansi}{text}\x1b[39m"),
+            None => panic!("Unknown theme color: {color}"),
+        }
     }
 
     /// Decorate text with a background token, upstream's `bg`.
@@ -176,11 +180,15 @@ impl Theme {
         clippy::panic,
         reason = "upstream throws on an unknown token; the validated-theme invariant makes it unreachable"
     )]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the match keeps the panic arm inside the function, where the contract is documented, instead of a closure"
+    )]
     pub fn bg(&self, color: &str, text: &str) -> String {
-        self.bg_colors.get(color).map_or_else(
-            || panic!("Unknown theme background color: {color}"),
-            |ansi| format!("{ansi}{text}\x1b[49m"),
-        )
+        match self.bg_colors.get(color) {
+            Some(ansi) => format!("{ansi}{text}\x1b[49m"),
+            None => panic!("Unknown theme background color: {color}"),
+        }
     }
 
     /// The raw foreground escape for a token, upstream's `getFgAnsi`.
@@ -192,10 +200,15 @@ impl Theme {
         clippy::panic,
         reason = "upstream throws on an unknown token; the validated-theme invariant makes it unreachable"
     )]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the match keeps the panic arm inside the function, where the contract is documented, instead of a closure"
+    )]
     pub fn get_fg_ansi(&self, color: &str) -> &str {
-        self.fg_colors
-            .get(color)
-            .unwrap_or_else(|| panic!("Unknown theme color: {color}"))
+        match self.fg_colors.get(color) {
+            Some(ansi) => ansi,
+            None => panic!("Unknown theme color: {color}"),
+        }
     }
 
     /// The raw background escape for a token, upstream's `getBgAnsi`.
@@ -207,10 +220,15 @@ impl Theme {
         clippy::panic,
         reason = "upstream throws on an unknown token; the validated-theme invariant makes it unreachable"
     )]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the match keeps the panic arm inside the function, where the contract is documented, instead of a closure"
+    )]
     pub fn get_bg_ansi(&self, color: &str) -> &str {
-        self.bg_colors
-            .get(color)
-            .unwrap_or_else(|| panic!("Unknown theme background color: {color}"))
+        match self.bg_colors.get(color) {
+            Some(ansi) => ansi,
+            None => panic!("Unknown theme background color: {color}"),
+        }
     }
 }
 
@@ -1144,12 +1162,19 @@ fn lock_or_recover<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     clippy::panic,
     reason = "upstream's proxy throws the same error; every consumer runs after init_theme"
 )]
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the match keeps the panic arm inside the function instead of a closure"
+)]
 pub fn theme() -> Arc<Theme> {
     let active = GLOBAL_THEME
         .read()
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
-    active.unwrap_or_else(|| panic!("Theme not initialized. Call init_theme() first."))
+    match active {
+        Some(theme) => theme,
+        None => panic!("Theme not initialized. Call init_theme() first."),
+    }
 }
 
 /// Install the process-wide theme, upstream's `setGlobalTheme`.
@@ -1293,10 +1318,7 @@ fn start_theme_watcher() {
         }
         schedule_theme_reload(&listener_name, &theme_file);
     };
-    let watcher = watch_with_error_handler(&listener_dir, listener, || {
-        let watcher = lock_or_recover(&THEME_WATCHER).take();
-        close_watcher(watcher);
-    });
+    let watcher = watch_with_error_handler(&listener_dir, listener, drop_theme_watcher);
     *lock_or_recover(&THEME_WATCHER) = watcher;
 }
 
@@ -1329,6 +1351,13 @@ fn schedule_theme_reload(watched_name: &str, theme_file: &Path) {
         set_global_theme(reloaded);
         notify_theme_change();
     });
+}
+
+/// Drop the watch after a runtime watch error, upstream's close-on-error
+/// callback.
+fn drop_theme_watcher() {
+    let watcher = lock_or_recover(&THEME_WATCHER).take();
+    close_watcher(watcher);
 }
 
 /// Stop the theme watch and invalidate a pending reload, upstream's
