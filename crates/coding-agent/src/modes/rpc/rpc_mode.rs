@@ -993,7 +993,7 @@ where
         ),
         RpcCommand::GetCommands { id: _ } => {
             let commands = slash_commands(runtime.session());
-            success_response(id, "get_commands", Some(to_json(&commands)?))
+            success_response(id, "get_commands", Some(json!({ "commands": commands })))
         }
     }))
 }

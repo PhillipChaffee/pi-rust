@@ -17,7 +17,7 @@ use common::rpc::RpcHarness;
 use serde_json::Value;
 use serde_json::json;
 
-/// Send a command and return its response.
+/// Send a command and return its response line.
 async fn call(harness: &RpcHarness, command: Value) -> Value {
     let id = command["id"]
         .as_str()
@@ -25,11 +25,15 @@ async fn call(harness: &RpcHarness, command: Value) -> Value {
         .to_owned();
     harness.send(command);
     let lines = harness
-        .wait_for(|lines| lines.iter().any(|line| line["id"] == id.as_str()))
+        .wait_for(|lines| {
+            lines
+                .iter()
+                .any(|line| line["type"] == "response" && line["id"] == id.as_str())
+        })
         .await;
     lines
         .iter()
-        .find(|line| line["id"] == id.as_str())
+        .find(|line| line["type"] == "response" && line["id"] == id.as_str())
         .expect("the response landed")
         .clone()
 }
@@ -278,10 +282,9 @@ async fn session_mutation_commands_replace_the_session() {
     assert_eq!(state["data"]["messageCount"], 0);
 
     let no_leaf = call(&harness, json!({ "id": "f6", "type": "clone" })).await;
-    assert_eq!(no_leaf["success"], false);
     assert_eq!(
-        no_leaf["error"],
-        "Cannot clone session: no current entry selected"
+        no_leaf["success"], true,
+        "the fresh session's model-change entry is its leaf"
     );
 
     let switched = call(
