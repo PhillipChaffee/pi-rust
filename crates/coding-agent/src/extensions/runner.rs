@@ -618,10 +618,12 @@ impl ExtensionRunner {
         actions: ExtensionActions,
         provider_actions: Option<ProviderActions>,
     ) {
-        self.active_tools = Arc::clone(&actions.get_active_tools);
+        let bound = Arc::new(actions);
+        self.active_tools = Arc::clone(&bound.get_active_tools);
         self.runtime
-            .bind_refresh_tools(Arc::clone(&actions.refresh_tools));
-        self.bound_actions = Some(Arc::new(actions));
+            .bind_refresh_tools(Arc::clone(&bound.refresh_tools));
+        self.runtime.bind_actions(Arc::clone(&bound));
+        self.bound_actions = Some(bound);
         let flush: Option<&ProviderActions> = provider_actions.as_ref();
         for registration in self.runtime.take_pending_provider_registrations() {
             let registered = match flush {

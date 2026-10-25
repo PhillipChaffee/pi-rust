@@ -23,10 +23,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pi_ai::types::BoxedFuture;
+use pi_ai::types::{BoxedFuture, UserContent};
 use serde_json::Value;
 
 use crate::core::event_bus::{EventBus, EventHandler};
+use crate::extensions::reasons::CustomMessagePayload;
+use crate::extensions::runner::{SendMessageOptions, SendUserMessageOptions};
 use crate::extensions::runtime::{
     CommandHandler, Extension, ExtensionFlag, ExtensionHandler, FlagType, FlagValue,
     RegisteredTool, ResolvedCommand,
@@ -120,6 +122,9 @@ pub struct ExtensionRuntime {
     /// The post-bind tool-registry refresh, upstream's bindCore
     /// `runtime.refreshTools` replacement; absent pre-bind.
     bound_refresh_tools: Arc<Mutex<Option<crate::extensions::runner::RefreshToolsHandler>>>,
+    /// The post-bind action bundle, upstream's bindCore replacing the
+    /// runtime's throwing action stubs; absent pre-bind.
+    bound_actions: Arc<Mutex<Option<Arc<crate::extensions::runner::ExtensionActions>>>>,
     /// The live event-bus unsubscribes, upstream's
     /// `eventBusUnsubscribers`; invalidation drops every one so a stale
     /// extension never hears the bus again.
@@ -174,6 +179,25 @@ impl ExtensionRuntime {
         if let Some(handler) = handler {
             handler();
         }
+    }
+
+    /// Arm the post-bind action bundle the API's action methods delegate
+    /// to, upstream's bindCore `runtime.sendMessage` family replacement.
+    pub fn bind_actions(&self, actions: Arc<crate::extensions::runner::ExtensionActions>) {
+        *self
+            .bound_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(actions);
+    }
+
+    /// The armed action bundle, absent until the bind pass; upstream's
+    /// runtime starts with throwing stubs the bind replaces.
+    #[must_use]
+    pub fn bound_actions(&self) -> Option<Arc<crate::extensions::runner::ExtensionActions>> {
+        self.bound_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Mark the runtime stale, upstream's `invalidate`; the first message
@@ -354,12 +378,14 @@ impl std::fmt::Debug for ExtensionRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
+        let actions_bound = self.bound_actions().is_some();
         f.debug_struct("ExtensionRuntime")
             .field("stale", &stale)
             .field("flag_values", &flags)
             .field("pending_provider_registrations", &queued)
             .field("bound_provider_actions", &bound)
             .field("bound_refresh_tools", &refresh_bound)
+            .field("bound_actions", &actions_bound)
             .field(
                 "event_bus_unsubscribers",
                 &self.event_bus_subscription_count(),
@@ -863,6 +889,77 @@ impl ExtensionApi {
             .runtime
             .flag_value(name)
             .or_else(|| pending.get(name).cloned()))
+    }
+
+    /// The bound action bundle, upstream's post-bind runtime action read.
+    ///
+    /// # Errors
+    /// When the API may not act, or the bind pass has not armed the actions
+    /// yet (upstream's throwing load-time stubs).
+    fn bound_actions(&self) -> Result<Arc<crate::extensions::runner::ExtensionActions>, String> {
+        self.assert_active()?;
+        self.runtime.bound_actions().ok_or_else(|| {
+            "Extension runtime not initialized. Action methods cannot be called during \
+             extension loading."
+                .to_string()
+        })
+    }
+
+    /// Send a custom message, upstream's `pi.sendMessage`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn send_message(
+        &self,
+        message: CustomMessagePayload,
+        options: Option<SendMessageOptions>,
+    ) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.send_message)(message, options);
+        Ok(())
+    }
+
+    /// Send a user message, upstream's `pi.sendUserMessage`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn send_user_message(
+        &self,
+        content: UserContent,
+        options: Option<SendUserMessageOptions>,
+    ) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.send_user_message)(content, options);
+        Ok(())
+    }
+
+    /// Append a custom session entry, upstream's `pi.appendEntry`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn append_entry(&self, custom_type: String, data: Option<Value>) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.append_entry)(custom_type, data);
+        Ok(())
+    }
+
+    /// The active tool names, upstream's `pi.getActiveTools`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
+        let actions = self.bound_actions()?;
+        Ok((actions.get_active_tools)())
+    }
+
+    /// Restate the active tool names, upstream's `pi.setActiveTools`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn set_active_tools(&self, tool_names: Vec<String>) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.set_active_tools)(tool_names);
+        Ok(())
     }
 
     /// Queue one provider registration for the bind pass, upstream's
