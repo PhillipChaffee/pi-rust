@@ -4,6 +4,7 @@
 //! `pi -p "prompt"` writes the final assistant text; `pi --mode json
 //! "prompt"` writes one JSON event per session event. Both modes dispose the
 //! runtime and emit `session_shutdown` before returning.
+//!
 //! Restatement: upstream binds the six command-context replacement actions
 //! by capturing `runtimeHost`; the handlers need the owned host, so they bind
 //! with the entry dispatch (#185) where the host handle exists. A bind

@@ -2,6 +2,7 @@
 //! `src/modes/json-event.ts` at pin
 //! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
 //!
+//! [`to_json_event`] removes the cumulative assistant snapshot from
 //! `message_update` stream events. `message_start` seeds the message, deltas
 //! rebuild it, and `message_end` carries the final authoritative form.
 //! Cumulative usage, tool-call ids, and tool names stay on the wire because
