@@ -1,6 +1,6 @@
 //! The spawn gate: verified child processes over piped stdio ([ADR 0010]).
 //!
-//! [`ExtensionProcess::spawn`] verifies an installed package's receipt,
+//! `ExtensionProcess::spawn` verifies an installed package's receipt,
 //! launches the entry binary with the session cwd, and hands its stdio to
 //! [`HostSession::connect`] under a handshake deadline.
 //! [`ExtensionLoader`] owns the loader cache: one live process per resolved
