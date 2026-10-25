@@ -311,8 +311,8 @@ async fn the_receipt_gate_fails_closed() {
             .contains("changed since install: bin/demo")
     );
 
-    std::fs::write(root.join("extra"), "surprise").expect("extra file");
     write_receipt(root, Some(EXTENSION_PROTOCOL_VERSION));
+    std::fs::write(root.join("extra"), "surprise").expect("extra file");
     assert!(
         verify_install_receipt(&binary)
             .expect_err("an unlisted file fails")
