@@ -1426,6 +1426,7 @@ async fn invalidate_first_message_wins_and_fails_the_runner_reads() {
             source_info(),
         )),
         runtime,
+        crate::core::event_bus::EventBus::default(),
         "/tmp/project".to_string(),
     );
     assert!(

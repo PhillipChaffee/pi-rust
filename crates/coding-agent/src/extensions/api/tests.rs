@@ -8,6 +8,7 @@ use std::sync::Arc;
 use pi_agent_core::types::{AgentToolError, AgentToolResult};
 
 use super::{ExtensionApi, ExtensionFactory, ExtensionRuntime};
+use crate::core::event_bus::EventBus;
 use crate::extensions::events::ExtensionEvent;
 use crate::extensions::results::HandlerResult;
 use crate::extensions::runtime::{CommandHandler, ExtensionHandler, FlagType, FlagValue};
@@ -32,6 +33,7 @@ fn api_with(extension_path: &str, runtime: &ExtensionRuntime) -> Arc<ExtensionAp
     Arc::new(ExtensionApi::new(
         Arc::new(extension),
         runtime.clone(),
+        EventBus::default(),
         "/tmp/project".to_string(),
     ))
 }
@@ -319,6 +321,11 @@ fn provider_queue_remembers_and_forgets_registrations() {
     api.register_provider("other".to_string(), ProviderConfigInput::default())
         .expect("queued");
     api.unregister_provider("custom").expect("dropped");
+    assert!(
+        runtime.take_pending_provider_registrations().is_empty(),
+        "a loading API keeps its changes private"
+    );
+    api.commit().expect("the API commits");
     let queued = runtime.take_pending_provider_registrations();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].name, "other");
@@ -355,6 +362,7 @@ async fn load_extension_from_factory_runs_commit_and_lifecycle() {
     let extension = crate::extensions::api::load_extension_from_factory(
         &factory,
         &runtime,
+        &EventBus::default(),
         "/tmp/project",
         "<inline:demo>",
     )
@@ -388,6 +396,7 @@ async fn failing_factory_fails_the_load_and_discards_the_api() {
     let error = crate::extensions::api::load_extension_from_factory(
         &factory,
         &runtime,
+        &EventBus::default(),
         "/tmp/project",
         "<inline:1>",
     )
@@ -404,6 +413,7 @@ async fn uninitialized_commit_paths_an_error_through_the_loader() {
     let error = crate::extensions::api::load_extension_from_factory(
         &factory,
         &runtime,
+        &EventBus::default(),
         "/tmp/project",
         "<inline:2>",
     )
@@ -422,17 +432,23 @@ async fn post_bind_provider_registration_registers_directly() {
         source_info("/ext/post-bind.ts"),
     );
 
-    // Pre-bind the registration queues.
+    // Pre-bind the registration queues privately until the API commits.
     let api = Arc::new(ExtensionApi::new(
         {
             let extension = Arc::new(extension);
             Arc::clone(&extension)
         },
         runtime.clone(),
+        EventBus::default(),
         "/tmp/project".to_string(),
     ));
     api.register_provider("queued".to_string(), ProviderConfigInput::default())
         .expect("the queue accepts");
+    assert!(
+        runtime.take_pending_provider_registrations().is_empty(),
+        "the loading API keeps its registration private"
+    );
+    api.commit().expect("the API commits");
     assert_eq!(
         runtime.take_pending_provider_registrations().len(),
         1,
@@ -481,4 +497,144 @@ fn flag_values_snapshot_reads_alphabetically() {
         values.keys().cloned().collect::<Vec<_>>(),
         vec!["alpha".to_string(), "zeta".to_string()]
     );
+}
+
+#[tokio::test]
+async fn events_surface_emits_and_tracks_subscriptions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let runtime = ExtensionRuntime::new();
+    let api = api_with("/ext/events.ts", &runtime);
+    let seen = Arc::new(AtomicUsize::new(0));
+    let handler: crate::core::event_bus::EventHandler = Arc::new({
+        let seen = Arc::clone(&seen);
+        move |_data: serde_json::Value| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                seen.fetch_add(1, Ordering::SeqCst);
+            })
+        }
+    });
+    let unsubscribe = api.events_on("demo", handler).expect("subscribed");
+    assert_eq!(runtime.event_bus_subscription_count(), 1);
+    api.events_emit("demo", &serde_json::json!({ "ok": true }))
+        .expect("emitted");
+    settle().await;
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+
+    // A committed API tracks too; the runtime only drops what was asked.
+    api.commit().expect("the API commits");
+    let late = Arc::new(AtomicUsize::new(0));
+    let late_unsubscribe = api
+        .events_on(
+            "demo",
+            Arc::new({
+                let late = Arc::clone(&late);
+                move |_data: serde_json::Value| {
+                    let late = Arc::clone(&late);
+                    Box::pin(async move {
+                        late.fetch_add(1, Ordering::SeqCst);
+                    })
+                }
+            }),
+        )
+        .expect("subscribed after commit");
+    assert_eq!(runtime.event_bus_subscription_count(), 2);
+    api.events_emit("demo", &serde_json::Value::Null)
+        .expect("emitted");
+    settle().await;
+    assert_eq!(late.load(Ordering::SeqCst), 1);
+
+    unsubscribe();
+    unsubscribe();
+    assert_eq!(
+        runtime.event_bus_subscription_count(),
+        1,
+        "the tracked unsubscribe is idempotent"
+    );
+    api.events_emit("demo", &serde_json::Value::Null)
+        .expect("emitted");
+    settle().await;
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "the listener is gone");
+    assert_eq!(
+        late.load(Ordering::SeqCst),
+        2,
+        "the committed listener runs"
+    );
+    late_unsubscribe();
+    assert_eq!(runtime.event_bus_subscription_count(), 0);
+}
+
+#[tokio::test]
+async fn a_failed_load_drops_its_loading_subscriptions() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let runtime = ExtensionRuntime::new();
+    let bus = EventBus::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory: ExtensionFactory = Arc::new({
+        let calls = Arc::clone(&calls);
+        move |api: Arc<ExtensionApi>| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                api.events_on(
+                    "demo",
+                    Arc::new(move |_data: serde_json::Value| {
+                        let calls = Arc::clone(&calls);
+                        Box::pin(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                        })
+                    }),
+                )?;
+                Err("the factory refused".to_string())
+            })
+        }
+    });
+    super::load_extension_from_factory(&factory, &runtime, &bus, "/tmp/project", "<inline:events>")
+        .await
+        .expect_err("the load fails");
+    assert_eq!(runtime.event_bus_subscription_count(), 0);
+    bus.emit("demo", &serde_json::Value::Null);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn invalidate_drops_every_tracked_subscription() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let runtime = ExtensionRuntime::new();
+    let bus = EventBus::default();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let factory: ExtensionFactory = Arc::new({
+        let calls = Arc::clone(&calls);
+        move |api: Arc<ExtensionApi>| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                api.events_on(
+                    "demo",
+                    Arc::new(move |_data: serde_json::Value| {
+                        let calls = Arc::clone(&calls);
+                        Box::pin(async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                        })
+                    }),
+                )?;
+                Ok(())
+            })
+        }
+    });
+    super::load_extension_from_factory(&factory, &runtime, &bus, "/tmp/project", "<inline:events>")
+        .await
+        .expect("the factory loads");
+    assert_eq!(runtime.event_bus_subscription_count(), 1);
+    runtime.invalidate(None);
+    assert_eq!(runtime.event_bus_subscription_count(), 0);
+    bus.emit("demo", &serde_json::Value::Null);
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
