@@ -9,6 +9,7 @@ pub mod bash_executor;
 pub mod event_bus;
 pub mod exec;
 pub mod experimental;
+pub mod keybindings;
 pub mod output_guard;
 pub mod sdk;
 pub mod slash_commands;

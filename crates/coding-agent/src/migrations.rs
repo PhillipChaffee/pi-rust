@@ -4,12 +4,9 @@
 //!
 //! Porting restatements this module records:
 //!
-//! - `migrateKeybindingsConfigFile` stages behind the keybindings ticket:
-//!   the migration machinery lives in upstream's `core/keybindings.ts` and
-//!   lands with the interactive shell (map ticket "pi-coding-agent:
-//!   interactive mode shell and selectors"), so the file migration runs
-//!   through the [`KeybindingsMigrator`] seam — the real one arrives with
-//!   that ticket, and until then the file passes through untouched.
+//! - `migrateKeybindingsConfigFile` runs the real migrator from
+//!   [`crate::core::keybindings`] through the [`KeybindingsMigrator`] seam;
+//!   the seam stays injectable for the sweep's boundary tests.
 //! - `showDeprecationWarnings` rides the CLI entry: its colored console
 //!   output and raw-mode stdin wait are startup-UI surface, upstream's
 //!   `main.ts` caller, and no suite covers it.
@@ -30,6 +27,7 @@ use serde_json::Value;
 use crate::config::{
     CONFIG_DIR_NAME, EnvLookup, default_env_lookup, encode_session_cwd, get_agent_dir_with,
 };
+use crate::core::keybindings::migrate_keybindings_config_value;
 use crate::utils::text::strip_bom;
 
 /// The extension-migration guide, upstream's `MIGRATION_GUIDE_URL`.
@@ -41,8 +39,7 @@ pub const EXTENSIONS_DOC_URL: &str =
 /// The printer seam, upstream's `console.log`.
 pub type Printer<'a> = &'a mut dyn FnMut(&str);
 
-/// The keybindings migration seam, upstream's `migrateKeybindingsConfig`
-/// until the interactive-shell ticket lands the real table.
+/// The keybindings migration seam, upstream's `migrateKeybindingsConfig`.
 pub type KeybindingsMigrator<'a> =
     &'a mut dyn FnMut(
         &serde_json::Map<String, Value>,
@@ -402,17 +399,6 @@ pub fn print_migration_line(line: &str) {
     println!("{line}");
 }
 
-/// The default keybindings migrator: the sweep rides the
-/// [`KeybindingsMigrator`] seam until the interactive-shell ticket lands the
-/// real table, so the default passes the config through untouched.
-#[doc(hidden)]
-#[must_use]
-pub const fn no_keybindings_migration(
-    _config: &serde_json::Map<String, Value>,
-) -> Option<(serde_json::Map<String, Value>, bool)> {
-    None
-}
-
 /// Run all migrations, upstream's `runMigrations`: the migrated auth
 /// providers plus the deprecation warnings.
 #[must_use]
@@ -421,7 +407,7 @@ pub fn run_migrations(cwd: &str) -> MigrationReport {
         &default_env_lookup(),
         cwd,
         &mut print_migration_line,
-        &mut no_keybindings_migration,
+        &mut migrate_keybindings_config_value,
     )
 }
 
