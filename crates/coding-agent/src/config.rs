@@ -148,6 +148,20 @@ pub fn get_custom_themes_dir() -> PathBuf {
     get_agent_dir().join("themes")
 }
 
+/// The built-in theme directory, upstream's `getThemesDir()`.
+///
+/// It is the source layout the theme listing reports. The built-in themes compile
+/// into the binary ([`crate::modes::interactive::theme`]), so a relocated
+/// binary still resolves them.
+#[must_use]
+pub fn get_themes_dir() -> PathBuf {
+    get_package_dir()
+        .join("src")
+        .join("modes")
+        .join("interactive")
+        .join("theme")
+}
+
 /// The custom-provider catalog path, upstream's `getModelsPath()`.
 #[must_use]
 pub fn get_models_path() -> PathBuf {
