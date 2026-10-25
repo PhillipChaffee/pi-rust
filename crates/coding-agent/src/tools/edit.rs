@@ -383,6 +383,8 @@ pub fn create_edit_tool_definition(cwd: &str, options: Option<EditToolOptions>) 
     let ops = Arc::new(options.operations.unwrap_or_else(default_edit_operations));
     let cwd = Arc::new(cwd.to_owned());
 
+    let renderers = super::renderers::edit::edit_renderers();
+
     ToolDefinition {
         name: "edit".to_owned(),
         label: "edit".to_owned(),
@@ -400,6 +402,8 @@ pub fn create_edit_tool_definition(cwd: &str, options: Option<EditToolOptions>) 
         constrained_sampling: Some(strict_sampling()),
         // The edit tool renders its own framing (the diff preview).
         render_shell: Some(crate::extensions::types::RenderShell::SelfRender),
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: Some(Arc::new(prepare_edit_arguments)),
         execution_mode: None,
         execute: Arc::new(move |_tool_call_id: &str, params: &Value, signal, _on_update, ctx| {

@@ -183,6 +183,8 @@ pub fn create_write_tool_definition(
     let ops = Arc::new(options.operations.unwrap_or_else(default_write_operations));
     let cwd = Arc::new(cwd.to_owned());
 
+    let renderers = super::renderers::write::write_renderers();
+
     ToolDefinition {
         name: "write".to_owned(),
         label: "write".to_owned(),
@@ -199,6 +201,8 @@ pub fn create_write_tool_definition(
         parameters: write_schema(),
         constrained_sampling: Some(strict_sampling()),
         render_shell: None,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(move |_tool_call_id: &str, params: &Value, signal, _on_update, ctx| {

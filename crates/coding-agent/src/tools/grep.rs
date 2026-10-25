@@ -572,6 +572,8 @@ pub fn create_grep_tool_definition(cwd: &str, options: Option<GrepToolOptions>) 
     let ops = Arc::new(options.operations.unwrap_or_else(default_grep_operations));
     let cwd = Arc::new(cwd.to_owned());
 
+    let renderers = super::renderers::grep::grep_renderers();
+
     ToolDefinition {
         name: "grep".to_owned(),
         label: "grep".to_owned(),
@@ -590,6 +592,8 @@ pub fn create_grep_tool_definition(cwd: &str, options: Option<GrepToolOptions>) 
         parameters: grep_schema(),
         constrained_sampling: None,
         render_shell: None,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(

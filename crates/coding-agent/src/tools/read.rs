@@ -427,6 +427,8 @@ pub fn create_read_tool_definition(cwd: &str, options: Option<ReadToolOptions>) 
     let ops = Arc::new(options.operations.unwrap_or_else(default_read_operations));
     let cwd = Arc::new(cwd.to_owned());
 
+    let renderers = super::renderers::read::read_renderers();
+
     ToolDefinition {
         name: "read".to_owned(),
         label: "read".to_owned(),
@@ -445,6 +447,8 @@ pub fn create_read_tool_definition(cwd: &str, options: Option<ReadToolOptions>) 
         parameters: read_schema(),
         constrained_sampling: Some(strict_sampling()),
         render_shell: None,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(

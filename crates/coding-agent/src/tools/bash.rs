@@ -889,6 +889,8 @@ pub fn create_shell_tool_definition(
         temp_file_prefix: config.temp_file_prefix,
     });
 
+    let renderers = super::renderers::bash::create_shell_renderers(config.prompt);
+
     ToolDefinition {
         name: config.name.to_owned(),
         label: config.label.to_owned(),
@@ -914,6 +916,8 @@ pub fn create_shell_tool_definition(
         parameters: bash_schema(),
         constrained_sampling: Some(strict_sampling()),
         render_shell: None,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(
