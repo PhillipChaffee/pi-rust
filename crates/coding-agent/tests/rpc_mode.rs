@@ -299,7 +299,7 @@ async fn session_mutation_commands_replace_the_session() {
 
 #[tokio::test]
 async fn bash_export_and_compaction_commands_run() {
-    let harness = RpcHarness::start(0).await;
+    let harness = RpcHarness::start_persisted(0).await;
 
     let bash = call(
         &harness,
@@ -319,6 +319,11 @@ async fn bash_export_and_compaction_commands_run() {
         call(&harness, json!({ "id": "b2", "type": "abort_bash" })).await["success"],
         true
     );
+
+    harness.send(json!({ "id": "p1", "type": "prompt", "message": "Hello" }));
+    let _ = harness
+        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_settled"))
+        .await;
 
     let exported = call(&harness, json!({ "id": "e1", "type": "export_html" })).await;
     assert_eq!(exported["success"], true);

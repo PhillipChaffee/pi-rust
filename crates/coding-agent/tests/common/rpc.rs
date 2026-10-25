@@ -92,6 +92,19 @@ impl RpcHarness {
     /// # Panics
     /// The fixture's own setup failures, which the tests cannot satisfy.
     pub async fn start(delay_ms: u64) -> Self {
+        Self::start_with(delay_ms, false).await
+    }
+
+    /// Start the mode over a persisted session manager, the export arms need
+    /// a session file.
+    ///
+    /// # Panics
+    /// The fixture's own setup failures, which the tests cannot satisfy.
+    pub async fn start_persisted(delay_ms: u64) -> Self {
+        Self::start_with(delay_ms, true).await
+    }
+
+    async fn start_with(delay_ms: u64, persisted: bool) -> Self {
         let fixture = Fixture::new();
         let registry = registry_with_faux_delay(delay_ms).await;
         let factory = runtime_factory(RuntimeFactoryOptions {
@@ -101,14 +114,20 @@ impl RpcHarness {
             no_extensions: true,
             tools: None,
         });
+        let session_manager = if persisted {
+            let session_dir = format!("{}/sessions", fixture.agent_dir);
+            SessionManager::create(&fixture.cwd, Some(&session_dir), None)
+                .expect("persisted manager")
+        } else {
+            SessionManager::in_memory(Some(&fixture.cwd), None, None).expect("session manager")
+        };
         let mut runtime: AgentSessionRuntime<InMemorySettingsStorage> =
             create_agent_session_runtime(
                 factory,
                 CreateAgentSessionRuntimeOptions {
                     cwd: fixture.cwd.clone(),
                     agent_dir: fixture.agent_dir.clone(),
-                    session_manager: SessionManager::in_memory(Some(&fixture.cwd), None, None)
-                        .expect("session manager"),
+                    session_manager,
                     session_start_event: None,
                     project_trust_context: None,
                 },
