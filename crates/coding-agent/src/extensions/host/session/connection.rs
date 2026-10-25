@@ -13,7 +13,7 @@ use super::super::link::Link;
 use super::super::payload::events::EVENT_CHANNELS;
 use super::super::{EXTENSION_PROTOCOL_VERSION, ExtensionIdentity, Frame, WireError};
 use super::ErrorListener;
-use super::HostConnectOptions;
+use super::{HostConnectOptions, SharedContext};
 
 /// The abort a signal watcher reports to the running call scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +25,7 @@ pub(super) struct SignalAbort {
 /// The shared session state the proxy closures capture.
 pub(super) struct SessionCore<T> {
     pub(super) link: Mutex<Link<T>>,
-    pub(super) context: HandlerContext,
+    pub(super) context: SharedContext,
     pub(super) ui: Option<Arc<dyn UiCallHandler>>,
     error_listener: Option<ErrorListener>,
     path: String,
@@ -66,6 +66,15 @@ where
 
     pub(super) async fn close(&self) -> Result<(), WireError> {
         self.link.lock().await.close().await
+    }
+
+    /// The handler context the owning session bound, absent before it
+    /// builds its runner.
+    pub(super) fn context(&self) -> Option<HandlerContext> {
+        self.context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(super) fn is_dead(&self) -> bool {

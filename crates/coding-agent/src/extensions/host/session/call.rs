@@ -85,6 +85,10 @@ where
 {
     /// Run one call scope to its result, answering nested requests.
     #[expect(
+        clippy::too_many_lines,
+        reason = "the select arms read as one frame dispatch; splitting them buries the scope's invariants"
+    )]
+    #[expect(
         clippy::significant_drop_tightening,
         reason = "the link and abort guards must span the whole call scope"
     )]
@@ -92,7 +96,7 @@ where
         &self,
         call: u64,
         frame: Frame,
-        context: &HandlerContext,
+        context: Option<&HandlerContext>,
         scope: &mut SignalScope,
         sink: CallSink<'_>,
         event: &str,
@@ -136,12 +140,17 @@ where
                     };
                     match incoming {
                         Frame::ContextCall { call: owner, id, method, params } if owner == call => {
-                            let value = call_context(
-                                context,
-                                &method,
-                                params.as_ref(),
-                                self.ui.is_some(),
-                                &mut |signal| scope.allocate(signal),
+                            let value = context.map_or_else(
+                                || Err(HostCallError::unsupported(
+                                    "no session context is bound to this extension session",
+                                )),
+                                |context| call_context(
+                                    context,
+                                    &method,
+                                    params.as_ref(),
+                                    self.ui.is_some(),
+                                    &mut |signal| scope.allocate(signal),
+                                ),
                             );
                             let answer = match value {
                                 Ok(value) => Frame::ContextResult { call, id, value },

@@ -140,7 +140,7 @@ async fn a_malformed_frame_fails_the_registration_pass() {
         path: "/ext/demo".to_string(),
         resolved_path: "/ext/demo".to_string(),
         source_info: source_info(),
-        context: test_context(ContextActions::default()).await,
+        context: shared_context(test_context(ContextActions::default()).await),
         ui: None,
         error_listener: None,
     };

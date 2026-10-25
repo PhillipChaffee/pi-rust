@@ -75,9 +75,15 @@ where
                 update: None,
                 stream: Some(&forward),
             };
-            let context = core.context.clone();
             let outcome = core
-                .run_call(call, frame, &context, &mut scope, sink, "provider")
+                .run_call(
+                    call,
+                    frame,
+                    core.context().as_ref(),
+                    &mut scope,
+                    sink,
+                    "provider",
+                )
                 .await;
             match outcome {
                 Ok(CallOutcome::StreamEnd) => output.end(None),

@@ -22,7 +22,7 @@ use crate::source_info::{SourceInfo, SourceOrigin, SourceScope, SyntheticSourceO
 use super::super::context::UiCallHandler;
 use super::super::link::Link;
 use super::super::{EXTENSION_PROTOCOL_VERSION, ExtensionIdentity, Frame, WireError};
-use super::{HostConnectOptions, HostSession};
+use super::{HostConnectOptions, HostSession, shared_context};
 
 #[path = "tests/command/tests.rs"]
 mod command;

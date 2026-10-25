@@ -91,7 +91,7 @@ pub(super) async fn connect_options(
         path: "/ext/demo".to_string(),
         resolved_path: "/ext/demo".to_string(),
         source_info: source_info(),
-        context: test_context(actions).await,
+        context: shared_context(test_context(actions).await),
         ui,
         error_listener: None,
     }
