@@ -36,6 +36,7 @@ pub mod model_registry;
 pub mod model_resolver;
 pub mod model_runtime;
 pub mod models_store;
+pub mod modes;
 pub mod package_manager;
 pub mod package_manager_cli;
 pub mod pi_manifest;
