@@ -55,7 +55,7 @@ async fn a_stream_end_outside_a_provider_call_reports() {
         .expect("stream end");
     assert!(matches!(task.await.expect("join"), HandlerResult::None));
     let captured = errors.lock().expect("errors").clone();
-    assert!(captured[0].error.contains("outside a provider call"));
+    assert!(captured[0].error.contains("stream end"));
 }
 
 #[tokio::test]
@@ -83,7 +83,7 @@ async fn a_malformed_event_result_reports() {
         .expect("result");
     assert!(matches!(task.await.expect("join"), HandlerResult::None));
     let captured = errors.lock().expect("errors").clone();
-    assert!(captured[0].error.contains("extension payload"));
+    assert!(captured[0].error.contains("unknown result channel"));
 }
 
 #[tokio::test]
