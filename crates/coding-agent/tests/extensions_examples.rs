@@ -775,7 +775,7 @@ async fn plan_mode_todos_command_reports_the_extracted_plan() {
     let notifications = example.ui.notifications.lock().expect("notifications");
     assert_eq!(
         notifications.last().expect("a notification").0,
-        "Plan Progress:\n1. ○ Inspect the current implementation\n2. ○ A regression test."
+        "Plan Progress:\n1. ○ Inspect the current implementation\n2. ○ A regression test"
     );
     assert!(example.log.messages.lock().expect("messages").is_empty());
 }
