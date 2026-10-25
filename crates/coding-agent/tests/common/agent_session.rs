@@ -151,6 +151,9 @@ pub struct SessionSetup {
     pub thinking_level: Option<pi_agent_core::types::ThinkingLevel>,
     /// Inline extensions the loader carries.
     pub extensions: Vec<pi_coding_agent::extensions::api::InlineExtension>,
+    /// The extension event bus the loader hands to every factory; a fresh
+    /// one when absent.
+    pub event_bus: Option<pi_coding_agent::core::event_bus::EventBus>,
     /// SDK custom tools registered outside extensions.
     pub custom_tools: Vec<pi_coding_agent::extensions::types::ToolDefinition>,
     /// Tools replacing the built-ins.
@@ -172,6 +175,7 @@ impl SessionSetup {
             stream: None,
             thinking_level: None,
             extensions: Vec::new(),
+            event_bus: None,
             custom_tools: Vec::new(),
             base_tools_override: None,
             bind_extensions: false,
@@ -192,6 +196,7 @@ pub async fn build(setup: SessionSetup) -> Arc<AgentSession<InMemorySettingsStor
         stream,
         thinking_level,
         extensions,
+        event_bus,
         custom_tools,
         base_tools_override,
         bind_extensions,
@@ -221,6 +226,7 @@ pub async fn build(setup: SessionSetup) -> Arc<AgentSession<InMemorySettingsStor
             cwd: root.clone(),
             agent_dir,
             extension_factories: extensions,
+            event_bus,
             no_skills: true,
             no_prompt_templates: true,
             no_themes: true,

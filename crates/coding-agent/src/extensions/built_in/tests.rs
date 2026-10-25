@@ -193,9 +193,15 @@ async fn first_party_extension_registers_and_consumes_the_runner_surface() {
             |name| format!("<inline:{name}>"),
         );
         records.push(
-            load_extension_from_factory(&input.factory, &runtime, "/tmp/project", &label)
-                .await
-                .expect("the factory loads"),
+            load_extension_from_factory(
+                &input.factory,
+                &runtime,
+                &crate::core::event_bus::EventBus::default(),
+                "/tmp/project",
+                &label,
+            )
+            .await
+            .expect("the factory loads"),
         );
     }
     assert_eq!(records[0].path, "<inline:first-party>");

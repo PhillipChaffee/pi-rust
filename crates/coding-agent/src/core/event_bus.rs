@@ -70,11 +70,16 @@ impl EventBus {
 
     /// Subscribe a handler on `channel`, upstream's `on`. Returns the
     /// unsubscribe closure, upstream's `() => emitter.off(...)`.
-    pub fn on(&self, channel: &str, handler: EventHandler) -> impl Fn() + Send + Sync {
+    ///
+    /// The closure owns its channel name so a subscriber can outlive the
+    /// caller's borrow; the extension runtime stores it as a `'static`
+    /// tracked unsubscriber.
+    pub fn on(&self, channel: &str, handler: EventHandler) -> impl Fn() + Send + Sync + 'static {
         let handler: EventHandler = Arc::new(move |data: Value| {
             let inner = Arc::clone(&handler);
             Box::pin(async move { inner(data).await })
         });
+        let channel = channel.to_string();
         let removal = Arc::clone(&self.state);
         {
             let mut state = self
@@ -83,7 +88,7 @@ impl EventBus {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .listeners
-                .entry(channel.to_string())
+                .entry(channel.clone())
                 .or_default()
                 .push(Arc::clone(&handler));
         };
@@ -91,7 +96,7 @@ impl EventBus {
             let mut state = removal
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(listeners) = state.listeners.get_mut(channel) {
+            if let Some(listeners) = state.listeners.get_mut(&channel) {
                 listeners.retain(|candidate| !Arc::ptr_eq(candidate, &handler));
             }
         }

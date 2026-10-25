@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use indexmap::IndexMap;
 
 use crate::config::CONFIG_DIR_NAME;
+use crate::core::event_bus::EventBus;
 use crate::diagnostics::{
     ResourceCollision, ResourceDiagnostic, ResourceDiagnosticKind, ResourceType,
 };
@@ -291,6 +292,9 @@ pub struct DefaultResourceLoaderOptions {
     pub theme_load_fn: Option<ThemeLoadFn>,
     /// The extension-load seam; defaults to an empty result (#128).
     pub load_extensions_fn: Option<LoadExtensionsFn>,
+    /// The shared extension event bus, upstream's `eventBus`; a fresh bus
+    /// when absent.
+    pub event_bus: Option<EventBus>,
     /// The skills override, upstream's `skillsOverride`.
     pub skills_override: Option<SkillsOverrideFn>,
     /// The prompts override, upstream's `promptsOverride`.
@@ -364,6 +368,7 @@ impl std::fmt::Debug for DefaultResourceLoaderOptions {
                     .as_ref()
                     .map(|_| "<override>"),
             )
+            .field("event_bus", &self.event_bus)
             .finish()
     }
 }
@@ -649,6 +654,9 @@ pub struct DefaultResourceLoader<S: SettingsStorage> {
     // drives the spawn cache's reload hooks and the session's bindings.
     extension_loader: Option<Arc<ExtensionLoader>>,
     theme_load_fn: ThemeLoadFn,
+    // The bus inline factories emit and subscribe on, upstream's
+    // `options.eventBus ?? createEventBus()`.
+    event_bus: EventBus,
 
     extensions_result: ExtensionLoadResult,
     skills: Vec<Skill>,
@@ -719,6 +727,7 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             load_extensions_fn,
             extension_loader,
             theme_load_fn: options.theme_load_fn.unwrap_or_else(default_theme_load_fn),
+            event_bus: options.event_bus.unwrap_or_default(),
             settings_manager,
             package_manager,
             cwd,
@@ -1295,6 +1304,7 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             match crate::extensions::api::load_extension_from_factory(
                 &input.factory,
                 runtime,
+                &self.event_bus,
                 &self.cwd,
                 &label,
             )

@@ -7,21 +7,26 @@
 //!
 //! Registration methods write the record; `registerProvider` queues into
 //! the runtime so a later bind pass can flush once the model registry
-//! exists. The factory runs to a result: an error (upstream's throw)
-//! discards the API's pending state and fails the load.
+//! exists. A factory's provider changes and event-bus subscriptions stay
+//! private to that factory until it commits, so one failing load never
+//! removes or adds another extension's state. The factory runs to a
+//! result: an error (upstream's throw) discards the API's pending state
+//! and fails the load.
 //!
 //! The interactive action methods (`sendMessage`, `setModel`, …) throw
 //! "not initialized" upstream during load and delegate post-bind; those
-//! ride their consumers' tickets. The event-bus surface and the session
-//! replace/reload subscriptions ride theirs. Upstream's
-//! `registerNativeProvider` queue rides the composer's native-provider
-//! ticket; the named-provider queue is wired here.
+//! ride their consumers' tickets. Upstream's `registerNativeProvider`
+//! queue rides the composer's native-provider ticket; the named-provider
+//! queue is wired here.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pi_ai::types::BoxedFuture;
+use serde_json::Value;
 
+use crate::core::event_bus::{EventBus, EventHandler};
 use crate::extensions::runtime::{
     CommandHandler, Extension, ExtensionFlag, ExtensionHandler, FlagType, FlagValue,
     RegisteredTool, ResolvedCommand,
@@ -36,6 +41,19 @@ use crate::source_info::{
 /// returns an error in place of upstream's throw.
 pub type ExtensionFactory =
     Arc<dyn Fn(Arc<ExtensionApi>) -> BoxedFuture<'static, Result<(), String>> + Send + Sync>;
+
+/// One event-bus unsubscribe closure, upstream's `() => void`.
+pub type EventBusUnsubscribe = Arc<dyn Fn() + Send + Sync>;
+
+/// One runtime change an API queues while its factory runs, upstream's
+/// `pendingRuntimeChanges` entries.
+enum PendingRuntimeChange {
+    /// A named provider registration; boxed because the provider config is
+    /// far larger than the removal arm.
+    RegisterProvider(Box<PendingProviderRegistration>),
+    /// A provider-name removal.
+    UnregisterProvider(String),
+}
 
 /// One inline-factory input, upstream's `InlineExtension` union: a bare
 /// factory labels as `<inline:N>`, a named one as `<inline:name>` and may
@@ -82,7 +100,8 @@ pub type BoundProviderActions = Arc<crate::extensions::runner::ProviderActions>;
 /// The loader runtime shared by every extension API in one load pass,
 /// upstream's `ExtensionRuntime`.
 ///
-/// Carries the flag values, the queued provider registrations, and the
+/// Carries the flag values, the queued provider registrations, the
+/// event-bus subscriptions the extensions opened, and the
 /// session-replacement staleness state. Providers queue until a bind pass
 /// drains the queue ([`Self::take_pending_provider_registrations`]).
 #[derive(Clone, Default)]
@@ -101,6 +120,19 @@ pub struct ExtensionRuntime {
     /// The post-bind tool-registry refresh, upstream's bindCore
     /// `runtime.refreshTools` replacement; absent pre-bind.
     bound_refresh_tools: Arc<Mutex<Option<crate::extensions::runner::RefreshToolsHandler>>>,
+    /// The live event-bus unsubscribes, upstream's
+    /// `eventBusUnsubscribers`; invalidation drops every one so a stale
+    /// extension never hears the bus again.
+    event_bus_unsubscribers: Arc<Mutex<Vec<TrackedSubscription>>>,
+}
+
+/// One tracked event-bus subscription: the token that identifies it in the
+/// runtime's list plus its unsubscribe closure.
+struct TrackedSubscription {
+    /// The identity the tracked closure removes by.
+    token: Arc<()>,
+    /// The bus unsubscribe.
+    unsubscribe: EventBusUnsubscribe,
 }
 
 impl ExtensionRuntime {
@@ -146,7 +178,8 @@ impl ExtensionRuntime {
 
     /// Mark the runtime stale, upstream's `invalidate`; the first message
     /// wins and later calls are no-ops. Without a message the port carries
-    /// upstream's guidance sentence.
+    /// upstream's guidance sentence. Every tracked event-bus subscription
+    /// is dropped, so a stale extension hears nothing further.
     pub fn invalidate(&self, message: Option<String>) {
         let mut stale = self
             .stale_message
@@ -163,6 +196,54 @@ impl ExtensionRuntime {
              withSession. For reload, do not use the old ctx after await ctx.reload()."
                 .to_string()
         }));
+        drop(stale);
+        let subscribers: Vec<TrackedSubscription> = self
+            .event_bus_unsubscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for subscriber in subscribers {
+            (subscriber.unsubscribe)();
+        }
+    }
+
+    /// Track one event-bus subscription, upstream's
+    /// `trackEventBusSubscription`: the returned closure unsubscribes at
+    /// most once and leaves the runtime's list when it runs.
+    pub fn track_event_bus_subscription(
+        &self,
+        unsubscribe: EventBusUnsubscribe,
+    ) -> EventBusUnsubscribe {
+        let token = Arc::new(());
+        self.event_bus_unsubscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(TrackedSubscription {
+                token: Arc::clone(&token),
+                unsubscribe: Arc::clone(&unsubscribe),
+            });
+        let list = Arc::clone(&self.event_bus_unsubscribers);
+        let active = Arc::new(AtomicBool::new(true));
+        Arc::new(move || {
+            if !active.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            list.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|candidate| !Arc::ptr_eq(&candidate.token, &token));
+            unsubscribe();
+        })
+    }
+
+    /// The live event-bus subscription count, the invalidation tests'
+    /// read side.
+    #[must_use]
+    pub fn event_bus_subscription_count(&self) -> usize {
+        self.event_bus_unsubscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     /// Write one flag value, upstream's `runtime.flagValues.set`. The
@@ -279,6 +360,10 @@ impl std::fmt::Debug for ExtensionRuntime {
             .field("pending_provider_registrations", &queued)
             .field("bound_provider_actions", &bound)
             .field("bound_refresh_tools", &refresh_bound)
+            .field(
+                "event_bus_unsubscribers",
+                &self.event_bus_subscription_count(),
+            )
             .finish()
     }
 }
@@ -361,11 +446,13 @@ async fn initialize_extension(
     factory: &ExtensionFactory,
     extension: Arc<Extension>,
     runtime: &ExtensionRuntime,
+    event_bus: &EventBus,
     cwd: String,
 ) -> Result<Arc<Extension>, String> {
     let api = Arc::new(ExtensionApi::new(
         Arc::clone(&extension),
         runtime.clone(),
+        event_bus.clone(),
         cwd,
     ));
     let factory_result = (factory)(Arc::clone(&api)).await;
@@ -392,11 +479,12 @@ async fn initialize_extension(
 pub async fn load_extension_from_factory(
     factory: &ExtensionFactory,
     runtime: &ExtensionRuntime,
+    event_bus: &EventBus,
     cwd: &str,
     extension_path: &str,
 ) -> Result<Arc<Extension>, String> {
     let extension = create_extension(extension_path);
-    initialize_extension(factory, extension, runtime, cwd.to_string()).await
+    initialize_extension(factory, extension, runtime, event_bus, cwd.to_string()).await
 }
 
 /// The API lifecycle state, upstream's `load.state`.
@@ -411,9 +499,12 @@ enum ApiState {
     Failed,
 }
 
-/// The `pi` object one factory receives, upstream's `createExtensionAPI`:
-/// registration methods write the extension record, flag reads fall from
-/// the runtime flags back to the pending seeds.
+/// The `pi` object one factory receives, upstream's
+/// `createExtensionAPI`.
+///
+/// Registration methods write the extension record, flag reads fall from
+/// the runtime flags back to the pending seeds, and runtime writes stay
+/// private until the factory commits.
 pub struct ExtensionApi {
     /// The record the registrations write.
     extension: Arc<Extension>,
@@ -422,23 +513,39 @@ pub struct ExtensionApi {
     /// The cwd the API methods resolve against; the `exec` method rides
     /// its consumers' ticket and reads this.
     cwd: String,
+    /// The bus the `events` surface reads and writes.
+    event_bus: EventBus,
     /// The lifecycle state.
     state: Mutex<ApiState>,
     /// The flag defaults seeded pre-commit, upstream's `pendingFlagValues`.
     pending_flag_values: Mutex<HashMap<String, FlagValue>>,
+    /// The provider changes queued pre-commit, upstream's
+    /// `pendingRuntimeChanges`; a failed load drops them.
+    pending_runtime_changes: Mutex<Vec<PendingRuntimeChange>>,
+    /// The bus subscriptions opened while loading, upstream's
+    /// `loadingUnsubscribers`; a failed load drops them.
+    loading_unsubscribers: Mutex<Vec<EventBusUnsubscribe>>,
 }
 
 impl ExtensionApi {
     /// Build the API over an empty record, upstream's `createExtensionAPI`
     /// entry state.
     #[must_use]
-    pub fn new(extension: Arc<Extension>, runtime: ExtensionRuntime, cwd: String) -> Self {
+    pub fn new(
+        extension: Arc<Extension>,
+        runtime: ExtensionRuntime,
+        event_bus: EventBus,
+        cwd: String,
+    ) -> Self {
         Self {
             extension,
             runtime,
+            event_bus,
             cwd,
             state: Mutex::new(ApiState::Loading),
             pending_flag_values: Mutex::new(HashMap::new()),
+            pending_runtime_changes: Mutex::new(Vec::new()),
+            loading_unsubscribers: Mutex::new(Vec::new()),
         }
     }
 
@@ -461,8 +568,8 @@ impl ExtensionApi {
     }
 
     /// The loader's commit, upstream's `load.commit`: flush the pending
-    /// flag seeds into the runtime and mark the API active. Not a factory
-    /// method; the loading path owns it.
+    /// flag seeds and provider changes into the runtime and mark the API
+    /// active. Not a factory method; the loading path owns it.
     ///
     /// # Errors
     /// When the runtime was invalidated before the commit.
@@ -472,15 +579,36 @@ impl ExtensionApi {
         }
         self.runtime.assert_active()?;
         self.seed_pending_flags();
+        self.apply_pending_runtime_changes();
         self.mark_active();
+        // The subscriptions stay live past commit; the runtime's own list
+        // owns them from here, so the loading-only handles drop.
+        self.loading_unsubscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         Ok(())
     }
 
     /// The loader's discard, upstream's `load.discard`: mark the API
-    /// failed and drop the pending seeds.
+    /// failed, drop the pending seeds and provider changes, and unsubscribe
+    /// the bus listeners it opened while loading.
     pub fn discard(&self) {
         if self.is_loading() {
             self.mark_failed_without_seeds();
+            self.pending_runtime_changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+            let subscribers: Vec<EventBusUnsubscribe> = self
+                .loading_unsubscribers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .drain(..)
+                .collect();
+            for unsubscribe in subscribers {
+                unsubscribe();
+            }
         }
     }
 
@@ -519,6 +647,33 @@ impl ExtensionApi {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = ApiState::Active;
+    }
+
+    /// Apply the provider changes the factory queued, upstream's commit
+    /// loop over `pendingRuntimeChanges`, then drop them.
+    fn apply_pending_runtime_changes(&self) {
+        let changes: Vec<PendingRuntimeChange> = self
+            .pending_runtime_changes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect();
+        for change in changes {
+            apply_pending_change(&self.runtime, change);
+        }
+    }
+
+    /// Queue a provider change while loading, apply it once active,
+    /// upstream's `applyRuntimeChange`.
+    fn apply_runtime_change(&self, change: PendingRuntimeChange) {
+        if self.is_loading() {
+            self.pending_runtime_changes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(change);
+        } else {
+            apply_pending_change(&self.runtime, change);
+        }
     }
 
     /// Mark the API failed and drop the pending seeds, without touching an
@@ -565,6 +720,39 @@ impl ExtensionApi {
         self.assert_active()?;
         self.extension.on(channel, handler);
         Ok(())
+    }
+
+    /// Emit on the shared event bus, upstream's `pi.events.emit`.
+    ///
+    /// # Errors
+    /// When the API may not act.
+    pub fn events_emit(&self, channel: &str, data: &Value) -> Result<(), String> {
+        self.assert_active()?;
+        self.event_bus.emit(channel, data);
+        Ok(())
+    }
+
+    /// Subscribe on the shared event bus, upstream's `pi.events.on`. The
+    /// returned closure unsubscribes once; the runtime also tracks it so
+    /// invalidation and a failed load both drop it.
+    ///
+    /// # Errors
+    /// When the API may not act.
+    pub fn events_on(
+        &self,
+        channel: &str,
+        handler: EventHandler,
+    ) -> Result<EventBusUnsubscribe, String> {
+        self.assert_active()?;
+        let unsubscribe: EventBusUnsubscribe = Arc::new(self.event_bus.on(channel, handler));
+        let tracked = self.runtime.track_event_bus_subscription(unsubscribe);
+        if self.is_loading() {
+            self.loading_unsubscribers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(Arc::clone(&tracked));
+        }
+        Ok(tracked)
     }
 
     /// Register one tool, upstream's `pi.registerTool`; the parameter
@@ -692,11 +880,13 @@ impl ExtensionApi {
         if let Some(provider_actions) = self.runtime.bound_provider_actions() {
             return (provider_actions.register_provider)(name, config);
         }
-        self.runtime.register_provider(PendingProviderRegistration {
-            name,
-            config,
-            extension_path: self.extension.path.clone(),
-        });
+        self.apply_runtime_change(PendingRuntimeChange::RegisterProvider(Box::new(
+            PendingProviderRegistration {
+                name,
+                config,
+                extension_path: self.extension.path.clone(),
+            },
+        )));
         Ok(())
     }
 
@@ -711,8 +901,19 @@ impl ExtensionApi {
         if let Some(provider_actions) = self.runtime.bound_provider_actions() {
             return (provider_actions.unregister_provider)(name.to_string());
         }
-        self.runtime.unregister_provider(name);
+        self.apply_runtime_change(PendingRuntimeChange::UnregisterProvider(name.to_string()));
         Ok(())
+    }
+}
+
+/// Apply one provider change to the shared runtime, upstream's
+/// `pendingRuntimeChanges` entry running.
+fn apply_pending_change(runtime: &ExtensionRuntime, change: PendingRuntimeChange) {
+    match change {
+        PendingRuntimeChange::RegisterProvider(registration) => {
+            runtime.register_provider(*registration);
+        }
+        PendingRuntimeChange::UnregisterProvider(name) => runtime.unregister_provider(&name),
     }
 }
 
