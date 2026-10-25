@@ -504,7 +504,9 @@ pub fn context_snapshot_from_wire(snapshot: &Value) -> Result<ContextSnapshot, W
 }
 
 /// Writes one resource's provenance, upstream's `SourceInfo` interface.
-pub(super) fn source_info_to_wire(info: &crate::source_info::SourceInfo) -> Value {
+pub(in crate::extensions::host) fn source_info_to_wire(
+    info: &crate::source_info::SourceInfo,
+) -> Value {
     let mut wire = json!({
         "path": info.path,
         "source": info.source,
