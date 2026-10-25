@@ -9,7 +9,7 @@
 //!
 //! [ADR 0010]: ../../../../../docs/adr/0010-extension-host-wire-protocol.md
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -31,6 +31,20 @@ use connection::{SessionCore, handshake, read_registrations};
 /// The dispatch-error listener, upstream's `ExtensionErrorListener`.
 pub(super) type ErrorListener = Arc<dyn Fn(&ExtensionError) + Send + Sync>;
 
+/// The handler context a session answers context calls from.
+///
+/// The loader spawns sessions before the owning session builds its runner,
+/// so the real context arrives after connect (the loader writes the slot
+/// once the runner exists). Tests bind theirs at connect time with
+/// [`shared_context`].
+pub type SharedContext = Arc<StdMutex<Option<HandlerContext>>>;
+
+/// A context bound at connect time, the in-process test shape.
+#[must_use]
+pub fn shared_context(context: HandlerContext) -> SharedContext {
+    Arc::new(StdMutex::new(Some(context)))
+}
+
 /// The ingredients the host session binds at connect time.
 pub struct HostConnectOptions {
     /// The path the extension was requested by.
@@ -40,7 +54,7 @@ pub struct HostConnectOptions {
     /// The provenance the loader stamps on the registrations.
     pub source_info: SourceInfo,
     /// The context the session answers context calls from.
-    pub context: HandlerContext,
+    pub context: SharedContext,
     /// The UI pass-through, absent when no UI is bound.
     pub ui: Option<Arc<dyn UiCallHandler>>,
     /// The listener a crash or handler failure reports to.
@@ -49,12 +63,17 @@ pub struct HostConnectOptions {
 
 impl std::fmt::Debug for HostConnectOptions {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bound = self
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         formatter
             .debug_struct("HostConnectOptions")
             .field("path", &self.path)
             .field("resolved_path", &self.resolved_path)
             .field("source_info", &self.source_info)
-            .field("context", &self.context)
+            .field("context_bound", &bound)
             .field("has_ui", &self.ui.is_some())
             .field("has_error_listener", &self.error_listener.is_some())
             .finish()

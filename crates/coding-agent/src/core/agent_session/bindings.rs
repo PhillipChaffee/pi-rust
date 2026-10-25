@@ -81,10 +81,20 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         runner.bind_command_context(lock(&self.extension_command_context_actions).clone());
         runner.set_mode(mode);
         let error_listener = lock(&self.extension_error_listener).clone();
-        if let Some(listener) = error_listener {
+        if let Some(listener) = error_listener.clone() {
             let unsubscribe = runner.on_error(listener);
             *lock(&self.extension_error_unsubscriber) = Some(Box::new(unsubscribe));
         }
+        for failure in &extensions_result.errors {
+            runner.emit_error(&crate::extensions::runtime::ExtensionError {
+                extension_path: failure.path.clone(),
+                event: "load".to_string(),
+                error: failure.error.clone(),
+                stack: None,
+            });
+        }
+        let host_context = runner.context();
+        self.with_loader(|loader| loader.set_extension_bindings(host_context, error_listener));
         let runner = Arc::new(runner);
         *lock(&self.extension_runner) = Arc::clone(&runner);
         if let Some(slot) = &self.extension_runner_ref {

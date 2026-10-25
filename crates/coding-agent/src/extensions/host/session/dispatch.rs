@@ -62,7 +62,7 @@ where
             .run_call(
                 call,
                 frame,
-                &context,
+                Some(&context),
                 &mut scope,
                 CallSink::default(),
                 channel,
@@ -141,9 +141,15 @@ where
             update: Some(&forward),
             stream: None,
         };
-        let context = self.context.clone();
         match self
-            .run_call(call, frame, &context, &mut scope, sink, "tool")
+            .run_call(
+                call,
+                frame,
+                self.context().as_ref(),
+                &mut scope,
+                sink,
+                "tool",
+            )
             .await
         {
             Ok(CallOutcome::Result(value)) => serde_json::from_value(value).map_err(|error| {
@@ -182,12 +188,11 @@ where
             name: name.to_string(),
             args: args.to_string(),
         };
-        let context = self.context.clone();
         if let Err(error) = self
             .run_call(
                 call,
                 frame,
-                &context,
+                self.context().as_ref(),
                 &mut scope,
                 CallSink::default(),
                 "command",
@@ -207,11 +212,20 @@ where
         if let Some(context) = extension_context {
             return ContextSnapshot::from_extension_context(context);
         }
-        let manager = self.context.session_manager().ok();
+        let Some(context) = self.context() else {
+            return ContextSnapshot {
+                cwd: String::new(),
+                model: None,
+                thinking_level: None,
+                session_id: None,
+                session_file: None,
+            };
+        };
+        let manager = context.session_manager().ok();
         ContextSnapshot {
-            cwd: self.context.cwd().unwrap_or_default(),
-            model: self.context.get_model().ok().flatten(),
-            thinking_level: self.context.get_thinking_level().ok(),
+            cwd: context.cwd().unwrap_or_default(),
+            model: context.get_model().ok().flatten(),
+            thinking_level: context.get_thinking_level().ok(),
             session_id: manager.as_ref().map(|manager| manager.session_id.clone()),
             session_file: manager.and_then(|manager| manager.session_file),
         }

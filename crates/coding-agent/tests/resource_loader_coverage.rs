@@ -184,43 +184,45 @@ async fn extension_seam_results_flow_through_preload_and_remaining_paths() {
     let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&calls);
     let (closure_a, closure_b, closure_c) = (path_a.clone(), path_b.clone(), path_c.clone());
-    options.load_extensions_fn = Some(Arc::new(move |paths: Vec<String>, _cwd: String| {
-        recorded.lock().expect("calls").push(paths);
-        let first = recorded.lock().expect("calls").len() == 1;
-        let path_a = closure_a.clone();
-        let path_b = closure_b.clone();
-        let path_c = closure_c.clone();
-        Box::pin(async move {
-            if first {
-                // The pre-trust bootstrap: preload A, fail B, leave C for
-                // the trusted pass, and contribute one inline factory.
-                ExtensionLoadResult {
-                    extensions: vec![
-                        extension_entry(&path_a),
-                        ExtensionEntry {
-                            path: "<inline:1>".to_string(),
-                            resolved_path: "<inline:1>".to_string(),
-                            hidden: true,
-                            source_info: None,
-                            record: None,
-                        },
-                    ],
-                    errors: vec![ExtensionLoadError {
-                        path: path_b.clone(),
-                        error: "boom".to_string(),
-                    }],
-                    runtime: ExtensionRuntimeHandle::new(),
+    options.load_extensions_fn = Some(Arc::new(
+        move |paths: Vec<String>, _cwd: String, _runtime: Option<ExtensionRuntimeHandle>| {
+            recorded.lock().expect("calls").push(paths);
+            let first = recorded.lock().expect("calls").len() == 1;
+            let path_a = closure_a.clone();
+            let path_b = closure_b.clone();
+            let path_c = closure_c.clone();
+            Box::pin(async move {
+                if first {
+                    // The pre-trust bootstrap: preload A, fail B, leave C for
+                    // the trusted pass, and contribute one inline factory.
+                    ExtensionLoadResult {
+                        extensions: vec![
+                            extension_entry(&path_a),
+                            ExtensionEntry {
+                                path: "<inline:1>".to_string(),
+                                resolved_path: "<inline:1>".to_string(),
+                                hidden: true,
+                                source_info: None,
+                                record: None,
+                            },
+                        ],
+                        errors: vec![ExtensionLoadError {
+                            path: path_b.clone(),
+                            error: "boom".to_string(),
+                        }],
+                        runtime: ExtensionRuntimeHandle::new(),
+                    }
+                } else {
+                    // The trusted pass loads the remaining path.
+                    ExtensionLoadResult {
+                        extensions: vec![extension_entry(&path_c)],
+                        errors: vec![],
+                        runtime: ExtensionRuntimeHandle::new(),
+                    }
                 }
-            } else {
-                // The trusted pass loads the remaining path.
-                ExtensionLoadResult {
-                    extensions: vec![extension_entry(&path_c)],
-                    errors: vec![],
-                    runtime: ExtensionRuntimeHandle::new(),
-                }
-            }
-        })
-    }));
+            })
+        },
+    ));
 
     let mut loader = DefaultResourceLoader::new(options, in_memory_manager());
     loader
@@ -304,20 +306,22 @@ async fn package_skill_and_extension_resources_stamp_their_package_metadata() {
 
     let mut options = env.options();
     let extension_ts_clone = extension_ts.clone();
-    options.load_extensions_fn = Some(Arc::new(move |paths: Vec<String>, _cwd: String| {
-        let extension_ts = extension_ts_clone.clone();
-        Box::pin(async move {
-            ExtensionLoadResult {
-                extensions: paths
-                    .iter()
-                    .filter(|path| path.as_str() == extension_ts)
-                    .map(|path| extension_entry(path))
-                    .collect(),
-                errors: vec![],
-                runtime: ExtensionRuntimeHandle::new(),
-            }
-        })
-    }));
+    options.load_extensions_fn = Some(Arc::new(
+        move |paths: Vec<String>, _cwd: String, _runtime: Option<ExtensionRuntimeHandle>| {
+            let extension_ts = extension_ts_clone.clone();
+            Box::pin(async move {
+                ExtensionLoadResult {
+                    extensions: paths
+                        .iter()
+                        .filter(|path| path.as_str() == extension_ts)
+                        .map(|path| extension_entry(path))
+                        .collect(),
+                    errors: vec![],
+                    runtime: ExtensionRuntimeHandle::new(),
+                }
+            })
+        },
+    ));
 
     let mut loader = DefaultResourceLoader::new(options, manager);
     loader.reload(None).await;

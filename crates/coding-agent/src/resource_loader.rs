@@ -30,6 +30,9 @@ use crate::config::CONFIG_DIR_NAME;
 use crate::diagnostics::{
     ResourceCollision, ResourceDiagnostic, ResourceDiagnosticKind, ResourceType,
 };
+use crate::extensions::host::ExtensionLoader;
+use crate::extensions::runner::ExtensionErrorListener;
+use crate::extensions::runtime::HandlerContext;
 use crate::footer_data_provider::{GitPaths, find_git_paths};
 use crate::package_manager::{
     DefaultPackageManager, PackageManagerOptions, PathMetadata, ResolvedResource,
@@ -142,10 +145,14 @@ pub struct ExtensionLoadResult {
     pub runtime: ExtensionRuntimeHandle,
 }
 
-/// The extension-load seam, upstream's `loadExtensionsCached`. #128
-/// replaces the default (an empty result) with the out-of-process loader
-/// and its cache.
-pub type LoadExtensionsFn = Arc<dyn Fn(Vec<String>, String) -> BoxedExtensionLoad + Send + Sync>;
+/// The extension-load seam, upstream's `loadExtensionsCached`.
+///
+/// The third argument is the runtime a later pass shares so queued
+/// provider registrations land in the session's one runtime. The default is
+/// the out-of-process loader and its cache (#171).
+pub type LoadExtensionsFn = Arc<
+    dyn Fn(Vec<String>, String, Option<ExtensionRuntimeHandle>) -> BoxedExtensionLoad + Send + Sync,
+>;
 
 /// The pre-trust decision callback, upstream's `resolveProjectTrust`
 /// reload option: given the extensions loaded before project trust
@@ -638,6 +645,9 @@ pub struct DefaultResourceLoader<S: SettingsStorage> {
     system_prompt_override: Option<SystemPromptOverrideFn>,
     append_system_prompt_override: Option<AppendSystemPromptOverrideFn>,
     load_extensions_fn: LoadExtensionsFn,
+    // Present only when `load_extensions_fn` is the default: the loader
+    // drives the spawn cache's reload hooks and the session's bindings.
+    extension_loader: Option<Arc<ExtensionLoader>>,
     theme_load_fn: ThemeLoadFn,
 
     extensions_result: ExtensionLoadResult,
@@ -680,6 +690,13 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             env: None,
             http_client: None,
         });
+        let (load_extensions_fn, extension_loader) = options.load_extensions_fn.map_or_else(
+            || {
+                let (function, loader) = default_load_extensions_fn();
+                (function, Some(loader))
+            },
+            |function| (function, None),
+        );
         Self {
             additional_extension_paths: options.additional_extension_paths,
             additional_skill_paths: options.additional_skill_paths,
@@ -699,9 +716,8 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             agents_files_override: options.agents_files_override,
             system_prompt_override: options.system_prompt_override,
             append_system_prompt_override: options.append_system_prompt_override,
-            load_extensions_fn: options
-                .load_extensions_fn
-                .unwrap_or_else(default_load_extensions_fn),
+            load_extensions_fn,
+            extension_loader,
             theme_load_fn: options.theme_load_fn.unwrap_or_else(default_theme_load_fn),
             settings_manager,
             package_manager,
@@ -909,8 +925,12 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
         reason = "the reload is infallible by signature; see # Panics for the trade-off"
     )]
     pub async fn reload(&mut self, options: Option<ResourceLoaderReloadOptions>) {
-        // Upstream clears the extension module cache between reloads; the
-        // cache lives with #128's loader, which owns its invalidation.
+        // The spawn cache is per reload: every child retires here and the
+        // passes below respawn what the settings still select, so a changed
+        // extension binary is picked up.
+        if let Some(loader) = &self.extension_loader {
+            loader.invalidate().await;
+        }
 
         let resolve_project_trust = options
             .as_ref()
@@ -1057,8 +1077,11 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
         };
 
         let mut extensions_result = self
-            .load_final_extension_set(extension_paths, pre_trust_extensions.as_ref())
+            .load_final_extension_set(&extension_paths, pre_trust_extensions.as_ref())
             .await;
+        if let Some(loader) = &self.extension_loader {
+            loader.retain(&extension_paths, &self.cwd).await;
+        }
         for p in &self.additional_extension_paths {
             if is_local_path(p) {
                 let resolved = self.resolve_resource_path(p);
@@ -1309,11 +1332,11 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
     /// merged path order.
     async fn load_final_extension_set(
         &self,
-        extension_paths: Vec<String>,
+        extension_paths: &[String],
         pre_trust_extensions: Option<&ExtensionLoadResult>,
     ) -> ExtensionLoadResult {
         let Some(pre_trust) = pre_trust_extensions else {
-            let mut result = self.call_load_extensions(&extension_paths).await;
+            let mut result = self.call_load_extensions(extension_paths).await;
             let (inline_extensions, inline_errors) =
                 self.load_extension_factories(&result.runtime).await;
             result.extensions.extend(inline_extensions);
@@ -1341,7 +1364,9 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
             })
             .cloned()
             .collect();
-        let remaining_extensions = self.call_load_extensions(&remaining_paths).await;
+        let remaining_extensions = self
+            .call_load_extensions_with(&remaining_paths, Some(pre_trust.runtime.clone()))
+            .await;
         for extension in &remaining_extensions.extensions {
             preloaded_by_path.insert(extension.resolved_path.clone(), extension.clone());
         }
@@ -1375,22 +1400,37 @@ impl<S: SettingsStorage + 'static> DefaultResourceLoader<S> {
 
     /// The extension-load seam call, upstream's `loadExtensionsCached`.
     async fn call_load_extensions(&self, extension_paths: &[String]) -> ExtensionLoadResult {
-        (self.load_extensions_fn)(extension_paths.to_vec(), self.cwd.clone()).await
+        self.call_load_extensions_with(extension_paths, None).await
+    }
+
+    /// The seam call carrying the runtime a later pass shares with the
+    /// pre-trust pass, upstream's explicit `runtime` argument.
+    async fn call_load_extensions_with(
+        &self,
+        extension_paths: &[String],
+        runtime: Option<ExtensionRuntimeHandle>,
+    ) -> ExtensionLoadResult {
+        (self.load_extensions_fn)(extension_paths.to_vec(), self.cwd.clone(), runtime).await
+    }
+
+    /// Bind the running session's context and dispatch-error listener to
+    /// the default spawn loader; the loader-spawned sessions read both
+    /// through its shared slots.
+    pub fn set_extension_bindings(
+        &self,
+        context: HandlerContext,
+        listener: Option<ExtensionErrorListener>,
+    ) {
+        if let Some(loader) = &self.extension_loader {
+            loader.bind(context, listener);
+        }
     }
 
     /// The extension load path resolver, upstream's
     /// `resolveExtensionLoadPath`: cwd-based with unicode space variants
     /// normalized.
     fn resolve_extension_load_path(&self, path: &str) -> String {
-        resolve_path_with(
-            path,
-            &self.cwd,
-            &PathInputOptions {
-                normalize_unicode_spaces: true,
-                ..PathInputOptions::default()
-            },
-        )
-        .unwrap_or_else(|_| path.to_string())
+        resolve_extension_load_path(path, &self.cwd)
     }
 
     /// Map an auto-discovered or package skill resource to its SKILL.md
@@ -1953,12 +1993,36 @@ impl<S: SettingsStorage> std::fmt::Debug for DefaultResourceLoader<S> {
     }
 }
 
-/// The default extension-load seam until #128: every pass resolves to an
-/// empty result, the documented degradation of upstream's module loading.
-fn default_load_extensions_fn() -> LoadExtensionsFn {
-    Arc::new(|_extension_paths: Vec<String>, _cwd: String| {
-        Box::pin(async { ExtensionLoadResult::default() })
-    })
+/// The default extension loader: the out-of-process spawner and its cache
+/// (#171), paired with the handle the loader drives its reload hooks
+/// through.
+fn default_load_extensions_fn() -> (LoadExtensionsFn, Arc<ExtensionLoader>) {
+    let loader = Arc::new(ExtensionLoader::new());
+    let handle = Arc::clone(&loader);
+    let function: LoadExtensionsFn = Arc::new(
+        move |extension_paths: Vec<String>,
+              cwd: String,
+              runtime: Option<ExtensionRuntimeHandle>| {
+            let loader = Arc::clone(&handle);
+            Box::pin(async move { loader.load(&extension_paths, &cwd, runtime).await })
+        },
+    );
+    (function, loader)
+}
+
+/// The shared extension load path resolution, upstream's
+/// `resolveExtensionLoadPath`: cwd-based with unicode space variants
+/// normalized.
+pub(crate) fn resolve_extension_load_path(path: &str, cwd: &str) -> String {
+    resolve_path_with(
+        path,
+        cwd,
+        &PathInputOptions {
+            normalize_unicode_spaces: true,
+            ..PathInputOptions::default()
+        },
+    )
+    .unwrap_or_else(|_| path.to_string())
 }
 
 /// Dedupe prompts by name, upstream's `dedupePrompts`: first wins, later
@@ -2029,7 +2093,7 @@ fn dedupe_themes(themes: Vec<ThemeHandle>) -> (Vec<ThemeHandle>, Vec<ResourceDia
 
 /// The resolver defaults for the loader's own paths, upstream's
 /// `resolvePath(input)` with no base.
-fn resolve_default(input: &str) -> String {
+pub(crate) fn resolve_default(input: &str) -> String {
     let base = crate::config::process_cwd();
     resolve_path_with(
         input,

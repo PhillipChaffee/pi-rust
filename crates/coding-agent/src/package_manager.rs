@@ -3228,10 +3228,11 @@ fn remove_dir_all_force(path: &Path) {
 /// re-verifies.
 ///
 /// `pi-package-install.json` at the package root carries the channel,
-/// source, resolved version/ref, and the per-file sha256 map (receipt file
-/// excluded) the extension host fails closed on when any byte changes.
-/// Local path packages carry no receipt — they resolve in place and their
-/// trust flows through project trust.
+/// source, resolved version/ref, the extension protocol version the install
+/// targets, and the per-file sha256 map (receipt file excluded) the
+/// extension host fails closed on when any byte changes. Local path
+/// packages carry no receipt — they resolve in place and their trust flows
+/// through project trust.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallReceipt {
     /// The channel that produced the install.
@@ -3242,6 +3243,9 @@ pub struct InstallReceipt {
     pub resolved_version: Option<String>,
     /// The resolved git ref, the git channel only.
     pub resolved_ref: Option<String>,
+    /// The extension wire version the install was built for; a receipt
+    /// without it predates the spawn gate and fails closed there.
+    pub protocol_version: Option<u64>,
     /// The per-file sha256 hex digests, relative posix paths.
     pub files: BTreeMap<String, String>,
 }
@@ -3278,6 +3282,12 @@ impl InstallReceipt {
             object.insert(
                 "resolvedRef".to_string(),
                 serde_json::Value::String(reference.clone()),
+            );
+        }
+        if let Some(version) = self.protocol_version {
+            object.insert(
+                "protocolVersion".to_string(),
+                serde_json::Value::from(version),
             );
         }
         object.insert(
@@ -3342,6 +3352,9 @@ impl InstallReceipt {
                 .get("resolvedRef")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
+            protocol_version: value
+                .get("protocolVersion")
+                .and_then(serde_json::Value::as_u64),
             files,
         })
     }
@@ -3349,7 +3362,7 @@ impl InstallReceipt {
 
 /// Hash the regular files under a package root into the receipt's map,
 /// relative posix paths, the receipt file itself excluded.
-fn hash_package_files(package_root: &Path) -> BTreeMap<String, String> {
+pub(crate) fn hash_package_files(package_root: &Path) -> BTreeMap<String, String> {
     let mut files = BTreeMap::new();
     let mut stack = vec![package_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -3475,6 +3488,7 @@ impl<S: SettingsStorage + 'static> DefaultPackageManager<S> {
             source: format!("crate:{}", source.name),
             resolved_version: source.version.clone(),
             resolved_ref: None,
+            protocol_version: Some(crate::extensions::host::EXTENSION_PROTOCOL_VERSION),
             files: hash_package_files(&target_path),
         };
         write_install_receipt(&target_path, &receipt)
@@ -3534,6 +3548,7 @@ impl<S: SettingsStorage + 'static> DefaultPackageManager<S> {
             source: source.url.clone(),
             resolved_version: None,
             resolved_ref: None,
+            protocol_version: Some(crate::extensions::host::EXTENSION_PROTOCOL_VERSION),
             files: hash_package_files(&target_path),
         };
         write_install_receipt(&target_path, &receipt)

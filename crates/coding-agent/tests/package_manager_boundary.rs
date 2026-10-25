@@ -201,6 +201,7 @@ fn the_receipt_round_trips_through_its_wire_shape() {
         source: "crate:pi-llm-tools".to_string(),
         resolved_version: Some("1.2.3".to_string()),
         resolved_ref: None,
+        protocol_version: Some(1),
         files: [
             ("bin/pi-llm-tools".to_string(), "deadbeef".to_string()),
             ("pi-package-install.json".to_string(), "cafe".to_string()),

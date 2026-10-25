@@ -352,11 +352,69 @@ async fn debug_views_carry_the_bound_shape() {
         path: "/ext/demo".to_string(),
         resolved_path: "/ext/demo".to_string(),
         source_info: source_info(),
-        context,
+        context: shared_context(context),
         ui: None,
         error_listener: None,
     };
     let debug = format!("{options:?}");
     assert!(debug.contains("/ext/demo"));
     assert!(debug.contains("has_ui: false"));
+}
+
+#[tokio::test]
+async fn context_calls_answer_unsupported_before_a_context_is_bound() {
+    let mut options = support::connect_options(ContextActions::default(), None).await;
+    options.context = crate::extensions::host::SharedContext::default();
+    let (host_io, child_io) = tokio::io::duplex(1 << 20);
+    let task = tokio::spawn(async move { HostSession::connect(host_io, options).await });
+    let mut child = Link::new(child_io).expect("child link");
+    child.write_frame(&hello()).await.expect("hello");
+    assert!(matches!(
+        child.read_frame().await.expect("welcome"),
+        Some(Frame::Welcome { .. })
+    ));
+    child
+        .write_frame(&support::demo_tool())
+        .await
+        .expect("register");
+    child.write_frame(&Frame::Ready).await.expect("ready");
+    let session = task.await.expect("join").expect("connect");
+
+    let definition = support::demo_definition(&session);
+    let execute = Arc::clone(&definition.execute);
+    let dispatch =
+        tokio::spawn(async move { execute("call_1", &json!({}), None, None, None).await });
+    let Some(Frame::CallTool { call, .. }) = child.read_frame().await.expect("call") else {
+        panic!("the host sends a call tool");
+    };
+    child
+        .write_frame(&Frame::ContextCall {
+            call,
+            id: 1,
+            method: "cwd".to_string(),
+            params: None,
+        })
+        .await
+        .expect("context call");
+    let Some(Frame::ContextError {
+        call: owner,
+        id,
+        code,
+        ..
+    }) = child.read_frame().await.expect("answer")
+    else {
+        panic!("the answer is an in-scope error");
+    };
+    assert_eq!((owner, id), (call, 1));
+    assert_eq!(code, "unsupported");
+    child
+        .write_frame(&Frame::CallResult {
+            call,
+            result: serde_json::to_value(support::tool_result(json!({"done": true})))
+                .expect("result"),
+        })
+        .await
+        .expect("result");
+    let result = dispatch.await.expect("join").expect("the tool succeeds");
+    assert_eq!(result.details, json!({"done": true}));
 }

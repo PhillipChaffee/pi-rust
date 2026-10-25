@@ -20,6 +20,7 @@ mod frame;
 mod link;
 mod payload;
 mod session;
+pub mod spawn;
 #[cfg(test)]
 mod tests;
 
@@ -37,7 +38,8 @@ pub use payload::descriptors::{
 };
 pub use payload::events::{EVENT_CHANNELS, event_from_wire, event_to_wire};
 pub use payload::results::{RESULT_CHANNELS, result_from_wire, result_to_wire};
-pub use session::{HostConnectOptions, HostSession};
+pub use session::{HostConnectOptions, HostSession, SharedContext, shared_context};
+pub use spawn::{ExtensionLoader, HANDSHAKE_TIMEOUT, SHUTDOWN_GRACE, SpawnError, SpawnOptions};
 
 /// A wire-level failure: a malformed or unknown frame, or a payload the
 /// JSON bridge cannot represent.
