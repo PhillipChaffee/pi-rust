@@ -374,19 +374,18 @@ async fn context_calls_answer_unsupported_before_a_context_is_bound() {
         Some(Frame::Welcome { .. })
     ));
     child
-        .write_frame(&Frame::RegisterEvent {
-            channel: "agent_start".to_string(),
-        })
+        .write_frame(&support::demo_tool())
         .await
         .expect("register");
     child.write_frame(&Frame::Ready).await.expect("ready");
     let session = task.await.expect("join").expect("connect");
 
-    let handler = handler(&session, "agent_start");
-    let context = test_context(ContextActions::default()).await;
-    let dispatch = tokio::spawn(async move { handler(ExtensionEvent::AgentStart, context).await });
-    let Some(Frame::CallEvent { call, .. }) = child.read_frame().await.expect("call") else {
-        panic!("the host sends a call event");
+    let definition = support::demo_definition(&session);
+    let execute = Arc::clone(&definition.execute);
+    let dispatch =
+        tokio::spawn(async move { execute("call_1", &json!({}), None, None, None).await });
+    let Some(Frame::CallTool { call, .. }) = child.read_frame().await.expect("call") else {
+        panic!("the host sends a call tool");
     };
     child
         .write_frame(&Frame::ContextCall {
@@ -411,9 +410,11 @@ async fn context_calls_answer_unsupported_before_a_context_is_bound() {
     child
         .write_frame(&Frame::CallResult {
             call,
-            result: Value::Null,
+            result: serde_json::to_value(support::tool_result(json!({"done": true})))
+                .expect("result"),
         })
         .await
         .expect("result");
-    assert!(matches!(dispatch.await.expect("join"), HandlerResult::None));
+    let result = dispatch.await.expect("join").expect("the tool succeeds");
+    assert_eq!(result.details, json!({"done": true}));
 }
