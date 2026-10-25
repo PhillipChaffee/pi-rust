@@ -4,6 +4,7 @@
 )]
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use pi_agent_core::types::{AgentToolError, AgentToolResult};
 
@@ -646,4 +647,129 @@ async fn invalidate_drops_every_tracked_subscription() {
     bus.emit("demo", &serde_json::Value::Null);
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+fn bound_actions(log: &Arc<Mutex<Vec<String>>>) -> crate::extensions::runner::ExtensionActions {
+    use crate::extensions::runner::ExtensionActions;
+    ExtensionActions {
+        send_message: Arc::new({
+            let log = Arc::clone(log);
+            move |message, options| {
+                log.lock()
+                    .expect("log")
+                    .push(format!("message:{}:{options:?}", message.custom_type));
+            }
+        }),
+        send_user_message: Arc::new({
+            let log = Arc::clone(log);
+            move |content, options| {
+                log.lock()
+                    .expect("log")
+                    .push(format!("user:{content:?}:{options:?}"));
+            }
+        }),
+        append_entry: Arc::new({
+            let log = Arc::clone(log);
+            move |custom_type, data| {
+                log.lock()
+                    .expect("log")
+                    .push(format!("entry:{custom_type}:{data:?}"));
+            }
+        }),
+        set_session_name: Arc::new(|_| {}),
+        get_session_name: Arc::new(|| None),
+        set_label: Arc::new(|_, _| {}),
+        get_active_tools: Arc::new({
+            let log = Arc::clone(log);
+            move || {
+                log.lock()
+                    .expect("log")
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("tools:").map(str::to_owned))
+                    .next_back()
+                    .map(|names| names.split(',').map(str::to_owned).collect())
+                    .unwrap_or_default()
+            }
+        }),
+        get_all_tools: Arc::new(Vec::new),
+        set_active_tools: Arc::new({
+            let log = Arc::clone(log);
+            move |names| {
+                log.lock()
+                    .expect("log")
+                    .push(format!("tools:{}", names.join(",")));
+            }
+        }),
+        refresh_tools: Arc::new(|| {}),
+        get_commands: Arc::new(Vec::new),
+        set_model: Arc::new(|_model| Box::pin(async { true })),
+        get_thinking_level: Arc::new(|| pi_agent_core::types::ThinkingLevel::Off),
+        set_thinking_level: Arc::new(|_| {}),
+    }
+}
+
+#[test]
+fn action_methods_report_the_unbound_runtime() {
+    let runtime = ExtensionRuntime::new();
+    let api = api_with("<inline:unbound>", &runtime);
+    let error = api
+        .get_active_tools()
+        .expect_err("the unbound runtime refuses action calls");
+    assert_eq!(
+        error,
+        "Extension runtime not initialized. Action methods cannot be called during extension \
+         loading."
+    );
+}
+
+#[tokio::test]
+async fn action_methods_delegate_to_the_bound_bundle() {
+    use crate::extensions::reasons::{CustomMessagePayload, text_block};
+    use crate::extensions::runner::{DeliverAs, SendMessageOptions, SendUserMessageOptions};
+
+    let runtime = ExtensionRuntime::new();
+    let api = api_with("<inline:bound>", &runtime);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    runtime.bind_actions(Arc::new(bound_actions(&log)));
+
+    api.send_message(
+        CustomMessagePayload {
+            custom_type: "plan".to_string(),
+            content: vec![text_block("body")],
+            display: true,
+            details: None,
+        },
+        Some(SendMessageOptions {
+            trigger_turn: Some(true),
+            deliver_as: Some(DeliverAs::FollowUp),
+        }),
+    )
+    .expect("send_message");
+    api.send_user_message(
+        pi_ai::types::UserContent::Text("refine".to_string()),
+        Some(SendUserMessageOptions {
+            deliver_as: Some(DeliverAs::FollowUp),
+            ..SendUserMessageOptions::default()
+        }),
+    )
+    .expect("send_user_message");
+    api.append_entry(
+        "plan-mode".to_string(),
+        Some(serde_json::json!({ "enabled": true })),
+    )
+    .expect("append_entry");
+    assert!(api.get_active_tools().expect("get_active_tools").is_empty());
+    api.set_active_tools(vec!["read".to_string(), "bash".to_string()])
+        .expect("set_active_tools");
+    assert_eq!(
+        api.get_active_tools().expect("get_active_tools"),
+        ["read", "bash"]
+    );
+
+    let lines = log.lock().expect("log").clone();
+    assert_eq!(lines.len(), 4);
+    assert!(lines[0].starts_with("message:plan:"));
+    assert!(lines[1].starts_with("user:Text(\"refine\"):"));
+    assert!(lines[2].starts_with("entry:plan-mode:"));
+    assert_eq!(lines[3], "tools:read,bash");
 }

@@ -13,11 +13,10 @@
 //! result: an error (upstream's throw) discards the API's pending state
 //! and fails the load.
 //!
-//! The session action methods a captured `pi` keeps calling after load
-//! (`sendUserMessage`, `setActiveTools`, `getActiveTools`,
-//! `setSessionName`) delegate through the bind pass's action bundle and
-//! reject before any bind. The remaining interactive methods
-//! (`sendMessage`, `setModel`, …) ride their consumers' tickets.
+//! The session action methods (`sendMessage`, `sendUserMessage`,
+//! `appendEntry`, `getActiveTools`, `setActiveTools`, `setSessionName`)
+//! throw "not initialized" upstream during load and delegate through the
+//! bind pass's action bundle; `setModel`, … ride their consumers' tickets.
 //! Upstream's `registerNativeProvider` queue rides the composer's
 //! native-provider ticket; the named-provider queue is wired here.
 
@@ -25,12 +24,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use pi_ai::types::BoxedFuture;
-use pi_ai::types::UserContent;
+use pi_ai::types::{BoxedFuture, UserContent};
 use serde_json::Value;
 
 use crate::core::event_bus::{EventBus, EventHandler};
-use crate::extensions::runner::{ExtensionActions, SendUserMessageOptions};
+use crate::extensions::reasons::CustomMessagePayload;
+use crate::extensions::runner::{SendMessageOptions, SendUserMessageOptions};
 use crate::extensions::runtime::{
     CommandHandler, Extension, ExtensionFlag, ExtensionHandler, FlagType, FlagValue,
     RegisteredTool, ResolvedCommand,
@@ -124,9 +123,9 @@ pub struct ExtensionRuntime {
     /// The post-bind tool-registry refresh, upstream's bindCore
     /// `runtime.refreshTools` replacement; absent pre-bind.
     bound_refresh_tools: Arc<Mutex<Option<crate::extensions::runner::RefreshToolsHandler>>>,
-    /// The post-bind session actions a captured `pi` surface delegates to,
-    /// upstream's bindCore action methods; absent pre-bind.
-    bound_actions: Arc<Mutex<Option<Arc<ExtensionActions>>>>,
+    /// The post-bind action bundle, upstream's bindCore replacing the
+    /// runtime's throwing action stubs; absent pre-bind.
+    bound_actions: Arc<Mutex<Option<Arc<crate::extensions::runner::ExtensionActions>>>>,
     /// The live event-bus unsubscribes, upstream's
     /// `eventBusUnsubscribers`; invalidation drops every one so a stale
     /// extension never hears the bus again.
@@ -183,18 +182,19 @@ impl ExtensionRuntime {
         }
     }
 
-    /// Bind the session actions the captured `pi` surface delegates to,
-    /// upstream's bindCore action methods.
-    pub fn bind_actions(&self, actions: Arc<ExtensionActions>) {
+    /// Arm the post-bind action bundle the API's action methods delegate
+    /// to, upstream's bindCore `runtime.sendMessage` family replacement.
+    pub fn bind_actions(&self, actions: Arc<crate::extensions::runner::ExtensionActions>) {
         *self
             .bound_actions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(actions);
     }
 
-    /// The bound session actions, absent before the bind pass.
+    /// The armed action bundle, absent until the bind pass; upstream's
+    /// runtime starts with throwing stubs the bind replaces.
     #[must_use]
-    pub fn bound_actions(&self) -> Option<Arc<ExtensionActions>> {
+    pub fn bound_actions(&self) -> Option<Arc<crate::extensions::runner::ExtensionActions>> {
         self.bound_actions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -379,11 +379,7 @@ impl std::fmt::Debug for ExtensionRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
-        let actions_bound = self
-            .bound_actions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
+        let actions_bound = self.bound_actions().is_some();
         f.debug_struct("ExtensionRuntime")
             .field("stale", &stale)
             .field("flag_values", &flags)
@@ -896,57 +892,85 @@ impl ExtensionApi {
             .or_else(|| pending.get(name).cloned()))
     }
 
-    /// The bound session actions, upstream's post-bind `pi` methods.
-    fn actions(&self) -> Result<Arc<ExtensionActions>, String> {
+    /// The bound action bundle, upstream's post-bind runtime action read.
+    ///
+    /// # Errors
+    /// When the API may not act, or the bind pass has not armed the actions
+    /// yet (upstream's throwing load-time stubs).
+    fn bound_actions(&self) -> Result<Arc<crate::extensions::runner::ExtensionActions>, String> {
         self.assert_active()?;
         self.runtime.bound_actions().ok_or_else(|| {
-            format!(
-                "Extension \"{}\" cannot act before the session binds.",
-                self.extension.path
-            )
+            "Extension runtime not initialized. Action methods cannot be called during \
+             extension loading."
+                .to_string()
         })
     }
 
-    /// Send a user message, upstream's `pi.sendUserMessage`; the action
-    /// queues through [`SendUserMessageOptions`](SendUserMessageOptions)
-    /// and reports failures on the runner's error channel.
+    /// Send a custom message, upstream's `pi.sendMessage`.
     ///
     /// # Errors
-    /// When the API may not act or the session actions are unbound.
+    /// When the API may not act or the runtime is unbound.
+    pub fn send_message(
+        &self,
+        message: CustomMessagePayload,
+        options: Option<SendMessageOptions>,
+    ) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.send_message)(message, options);
+        Ok(())
+    }
+
+    /// Send a user message, upstream's `pi.sendUserMessage`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
     pub fn send_user_message(
         &self,
         content: UserContent,
         options: Option<SendUserMessageOptions>,
     ) -> Result<(), String> {
-        (self.actions()?.send_user_message)(content, options);
+        let actions = self.bound_actions()?;
+        (actions.send_user_message)(content, options);
         Ok(())
     }
 
-    /// Replace the active tool set, upstream's `pi.setActiveTools`; unknown
-    /// names are dropped by the session.
+    /// Append a custom session entry, upstream's `pi.appendEntry`.
     ///
     /// # Errors
-    /// When the API may not act or the session actions are unbound.
-    pub fn set_active_tools(&self, tool_names: Vec<String>) -> Result<(), String> {
-        (self.actions()?.set_active_tools)(tool_names);
+    /// When the API may not act or the runtime is unbound.
+    pub fn append_entry(&self, custom_type: String, data: Option<Value>) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.append_entry)(custom_type, data);
         Ok(())
     }
 
-    /// Read the active tool names, upstream's `pi.getActiveTools`.
+    /// The active tool names, upstream's `pi.getActiveTools`.
     ///
     /// # Errors
-    /// When the API may not act or the session actions are unbound.
+    /// When the API may not act or the runtime is unbound.
     pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
-        Ok((self.actions()?.get_active_tools)())
+        let actions = self.bound_actions()?;
+        Ok((actions.get_active_tools)())
+    }
+
+    /// Restate the active tool names, upstream's `pi.setActiveTools`.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn set_active_tools(&self, tool_names: Vec<String>) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.set_active_tools)(tool_names);
+        Ok(())
     }
 
     /// Set the session display name, upstream's `pi.setSessionName`; the
     /// session manager sanitizes the stored value.
     ///
     /// # Errors
-    /// When the API may not act or the session actions are unbound.
+    /// When the API may not act or the runtime is unbound.
     pub fn set_session_name(&self, name: String) -> Result<(), String> {
-        (self.actions()?.set_session_name)(name);
+        let actions = self.bound_actions()?;
+        (actions.set_session_name)(name);
         Ok(())
     }
 
