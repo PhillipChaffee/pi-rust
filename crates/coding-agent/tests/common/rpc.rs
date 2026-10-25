@@ -12,6 +12,7 @@ use pi_coding_agent::core::agent_session_runtime::CreateAgentSessionRuntimeOptio
 use pi_coding_agent::core::agent_session_runtime::create_agent_session_runtime;
 use pi_coding_agent::core::output_guard::RawStdoutWriter;
 use pi_coding_agent::core::output_guard::set_raw_writer_for_test;
+use pi_coding_agent::core::output_guard::take_over_stdout;
 use pi_coding_agent::modes::rpc::jsonl::serialize_json_line;
 use pi_coding_agent::modes::rpc::rpc_mode::run_rpc_mode;
 use pi_coding_agent::session_manager::SessionManager;
@@ -115,6 +116,9 @@ impl RpcHarness {
             .await
             .expect("runtime");
 
+        // The mode takes over stdout at entry; install the capture after the
+        // takeover so the mode's own takeover is the idempotent no-op.
+        take_over_stdout();
         let captured = CapturedStdout::new();
         let (lines, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(async move { run_rpc_mode(&mut runtime, receiver).await });

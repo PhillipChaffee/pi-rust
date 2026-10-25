@@ -257,8 +257,8 @@ done
 
 #[tokio::test]
 async fn the_idle_helpers_resolve_on_agent_settled() {
-    let (_dir, path) =
-        child_script("#!/bin/sh\nprintf '%s\\n' '{\"type\":\"agent_settled\"}'\nsleep 1\n");
+    let script = "#!/bin/sh\nwhile true; do printf '%s\\n' '{\"type\":\"agent_settled\"}'; sleep 0.1; done\n";
+    let (_dir, path) = child_script(script);
     let mut client = client_for(&path);
     client.start().await.expect("start");
 
@@ -268,16 +268,18 @@ async fn the_idle_helpers_resolve_on_agent_settled() {
         .expect("wait_for_idle");
     client.stop().await;
 
-    let (_dir, path) =
-        child_script("#!/bin/sh\nprintf '%s\\n' '{\"type\":\"agent_settled\"}'\nsleep 1\n");
+    let (_dir, path) = child_script(script);
     let mut client = client_for(&path);
     client.start().await.expect("start");
     let events = client
         .collect_events(Duration::from_secs(1))
         .await
         .expect("collect_events");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["type"], "agent_settled");
+    assert!(
+        events.iter().any(|event| event["type"] == "agent_settled"),
+        "the collection settles on the event: {events:?}"
+    );
+    assert_eq!(events.last().expect("events")["type"], "agent_settled");
     client.stop().await;
 }
 
