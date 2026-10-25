@@ -556,10 +556,15 @@ async fn events_surface_emits_and_tracks_subscriptions() {
         1,
         "the tracked unsubscribe is idempotent"
     );
+    let seen_before = seen.load(Ordering::SeqCst);
     api.events_emit("demo", &serde_json::Value::Null)
         .expect("emitted");
     settle().await;
-    assert_eq!(seen.load(Ordering::SeqCst), 1, "the listener is gone");
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        seen_before,
+        "the listener is gone"
+    );
     assert_eq!(
         late.load(Ordering::SeqCst),
         2,

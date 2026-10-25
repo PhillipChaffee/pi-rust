@@ -141,6 +141,41 @@ async fn mixed_bare_and_named_factories_count_positionally() {
     );
 }
 
+#[tokio::test]
+async fn the_test_stand_in_labels_inputs_and_carries_explicit_paths() {
+    use common::extensions::TestExtensionInput;
+    use common::extensions::create_test_extensions_result;
+
+    let result = create_test_extensions_result(
+        vec![
+            TestExtensionInput::Bare(noop()),
+            TestExtensionInput::Named {
+                name: "named".to_string(),
+                factory: noop(),
+            },
+            TestExtensionInput::At {
+                path: "/ext/explicit.rs".to_string(),
+                factory: noop(),
+            },
+        ],
+        "/tmp/project",
+    )
+    .await;
+    let paths: Vec<&str> = result
+        .extensions
+        .iter()
+        .map(|extension| extension.path.as_str())
+        .collect();
+    assert_eq!(paths, ["<inline:1>", "<inline:named>", "/ext/explicit.rs"]);
+    assert!(result.errors.is_empty());
+    assert!(
+        result
+            .extensions
+            .iter()
+            .all(|extension| extension.record.is_some())
+    );
+}
+
 // =============================================================================
 // #8423 extension factory failure
 // =============================================================================
