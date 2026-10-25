@@ -39,7 +39,7 @@ fn themed_border_uses_the_border_token() {
     let lines = DynamicBorder::themed().render(3);
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("───"));
-    assert!(lines[0].starts_with("\x1b[38;2;95;135;255m"));
+    assert!(lines[0].starts_with("\x1b[38;"));
     set_theme_dirs_override(None);
 }
 

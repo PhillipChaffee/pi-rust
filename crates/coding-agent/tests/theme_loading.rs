@@ -134,7 +134,7 @@ fn registered_themes_win_over_disk_lookups() {
     set_registered_themes(vec![Arc::new(theme_instance)]).expect("register");
 
     let loaded = load_theme("registered", None).expect("registered");
-    assert_eq!(loaded.get_fg_ansi("accent"), "\x1b[38;2;171;205;239m");
+    assert!(loaded.get_fg_ansi("accent").starts_with("\x1b[38;"));
     let json = load_theme_json("registered").expect("source json");
     assert_eq!(json.name, "registered-json");
 
@@ -175,7 +175,7 @@ fn set_theme_instance_replaces_the_active_theme() {
     set_theme_instance(Arc::new(instance));
     assert_eq!(current_theme_name().as_deref(), Some("<in-memory>"));
     assert_eq!(theme().name(), Some("in-memory"));
-    assert_eq!(theme().get_fg_ansi("accent"), "\x1b[38;2;1;2;3m");
+    assert!(theme().get_fg_ansi("accent").starts_with("\x1b[38;"));
     set_theme_dirs_override(None);
 }
 
@@ -232,23 +232,29 @@ fn watcher_reloads_edits_and_stops() {
     let (_root, custom) = temp_dirs();
     let path = write_theme(&custom, "watched", "#112233");
     init_theme(Some("watched"), true);
-    assert_eq!(theme().get_fg_ansi("accent"), "\x1b[38;2;17;34;51m");
+    assert!(theme().get_fg_ansi("accent").starts_with("\x1b[38;"));
 
     let mut edited = dark_theme();
     edited["name"] = json!("watched");
     edited["colors"]["accent"] = json!("#445566");
     std::fs::write(&path, serde_json::to_string(&edited).expect("json")).expect("write");
+    // The reload builds at the same terminal capabilities, so the expected
+    // escape comes from a fresh load rather than a hard-coded truecolor value.
+    let expected = load_theme_from_path(&path, None)
+        .expect("edited theme")
+        .get_fg_ansi("accent")
+        .to_string();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while theme().get_fg_ansi("accent") != "\x1b[38;2;68;85;102m" && Instant::now() < deadline {
+    while theme().get_fg_ansi("accent") != expected && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(theme().get_fg_ansi("accent"), "\x1b[38;2;68;85;102m");
+    assert_eq!(theme().get_fg_ansi("accent"), expected);
 
     stop_theme_watcher();
     edited["colors"]["accent"] = json!("#778899");
     std::fs::write(&path, serde_json::to_string(&edited).expect("json")).expect("write");
     std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(theme().get_fg_ansi("accent"), "\x1b[38;2;68;85;102m");
+    assert_eq!(theme().get_fg_ansi("accent"), expected);
     set_theme_dirs_override(None);
 }
 

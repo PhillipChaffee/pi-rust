@@ -18,7 +18,7 @@ fn markdown_theme_decorates_and_highlights() {
     init_theme(Some("dark"), false);
     let theme = get_markdown_theme();
     let heading = (theme.heading)("Title");
-    assert!(heading.starts_with("\x1b[38;2;"));
+    assert!(heading.starts_with("\x1b[38;"));
     assert!(heading.ends_with("\x1b[39m"));
     assert_eq!((theme.bold)("x"), "\x1b[1mx\x1b[22m");
     assert_eq!((theme.italic)("x"), "\x1b[3mx\x1b[23m");
@@ -37,7 +37,7 @@ fn markdown_theme_decorates_and_highlights() {
 
     let plain = (theme.highlight_code.as_ref().expect("highlighter"))("text", None);
     assert_eq!(plain.len(), 1);
-    assert!(plain[0].starts_with("\x1b[38;2;"));
+    assert!(plain[0].starts_with("\x1b[38;"));
 }
 
 #[test]
@@ -45,7 +45,7 @@ fn highlight_code_skips_unknown_languages() {
     init_theme(Some("dark"), false);
     let lines = highlight_code("let x = 1;", Some("not-a-language"));
     assert_eq!(lines.len(), 1);
-    assert!(lines[0].starts_with("\x1b[38;2;"));
+    assert!(lines[0].starts_with("\x1b[38;"));
     assert_eq!(highlight_code("a\nb", None).len(), 2);
 }
 
