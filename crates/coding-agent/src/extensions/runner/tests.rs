@@ -1144,7 +1144,7 @@ async fn registered_commands_rename_collisions_and_land_free_names() {
         .get_command("ship:2")
         .expect("the second ship resolves by its renamed invocation");
     assert_eq!(found.name, "ship");
-    (found.handler)("args".to_string(), runner.context()).await;
+    (found.handler)("args".to_string(), runner.command_context()).await;
     assert!(runner.get_command("ship").is_none());
 
     // A unique name keeps its bare name and the reads reset diagnostics.

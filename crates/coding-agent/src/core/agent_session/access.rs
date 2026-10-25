@@ -69,9 +69,19 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
     /// Set the session display name.
     pub fn set_session_name(&self, name: &str) {
         let _ = lock(&self.session_manager).append_session_info(name);
-        self.emit(AgentSessionEvent::SessionInfoChanged {
-            name: self.session_name(),
-        });
+        let name = self.session_name();
+        self.emit(AgentSessionEvent::SessionInfoChanged { name: name.clone() });
+        let runner = self.extension_runner();
+        // The emit is fire-and-forget, upstream's `void emit`; a caller
+        // outside a runtime (a sync UI thread) simply has no extension
+        // handlers to reach.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                runner
+                    .emit(crate::extensions::events::ExtensionEvent::SessionInfoChanged { name })
+                    .await;
+            });
+        }
     }
 
     /// The extension runner.

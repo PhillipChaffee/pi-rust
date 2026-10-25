@@ -13,20 +13,24 @@
 //! result: an error (upstream's throw) discards the API's pending state
 //! and fails the load.
 //!
-//! The interactive action methods (`sendMessage`, `setModel`, …) throw
-//! "not initialized" upstream during load and delegate post-bind; those
-//! ride their consumers' tickets. Upstream's `registerNativeProvider`
-//! queue rides the composer's native-provider ticket; the named-provider
-//! queue is wired here.
+//! The session action methods a captured `pi` keeps calling after load
+//! (`sendUserMessage`, `setActiveTools`, `getActiveTools`,
+//! `setSessionName`) delegate through the bind pass's action bundle and
+//! reject before any bind. The remaining interactive methods
+//! (`sendMessage`, `setModel`, …) ride their consumers' tickets.
+//! Upstream's `registerNativeProvider` queue rides the composer's
+//! native-provider ticket; the named-provider queue is wired here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pi_ai::types::BoxedFuture;
+use pi_ai::types::UserContent;
 use serde_json::Value;
 
 use crate::core::event_bus::{EventBus, EventHandler};
+use crate::extensions::runner::{ExtensionActions, SendUserMessageOptions};
 use crate::extensions::runtime::{
     CommandHandler, Extension, ExtensionFlag, ExtensionHandler, FlagType, FlagValue,
     RegisteredTool, ResolvedCommand,
@@ -120,6 +124,9 @@ pub struct ExtensionRuntime {
     /// The post-bind tool-registry refresh, upstream's bindCore
     /// `runtime.refreshTools` replacement; absent pre-bind.
     bound_refresh_tools: Arc<Mutex<Option<crate::extensions::runner::RefreshToolsHandler>>>,
+    /// The post-bind session actions a captured `pi` surface delegates to,
+    /// upstream's bindCore action methods; absent pre-bind.
+    bound_actions: Arc<Mutex<Option<Arc<ExtensionActions>>>>,
     /// The live event-bus unsubscribes, upstream's
     /// `eventBusUnsubscribers`; invalidation drops every one so a stale
     /// extension never hears the bus again.
@@ -174,6 +181,24 @@ impl ExtensionRuntime {
         if let Some(handler) = handler {
             handler();
         }
+    }
+
+    /// Bind the session actions the captured `pi` surface delegates to,
+    /// upstream's bindCore action methods.
+    pub fn bind_actions(&self, actions: Arc<ExtensionActions>) {
+        *self
+            .bound_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(actions);
+    }
+
+    /// The bound session actions, absent before the bind pass.
+    #[must_use]
+    pub fn bound_actions(&self) -> Option<Arc<ExtensionActions>> {
+        self.bound_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Mark the runtime stale, upstream's `invalidate`; the first message
@@ -354,12 +379,18 @@ impl std::fmt::Debug for ExtensionRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
+        let actions_bound = self
+            .bound_actions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         f.debug_struct("ExtensionRuntime")
             .field("stale", &stale)
             .field("flag_values", &flags)
             .field("pending_provider_registrations", &queued)
             .field("bound_provider_actions", &bound)
             .field("bound_refresh_tools", &refresh_bound)
+            .field("bound_actions", &actions_bound)
             .field(
                 "event_bus_unsubscribers",
                 &self.event_bus_subscription_count(),
@@ -863,6 +894,60 @@ impl ExtensionApi {
             .runtime
             .flag_value(name)
             .or_else(|| pending.get(name).cloned()))
+    }
+
+    /// The bound session actions, upstream's post-bind `pi` methods.
+    fn actions(&self) -> Result<Arc<ExtensionActions>, String> {
+        self.assert_active()?;
+        self.runtime.bound_actions().ok_or_else(|| {
+            format!(
+                "Extension \"{}\" cannot act before the session binds.",
+                self.extension.path
+            )
+        })
+    }
+
+    /// Send a user message, upstream's `pi.sendUserMessage`; the action
+    /// queues through [`SendUserMessageOptions`](SendUserMessageOptions)
+    /// and reports failures on the runner's error channel.
+    ///
+    /// # Errors
+    /// When the API may not act or the session actions are unbound.
+    pub fn send_user_message(
+        &self,
+        content: UserContent,
+        options: Option<SendUserMessageOptions>,
+    ) -> Result<(), String> {
+        (self.actions()?.send_user_message)(content, options);
+        Ok(())
+    }
+
+    /// Replace the active tool set, upstream's `pi.setActiveTools`; unknown
+    /// names are dropped by the session.
+    ///
+    /// # Errors
+    /// When the API may not act or the session actions are unbound.
+    pub fn set_active_tools(&self, tool_names: Vec<String>) -> Result<(), String> {
+        (self.actions()?.set_active_tools)(tool_names);
+        Ok(())
+    }
+
+    /// Read the active tool names, upstream's `pi.getActiveTools`.
+    ///
+    /// # Errors
+    /// When the API may not act or the session actions are unbound.
+    pub fn get_active_tools(&self) -> Result<Vec<String>, String> {
+        Ok((self.actions()?.get_active_tools)())
+    }
+
+    /// Set the session display name, upstream's `pi.setSessionName`; the
+    /// session manager sanitizes the stored value.
+    ///
+    /// # Errors
+    /// When the API may not act or the session actions are unbound.
+    pub fn set_session_name(&self, name: String) -> Result<(), String> {
+        (self.actions()?.set_session_name)(name);
+        Ok(())
     }
 
     /// Queue one provider registration for the bind pass, upstream's

@@ -130,7 +130,24 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         *lock(&session.unsubscribe_agent) = Some(Box::new(unsubscribe));
         session.install_agent_tool_hooks();
         session.install_agent_next_turn_refresh();
-        session.build_runtime(session.initial_active_tool_names.clone(), true);
+        let initial_active_tool_names =
+            session
+                .initial_active_tool_names
+                .clone()
+                .unwrap_or_else(|| {
+                    if session.base_tools_override.is_some() {
+                        session
+                            .base_tools_override
+                            .as_ref()
+                            .map_or_else(Vec::new, |overrides| overrides.keys().cloned().collect())
+                    } else {
+                        ["read", "bash", "edit", "write"]
+                            .iter()
+                            .map(|name| (*name).to_owned())
+                            .collect()
+                    }
+                });
+        session.build_runtime(Some(initial_active_tool_names), true);
         session
     }
 }

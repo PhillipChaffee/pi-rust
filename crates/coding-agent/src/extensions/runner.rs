@@ -216,6 +216,46 @@ impl std::fmt::Debug for CommandContextActions {
     }
 }
 
+#[cfg(test)]
+impl CommandContextActions {
+    /// The unbound actions: an immediate idle wait and no-op replacements.
+    pub(crate) fn no_ops() -> Self {
+        let noop = Arc::new(|| -> BoxedFuture<'static, ()> { Box::pin(async {}) });
+        let proceed = Arc::new(
+            |_options: NewSessionOptions| -> BoxedFuture<'static, SessionReplaceOutcome> {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            },
+        );
+        let fork = Arc::new(
+            |_id: String, _options: ForkOptions| -> BoxedFuture<'static, SessionReplaceOutcome> {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            },
+        );
+        let navigate = Arc::new(
+            |_id: String,
+             _options: NavigateTreeOptions|
+             -> BoxedFuture<'static, SessionReplaceOutcome> {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            },
+        );
+        let switch = Arc::new(
+            |_path: String,
+             _options: SwitchSessionOptions|
+             -> BoxedFuture<'static, SessionReplaceOutcome> {
+                Box::pin(async { SessionReplaceOutcome::proceeded() })
+            },
+        );
+        Self {
+            wait_for_idle: noop,
+            new_session: proceed,
+            fork,
+            navigate_tree: navigate,
+            switch_session: switch,
+            reload: Arc::new(|| -> BoxedFuture<'static, ()> { Box::pin(async {}) }),
+        }
+    }
+}
+
 /// Where a sent message lands relative to the current run, upstream's
 /// `deliverAs: "steer" | "followUp" | "nextTurn"`.
 ///
@@ -621,7 +661,9 @@ impl ExtensionRunner {
         self.active_tools = Arc::clone(&actions.get_active_tools);
         self.runtime
             .bind_refresh_tools(Arc::clone(&actions.refresh_tools));
-        self.bound_actions = Some(Arc::new(actions));
+        let actions = Arc::new(actions);
+        self.runtime.bind_actions(Arc::clone(&actions));
+        self.bound_actions = Some(actions);
         let flush: Option<&ProviderActions> = provider_actions.as_ref();
         for registration in self.runtime.take_pending_provider_registrations() {
             let registered = match flush {
@@ -1055,6 +1097,20 @@ impl std::ops::Deref for ExtensionCommandContext {
 }
 
 impl ExtensionCommandContext {
+    /// Build the command context over a handler context and the six
+    /// replace/reload actions, upstream's `createCommandContext`.
+    pub(crate) fn new(context: HandlerContext, actions: CommandContextActions) -> Self {
+        Self {
+            context,
+            wait_for_idle: actions.wait_for_idle,
+            new_session: actions.new_session,
+            fork: actions.fork,
+            navigate_tree: actions.navigate_tree,
+            switch_session: actions.switch_session,
+            reload: actions.reload,
+        }
+    }
+
     /// Wait until the session is idle, upstream's `ctx.waitForIdle()`.
     ///
     /// # Errors
@@ -1149,15 +1205,17 @@ impl ExtensionRunner {
     /// it, so the deref passes it through.
     #[must_use]
     pub fn command_context(&self) -> ExtensionCommandContext {
-        ExtensionCommandContext {
-            context: self.context(),
-            wait_for_idle: Arc::clone(&self.command.wait_for_idle),
-            new_session: Arc::clone(&self.command.new_session),
-            fork: Arc::clone(&self.command.fork),
-            navigate_tree: Arc::clone(&self.command.navigate_tree),
-            switch_session: Arc::clone(&self.command.switch_session),
-            reload: Arc::clone(&self.command.reload),
-        }
+        ExtensionCommandContext::new(
+            self.context(),
+            CommandContextActions {
+                wait_for_idle: Arc::clone(&self.command.wait_for_idle),
+                new_session: Arc::clone(&self.command.new_session),
+                fork: Arc::clone(&self.command.fork),
+                navigate_tree: Arc::clone(&self.command.navigate_tree),
+                switch_session: Arc::clone(&self.command.switch_session),
+                reload: Arc::clone(&self.command.reload),
+            },
+        )
     }
 }
 

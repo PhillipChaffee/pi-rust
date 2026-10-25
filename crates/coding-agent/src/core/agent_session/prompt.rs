@@ -150,7 +150,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         let Some(command) = runner.get_command(command_name) else {
             return false;
         };
-        (command.handler)(args.to_owned(), runner.context()).await;
+        (command.handler)(args.to_owned(), runner.command_context()).await;
         true
     }
 
@@ -175,6 +175,9 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         }
         self.is_agent_run_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.extension_runner()
+            .emit(crate::extensions::events::ExtensionEvent::AgentSettled)
+            .await;
         self.bump_idle();
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();
