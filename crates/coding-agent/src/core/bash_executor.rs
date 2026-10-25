@@ -40,11 +40,13 @@ impl std::fmt::Debug for BashExecutorOptions {
 }
 
 /// The execution outcome, upstream's `BashResult`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BashResult {
     /// The combined stdout + stderr output (sanitized, possibly truncated).
     pub output: String,
     /// The process exit code, absent when killed or cancelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Whether the command was cancelled via the signal.
     pub cancelled: bool,
@@ -52,6 +54,7 @@ pub struct BashResult {
     pub truncated: bool,
     /// The temp file holding the full output, when the output exceeded the
     /// truncation threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
 }
 

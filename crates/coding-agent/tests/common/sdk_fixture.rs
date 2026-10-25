@@ -96,6 +96,15 @@ pub fn done_message() -> AssistantMessage {
 /// # Panics
 /// The provider registration failure, which the fixture cannot satisfy.
 pub async fn registry_with_faux() -> ModelRegistry {
+    registry_with_faux_delay(0).await
+}
+
+/// [`registry_with_faux`] with the settlement delayed by `delay_ms`, upstream's
+/// `responseDelayMs` fixture.
+///
+/// # Panics
+/// The provider registration failure, which the fixture cannot satisfy.
+pub async fn registry_with_faux_delay(delay_ms: u64) -> ModelRegistry {
     let registry = super::model_layer::create_in_memory_model_registry(
         super::model_layer::empty_auth_storage(),
     )
@@ -108,12 +117,24 @@ pub async fn registry_with_faux() -> ModelRegistry {
                 base_url: Some("https://faux.invalid/v1".to_owned()),
                 api: Some(Api::from("openai-completions")),
                 api_key: Some("faux-key".to_owned()),
-                stream_simple: Some(Arc::new(|_model, _context, _options| {
+                stream_simple: Some(Arc::new(move |_model, _context, _options| {
                     let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
-                    stream.push(AssistantMessageEvent::Done {
-                        reason: StopReason::Stop,
-                        message: done_message(),
-                    });
+                    let settle = stream.clone();
+                    let settle_now =
+                        |stream: &pi_ai::utils::event_stream::AssistantMessageEventStream| {
+                            stream.push(AssistantMessageEvent::Done {
+                                reason: StopReason::Stop,
+                                message: done_message(),
+                            });
+                        };
+                    if delay_ms == 0 {
+                        settle_now(&settle);
+                    } else {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            settle_now(&settle);
+                        });
+                    }
                     stream
                 })),
                 models: Some(vec![

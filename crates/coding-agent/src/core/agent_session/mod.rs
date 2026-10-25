@@ -130,6 +130,7 @@ pub struct AgentSession<S: SettingsStorage + 'static> {
     pub(crate) pending_bash_messages: Mutex<Vec<pi_agent_core::types::AgentMessage>>,
     pub(crate) extension_runner: Mutex<Arc<ExtensionRunner>>,
     pub(crate) extension_mode: Mutex<ExtensionMode>,
+    pub(crate) extension_ui: Mutex<Option<Arc<dyn std::any::Any + Send + Sync>>>,
     pub(crate) extension_command_context_actions: Mutex<Option<CommandContextActions>>,
     pub(crate) extension_abort_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     pub(crate) extension_shutdown_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,

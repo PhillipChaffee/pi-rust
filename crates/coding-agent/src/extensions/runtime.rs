@@ -214,7 +214,8 @@ impl Extension {
 pub use pi_agent_core::harness::context::AbortSignal as AbortSignalHandle;
 
 /// The context-usage reading, upstream's `ContextUsage`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContextUsage {
     /// The estimated tokens, `None` when unknown until the next response.
     pub tokens: Option<u64>,
