@@ -184,7 +184,7 @@ async fn a_handshake_version_drift_fails_closed() {
 #[tokio::test]
 async fn a_silent_child_hits_the_handshake_deadline() {
     let dir = TempDir::new().expect("temp dir");
-    let script = write_executable(dir.path(), "bin/silent", "#!/bin/sh\nsleep 30\n");
+    let script = write_executable(dir.path(), "bin/silent", "#!/bin/sh\nexec sleep 30\n");
     let cwd = dir.path().to_string_lossy().into_owned();
     let loader = ExtensionLoader {
         handshake_timeout: Duration::from_millis(50),

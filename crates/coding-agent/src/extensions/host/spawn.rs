@@ -12,11 +12,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::Join;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
 
@@ -43,7 +45,56 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// One child session over the process's piped stdio.
-type ChildSession = HostSession<Join<ChildStdout, ChildStdin>>;
+type ChildSession = HostSession<ChildIo>;
+
+/// The child's piped stdio.
+///
+/// tokio's `ChildStdin` shutdown only flushes, so the wrapper drops the
+/// write half on shutdown: closing the pipe is what gives the child its
+/// end of stream.
+struct ChildIo {
+    stdout: ChildStdout,
+    stdin: Option<ChildStdin>,
+}
+
+impl AsyncRead for ChildIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for ChildIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.stdin.as_mut().map_or_else(
+            || {
+                Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "the extension stdin is closed",
+                )))
+            },
+            |stdin| Pin::new(stdin).poll_write(cx, buffer),
+        )
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.stdin
+            .as_mut()
+            .map_or(Poll::Ready(Ok(())), |stdin| Pin::new(stdin).poll_flush(cx))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.stdin.take();
+        Poll::Ready(Ok(()))
+    }
+}
 
 /// A spawn-gate failure; the loader reports the message as a load error.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +190,13 @@ impl ExtensionProcess {
         };
         let mut session = match timeout(
             options.handshake_timeout,
-            HostSession::connect(tokio::io::join(stdout, stdin), options.connect),
+            HostSession::connect(
+                ChildIo {
+                    stdout,
+                    stdin: Some(stdin),
+                },
+                options.connect,
+            ),
         )
         .await
         {
