@@ -249,7 +249,7 @@ fn builds_a_theme_with_fallbacks_and_variables() {
     assert_eq!(theme.name(), Some("custom"));
     assert_eq!(theme.source_path(), Some("custom.json"));
     assert_eq!(theme.color_mode(), ColorMode::Color256);
-    assert_eq!(theme.get_fg_ansi("accent"), "\x1b[38;5;24m");
+    assert_eq!(theme.get_fg_ansi("accent"), "\x1b[38;5;23m");
     assert_eq!(theme.get_fg_ansi("text"), "\x1b[39m");
 }
 
