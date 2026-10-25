@@ -1,6 +1,8 @@
-//! The app modes, upstream's `packages/coding-agent/src/modes/`.
+//! The app modes, upstream's `src/modes/`.
 //!
-//! The print, JSON-event, and RPC modes ride their own slice (#133); the
-//! interactive shell and selectors land here ticket by ticket (#131, #132).
+//! Interactive mode lives with its TUI tickets (#131, #132); this module
+//! carries the non-interactive modes and the event wire they share.
 
 pub mod interactive;
+pub mod json_event;
+pub mod print_mode;

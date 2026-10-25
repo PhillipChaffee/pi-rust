@@ -31,6 +31,12 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         lock(&self.session_manager).get_session_name()
     }
 
+    /// The session header, upstream's `sessionManager.getHeader()`.
+    #[must_use]
+    pub fn session_header(&self) -> Option<crate::session_manager::SessionHeader> {
+        lock(&self.session_manager).get_header().cloned()
+    }
+
     /// The current leaf id, absent before any entry.
     #[must_use]
     pub fn leaf_id(&self) -> Option<String> {
