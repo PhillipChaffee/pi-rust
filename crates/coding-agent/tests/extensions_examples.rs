@@ -52,7 +52,9 @@ use pi_coding_agent::extensions::reasons::{CustomMessagePayload, text_block};
 use pi_coding_agent::extensions::reasons::{InputSource, StreamingBehavior};
 use pi_coding_agent::extensions::results::HandlerResult;
 use pi_coding_agent::extensions::results::InputResult;
-use pi_coding_agent::extensions::runner::{DeliverAs, SendMessageOptions, SendUserMessageOptions};
+use pi_coding_agent::extensions::runner::{
+    DeliverAs, ExtensionCommandContext, SendMessageOptions, SendUserMessageOptions,
+};
 use pi_coding_agent::extensions::runtime::{
     CommandHandler, ContextActions, FlagType, FlagValue, HandlerContext,
 };
@@ -354,7 +356,7 @@ fn plan_mode_factory() -> ExtensionFactory {
             let toggle: CommandHandler = {
                 let api = Arc::clone(&api);
                 let state = Arc::clone(&state);
-                Arc::new(move |_args: String, ctx: HandlerContext| {
+                Arc::new(move |_args: String, ctx: ExtensionCommandContext| {
                     let api = Arc::clone(&api);
                     let state = Arc::clone(&state);
                     Box::pin(async move {
@@ -369,7 +371,7 @@ fn plan_mode_factory() -> ExtensionFactory {
             )?;
             let todos_command: CommandHandler = {
                 let state = Arc::clone(&state);
-                Arc::new(move |_args: String, ctx: HandlerContext| {
+                Arc::new(move |_args: String, ctx: ExtensionCommandContext| {
                     let state = Arc::clone(&state);
                     Box::pin(async move {
                         let todos = state
@@ -648,7 +650,7 @@ async fn plan_harness(
 
 async fn run_plan_command(harness: &ExampleHarness, name: &str) {
     let handler = command(&harness.runner, name).handler;
-    (handler)(String::new(), harness.runner.context()).await;
+    (handler)(String::new(), harness.runner.command_context()).await;
 }
 
 async fn trigger_agent_end(harness: &ExampleHarness, text: &str) {
@@ -1540,7 +1542,7 @@ fn trigger_compact_factory() -> ExtensionFactory {
             api.register_command(
                 "trigger-compact".to_string(),
                 Some("Trigger compaction immediately".to_string()),
-                Arc::new(move |args: String, ctx: HandlerContext| {
+                Arc::new(move |args: String, ctx: ExtensionCommandContext| {
                     Box::pin(async move {
                         let instructions = args.trim();
                         trigger_compaction(
@@ -1637,7 +1639,7 @@ async fn trigger_compact_command_passes_its_instructions() {
     let handler = command(&example.runner, "trigger-compact").handler;
     (handler)(
         "  keep the api notes  ".to_string(),
-        example.runner.context(),
+        example.runner.command_context(),
     )
     .await;
     assert_eq!(

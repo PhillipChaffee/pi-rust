@@ -249,11 +249,17 @@ impl<S: SettingsStorage + 'static> AgentSession<S> {
 
     /// Abort the current operation and wait for idle.
     pub async fn abort(&self) {
+        self.abort_now();
+        self.wait_for_idle().await;
+    }
+
+    /// Cancel the run and the compaction controllers without waiting, the
+    /// synchronous prefix of upstream's `abort`.
+    pub(crate) fn abort_now(&self) {
         self.abort_retry();
         self.abort_compaction();
         self.abort_branch_summary();
         self.agent.abort();
-        self.wait_for_idle().await;
     }
 
     /// Wait until the session is idle.

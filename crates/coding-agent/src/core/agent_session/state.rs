@@ -100,7 +100,14 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         }
 
         let replacement = self.dispatch_extension_event(&event).await;
-        self.forward_event(&event);
+        match (&event, &replacement) {
+            (AgentEvent::MessageEnd { .. }, Some(message)) => {
+                self.emit(AgentSessionEvent::MessageEnd {
+                    message: message.clone(),
+                });
+            }
+            _ => self.forward_event(&event),
+        }
 
         if let AgentEvent::MessageEnd { message } = &event {
             let message = replacement.as_ref().unwrap_or(message);

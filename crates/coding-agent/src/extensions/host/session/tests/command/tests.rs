@@ -26,7 +26,10 @@ async fn command_dispatch_runs_and_reports_failures() {
         .expect("one command")
         .clone();
     let run = Arc::clone(&command.handler);
-    let context = test_context(ContextActions::default()).await;
+    let context = crate::extensions::runner::ExtensionCommandContext::new(
+        test_context(ContextActions::default()).await,
+        crate::extensions::runner::CommandContextActions::no_ops(),
+    );
     let task = tokio::spawn(async move { run("--flag".to_string(), context).await });
     let Some(Frame::CallCommand { call, name, args }) = child.read_frame().await.expect("call")
     else {
@@ -43,7 +46,10 @@ async fn command_dispatch_runs_and_reports_failures() {
     task.await.expect("join");
 
     let run = Arc::clone(&command.handler);
-    let context = test_context(ContextActions::default()).await;
+    let context = crate::extensions::runner::ExtensionCommandContext::new(
+        test_context(ContextActions::default()).await,
+        crate::extensions::runner::CommandContextActions::no_ops(),
+    );
     let task = tokio::spawn(async move { run("--again".to_string(), context).await });
     let Some(Frame::CallCommand { call, .. }) = child.read_frame().await.expect("call") else {
         panic!("the host sends a call command");
@@ -80,7 +86,10 @@ async fn a_dead_session_skips_commands() {
         .expect("one command")
         .clone();
     let run = Arc::clone(&command.handler);
-    let context = test_context(ContextActions::default()).await;
+    let context = crate::extensions::runner::ExtensionCommandContext::new(
+        test_context(ContextActions::default()).await,
+        crate::extensions::runner::CommandContextActions::no_ops(),
+    );
     let task = tokio::spawn(async move { run("--flag".to_string(), context).await });
     drop(child);
     task.await.expect("join");

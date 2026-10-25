@@ -14,6 +14,7 @@ use crate::extensions::api::{
 use crate::extensions::events::ExtensionEvent;
 use crate::extensions::reasons::{ExtensionMode, SessionStartReason};
 use crate::extensions::results::HandlerResult;
+use crate::extensions::runner::ExtensionCommandContext;
 use crate::extensions::runner::ExtensionRunner;
 use crate::extensions::runtime::{
     CommandHandler, ContextActions, ExtensionHandler, FlagType, FlagValue, HandlerContext,
@@ -41,7 +42,7 @@ fn noop_handler(log: &EventLog) -> ExtensionHandler {
 }
 
 fn noop_command() -> CommandHandler {
-    Arc::new(|_args: String, _ctx: HandlerContext| Box::pin(async {}))
+    Arc::new(|_args: String, _ctx: ExtensionCommandContext| Box::pin(async {}))
 }
 
 fn simple_tool() -> ToolDefinition {

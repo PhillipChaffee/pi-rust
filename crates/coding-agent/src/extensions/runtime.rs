@@ -23,8 +23,11 @@ pub type ExtensionHandler = Arc<
 >;
 
 /// A command handler, upstream's `(args, ctx) => Promise<void>`.
-pub type CommandHandler =
-    Arc<dyn Fn(String, HandlerContext) -> BoxedFuture<'static, ()> + Send + Sync>;
+pub type CommandHandler = Arc<
+    dyn Fn(String, crate::extensions::runner::ExtensionCommandContext) -> BoxedFuture<'static, ()>
+        + Send
+        + Sync,
+>;
 
 /// An extension-load or handler failure, upstream's `ExtensionError`.
 #[derive(Clone, Debug, PartialEq, Eq)]

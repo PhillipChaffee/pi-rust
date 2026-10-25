@@ -101,10 +101,10 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         self.flush_pending_custom_messages();
 
         let mut content = vec![UserBlock::Text(TextContent {
-            text: expanded,
+            text: expanded.clone(),
             text_signature: None,
         })];
-        if let Some(images) = images {
+        if let Some(images) = images.clone() {
             content.extend(images.into_iter().map(UserBlock::Image));
         }
         let mut messages = vec![AgentMessage::Standard(Message::User(UserMessage {
@@ -112,6 +112,29 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             timestamp: now_ms(),
         }))];
         messages.extend(lock(&self.pending_next_turn_messages).drain(..));
+
+        let base_prompt = lock(&self.base_system_prompt).clone();
+        let base_options = lock(&self.base_system_prompt_options).clone();
+        let before_agent_start = self
+            .extension_runner()
+            .emit_before_agent_start(expanded, images, base_prompt.clone(), base_options)
+            .await;
+        if let Some(result) = &before_agent_start {
+            for message in &result.messages {
+                messages.push(super::helpers::custom_message(
+                    message.custom_type.clone(),
+                    UserContent::Blocks(message.content.clone()),
+                    message.display,
+                    message.details.clone(),
+                ));
+            }
+        }
+        let override_prompt = before_agent_start
+            .as_ref()
+            .and_then(|result| result.system_prompt.clone());
+        lock(&self.system_prompt_override).clone_from(&override_prompt);
+        self.agent
+            .set_system_prompt(override_prompt.unwrap_or(base_prompt));
 
         notify_preflight(preflight, true);
         self.run_agent_prompt(messages).await;
@@ -150,7 +173,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         let Some(command) = runner.get_command(command_name) else {
             return false;
         };
-        (command.handler)(args.to_owned(), runner.context()).await;
+        (command.handler)(args.to_owned(), runner.command_context()).await;
         true
     }
 
@@ -175,6 +198,9 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         }
         self.is_agent_run_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.extension_runner()
+            .emit(crate::extensions::events::ExtensionEvent::AgentSettled)
+            .await;
         self.bump_idle();
         self.flush_pending_bash_messages();
         self.flush_pending_custom_messages();

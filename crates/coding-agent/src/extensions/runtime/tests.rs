@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use pi_agent_core::types::ThinkingLevel;
 use pi_ai::auth::credential_store::InMemoryCredentialStore;
 
+use crate::extensions::runner::ExtensionCommandContext;
 use crate::model_registry::ModelRegistry;
 use crate::model_runtime::{CreateModelRuntimeOptions, ModelRuntime};
 use crate::session_manager::SessionManager;
@@ -76,7 +77,7 @@ fn extension_registers_handlers_tools_and_commands() {
         invocation_name: "ship".to_string(),
         description: Some("ships it".to_string()),
         source_info: source_info(),
-        handler: Arc::new(|_args: String, _ctx: HandlerContext| Box::pin(async {})),
+        handler: Arc::new(|_args: String, _ctx: ExtensionCommandContext| Box::pin(async {})),
     });
 
     let handlers = extension
@@ -240,7 +241,7 @@ async fn context_accessors_bind_default_and_fail_stale() {
         invocation_name: "ship".to_string(),
         description: None,
         source_info: source_info(),
-        handler: Arc::new(|_args: String, _ctx: HandlerContext| Box::pin(async {})),
+        handler: Arc::new(|_args: String, _ctx: ExtensionCommandContext| Box::pin(async {})),
     };
     assert!(format!("{command:?}").contains("ResolvedCommand"));
     assert!(format!("{:?}", Arc::clone(&bound_actions)).contains("bound_actions: 13"));
