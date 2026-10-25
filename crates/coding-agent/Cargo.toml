@@ -44,7 +44,8 @@ indexmap = "2"
 # The async substrate the stack decision pins. sync: the CancellationToken
 # abort plumbing and channels; time: sleep and the child-stdio grace timer;
 # macros: the select! races; process: child processes; rt: spawn_blocking
-# handoffs (upstream's worker threads); io-util: child stdout/stderr readers.
+# handoffs (upstream's worker threads); io-util: child stdout/stderr readers;
+# signal: the print mode's SIGTERM/SIGHUP shutdown.
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
   "sync",
@@ -52,6 +53,7 @@ tokio = { version = "1.47", default-features = false, features = [
   "macros",
   "process",
   "io-util",
+  "signal",
 ] }
 # The CancellationToken the abort belt carries, the same token pi-ai's
 # transport options take.
