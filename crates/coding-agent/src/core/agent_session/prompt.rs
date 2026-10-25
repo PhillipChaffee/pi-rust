@@ -132,7 +132,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         let override_prompt = before_agent_start
             .as_ref()
             .and_then(|result| result.system_prompt.clone());
-        *lock(&self.system_prompt_override) = override_prompt.clone();
+        lock(&self.system_prompt_override).clone_from(&override_prompt);
         self.agent
             .set_system_prompt(override_prompt.unwrap_or(base_prompt));
 
