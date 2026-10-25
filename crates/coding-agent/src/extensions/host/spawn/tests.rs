@@ -127,6 +127,12 @@ async fn retain_shuts_down_the_paths_that_left_the_set() {
     let outcome = loader.load(&paths, &cwd, None).await;
     assert_eq!(outcome.extensions.len(), 2);
 
+    // A retain under another cwd is a no-op: the next load retires the
+    // cache instead.
+    loader
+        .retain(&[], dir.path().join("elsewhere").to_string_lossy().as_ref())
+        .await;
+
     loader.retain(&[kept_path], &cwd).await;
     assert!(dropped.marker.exists(), "the left path shuts down");
     assert!(!kept.marker.exists(), "the kept path stays live");
@@ -344,6 +350,72 @@ fn write_receipt(root: &Path, protocol_version: Option<u64>) {
         serde_json::to_string(&receipt.to_value()).expect("serialize receipt"),
     )
     .expect("write receipt");
+}
+
+#[tokio::test]
+async fn provider_registrations_queue_into_the_shared_runtime() {
+    let dir = TempDir::new().expect("temp dir");
+    let hello_path = dir.path().join("hello.bin");
+    let provider_path = dir.path().join("provider.bin");
+    let ready_path = dir.path().join("ready.bin");
+    std::fs::write(&hello_path, hello(EXTENSION_PROTOCOL_VERSION)).expect("hello bytes");
+    std::fs::write(
+        &provider_path,
+        encode_frame(&Frame::RegisterProvider {
+            provider: serde_json::json!({
+                "name": "demo-provider",
+                "config": {"name": "Demo", "api": "openai-completions"},
+            }),
+        })
+        .expect("provider frame"),
+    )
+    .expect("provider bytes");
+    std::fs::write(&ready_path, ready()).expect("ready bytes");
+    let body = format!(
+        "#!/bin/sh\ncat '{}' '{}' '{}'\ncat > /dev/null\n",
+        hello_path.display(),
+        provider_path.display(),
+        ready_path.display()
+    );
+    let script = write_executable(dir.path(), "bin/provider", &body);
+    let cwd = dir.path().to_string_lossy().into_owned();
+    let loader = ExtensionLoader::new();
+    let runtime = ExtensionRuntime::new();
+
+    let outcome = loader
+        .load(
+            &[script.to_string_lossy().into_owned()],
+            &cwd,
+            Some(runtime),
+        )
+        .await;
+    assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+    let pending = outcome.runtime.take_pending_provider_registrations();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].name, "demo-provider");
+}
+
+#[test]
+fn the_spawn_surfaces_render() {
+    let loader = ExtensionLoader::new();
+    assert!(format!("{loader:?}").contains("ExtensionLoader"));
+    let error = SpawnError::new("boom");
+    assert_eq!(error.to_string(), "boom");
+    let options = SpawnOptions::new(
+        "/cwd".to_string(),
+        HostConnectOptions {
+            path: "/ext/demo".to_string(),
+            resolved_path: "/ext/demo".to_string(),
+            source_info: create_synthetic_source_info(
+                "/ext/demo",
+                &SyntheticSourceOptions::default(),
+            ),
+            context: SharedContext::default(),
+            ui: None,
+            error_listener: None,
+        },
+    );
+    assert!(format!("{options:?}").contains("/cwd"));
 }
 
 #[test]
