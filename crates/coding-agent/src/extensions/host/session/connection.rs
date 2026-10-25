@@ -80,7 +80,7 @@ where
     /// crash yields one diagnostic rather than one per layer.
     pub(super) fn fail(&self, _event: &str, error: HostCallError) -> HostCallError {
         if !self.dead.swap(true, Ordering::SeqCst) {
-            self.set_dead_message(error.message());
+            self.set_dead_message(&format!("{}: {}", error.code(), error.message()));
         }
         error
     }

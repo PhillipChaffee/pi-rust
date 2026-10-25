@@ -103,7 +103,7 @@ where
         let mut link = self.link.lock().await;
         link.write_frame(&frame)
             .await
-            .map_err(|error| self.fail(event, Self::link_failure(&error)))?;
+            .map_err(|error| self.fail(event, Self::write_failure(&error)))?;
         let mut aborts = self.abort_rx.lock().await;
         loop {
             tokio::select! {
@@ -121,7 +121,7 @@ where
                             aborted: true,
                         })
                         .await
-                        .map_err(|error| self.fail(event, Self::link_failure(&error)))?;
+                        .map_err(|error| self.fail(event, Self::write_failure(&error)))?;
                     }
                 }
                 incoming = link.read_frame() => {
@@ -154,13 +154,13 @@ where
                             };
                             link.write_frame(&answer)
                                 .await
-                                .map_err(|error| self.fail(event, Self::link_failure(&error)))?;
+                                .map_err(|error| self.fail(event, Self::write_failure(&error)))?;
                         }
                         Frame::UiCall { call: owner, id, method, params } if owner == call => {
                             let answer = self.answer_ui(call, id, &method, params).await;
                             link.write_frame(&answer)
                                 .await
-                                .map_err(|error| self.fail(event, Self::link_failure(&error)))?;
+                                .map_err(|error| self.fail(event, Self::write_failure(&error)))?;
                         }
                         Frame::CallUpdate { call: owner, update } if owner == call => {
                             match sink.update {
@@ -218,6 +218,10 @@ where
 
     fn link_failure(error: &WireError) -> HostCallError {
         HostCallError::new("extension_protocol_error", error.message().to_string())
+    }
+
+    fn write_failure(error: &WireError) -> HostCallError {
+        HostCallError::new("extension_exited", error.message().to_string())
     }
 
     fn protocol_failure(&self, event: &str, what: &str) -> HostCallError {
