@@ -13,7 +13,8 @@ useDefault = true
 # false positives result, all content hashes, not credentials (#28):
 #   1. .manifest.json holds per-shard SHA-256 file hashes; shard names like
 #      qwen-token-plan.json contain "token", tripping generic-api-key.
-#   2. Modules whose ids contain "sgp_" (the Xiaomi Token Plan SGP) put the
+#   2. Modules whose ids contain "sgp_" (the Xiaomi Token Plan SGP) — or the
+#      CLI help text's XIAOMI_TOKEN_PLAN_SGP_API_KEY names — put the
 #      sourcegraph keyword in the scan chunk, and every file cites the 40-hex
 #      pin SHA.
 # The allowlist targets the hash-shaped matches only, so a real credential
@@ -24,6 +25,7 @@ paths = [
     '^crates/ai/src/providers/data/[.]manifest[.]json$',
     '^crates/ai/src/.*[.]rs$',
     '^crates/ai/tests/.*[.]rs$',
+    '^crates/coding-agent/src/.*[.]rs$',
 ]
 regexTarget = "match"
 regexes = [
