@@ -236,7 +236,11 @@ async fn registered_callables_execute_through_the_record() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)[0]
         .clone();
-    (command.handler)("args".to_string(), dispatch_context().await).await;
+    let command_context = crate::extensions::runner::ExtensionCommandContext::new(
+        dispatch_context().await,
+        crate::extensions::runner::CommandContextActions::no_ops(),
+    );
+    (command.handler)("args".to_string(), command_context).await;
 
     let tool = record
         .tools

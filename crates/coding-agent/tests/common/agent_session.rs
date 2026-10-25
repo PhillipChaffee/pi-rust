@@ -159,6 +159,12 @@ pub struct SessionSetup {
     /// Tools replacing the built-ins.
     pub base_tools_override:
         Option<std::collections::BTreeMap<String, pi_agent_core::types::AgentTool>>,
+    /// Optional allowlist of exposed tool names.
+    pub allowed_tool_names: Option<Vec<String>>,
+    /// Optional denylist of exposed tool names.
+    pub excluded_tool_names: Option<Vec<String>>,
+    /// The initial active tool names; `None` keeps the default set.
+    pub initial_active_tool_names: Option<Vec<String>>,
     /// Whether to emit the session-start bind after construction.
     pub bind_extensions: bool,
 }
@@ -178,6 +184,9 @@ impl SessionSetup {
             event_bus: None,
             custom_tools: Vec::new(),
             base_tools_override: None,
+            allowed_tool_names: None,
+            excluded_tool_names: None,
+            initial_active_tool_names: None,
             bind_extensions: false,
         }
     }
@@ -199,6 +208,9 @@ pub async fn build(setup: SessionSetup) -> Arc<AgentSession<InMemorySettingsStor
         event_bus,
         custom_tools,
         base_tools_override,
+        allowed_tool_names,
+        excluded_tool_names,
+        initial_active_tool_names,
         bind_extensions,
     } = setup;
     let agent_dir = format!("{root}/agent");
@@ -244,9 +256,9 @@ pub async fn build(setup: SessionSetup) -> Arc<AgentSession<InMemorySettingsStor
         scoped_models: None,
         model_runtime: runtime,
         custom_tools: Some(custom_tools),
-        initial_active_tool_names: None,
-        allowed_tool_names: None,
-        excluded_tool_names: None,
+        initial_active_tool_names,
+        allowed_tool_names,
+        excluded_tool_names,
         base_tools_override,
         extension_runner_ref: None,
         session_start_event: None,

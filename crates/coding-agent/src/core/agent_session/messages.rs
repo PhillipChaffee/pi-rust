@@ -63,7 +63,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         self.prompt(
             text,
             Some(PromptOptions {
-                expand_prompt_templates: options.expand_prompt_templates,
+                expand_prompt_templates: Some(options.expand_prompt_templates.unwrap_or(false)),
                 images,
                 streaming_behavior: match options.deliver_as {
                     Some(DeliverAs::Steer) => Some(StreamingBehavior::Steer),

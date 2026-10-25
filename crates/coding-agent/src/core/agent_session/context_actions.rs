@@ -53,7 +53,8 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             })),
             abort: Some(Arc::new(move || {
                 if let Some(session) = weak_abort.upgrade() {
-                    tokio::spawn(async move { session.abort().await });
+                    session.abort_now();
+                    tokio::spawn(async move { session.wait_for_idle().await });
                 }
             })),
             has_pending_messages: Some(Arc::new(move || {

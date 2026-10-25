@@ -13,11 +13,12 @@
 //! result: an error (upstream's throw) discards the API's pending state
 //! and fails the load.
 //!
-//! The interactive action methods (`sendMessage`, `setModel`, …) throw
-//! "not initialized" upstream during load and delegate post-bind; those
-//! ride their consumers' tickets. Upstream's `registerNativeProvider`
-//! queue rides the composer's native-provider ticket; the named-provider
-//! queue is wired here.
+//! The session action methods (`sendMessage`, `sendUserMessage`,
+//! `appendEntry`, `getActiveTools`, `setActiveTools`, `setSessionName`)
+//! throw "not initialized" upstream during load and delegate through the
+//! bind pass's action bundle; `setModel`, … ride their consumers' tickets.
+//! Upstream's `registerNativeProvider` queue rides the composer's
+//! native-provider ticket; the named-provider queue is wired here.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -959,6 +960,17 @@ impl ExtensionApi {
     pub fn set_active_tools(&self, tool_names: Vec<String>) -> Result<(), String> {
         let actions = self.bound_actions()?;
         (actions.set_active_tools)(tool_names);
+        Ok(())
+    }
+
+    /// Set the session display name, upstream's `pi.setSessionName`; the
+    /// session manager sanitizes the stored value.
+    ///
+    /// # Errors
+    /// When the API may not act or the runtime is unbound.
+    pub fn set_session_name(&self, name: String) -> Result<(), String> {
+        let actions = self.bound_actions()?;
+        (actions.set_session_name)(name);
         Ok(())
     }
 

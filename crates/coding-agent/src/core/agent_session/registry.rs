@@ -56,10 +56,6 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             .map(|entry| entry.definition.clone())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the 1:1 registry rebuild carries the base/custom merge and the selection ladder inline"
-    )]
     pub(crate) fn refresh_tool_registry(
         &self,
         active_tool_names: Option<Vec<String>>,
@@ -144,15 +140,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         *lock(&self.tool_registry) = registry;
 
         let include_new = active_tool_names.is_none();
-        let default_names: Vec<String> = if self.base_tools_override.is_some() {
-            lock(&self.base_tool_definitions).keys().cloned().collect()
-        } else {
-            ["read", "bash", "edit", "write"]
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect()
-        };
-        let mut next: Vec<String> = active_tool_names.unwrap_or(default_names);
+        let mut next: Vec<String> = active_tool_names.unwrap_or_else(|| self.active_tool_names());
         next.retain(|name| is_allowed(name));
         if let Some(allowed) = &self.allowed_tool_names {
             for name in lock(&self.tool_registry).keys() {

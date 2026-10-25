@@ -1144,7 +1144,7 @@ async fn registered_commands_rename_collisions_and_land_free_names() {
         .get_command("ship:2")
         .expect("the second ship resolves by its renamed invocation");
     assert_eq!(found.name, "ship");
-    (found.handler)("args".to_string(), runner.context()).await;
+    (found.handler)("args".to_string(), runner.command_context()).await;
     assert!(runner.get_command("ship").is_none());
 
     // A unique name keeps its bare name and the reads reset diagnostics.
@@ -1484,4 +1484,31 @@ async fn session_rebindings_land_on_the_next_context() {
         context.mode().expect("the rebound mode"),
         ExtensionMode::Rpc
     );
+}
+
+#[tokio::test]
+async fn no_op_command_actions_decline_every_replacement() {
+    let actions = CommandContextActions::no_ops();
+    (actions.wait_for_idle)().await;
+    assert!(
+        !(actions.new_session)(NewSessionOptions::default())
+            .await
+            .cancelled
+    );
+    assert!(
+        !(actions.fork)("entry".to_string(), ForkOptions::default())
+            .await
+            .cancelled
+    );
+    assert!(
+        !(actions.navigate_tree)("entry".to_string(), NavigateTreeOptions::default())
+            .await
+            .cancelled
+    );
+    assert!(
+        !(actions.switch_session)("path".to_string(), SwitchSessionOptions::default())
+            .await
+            .cancelled
+    );
+    (actions.reload)().await;
 }

@@ -15,6 +15,7 @@ use super::super::super::payload::descriptors::{
 };
 use super::super::super::session::HostConnectOptions;
 use super::super::connection::{Registrations, SessionCore};
+use crate::extensions::runner::ExtensionCommandContext;
 use crate::extensions::runtime::HandlerContext;
 
 /// Build the in-process record over the child's declarations.
@@ -145,7 +146,7 @@ where
         invocation_name: command.name.clone(),
         description: command.description.clone(),
         source_info: options.source_info.clone(),
-        handler: Arc::new(move |args: String, _context: HandlerContext| {
+        handler: Arc::new(move |args: String, _context: ExtensionCommandContext| {
             let core = Arc::clone(&core);
             let name = handler_name.clone();
             Box::pin(async move { core.call_command(&name, &args).await })
