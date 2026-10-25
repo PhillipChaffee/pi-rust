@@ -102,7 +102,8 @@ fn get_message_from_entry_for_compaction(entry: &SessionEntry) -> Option<AgentMe
 
 /// Result from [`compact`] — the session manager adds uuid/parentUuid when
 /// saving, upstream's `CompactionResult`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CompactionResult {
     /// The generated summary, file lists appended.
     pub summary: String,
@@ -111,11 +112,13 @@ pub struct CompactionResult {
     /// The estimated context token count before compaction.
     pub tokens_before: u64,
     /// The estimated tokens after compaction, when computed.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_tokens_after: Option<u64>,
     /// Usage from the LLM call(s) that generated this summary, if available.
     pub usage: Usage,
     /// Extension-specific data (e.g. an `ArtifactIndex`, version markers for
     /// structured compaction).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<JsonValue>,
 }
 
