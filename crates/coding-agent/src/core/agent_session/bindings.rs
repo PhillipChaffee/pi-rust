@@ -66,13 +66,14 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             .filter_map(|entry| entry.record.clone())
             .collect();
         let mode = *lock(&self.extension_mode);
+        let ui = lock(&self.extension_ui).clone();
         let mut runner = ExtensionRunner::new(
             extensions,
             Arc::new(self.context_actions()),
             Arc::new(|| Ok(())),
             self.cwd.clone(),
             mode,
-            None,
+            ui,
             lock(&self.session_manager).clone(),
             ModelRegistry::new(self.model_runtime.clone()),
             extensions_result.runtime,
@@ -115,6 +116,9 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
     ) -> Result<(), String> {
         if let Some(mode) = bindings.mode {
             *lock(&self.extension_mode) = mode;
+        }
+        if let Some(ui) = bindings.ui_context {
+            *lock(&self.extension_ui) = Some(ui);
         }
         if let Some(actions) = bindings.command_context_actions {
             *lock(&self.extension_command_context_actions) = Some(actions);
