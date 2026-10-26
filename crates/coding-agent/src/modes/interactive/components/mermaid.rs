@@ -232,7 +232,7 @@ fn render_flowchart(flowchart: &Flowchart) -> MermaidArt {
     let inner_widths: Vec<usize> = flowchart
         .labels
         .iter()
-        .map(|label| label.chars().count().max(1))
+        .map(|label| label.chars().count() + 2)
         .collect();
     let gap = 4;
     let width = inner_widths.iter().map(|inner| inner + 2).sum::<usize>()
@@ -312,13 +312,17 @@ fn row_with_boxes(
 /// spacing and box drawing, upstream's `codeSpan`.
 fn code_span(line: &str) -> String {
     let content = if line.is_empty() { "\u{a0}" } else { line };
-    let fence_length = content
-        .as_bytes()
-        .split(|byte| *byte == b'`')
-        .map(<[u8]>::len)
-        .max()
-        .unwrap_or(0);
-    let fence = "`".repeat(fence_length + 1);
+    let mut longest_backtick_run = 0;
+    let mut current_run = 0;
+    for character in content.chars() {
+        if character == '`' {
+            current_run += 1;
+            longest_backtick_run = longest_backtick_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    let fence = "`".repeat(longest_backtick_run + 1);
     let padding = if content.starts_with('`') || content.ends_with('`') {
         " "
     } else {

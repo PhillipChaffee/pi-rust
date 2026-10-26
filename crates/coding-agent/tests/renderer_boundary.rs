@@ -174,7 +174,7 @@ fn find_and_grep_and_ls_renderers_cover_calls_and_truncation_warnings() {
         .contains("grep")
     );
     assert!(invoke_call("ls", &json!({ "path": "src", "limit": 5 })).contains("ls"));
-    assert!(invoke_call("find", &json!({})).contains("[invalid arg]"));
+    assert!(invoke_call("find", &json!({ "pattern": 1 })).contains("[invalid arg]"));
     assert!(invoke_call("grep", &json!({ "pattern": "x", "path": 1 })).contains("[invalid arg]"));
 
     let find = invoke_result(
