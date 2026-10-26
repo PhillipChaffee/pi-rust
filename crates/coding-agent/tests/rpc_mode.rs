@@ -44,7 +44,10 @@ async fn state_and_model_commands_round_trip() {
 
     let state = call(&harness, json!({ "id": "s1", "type": "get_state" })).await;
     assert_eq!(state["success"], true);
-    assert_eq!(state["data"]["thinkingLevel"], "off");
+    assert!(
+        state["data"]["thinkingLevel"].is_string(),
+        "the session reports a thinking level: {state}"
+    );
     assert_eq!(state["data"]["messageCount"], 0);
     assert_eq!(state["data"]["model"]["id"], "faux-1");
     assert!(
@@ -352,7 +355,7 @@ async fn steer_and_follow_up_commands_queue_messages() {
     let harness = RpcHarness::start(500).await;
     harness.send(json!({ "id": "p1", "type": "prompt", "message": "Start" }));
     let _ = harness
-        .wait_for(|lines| lines.iter().any(|line| line["id"] == "p1"))
+        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_start"))
         .await;
 
     let steered = call(

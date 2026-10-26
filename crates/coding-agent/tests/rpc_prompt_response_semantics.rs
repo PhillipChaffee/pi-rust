@@ -59,6 +59,9 @@ async fn emits_one_failure_response_when_prompt_preflight_rejects() {
     let _ = harness
         .wait_for(|lines| prompt_responses(lines, "b1-start").len() == 1)
         .await;
+    let _ = harness
+        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_start"))
+        .await;
 
     harness.send(json!({ "id": "b1", "type": "prompt", "message": "Hello" }));
     let lines = harness
@@ -86,6 +89,9 @@ async fn emits_one_success_response_when_prompt_is_queued_during_streaming() {
     let _ = harness
         .wait_for(|lines| prompt_responses(lines, "b3-start").len() == 1)
         .await;
+    let _ = harness
+        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_start"))
+        .await;
 
     harness.send(json!({
         "id": "b3",
@@ -108,6 +114,9 @@ async fn returns_and_clears_queued_steering_and_follow_up_messages() {
     harness.send(json!({ "id": "clear-start", "type": "prompt", "message": "Start" }));
     let _ = harness
         .wait_for(|lines| prompt_responses(lines, "clear-start").len() == 1)
+        .await;
+    let _ = harness
+        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_start"))
         .await;
 
     harness.send(json!({
