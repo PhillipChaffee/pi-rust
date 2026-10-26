@@ -135,7 +135,8 @@ impl AssistantMessageComponent {
 
     /// Re-render the last message with the current settings.
     fn refresh(&self) {
-        if let Some(message) = self.last_message.borrow().clone() {
+        let message = self.last_message.borrow().clone();
+        if let Some(message) = message {
             self.update_content(&message, self.is_streaming.get());
         }
     }
@@ -349,9 +350,9 @@ impl std::fmt::Debug for AssistantMessageComponent {
 
 impl Component for AssistantMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        if self.thinking.dirty.replace(false)
-            && let Some(message) = self.last_message.borrow().clone()
-        {
+        let dirty = self.thinking.dirty.replace(false);
+        let message = self.last_message.borrow().clone();
+        if dirty && let Some(message) = message {
             self.content_container.clear();
             self.rebuild_content(&message, self.is_streaming.get());
         }
