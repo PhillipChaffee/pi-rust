@@ -264,6 +264,7 @@ fn ctrl_backspace_confirms_and_enter_deletes_when_the_query_is_empty() {
 
     list.handle_input(CTRL_BACKSPACE);
     assert_eq!(confirmations.borrow().as_slice(), [Some(session("a").path)]);
+    assert!(output(picker.component.as_ref(), 120).contains("Delete session?"));
 
     list.handle_input(ENTER);
     assert_eq!(
@@ -274,6 +275,23 @@ fn ctrl_backspace_confirms_and_enter_deletes_when_the_query_is_empty() {
         deleted.borrow().as_deref(),
         Some(session("a").path.as_str())
     );
+}
+
+#[test]
+fn escape_cancels_delete_confirmation() {
+    setup(&[]);
+    let picker = picker(vec![session("a")]);
+    let list = picker.component.get_session_list();
+    let confirmations = watch_confirmation(&list);
+
+    list.handle_input(CTRL_D);
+    list.handle_input(ESC);
+
+    assert_eq!(
+        confirmations.borrow().as_slice(),
+        [Some(session("a").path), None]
+    );
+    assert!(!output(picker.component.as_ref(), 120).contains("Delete session?"));
 }
 
 #[test]
@@ -606,6 +624,21 @@ fn set_current_sessions_replaces_the_visible_rows() {
 }
 
 #[test]
+fn all_scope_empty_states_name_the_named_filter() {
+    setup(&[]);
+    let picker = picker(Vec::new());
+    let list = picker.component.get_session_list();
+    list.handle_input(TAB);
+    picker.component.set_all_sessions(Vec::new());
+
+    assert!(output(picker.component.as_ref(), 120).contains("No sessions found"));
+    list.handle_input(CTRL_N);
+    let named = output(picker.component.as_ref(), 120);
+    assert!(named.contains("No named sessions found."));
+    assert!(named.contains("Name: Named"));
+}
+
+#[test]
 fn delete_confirmation_removes_the_file_and_requests_a_refresh() {
     setup(&[]);
     let path = std::env::temp_dir().join(format!(
@@ -760,4 +793,9 @@ fn current_snapshot_updates_do_not_disturb_the_all_scope() {
 
     list.handle_input(TAB);
     assert!(output(picker.component.as_ref(), 120).contains("fresh-row"));
+
+    list.handle_input(TAB);
+    let cached = output(picker.component.as_ref(), 120);
+    assert!(cached.contains("all-row"));
+    assert_eq!(picker.requested_all.get(), 1);
 }
