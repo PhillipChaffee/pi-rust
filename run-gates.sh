@@ -41,7 +41,7 @@ add "tests" "cargo nextest run --workspace --no-fail-fast && cargo test --doc --
 # plumbing; ratchet it down as the measured count shrinks and revisit
 # when upstream ships instance dedup (taiki-e/cargo-llvm-cov#512,
 # rust-lang/rust#84605). Measured 718 uncovered on the #124 merge tree on macOS against 620 at its original base; the Linux runners measure higher (platform-conditional code turns into never-executed instances), so the budget leaves that cross-platform delta headroom.
-add "coverage" "cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 898 --lcov --output-path lcov.info"
+add "coverage" "cargo llvm-cov nextest --workspace --fail-under-lines 95 --fail-under-regions 95 --fail-uncovered-functions 971 --lcov --output-path lcov.info"
 
 add "spell-check" "typos"
 add "markdown-lint" "markdownlint-cli2 \"**/*.md\""

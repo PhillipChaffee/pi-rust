@@ -19,15 +19,18 @@ use super::types::SessionHeader;
 
 /// The session tree node, upstream's `SessionTreeNode` — a defensive copy of
 /// the session structure with resolved labels.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTreeNode {
     /// The entry copy.
     pub entry: FileEntry,
     /// Child nodes, oldest first.
     pub children: Vec<Self>,
     /// The resolved label for this entry, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// The timestamp of the latest label change for this entry, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub label_timestamp: Option<String>,
 }
 

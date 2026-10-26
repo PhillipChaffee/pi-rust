@@ -151,6 +151,7 @@ async fn bound_actions_drive_the_session() {
     session
         .bind_extensions(ExtensionBindings {
             mode: Some(ExtensionMode::Rpc),
+            ui_context: None,
             command_context_actions: Some(command_actions()),
             abort_handler: Some(Arc::new(|| {})),
             shutdown_handler: Some(Arc::new(|| {})),

@@ -95,7 +95,8 @@ pub enum ForkPosition {
 }
 
 /// How a queued message joins a streaming run, upstream's `"steer" | "followUp"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum StreamingBehavior {
     /// Interrupt after the current tool batch.
     Steer,
