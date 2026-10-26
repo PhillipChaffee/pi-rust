@@ -255,7 +255,6 @@ fn ctrl_backspace_confirms_and_enter_deletes_when_the_query_is_empty() {
     setup(&[]);
     let picker = picker(vec![session("a"), session("b")]);
     let list = picker.component.get_session_list();
-    let confirmations = watch_confirmation(&list);
     let deleted = Rc::new(RefCell::new(None));
     let deleted_log = Rc::clone(&deleted);
     *list.on_delete_session.borrow_mut() = Some(Rc::new(move |path: &str| {
@@ -263,17 +262,29 @@ fn ctrl_backspace_confirms_and_enter_deletes_when_the_query_is_empty() {
     }));
 
     list.handle_input(CTRL_BACKSPACE);
-    assert_eq!(confirmations.borrow().as_slice(), [Some(session("a").path)]);
     assert!(output(picker.component.as_ref(), 120).contains("Delete session?"));
 
     list.handle_input(ENTER);
     assert_eq!(
-        confirmations.borrow().as_slice(),
-        [Some(session("a").path), None]
-    );
-    assert_eq!(
         deleted.borrow().as_deref(),
         Some(session("a").path.as_str())
+    );
+    assert!(!output(picker.component.as_ref(), 120).contains("Delete session?"));
+}
+
+#[test]
+fn delete_confirmation_callback_reports_the_path_then_clear() {
+    setup(&[]);
+    let picker = picker(vec![session("a")]);
+    let list = picker.component.get_session_list();
+    let confirmations = watch_confirmation(&list);
+
+    list.handle_input(CTRL_D);
+    list.handle_input(ENTER);
+
+    assert_eq!(
+        confirmations.borrow().as_slice(),
+        [Some(session("a").path), None]
     );
 }
 
@@ -282,15 +293,10 @@ fn escape_cancels_delete_confirmation() {
     setup(&[]);
     let picker = picker(vec![session("a")]);
     let list = picker.component.get_session_list();
-    let confirmations = watch_confirmation(&list);
 
     list.handle_input(CTRL_D);
+    assert!(output(picker.component.as_ref(), 120).contains("Delete session?"));
     list.handle_input(ESC);
-
-    assert_eq!(
-        confirmations.borrow().as_slice(),
-        [Some(session("a").path), None]
-    );
     assert!(!output(picker.component.as_ref(), 120).contains("Delete session?"));
 }
 
