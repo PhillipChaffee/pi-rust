@@ -351,7 +351,7 @@ async fn bash_export_and_compaction_commands_run() {
 }
 
 #[tokio::test]
-async fn steer_and_follow_up_commands_queue_messages() {
+async fn steer_and_follow_up_commands_answer_and_queue() {
     let harness = RpcHarness::start(500).await;
     harness.send(json!({ "id": "p1", "type": "prompt", "message": "Start" }));
     let _ = harness
@@ -371,13 +371,13 @@ async fn steer_and_follow_up_commands_queue_messages() {
     .await;
     assert_eq!(followed["success"], true);
 
+    // A steer may join the run before the queue is read back (the agent polls
+    // steering at its start), so only the follow-up is pinned here; the
+    // prompt-with-behavior case pins the steering arm.
     let cleared = call(&harness, json!({ "id": "q3", "type": "clear_queue" })).await;
     assert_eq!(
-        cleared["data"],
-        json!({
-            "steering": ["Change direction"],
-            "followUp": ["Summarize when finished"]
-        })
+        cleared["data"]["followUp"],
+        json!(["Summarize when finished"])
     );
     assert_eq!(harness.shutdown().await, 0);
 }
