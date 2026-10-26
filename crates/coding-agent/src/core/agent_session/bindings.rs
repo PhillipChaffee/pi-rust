@@ -220,6 +220,8 @@ fn agent_tool_to_definition(tool: &pi_agent_core::types::AgentTool) -> ToolDefin
         parameters: tool.tool.parameters.clone(),
         constrained_sampling: tool.tool.constrained_sampling.clone(),
         render_shell: None,
+        render_call: None,
+        render_result: None,
         prepare_arguments: tool.prepare_arguments.clone(),
         execution_mode: tool.execution_mode,
         execute: Arc::new(move |id, args, _signal, on_update, _context| {

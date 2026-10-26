@@ -106,6 +106,8 @@ where
         parameters: tool.parameters.clone(),
         constrained_sampling: tool.constrained_sampling.clone(),
         render_shell: tool.render_shell,
+        render_call: None,
+        render_result: None,
         prepare_arguments: None,
         execution_mode: tool.execution_mode,
         execute: Arc::new(move |tool_call_id, params, signal, update, context| {

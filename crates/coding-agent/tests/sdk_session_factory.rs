@@ -402,6 +402,8 @@ fn custom_tool(name: &str) -> pi_coding_agent::extensions::types::ToolDefinition
         parameters: json!({"type": "object", "properties": {}}),
         constrained_sampling: None,
         render_shell: None,
+        render_call: None,
+        render_result: None,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(|_id, _args, _signal, _update, _ctx| {

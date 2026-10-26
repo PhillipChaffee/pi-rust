@@ -252,6 +252,8 @@ pub fn tool_definition(name: &str, description: &str, snippet: Option<&str>) -> 
         parameters: json!({ "type": "object" }),
         constrained_sampling: None,
         render_shell: None,
+        render_call: None,
+        render_result: None,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(|_id, _params, _signal, _on_update, _ctx| {

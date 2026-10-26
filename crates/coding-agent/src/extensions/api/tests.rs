@@ -57,6 +57,8 @@ fn simple_tool(name: &str, parameters: serde_json::Value) -> ToolDefinition {
         parameters,
         constrained_sampling: None,
         render_shell: None,
+        render_call: None,
+        render_result: None,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(

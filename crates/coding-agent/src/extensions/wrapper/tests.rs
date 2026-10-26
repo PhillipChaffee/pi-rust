@@ -114,6 +114,8 @@ fn registered_tool(mutation: impl Fn() + Send + Sync + Clone + 'static) -> Regis
             parameters: json!({ "type": "object" }),
             constrained_sampling: None,
             render_shell: None,
+            render_call: None,
+            render_result: None,
             prepare_arguments: None,
             execution_mode: None,
             execute: Arc::new(

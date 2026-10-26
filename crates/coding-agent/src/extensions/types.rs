@@ -17,13 +17,20 @@
 //! runtime path carries validated `serde_json::Value` arguments the same way
 //! the harness tools do.
 
+use std::any::{Any, TypeId};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use pi_agent_core::harness::context::AbortSignal;
 use pi_agent_core::harness::types::AgentHarnessToolUpdateCallback;
-use pi_agent_core::types::ToolExecutionMode;
+use pi_agent_core::types::{CustomAgentMessage, ToolExecutionMode};
 use pi_ai::types::{BoxedFuture, ConstrainedSamplingSetting, Model};
+use pi_tui::tui::Component;
 use serde_json::Value;
+
+use crate::modes::interactive::theme::theme::Theme;
 
 /// The result the tool executes return, upstream's `AgentToolResult`.
 pub use pi_agent_core::types::AgentToolResult;
@@ -37,6 +44,175 @@ pub enum RenderShell {
     /// The tool renders its own framing.
     SelfRender,
 }
+
+/// Rendering options for tool results, upstream's `ToolRenderResultOptions`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToolRenderResultOptions {
+    /// Whether the result view is expanded.
+    pub expanded: bool,
+    /// Whether this is a partial/streaming result.
+    pub is_partial: bool,
+}
+
+/// One tool row's shared renderer state, upstream's `ToolRenderContext.state`.
+///
+/// Renderers keep typed state under their own type id, so the call and result
+/// slots of one row read and write the same value without a global map.
+#[derive(Default)]
+pub struct ToolRenderState {
+    values: RefCell<HashMap<TypeId, Box<dyn Any>>>,
+}
+
+impl std::fmt::Debug for ToolRenderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolRenderState")
+            .field("len", &self.values.borrow().len())
+            .finish()
+    }
+}
+
+impl ToolRenderState {
+    /// An empty state, upstream's `{}` initialized per tool row.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Run `f` over the state value for `T`, inserting `init()` first when
+    /// the type has not been touched yet.
+    ///
+    /// Returns `None` only when the stored value's type and its key disagree,
+    /// which no typed caller can produce.
+    pub fn with_state_mut<T: 'static, R>(
+        &self,
+        init: impl FnOnce() -> T,
+        f: impl FnOnce(&mut T) -> R,
+    ) -> Option<R> {
+        let mut values = self.values.borrow_mut();
+        let value = values
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(init()));
+        value.downcast_mut::<T>().map(f)
+    }
+}
+
+/// Context passed to tool renderers, upstream's `ToolRenderContext`.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the context restates upstream's flag-for-flag `ToolRenderContext`; each bool is one upstream member"
+)]
+pub struct ToolRenderContext<'a> {
+    /// Current tool call arguments, shared across the call/result slots.
+    pub args: &'a Value,
+    /// The tool call id, stable across the call/result slots.
+    pub tool_call_id: &'a str,
+    /// Redraw just this tool row.
+    pub invalidate: &'a dyn Fn(),
+    /// The component the same slot returned last time, if any.
+    pub last_component: Option<Rc<dyn Component>>,
+    /// Shared renderer state for this row.
+    pub state: &'a ToolRenderState,
+    /// Working directory for this tool execution.
+    pub cwd: &'a str,
+    /// Whether the tool execution has started.
+    pub execution_started: bool,
+    /// Whether the tool call arguments are complete.
+    pub args_complete: bool,
+    /// Whether the tool result is partial/streaming.
+    pub is_partial: bool,
+    /// Whether the result view is expanded.
+    pub expanded: bool,
+    /// Whether inline images are currently shown in the TUI.
+    pub show_images: bool,
+    /// Whether the current result is an error.
+    pub is_error: bool,
+}
+
+impl std::fmt::Debug for ToolRenderContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolRenderContext")
+            .field("args", &self.args)
+            .field("tool_call_id", &self.tool_call_id)
+            .field("last_component", &self.last_component.is_some())
+            .field("cwd", &self.cwd)
+            .field("execution_started", &self.execution_started)
+            .field("args_complete", &self.args_complete)
+            .field("is_partial", &self.is_partial)
+            .field("expanded", &self.expanded)
+            .field("show_images", &self.show_images)
+            .field("is_error", &self.is_error)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The call-side render hook, upstream `ToolDefinition.renderCall`.
+pub type ToolRenderCallFn =
+    dyn for<'a> Fn(&'a Value, &'a Theme, &ToolRenderContext<'a>) -> Rc<dyn Component> + Send + Sync;
+
+/// The result-side render hook, upstream `ToolDefinition.renderResult`.
+pub type ToolRenderResultFn = dyn for<'a> Fn(
+        &'a AgentToolResult,
+        &ToolRenderResultOptions,
+        &'a Theme,
+        &ToolRenderContext<'a>,
+    ) -> Rc<dyn Component>
+    + Send
+    + Sync;
+
+/// Options passed to message renderers, upstream's `MessageRenderOptions`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageRenderOptions {
+    /// Whether the message view is expanded.
+    pub expanded: bool,
+    /// Horizontal padding configured by the `outputPad` setting.
+    pub output_pad: usize,
+}
+
+/// The message kind a Markdown transformer runs for, upstream's
+/// `MarkdownTransformContext.messageType`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkdownMessageType {
+    /// A user message.
+    User,
+    /// An assistant text block.
+    Assistant,
+    /// An assistant thinking block.
+    AssistantThinking,
+}
+
+impl MarkdownMessageType {
+    /// The upstream wire spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::AssistantThinking => "assistant-thinking",
+        }
+    }
+}
+
+/// The context a Markdown transformer reads, upstream's
+/// `MarkdownTransformContext`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkdownTransformContext {
+    /// The block being rendered.
+    pub message_type: MarkdownMessageType,
+    /// Whether the message is still streaming.
+    pub is_streaming: bool,
+    /// The width available for content.
+    pub available_width: usize,
+}
+
+/// A Markdown transformer, upstream's `MarkdownTransformer`.
+pub type MarkdownTransformer = Arc<dyn Fn(&str, &MarkdownTransformContext) -> String + Send + Sync>;
+
+/// A custom-message renderer, upstream's `MessageRenderer`.
+pub type MessageRenderer = Arc<
+    dyn Fn(&CustomAgentMessage, &MessageRenderOptions, &Theme) -> Option<Rc<dyn Component>>
+        + Send
+        + Sync,
+>;
 
 /// The extension-facing tool executor, upstream's `ToolDefinition.execute`:
 /// the call id, the validated arguments, the run's abort signal, the
@@ -80,6 +256,10 @@ pub struct ToolDefinition {
     pub prepare_arguments: Option<pi_agent_core::types::AgentToolPrepareArguments>,
     /// Per-tool execution mode override; absent, the default applies.
     pub execution_mode: Option<ToolExecutionMode>,
+    /// Custom rendering for the tool call display.
+    pub render_call: Option<Arc<ToolRenderCallFn>>,
+    /// Custom rendering for the tool result display.
+    pub render_result: Option<Arc<ToolRenderResultFn>>,
     /// Execute the tool.
     pub execute: Arc<ToolExecuteFn>,
 }
@@ -99,6 +279,8 @@ impl std::fmt::Debug for ToolDefinition {
             .field("render_shell", &self.render_shell)
             .field("prepare_arguments", &self.prepare_arguments.is_some())
             .field("execution_mode", &self.execution_mode)
+            .field("render_call", &self.render_call.is_some())
+            .field("render_result", &self.render_result.is_some())
             .field("execute", &())
             .finish_non_exhaustive()
     }
@@ -111,7 +293,7 @@ impl std::fmt::Debug for ToolDefinition {
 /// level, and the session identifiers the bash spawn environment exposes.
 /// The interactive surface (UI methods, run mode, abort, compaction) lands
 /// with its consumers.
-pub trait ExtensionContext: std::any::Any + Send + Sync {
+pub trait ExtensionContext: Any + Send + Sync {
     /// Current working directory, upstream's `ctx.cwd` — the cwd override
     /// every tool's path resolution falls back from.
     fn cwd(&self) -> &str;

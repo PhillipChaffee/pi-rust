@@ -485,6 +485,8 @@ pub fn create_find_tool_definition(cwd: &str, options: Option<FindToolOptions>) 
     let ops = Arc::new(options.operations.unwrap_or_else(default_find_operations));
     let cwd = Arc::new(cwd.to_owned());
 
+    let renderers = super::renderers::find::find_renderers();
+
     ToolDefinition {
         name: "find".to_owned(),
         label: "find".to_owned(),
@@ -503,6 +505,8 @@ pub fn create_find_tool_definition(cwd: &str, options: Option<FindToolOptions>) 
         parameters: find_schema(),
         constrained_sampling: None,
         render_shell: None,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(

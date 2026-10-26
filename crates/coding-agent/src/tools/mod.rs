@@ -5,10 +5,9 @@
 //! The tools execute over the extension-tool contract the
 //! [`crate::extensions`] seam carries: a [`crate::extensions::ToolDefinition`]
 //! wraps into a `pi_agent_core` harness tool through
-//! [`tool_definition_wrapper::wrap_tool_definition`]. Upstream's renderer
-//! slices (`core/tools/renderers/`, `render-utils.ts`) ride the theme
-//! ticket's landing (map child "pi-coding-agent: interactive renderers and
-//! theme system") — their `ToolDefinition` fields land there.
+//! [`tool_definition_wrapper::wrap_tool_definition`]. The renderer modules
+//! (`render-utils` and `renderers/`) live beside the tools and attach to each
+//! definition's `render_call`/`render_result` slots.
 //!
 //! The grep and find tools restate their backing binaries' semantics
 //! natively: find's `fd` walk on the `ignore` crate's hierarchical
@@ -29,6 +28,8 @@ pub mod output_accumulator;
 pub mod path_utils;
 pub mod powershell;
 pub mod read;
+pub mod render_utils;
+pub mod renderers;
 pub mod tool_definition_wrapper;
 pub mod truncate;
 pub mod write;

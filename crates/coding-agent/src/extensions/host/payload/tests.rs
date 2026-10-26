@@ -948,6 +948,8 @@ fn the_tool_declaration_covers_the_declarative_surface() {
         parameters: json!({"type": "object"}),
         constrained_sampling: Some(pi_ai::types::ConstrainedSamplingSetting::Disabled(false)),
         render_shell: Some(crate::extensions::RenderShell::SelfRender),
+        render_call: None,
+        render_result: None,
         prepare_arguments: None,
         execution_mode: Some(ToolExecutionMode::Sequential),
         execute: std::sync::Arc::new(|_, _, _, _, _| {

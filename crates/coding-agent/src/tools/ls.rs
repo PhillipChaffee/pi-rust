@@ -309,6 +309,8 @@ pub fn create_ls_tool_definition(cwd: &str, options: Option<LsToolOptions>) -> T
     let ops = Arc::new(options.operations.unwrap_or_else(default_ls_operations));
     let cwd = Arc::new(cwd.to_owned());
 
+    let renderers = super::renderers::ls::ls_renderers();
+
     ToolDefinition {
         name: "ls".to_owned(),
         label: "ls".to_owned(),
@@ -327,6 +329,8 @@ pub fn create_ls_tool_definition(cwd: &str, options: Option<LsToolOptions>) -> T
         parameters: ls_schema(),
         constrained_sampling: None,
         render_shell: None,
+        render_call: renderers.render_call,
+        render_result: renderers.render_result,
         prepare_arguments: None,
         execution_mode: None,
         execute: Arc::new(
