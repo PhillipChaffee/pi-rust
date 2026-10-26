@@ -83,7 +83,12 @@ impl CustomMessageComponent {
                 output_pad: self.output_pad.get(),
             };
             let active = theme();
-            if let Some(component) = renderer(&self.message, &options, &active) {
+            let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                renderer(&self.message, &options, &active)
+            }))
+            .ok()
+            .flatten();
+            if let Some(component) = rendered {
                 self.container.add_child(Rc::clone(&component));
                 *self.custom_component.borrow_mut() = Some(component);
                 return;

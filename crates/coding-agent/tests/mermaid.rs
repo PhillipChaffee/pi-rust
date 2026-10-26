@@ -219,3 +219,28 @@ fn respects_rendering_modes_and_skips_thinking_blocks() {
         markdown
     );
 }
+
+#[test]
+fn styles_warnings_and_leaves_non_mermaid_fences_alone() {
+    init_theme(Some("dark"), false);
+    let transformer: MarkdownTransformer = create_mermaid_markdown_transformer(
+        Arc::new(|| MermaidRenderingMode::Streaming),
+        Some(theme()),
+    );
+    let rendered = transformer(
+        "```mermaid\nflowchart LR\n  A[Foo] invalid\n```",
+        &MarkdownTransformContext {
+            message_type: MarkdownMessageType::Assistant,
+            is_streaming: false,
+            available_width: 100,
+        },
+    );
+    assert!(rendered.contains(theme().get_fg_ansi("warning")));
+
+    let mixed = transform_mermaid(
+        "```rust\nfn x() {}\n```\n\n```mermaid\nflowchart LR\n  A --> B\n```",
+        &TransformOptions::default(),
+    );
+    assert!(mixed.contains("fn x() {}"));
+    assert!(mixed.contains("───▶"));
+}

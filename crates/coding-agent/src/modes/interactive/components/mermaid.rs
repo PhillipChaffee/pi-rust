@@ -63,6 +63,7 @@ enum Segment<'a> {
 /// the prose segment.
 fn split_mermaid_fences(markdown: &str) -> Vec<Segment<'_>> {
     let mut segments = Vec::new();
+    let mut prose_start = 0;
     let mut search_from = 0;
     let bytes = markdown.as_bytes();
     while search_from < bytes.len() {
@@ -76,11 +77,17 @@ fn split_mermaid_fences(markdown: &str) -> Vec<Segment<'_>> {
         let header = &markdown[open + 3..header_end];
         let language = header.split_whitespace().next().unwrap_or_default();
         if language != "mermaid" {
-            search_from = header_end.min(bytes.len()).saturating_add(1);
+            // Leave the block in the prose segment; skip past its closing
+            // fence so its contents are not scanned for diagrams.
+            let body_start = header_end.min(markdown.len()).saturating_add(1);
+            let Some(close_offset) = markdown[body_start..].find("\n```") else {
+                break;
+            };
+            search_from = (body_start + close_offset + 4).min(markdown.len());
             continue;
         }
-        if open > search_from {
-            segments.push(Segment::Markdown(&markdown[search_from..open]));
+        if open > prose_start {
+            segments.push(Segment::Markdown(&markdown[prose_start..open]));
         }
         let body_start = header_end.min(markdown.len()).saturating_add(1);
         let Some(close_offset) = markdown[body_start..].find("\n```") else {
@@ -88,7 +95,7 @@ fn split_mermaid_fences(markdown: &str) -> Vec<Segment<'_>> {
                 raw: &markdown[open..],
                 body: &markdown[body_start.min(markdown.len())..],
             });
-            search_from = markdown.len();
+            prose_start = markdown.len();
             break;
         };
         let close = body_start + close_offset;
@@ -102,10 +109,11 @@ fn split_mermaid_fences(markdown: &str) -> Vec<Segment<'_>> {
             raw: &markdown[open..raw_end],
             body: &markdown[body_start..close],
         });
+        prose_start = raw_end;
         search_from = raw_end;
     }
-    if search_from < markdown.len() {
-        segments.push(Segment::Markdown(&markdown[search_from..]));
+    if prose_start < markdown.len() {
+        segments.push(Segment::Markdown(&markdown[prose_start..]));
     }
     segments
 }
