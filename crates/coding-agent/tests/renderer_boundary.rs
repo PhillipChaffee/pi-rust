@@ -308,6 +308,44 @@ fn bash_execution_covers_elapsed_preview_and_reader_surfaces() {
 }
 
 #[test]
+fn shell_and_write_result_renderers_cover_collapsed_and_error_rows() {
+    init_theme(Some("dark"), false);
+    let shell_definition =
+        with_built_in_renderers("bash", Some(base_definition("bash"))).expect("bash");
+    let shell = ToolExecutionComponent::new(
+        "bash",
+        "bash-boundary",
+        json!({ "command": "echo hi", "timeout": 5 }),
+        ToolExecutionOptions::default(),
+        Some(shell_definition),
+        render_request(),
+        "/tmp",
+    );
+    shell.mark_execution_started();
+    shell.update_result(text_result("one\ntwo\nthree", json!({})), false, false);
+    let collapsed = strip_ansi(&shell.render(60).join("\n"));
+    assert!(collapsed.contains("$ echo hi"));
+    shell.set_expanded(true);
+    let expanded = strip_ansi(&shell.render(60).join("\n"));
+    assert!(expanded.contains("Took") || expanded.contains("Elapsed"));
+    assert!(expanded.contains("three"));
+
+    let write = ToolExecutionComponent::new(
+        "write",
+        "write-boundary",
+        json!({ "path": "notes.txt", "content": "x" }),
+        ToolExecutionOptions::default(),
+        Some(pi_coding_agent::tools::write::create_write_tool_definition(
+            "/tmp", None,
+        )),
+        render_request(),
+        "/tmp",
+    );
+    write.update_result(text_result("denied", json!({})), true, false);
+    assert!(strip_ansi(&write.render(60).join("\n")).contains("denied"));
+}
+
+#[test]
 fn tool_execution_covers_every_setter_and_the_self_render_mouse_path() {
     init_theme(Some("dark"), false);
     let definition = ToolDefinition {
