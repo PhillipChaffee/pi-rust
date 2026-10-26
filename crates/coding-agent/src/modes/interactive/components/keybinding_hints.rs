@@ -1,37 +1,42 @@
-//! Keybinding hint formatting, upstream
-//! `src/modes/interactive/components/keybinding-hints.ts` at pin
-//! `60e7e76bd7ea25cad1dd6f3f1ce0d18814a42759`.
-//!
-//! Hints read the process-wide keybinding registry, so a remapped action's
-//! physical keys appear in every row that names it.
+//! Key hints use the active registry, including user overrides (#195).
 
 use pi_tui::keybindings::get_keybindings;
 
 use crate::core::keybindings::node_platform;
 use crate::modes::interactive::theme::theme::theme;
 
-/// Format one key chord, mapping `alt` to `option` on macOS, upstream's
-/// `formatKeyPart` plus `formatKeyText`.
+/// Display options for key parts, upstream's `KeyTextFormatOptions`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyTextFormatOptions {
+    /// Capitalize each modifier and key; defaults to false.
+    pub capitalize: bool,
+}
+
+/// Formats slash-separated alternatives and plus-separated key parts.
 #[must_use]
-pub fn format_key_text(key: &str, capitalize: bool) -> String {
+pub fn format_key_text(key: &str, options: KeyTextFormatOptions) -> String {
+    format_key_text_with(key, options, node_platform())
+}
+
+/// The platform-injected form; `darwin` displays `alt` as `option`.
+#[must_use]
+pub fn format_key_text_with(key: &str, options: KeyTextFormatOptions, platform: &str) -> String {
     key.split('/')
-        .map(|chord| {
-            chord
-                .split('+')
+        .map(|key| {
+            key.split('+')
                 .map(|part| {
-                    let display = if node_platform() == "darwin" && part.eq_ignore_ascii_case("alt")
-                    {
+                    let part = if platform == "darwin" && part.eq_ignore_ascii_case("alt") {
                         "option"
                     } else {
                         part
                     };
-                    if capitalize {
-                        let mut characters = display.chars();
-                        characters.next().map_or_else(String::new, |first| {
-                            format!("{}{}", first.to_uppercase(), characters.as_str())
+                    if options.capitalize {
+                        let mut chars = part.chars();
+                        chars.next().map_or_else(String::new, |first| {
+                            first.to_uppercase().collect::<String>() + chars.as_str()
                         })
                     } else {
-                        display.to_string()
+                        part.to_string()
                     }
                 })
                 .collect::<Vec<_>>()
@@ -41,45 +46,31 @@ pub fn format_key_text(key: &str, capitalize: bool) -> String {
         .join("/")
 }
 
-/// The keys bound to `action`, formatted for prose, upstream's `keyText`.
+/// Lowercase key text from the active bindings; unbound actions yield empty text.
 #[must_use]
-pub fn key_text(action: &str) -> String {
-    let keys = get_keybindings().get_keys(action);
-    if keys.is_empty() {
-        return String::new();
-    }
-    format_key_text(&keys.join("/"), false)
+pub fn key_text(keybinding: &str) -> String {
+    let keys = get_keybindings().get_keys(keybinding);
+    format_key_text(&keys.join("/"), KeyTextFormatOptions::default())
 }
 
-/// The keys bound to `action`, capitalized for a label, upstream's
-/// `keyDisplayText`.
+/// Capitalized key text from the active bindings.
 #[must_use]
-pub fn key_display_text(action: &str) -> String {
-    let keys = get_keybindings().get_keys(action);
-    if keys.is_empty() {
-        return String::new();
-    }
-    format_key_text(&keys.join("/"), true)
+pub fn key_display_text(keybinding: &str) -> String {
+    let keys = get_keybindings().get_keys(keybinding);
+    format_key_text(&keys.join("/"), KeyTextFormatOptions { capitalize: true })
 }
 
-/// A dim key chord followed by a muted description, upstream's `keyHint`.
+/// A dimmed active binding followed by its muted description.
 #[must_use]
-pub fn key_hint(action: &str, description: &str) -> String {
-    let theme = theme();
-    format!(
-        "{}{}",
-        theme.fg("dim", &key_text(action)),
-        theme.fg("muted", &format!(" {description}"))
-    )
+pub fn key_hint(keybinding: &str, description: &str) -> String {
+    theme().fg("dim", &key_text(keybinding)) + &theme().fg("muted", &format!(" {description}"))
 }
 
-/// [`key_hint`] over a literal key chord, upstream's `rawKeyHint`.
+/// A literal key hint, for navigation not represented by one registry action.
 #[must_use]
 pub fn raw_key_hint(key: &str, description: &str) -> String {
-    let theme = theme();
-    format!(
-        "{}{}",
-        theme.fg("dim", &format_key_text(key, false)),
-        theme.fg("muted", &format!(" {description}"))
-    )
+    theme().fg(
+        "dim",
+        &format_key_text(key, KeyTextFormatOptions::default()),
+    ) + &theme().fg("muted", &format!(" {description}"))
 }

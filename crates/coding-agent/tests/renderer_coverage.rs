@@ -569,7 +569,9 @@ fn bash_preview_invalidate_and_hint_formatting_are_exercised() {
     assert!(
         pi_coding_agent::modes::interactive::components::keybinding_hints::format_key_text(
             "alt+enter",
-            true
+            pi_coding_agent::modes::interactive::components::keybinding_hints::KeyTextFormatOptions {
+                capitalize: true,
+            }
         )
         .contains("Enter")
     );
