@@ -18,10 +18,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use pi_coding_agent::config::{CONFIG_DIR_NAME, EnvLookup, encode_session_cwd};
+use pi_coding_agent::core::keybindings::migrate_keybindings_config_value;
 use pi_coding_agent::migrations::{
     MigrationReport, migrate_auth_to_auth_json_in, migrate_auth_to_auth_json_with,
     migrate_sessions_from_agent_root_in, migrate_sessions_from_agent_root_with,
-    no_keybindings_migration, print_migration_line, run_migrations_with, run_migrations_with_in,
+    print_migration_line, run_migrations_with, run_migrations_with_in,
 };
 use serde_json::{Map, Value, json};
 
@@ -966,13 +967,14 @@ fn the_with_forms_drive_the_process_entries_through_the_injected_environment() {
 }
 
 #[test]
-fn the_default_printer_prints_and_the_default_keybindings_migrator_passes_through() {
-    // upstream's unoverridden defaults: console.log to stdout, and the
-    // keybindings config untouched until the interactive shell lands the
-    // real migration table.
+fn the_default_printer_prints_and_the_real_keybindings_migrator_answers() {
+    // upstream's unoverridden defaults: console.log to stdout, and the real
+    // `migrateKeybindingsConfig` table behind the sweep's seam.
     print_migration_line("migrations boundary print");
     let config = json!({"a": 1});
-    let outcome = no_keybindings_migration(config.as_object().expect("object"));
+    let outcome = migrate_keybindings_config_value(config.as_object().expect("object"));
 
-    assert_eq!(outcome, None);
+    let (migrated, changed) = outcome.expect("the real migrator always answers");
+    assert!(!changed, "an unknown namespaced key needs no migration");
+    assert_eq!(Value::Object(migrated), config, "unknown keys pass through");
 }
