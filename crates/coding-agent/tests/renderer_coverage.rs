@@ -170,6 +170,7 @@ fn component_surface_methods_and_debug_implementations() {
     assert!(!assistant.children().is_empty());
 
     let user = UserMessageComponent::new("hello", None, 1, Arc::new(Vec::new()));
+    user.set_output_pad(0);
     assert!(!user.children().is_empty());
     user.invalidate();
     let _ = user.handle_mouse(&event(99, 1));
@@ -576,4 +577,156 @@ fn bash_preview_invalidate_and_hint_formatting_are_exercised() {
     let _ = pi_coding_agent::tools::renderers::bash::BashResultRenderComponent::default();
     let truncation = truncate_tail("x", TruncationOptions::default());
     assert!(!truncation.truncated);
+}
+
+#[test]
+fn expanded_results_cover_highlight_and_more_lines_rows() {
+    init_theme(Some("dark"), false);
+    let read = ToolExecutionComponent::new(
+        "read",
+        "expanded-read",
+        json!({ "path": "main.rs" }),
+        ToolExecutionOptions::default(),
+        Some(pi_coding_agent::tools::read::create_read_tool_definition(
+            "/tmp", None,
+        )),
+        render_request(),
+        "/tmp",
+    );
+    let code = (1..=14)
+        .map(|index| format!("let value_{index} = {index};"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    read.update_result(text_result(&code, json!({})), true, false);
+    assert!(strip_ansi(&read.render(120).join("\n")).contains("more lines"));
+
+    let write = ToolExecutionComponent::new(
+        "write",
+        "expanded-write",
+        json!({ "path": "main.rs", "content": (1..=14).map(|index| format!("let v{index} = {index};")).collect::<Vec<_>>().join("\n") }),
+        ToolExecutionOptions::default(),
+        Some(pi_coding_agent::tools::write::create_write_tool_definition(
+            "/tmp", None,
+        )),
+        render_request(),
+        "/tmp",
+    );
+    assert!(strip_ansi(&write.render(120).join("\n")).contains("more lines"));
+
+    for tool in ["find", "grep", "ls"] {
+        let definition = match tool {
+            "find" => pi_coding_agent::tools::find::create_find_tool_definition("/tmp", None),
+            "grep" => pi_coding_agent::tools::grep::create_grep_tool_definition("/tmp", None),
+            _ => pi_coding_agent::tools::ls::create_ls_tool_definition("/tmp", None),
+        };
+        let component = ToolExecutionComponent::new(
+            tool,
+            tool,
+            json!({ "pattern": "x", "path": "src" }),
+            ToolExecutionOptions::default(),
+            Some(definition),
+            render_request(),
+            "/tmp",
+        );
+        let output = (1..=22)
+            .map(|index| format!("row-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        component.update_result(text_result(&output, json!({})), false, false);
+        assert!(strip_ansi(&component.render(120).join("\n")).contains("more lines"));
+        component.set_expanded(true);
+        assert!(strip_ansi(&component.render(120).join("\n")).contains("row-22"));
+    }
+}
+
+#[test]
+fn remaining_debug_and_empty_argument_branches_are_exercised() {
+    init_theme(Some("dark"), false);
+    let _ = format!("{:?}", AssistantMessageOptions::default());
+    let options = AssistantMessageOptions::default();
+    assert_eq!(options.clone().output_pad, options.output_pad);
+    let truncation = VisualTruncateResult::default();
+    assert_eq!(truncation.clone(), truncation);
+    let span = Span {
+        cls: "none",
+        text: "x".to_string(),
+    };
+    assert_eq!(span.clone(), span);
+    let renderers = ToolRenderers::default();
+    let cloned_renderers = renderers.clone();
+    assert!(cloned_renderers.render_call.is_none());
+    assert!(renderers.render_result.is_none());
+    let _ = format!(
+        "{:?}",
+        pi_coding_agent::tools::renderers::bash::BashResultRenderComponent::default()
+    );
+    let _ = pi_coding_agent::tools::renderers::bash::BashResultRenderComponent::default()
+        .handle_mouse(&event(0, 1));
+    let _ = format!("{:?}", base_definition("debug"));
+    let _ = format!("{:?}", ToolRenderResultOptions::default());
+    let _ = format!("{:?}", MessageRenderOptions::default());
+    let _ = format!("{:?}", ToolExecutionOptions::default());
+    let _ = format!("{:?}", truncate_to_visual_lines("x", 1, 10, 0));
+    let _ = format!("{:?}", MarkdownMessageType::AssistantThinking);
+
+    let args = json!({ "path": "" });
+    let definition = pi_coding_agent::tools::renderers::with_built_in_renderers(
+        "read",
+        Some(base_definition("read")),
+    )
+    .expect("read");
+    let state = ToolRenderState::new();
+    let invalidate = || {};
+    let context = ToolRenderContext {
+        args: &args,
+        tool_call_id: "empty",
+        invalidate: &invalidate,
+        last_component: None,
+        state: &state,
+        cwd: "/tmp",
+        execution_started: false,
+        args_complete: true,
+        is_partial: false,
+        expanded: false,
+        show_images: false,
+        is_error: false,
+    };
+    let component = (definition.render_call.as_ref().expect("call"))(
+        &args,
+        &pi_coding_agent::modes::interactive::theme::theme::theme(),
+        &context,
+    );
+    assert!(strip_ansi(&component.render(40).join("\n")).contains("..."));
+
+    let tool = read_component();
+    tool.update_result(image_result(), false, false);
+    tool.set_expanded(true);
+    let fallback = strip_ansi(&tool.render(80).join("\n"));
+    assert!(fallback.contains("caption"));
+}
+
+#[test]
+fn bash_continuation_and_custom_collapse_branches_are_exercised() {
+    init_theme(Some("dark"), false);
+    let shell = BashExecutionComponent::new("echo hi", render_request(), false);
+    shell.append_output("first");
+    shell.append_output("-second\n");
+    assert!(shell.get_output().contains("first-second"));
+
+    let custom = CustomMessageComponent::new(
+        CustomAgentMessage {
+            role: "custom".to_string(),
+            timestamp: 0,
+            data: serde_json::Map::from_iter([
+                ("customType".to_string(), json!("t")),
+                ("content".to_string(), json!("body")),
+            ]),
+        },
+        None,
+        None,
+        1,
+    );
+    custom.set_expanded(true);
+    custom.set_expanded(false);
+    assert!(strip_ansi(&custom.render(40).join("\n")).contains("body"));
 }
