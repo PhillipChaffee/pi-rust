@@ -27,16 +27,26 @@ use serde_json::json;
 
 /// Poll the capture for one request with `method`.
 async fn wait_for_request(captured: &CapturedStdout, method: &str) -> Value {
+    wait_for_request_matching(captured, |line| {
+        line["type"] == "extension_ui_request" && line["method"] == method
+    })
+    .await
+}
+
+/// Poll the capture for one request matching `predicate`.
+async fn wait_for_request_matching(
+    captured: &CapturedStdout,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(request) = captured
-            .parsed()
-            .into_iter()
-            .find(|line| line["type"] == "extension_ui_request" && line["method"] == method)
-        {
-            return request;
+        if let Some(request) = captured.parsed().iter().find(|line| predicate(line)) {
+            return (*request).clone();
         }
-        assert!(Instant::now() < deadline, "timed out waiting for {method}");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the request"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -212,10 +222,11 @@ async fn fire_and_forget_ui_frames_match_the_wire() {
     );
 
     ui.paste_to_editor("pasted");
-    assert_eq!(
-        wait_for_request(&captured, "set_editor_text").await["text"],
-        "pasted"
-    );
+    let pasted = wait_for_request_matching(&captured, |line| {
+        line["method"] == "set_editor_text" && line["text"] == "pasted"
+    })
+    .await;
+    assert_eq!(pasted["text"], "pasted");
 }
 
 #[tokio::test]

@@ -26,6 +26,7 @@ use super::agent_session::runtime_factory;
 use super::sdk_fixture::Fixture;
 use super::sdk_fixture::faux_model;
 use super::sdk_fixture::registry_with_faux_delay;
+use super::sdk_fixture::registry_with_gated_stream;
 
 /// The raw stdout chunks captured through the injectable writer; the
 /// previous writer is restored when the capture drops.
@@ -92,7 +93,7 @@ impl RpcHarness {
     /// # Panics
     /// The fixture's own setup failures, which the tests cannot satisfy.
     pub async fn start(delay_ms: u64) -> Self {
-        Self::start_with(delay_ms, false).await
+        Self::start_registry(registry_with_faux_delay(delay_ms).await, false).await
     }
 
     /// Start the mode over a persisted session manager, the export arms need
@@ -101,12 +102,23 @@ impl RpcHarness {
     /// # Panics
     /// The fixture's own setup failures, which the tests cannot satisfy.
     pub async fn start_persisted(delay_ms: u64) -> Self {
-        Self::start_with(delay_ms, true).await
+        Self::start_registry(registry_with_faux_delay(delay_ms).await, true).await
     }
 
-    async fn start_with(delay_ms: u64, persisted: bool) -> Self {
+    /// Start the mode over the gated stream so queue tests can act while the
+    /// run parks in the provider call.
+    ///
+    /// # Panics
+    /// The fixture's own setup failures, which the tests cannot satisfy.
+    pub async fn start_gated(release: Arc<tokio::sync::Notify>) -> Self {
+        Self::start_registry(registry_with_gated_stream(release).await, false).await
+    }
+
+    async fn start_registry(
+        registry: pi_coding_agent::model_registry::ModelRegistry,
+        persisted: bool,
+    ) -> Self {
         let fixture = Fixture::new();
-        let registry = registry_with_faux_delay(delay_ms).await;
         let factory = runtime_factory(RuntimeFactoryOptions {
             runtime: registry.runtime().clone(),
             model: faux_model(),

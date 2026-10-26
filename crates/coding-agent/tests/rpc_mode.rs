@@ -351,11 +351,16 @@ async fn bash_export_and_compaction_commands_run() {
 }
 
 #[tokio::test]
-async fn steer_and_follow_up_commands_answer_and_queue() {
-    let harness = RpcHarness::start(500).await;
+async fn steer_and_follow_up_commands_queue_messages() {
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let harness = RpcHarness::start_gated(std::sync::Arc::clone(&release)).await;
     harness.send(json!({ "id": "p1", "type": "prompt", "message": "Start" }));
     let _ = harness
-        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_start"))
+        .wait_for(|lines| {
+            lines.iter().any(|line| {
+                line["type"] == "message_start" && line["message"]["role"] == "assistant"
+            })
+        })
         .await;
 
     let steered = call(
@@ -371,14 +376,15 @@ async fn steer_and_follow_up_commands_answer_and_queue() {
     .await;
     assert_eq!(followed["success"], true);
 
-    // A steer may join the run before the queue is read back (the agent polls
-    // steering at its start), so only the follow-up is pinned here; the
-    // prompt-with-behavior case pins the steering arm.
     let cleared = call(&harness, json!({ "id": "q3", "type": "clear_queue" })).await;
     assert_eq!(
-        cleared["data"]["followUp"],
-        json!(["Summarize when finished"])
+        cleared["data"],
+        json!({
+            "steering": ["Change direction"],
+            "followUp": ["Summarize when finished"]
+        })
     );
+    release.notify_waiters();
     assert_eq!(harness.shutdown().await, 0);
 }
 

@@ -105,6 +105,68 @@ pub async fn registry_with_faux() -> ModelRegistry {
 /// # Panics
 /// The provider registration failure, which the fixture cannot satisfy.
 pub async fn registry_with_faux_delay(delay_ms: u64) -> ModelRegistry {
+    registry_with_stream(move |stream| {
+        let settle = stream.clone();
+        let settle_now = |stream: &pi_ai::utils::event_stream::AssistantMessageEventStream| {
+            stream.push(AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message: done_message(),
+            });
+        };
+        if delay_ms == 0 {
+            settle_now(&settle);
+        } else {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                settle_now(&settle);
+            });
+        }
+    })
+    .await
+}
+
+/// A registry whose stream opens immediately and settles only when `release`
+/// notifies, so queue tests can act while the run is parked in the provider
+/// call.
+///
+/// # Panics
+/// The provider registration failure, which the fixture cannot satisfy.
+pub async fn registry_with_gated_stream(release: Arc<tokio::sync::Notify>) -> ModelRegistry {
+    registry_with_stream(
+        move |stream: &pi_ai::utils::event_stream::AssistantMessageEventStream| {
+            stream.push(AssistantMessageEvent::Start {
+                partial: empty_message(),
+            });
+            let settle = stream.clone();
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                release.notified().await;
+                settle.push(AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: done_message(),
+                });
+            });
+        },
+    )
+    .await
+}
+
+/// An assistant message with no content blocks, the stream's start partial.
+fn empty_message() -> AssistantMessage {
+    AssistantMessage {
+        content: Vec::new(),
+        ..done_message()
+    }
+}
+
+/// Register the faux provider over `opener`, which seeds the stream's
+/// settle behavior.
+///
+/// # Panics
+/// The provider registration failure, which the fixture cannot satisfy.
+async fn registry_with_stream(
+    opener: impl Fn(&pi_ai::utils::event_stream::AssistantMessageEventStream) + Send + Sync + 'static,
+) -> ModelRegistry {
     let registry = super::model_layer::create_in_memory_model_registry(
         super::model_layer::empty_auth_storage(),
     )
@@ -119,22 +181,7 @@ pub async fn registry_with_faux_delay(delay_ms: u64) -> ModelRegistry {
                 api_key: Some("faux-key".to_owned()),
                 stream_simple: Some(Arc::new(move |_model, _context, _options| {
                     let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
-                    let settle = stream.clone();
-                    let settle_now =
-                        |stream: &pi_ai::utils::event_stream::AssistantMessageEventStream| {
-                            stream.push(AssistantMessageEvent::Done {
-                                reason: StopReason::Stop,
-                                message: done_message(),
-                            });
-                        };
-                    if delay_ms == 0 {
-                        settle_now(&settle);
-                    } else {
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                            settle_now(&settle);
-                        });
-                    }
+                    opener(&stream);
                     stream
                 })),
                 models: Some(vec![

@@ -109,14 +109,21 @@ async fn emits_one_success_response_when_prompt_is_queued_during_streaming() {
 
 #[tokio::test]
 async fn returns_and_clears_queued_steering_and_follow_up_messages() {
-    let harness = RpcHarness::start(500).await;
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let harness = RpcHarness::start_gated(std::sync::Arc::clone(&release)).await;
 
     harness.send(json!({ "id": "clear-start", "type": "prompt", "message": "Start" }));
     let _ = harness
         .wait_for(|lines| prompt_responses(lines, "clear-start").len() == 1)
         .await;
+    // The stream opens before the provider call parks; a steering message sent
+    // from here waits for the run instead of joining its first turn.
     let _ = harness
-        .wait_for(|lines| lines.iter().any(|line| line["type"] == "agent_start"))
+        .wait_for(|lines| {
+            lines.iter().any(|line| {
+                line["type"] == "message_start" && line["message"]["role"] == "assistant"
+            })
+        })
         .await;
 
     harness.send(json!({
@@ -162,12 +169,13 @@ async fn returns_and_clears_queued_steering_and_follow_up_messages() {
         })
     );
 
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     let agent_starts = harness
         .parsed()
         .iter()
         .filter(|line| line["type"] == "agent_start")
         .count();
+    release.notify_waiters();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(agent_starts, 1, "the cleared queue starts no second run");
     assert_eq!(harness.shutdown().await, 0);
 }
