@@ -109,7 +109,8 @@ pub enum CycleDirection {
 }
 
 /// The model cycle result, upstream's `ModelCycleResult`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelCycleResult {
     /// The selected model.
     pub model: Model,
@@ -120,7 +121,8 @@ pub struct ModelCycleResult {
 }
 
 /// The session token totals.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionTokens {
     /// Prompt tokens.
     pub input: u64,
@@ -135,9 +137,11 @@ pub struct SessionTokens {
 }
 
 /// Session statistics, upstream's `SessionStats`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionStats {
     /// The session file, absent for in-memory sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_file: Option<String>,
     /// The session id.
     pub session_id: String,
@@ -156,15 +160,20 @@ pub struct SessionStats {
     /// Provider-priced cost total.
     pub cost: f64,
     /// The context usage reading, absent without a model.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<crate::extensions::runtime::ContextUsage>,
 }
 
-/// The extension bindings one session accepts, upstream's
-/// `ExtensionBindings` minus the UI context (which rides #132).
+/// The extension bindings one session accepts.
+///
+/// The UI context stays an opaque handle until the interactive surface types
+/// it (#132); the RPC mode's implementation rides it as its concrete type.
 #[derive(Clone, Default)]
 pub struct ExtensionBindings {
     /// The run mode.
     pub mode: Option<ExtensionMode>,
+    /// The bound `ctx.ui` handle, upstream's `uiContext`.
+    pub ui_context: Option<Arc<dyn std::any::Any + Send + Sync>>,
     /// The command-context replace/reload handlers.
     pub command_context_actions: Option<CommandContextActions>,
     /// The abort handler override.
@@ -179,6 +188,7 @@ impl std::fmt::Debug for ExtensionBindings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExtensionBindings")
             .field("mode", &self.mode)
+            .field("ui_context", &self.ui_context.is_some())
             .field(
                 "command_context_actions",
                 &self.command_context_actions.is_some(),
