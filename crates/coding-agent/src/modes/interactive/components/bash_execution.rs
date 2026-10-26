@@ -200,6 +200,10 @@ impl BashExecutionComponent {
         clippy::too_many_lines,
         reason = "the truncation, preview, loader, and status ladder are one upstream method"
     )]
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "the match keeps the error label's two arms explicit; the closure form adds function instances the coverage budget counts"
+    )]
     fn update_display(&self) {
         let theme = theme();
         let full_output = self.output_lines.borrow().join("\n");
@@ -284,15 +288,13 @@ impl BashExecutionComponent {
         }
         match self.status.get() {
             BashStatus::Cancelled => status_parts.push(theme.fg("warning", "(cancelled)")),
-            BashStatus::Error => status_parts.push(theme.fg(
-                "error",
-                &format!(
-                    "(exit {})",
-                    self.exit_code
-                        .get()
-                        .map_or_else(|| "unknown".to_string(), |code| code.to_string())
-                ),
-            )),
+            BashStatus::Error => {
+                let exit = match self.exit_code.get() {
+                    Some(code) => code.to_string(),
+                    None => "unknown".to_string(),
+                };
+                status_parts.push(theme.fg("error", &format!("(exit {exit})")));
+            }
             _ => {}
         }
         let was_truncated = self

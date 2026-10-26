@@ -191,6 +191,10 @@ fn parse_flowchart(body: &str) -> Option<Flowchart> {
 
 /// Parse one node token into its name and label; the shape characters decide
 /// where the label sits, and an unterminated shape keeps the remaining text.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the match keeps the unterminated-shape arm explicit; the closure form adds function instances the coverage budget counts"
+)]
 fn parse_node(token: &str) -> Option<(String, String)> {
     let token = token.split(":::").next().unwrap_or(token);
     if token.is_empty() {
@@ -214,9 +218,10 @@ fn parse_node(token: &str) -> Option<(String, String)> {
         _ => '}',
     };
     let rest = &token[shape + 1..];
-    let label = rest
-        .find(closer)
-        .map_or_else(|| rest.to_string(), |end| rest[..end].to_string());
+    let label = match rest.find(closer) {
+        Some(end) => rest[..end].to_string(),
+        None => rest.to_string(),
+    };
     Some((name.to_string(), label))
 }
 

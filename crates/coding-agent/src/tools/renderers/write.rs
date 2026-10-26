@@ -63,10 +63,10 @@ fn refresh_write_highlight_prefix(cache: &mut WriteHighlightCache) {
     let prefix_source = cache.normalized_lines[..prefix_count].join("\n");
     let prefix_highlighted = highlight_code(&prefix_source, Some(cache.lang));
     for index in 0..prefix_count {
-        cache.highlighted_lines[index] = prefix_highlighted
-            .get(index)
-            .cloned()
-            .unwrap_or_else(|| highlight_single_line(&cache.normalized_lines[index], cache.lang));
+        cache.highlighted_lines[index] = match prefix_highlighted.get(index) {
+            Some(line) => line.clone(),
+            None => highlight_single_line(&cache.normalized_lines[index], cache.lang),
+        };
     }
 }
 

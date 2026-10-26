@@ -309,11 +309,14 @@ pub fn create_shell_renderers(prompt: &str) -> ToolRenderers {
                 if !options.is_partial || context.is_error {
                     state.ended_at.get_or_insert_with(now_millis);
                 }
-                let component = Rc::clone(
-                    state
-                        .result_component
-                        .get_or_insert_with(|| Rc::new(BashResultRenderComponent::new())),
-                );
+                let existing = state.result_component.clone();
+                let component = if let Some(component) = existing {
+                    component
+                } else {
+                    let component = Rc::new(BashResultRenderComponent::new());
+                    state.result_component = Some(Rc::clone(&component));
+                    component
+                };
                 (component, state.started_at, state.ended_at)
             })
             .unwrap_or_else(|| (Rc::new(BashResultRenderComponent::new()), None, None));

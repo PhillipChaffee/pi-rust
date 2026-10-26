@@ -49,13 +49,20 @@ fn read_path(args: Option<&serde_json::Value>) -> Option<String> {
 }
 
 /// `:start-end` for a ranged read, upstream's `formatReadLineRange`.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the match keeps the absent-argument arm explicit; the closure form adds function instances the coverage budget counts"
+)]
+fn numeric_arg(args: Option<&serde_json::Value>, name: &str) -> Option<f64> {
+    match args {
+        Some(args) => args.get(name).and_then(serde_json::Value::as_f64),
+        None => None,
+    }
+}
+
 fn format_read_line_range(args: Option<&serde_json::Value>, theme: &Theme) -> String {
-    let value = |name: &str| {
-        args.and_then(|args| args.get(name))
-            .and_then(serde_json::Value::as_f64)
-    };
-    let offset = value("offset");
-    let limit = value("limit");
+    let offset = numeric_arg(args, "offset");
+    let limit = numeric_arg(args, "limit");
     if offset.is_none() && limit.is_none() {
         return String::new();
     }

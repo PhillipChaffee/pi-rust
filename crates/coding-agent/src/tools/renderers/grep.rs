@@ -18,14 +18,19 @@ use crate::tools::render_utils::{
 use crate::tools::truncate::format_size;
 
 /// The grep call row, upstream's `formatGrepCall`.
+#[expect(
+    clippy::option_if_let_else,
+    reason = "the match keeps the absent-argument arm explicit; the closure form adds function instances the coverage budget counts"
+)]
 fn format_grep_call(args: Option<&serde_json::Value>, theme: &Theme) -> String {
     let pattern = first_string_arg(args, &["pattern"]);
     let raw_path = first_string_arg(args, &["path"]);
     let path = raw_path.map(|path| shorten_path(if path.is_empty() { "." } else { &path }));
     let glob = first_string_arg(args, &["glob"]);
-    let limit = args
-        .and_then(|args| args.get("limit"))
-        .and_then(serde_json::Value::as_f64);
+    let limit = match args {
+        Some(args) => args.get("limit").and_then(serde_json::Value::as_f64),
+        None => None,
+    };
     let invalid_arg = invalid_arg_text(theme);
     let pattern_display = pattern.map_or_else(
         || invalid_arg.clone(),
