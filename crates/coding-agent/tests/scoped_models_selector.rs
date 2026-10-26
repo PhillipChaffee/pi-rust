@@ -255,10 +255,13 @@ fn provider_toggle_edits_the_whole_provider_even_when_search_hides_its_other_mod
     );
     p.component.handle_input("\x10");
     assert_eq!(p.changes.borrow().last(), Some(&None));
+    let mut models = catalog();
+    models[0].name = "UniqueDisplay".to_string();
     p.component
-        .update_models(&catalog(), Some(ids(&["model-a", "missing"])));
+        .update_models(&models, Some(ids(&["model-a", "missing"])));
     p.component.handle_input("\x03");
-    p.component.handle_input("model-a");
+    p.component.handle_input("UniqueDisplay");
+    assert!(!output(&p.component, 200).contains("model-b [faux]"));
     p.component.handle_input("\x10");
     assert_eq!(
         p.changes.borrow().last(),
