@@ -690,21 +690,22 @@ fn failed_delete_reports_the_unlink_error_with_the_trash_hint() {
     fs::write(&path, "session\n").expect("write locked session");
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("lock directory");
 
+    let sanitized = path.display().to_string();
     let mut only = session("locked");
-    only.path = path.display().to_string();
+    only.path = sanitized;
     let picker = picker(vec![only]);
     let list = picker.component.get_session_list();
     list.handle_input(CTRL_D);
     list.handle_input(ENTER);
 
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("unlock directory");
-    let _ = fs::remove_dir_all(&dir);
-
-    assert!(path.exists());
+    assert!(path.exists(), "the failed delete leaves the file in place");
     let text = output(picker.component.as_ref(), 120);
     assert!(text.contains("Failed to delete:"));
     assert!(text.contains("trash:"));
     assert_eq!(picker.refreshed.get(), 0);
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("unlock directory");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]
