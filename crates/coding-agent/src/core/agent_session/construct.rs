@@ -96,6 +96,7 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             pending_bash_messages: Mutex::new(Vec::new()),
             extension_runner: Mutex::new(Arc::new(placeholder)),
             extension_mode: Mutex::new(ExtensionMode::Print),
+            extension_ui: Mutex::new(None),
             extension_command_context_actions: Mutex::new(None),
             extension_abort_handler: Mutex::new(None),
             extension_shutdown_handler: Mutex::new(None),

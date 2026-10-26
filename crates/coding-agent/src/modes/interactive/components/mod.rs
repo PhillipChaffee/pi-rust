@@ -2,8 +2,9 @@
 //! `packages/coding-agent/src/modes/interactive/components/`.
 //!
 //! This module carries the theme-selector pair (#187), the message/tool
-//! renderers (#188), and the thinking/trust selectors (#195); the extension
-//! dialogs and the app frame's remaining selectors land with #131.
+//! renderers (#188), the thinking/trust selectors (#195), and the
+//! scoped-model picker (#198); the extension dialogs and the app frame's
+//! remaining selectors land with #131.
 
 pub mod assistant_message;
 pub mod bash_execution;
@@ -13,6 +14,7 @@ pub mod dynamic_border;
 pub mod keybinding_hints;
 pub mod markdown_transform;
 pub mod mermaid;
+pub mod scoped_models_selector;
 pub mod theme_selector;
 pub mod thinking_selector;
 pub mod tool_execution;

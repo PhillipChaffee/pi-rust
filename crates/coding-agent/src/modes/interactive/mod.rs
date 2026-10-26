@@ -6,4 +6,5 @@
 //! selectors rides #131.
 
 pub mod components;
+pub mod model_search;
 pub mod theme;

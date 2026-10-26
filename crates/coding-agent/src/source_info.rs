@@ -9,7 +9,8 @@
 use crate::package_manager::PathMetadata;
 
 /// The trust scope a resource loads under, upstream's `SourceScope`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SourceScope {
     /// The user's agent dir.
     User,
@@ -21,7 +22,8 @@ pub enum SourceScope {
 
 /// Whether a resource came from a package manifest or a top-level
 /// declaration, upstream's `SourceOrigin`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SourceOrigin {
     /// Declared by a package's `pi` manifest (or an installed package's
     /// default layout).
@@ -32,7 +34,8 @@ pub enum SourceOrigin {
 }
 
 /// Where a loaded resource came from, upstream's `SourceInfo`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SourceInfo {
     /// The resource's own path.
     pub path: String,
@@ -46,6 +49,7 @@ pub struct SourceInfo {
     /// The directory the resource was declared against, upstream's
     /// `baseDir` — the agent dir, the project `.pi` dir, or the package
     /// root.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_dir: Option<String>,
 }
 

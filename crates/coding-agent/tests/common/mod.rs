@@ -44,6 +44,11 @@ pub mod model_layer;
     unused,
     reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
 )]
+pub mod rpc;
+#[allow(
+    unused,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
 pub mod sdk_fixture;
 
 /// A map-backed [`EnvLookup`], the injected environment the `_with`

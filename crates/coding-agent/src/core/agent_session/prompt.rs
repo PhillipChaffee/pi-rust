@@ -55,6 +55,12 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
             notify_preflight(preflight, true);
             return Ok(());
         }
+        if self.is_compacting() {
+            return Err(
+                "Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry."
+                    .to_owned(),
+            );
+        }
         let source = options.source.unwrap_or_default();
         let Some((text, images)) = self
             .run_input_handlers(
