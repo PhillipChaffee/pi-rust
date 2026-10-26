@@ -3,8 +3,9 @@
 //!
 //! This module carries the theme-selector pair (#187), the message/tool
 //! renderers (#188), the thinking/trust selectors (#195), the scoped-model
-//! picker (#198), and the ordinary model picker (#200); the extension dialogs
-//! and the app frame's remaining selectors land with #131.
+//! picker (#198), the ordinary model picker (#200), and the session picker
+//! with its search helper (#202); the extension dialogs and the app frame's
+//! remaining selectors land with #131.
 
 pub mod assistant_message;
 pub mod bash_execution;
@@ -16,6 +17,8 @@ pub mod markdown_transform;
 pub mod mermaid;
 pub mod model_selector;
 pub mod scoped_models_selector;
+pub mod session_selector;
+pub mod session_selector_search;
 pub mod theme_selector;
 pub mod thinking_selector;
 pub mod tool_execution;
