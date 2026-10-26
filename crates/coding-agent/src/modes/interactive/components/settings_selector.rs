@@ -1575,3 +1575,36 @@ impl Component for SettingsSelectorComponent {
         self.container.handle_mouse(event)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pi_tui::tui::{TuiMouseButton, TuiMouseEventType};
+
+    #[test]
+    fn warning_submenu_delegates_component_surfaces() {
+        let done: SettingsSubmenuDone = Rc::new(|_, _| {});
+        let submenu =
+            WarningSettingsSubmenu::new(WarningSettings::default(), Rc::new(|_| {}), done);
+        let _ = submenu.render(80);
+        submenu.handle_input("\r");
+        submenu.invalidate();
+        assert_eq!(submenu.children().len(), 1);
+        let event = TuiMouseEvent {
+            event_type: TuiMouseEventType::Click,
+            button: TuiMouseButton::Left,
+            x: 0,
+            y: 0,
+            screen_x: 0,
+            screen_y: 0,
+            width: 80,
+            height: 10,
+            shift: false,
+            alt: false,
+            ctrl: false,
+            wheel_delta: None,
+            click_count: Some(1),
+        };
+        let _ = submenu.handle_mouse(&event);
+    }
+}

@@ -11,16 +11,21 @@ use std::rc::Rc;
 use pi_agent_core::types::ThinkingLevel;
 use pi_ai::types::{Api, Modality, Model, ModelCost, ModelCostRates, ProviderId, Transport};
 use pi_coding_agent::modes::interactive::components::settings_selector::{
-    SettingsCallbacks, SettingsConfig, SettingsSelectorComponent, WarningSettings,
+    SettingsCallbacks, SettingsConfig, SettingsSelectorComponent, ThemeSubmenu, WarningSettings,
+};
+use pi_coding_agent::modes::interactive::components::settings_submenu::{
+    SelectSubmenu, SteppedSubmenu, SteppedSubmenuOptions, SteppedSubmenuStep, SteppedSubmenuText,
 };
 use pi_coding_agent::modes::interactive::theme::theme::TerminalTheme;
 use pi_coding_agent::settings_manager::{
     DefaultProjectTrust, FullscreenExitOutput, MermaidRenderingMode, QueueMode,
 };
 use pi_tui::components::scroll_view::ScrollViewScrollbar;
+use pi_tui::components::select_list::SelectItem;
+use pi_tui::components::settings_list::SettingsSubmenuDone;
 use pi_tui::tui::{Component, TuiMode};
 
-use selectors::{cancellation, output, setup};
+use selectors::{cancellation, click, output, setup};
 
 fn config() -> SettingsConfig {
     SettingsConfig {
@@ -472,4 +477,265 @@ fn no_models_available_offers_the_login_hint() {
     list.handle_input("\r");
     let rendered = output(list.as_ref(), 120);
     assert!(rendered.contains("No models available"), "{rendered}");
+}
+
+#[test]
+fn cycles_every_scalar_setting_through_its_values() {
+    setup(&[]);
+    let rows: &[(&str, usize)] = &[
+        ("Auto-compact", 2),
+        ("Steering mode", 2),
+        ("Follow-up mode", 2),
+        ("Transport", 4),
+        ("HTTP idle timeout", 4),
+        ("Hide thinking", 2),
+        ("Mermaid diagrams", 3),
+        ("Cache miss notices", 2),
+        ("Collapse changelog", 2),
+        ("Quiet startup", 2),
+        ("Install telemetry", 2),
+        ("Default project trust", 3),
+        ("Double-escape action", 3),
+        ("Tree filter mode", 5),
+        ("TUI mode", 2),
+        ("Fullscreen exit output", 2),
+        ("Fullscreen scrollbar", 3),
+        ("Fullscreen copy on select", 2),
+        ("Editor padding", 4),
+        ("Output padding", 2),
+        ("Autocomplete max items", 6),
+        ("Clear on shrink", 2),
+        ("Terminal progress", 2),
+        ("Show hardware cursor", 2),
+        ("Skill commands", 2),
+        ("Block images", 2),
+        ("Auto-resize images", 2),
+    ];
+    for (label, times) in rows {
+        let selector = component(&config(), noop_callbacks());
+        let list = selector.get_settings_list();
+        assert!(output(list.as_ref(), 120).contains(label), "{label}");
+        for character in label.chars() {
+            list.handle_input(&character.to_string());
+        }
+        for _ in 0..*times {
+            list.handle_input("\r");
+        }
+    }
+}
+
+#[test]
+fn theme_mode_switches_between_single_and_automatic() {
+    setup(&[]);
+    let previews = Rc::new(RefCell::new(Vec::<String>::new()));
+    let (cancellations, on_cancel) = cancellation();
+    let selector = component(
+        &SettingsConfig {
+            current_theme: "dark".to_string(),
+            available_themes: vec!["dark".to_string(), "light".to_string()],
+            ..config()
+        },
+        SettingsCallbacks {
+            on_theme_preview: Some({
+                let previews = Rc::clone(&previews);
+                Rc::new(move |theme| previews.borrow_mut().push(theme.to_string()))
+            }),
+            on_cancel,
+            ..noop_callbacks()
+        },
+    );
+    let list = selector.get_settings_list();
+
+    list.select_item("theme");
+    list.handle_input("\r");
+    list.handle_input("\x1b[A");
+    list.handle_input("\r");
+    assert!(output(list.as_ref(), 120).contains("Automatic Theme"));
+
+    for _ in 0..3 {
+        list.handle_input("\x1b[B");
+    }
+    list.handle_input("\r");
+    assert!(output(list.as_ref(), 120).contains("→ ✓ dark"));
+
+    list.handle_input("\x1b");
+    assert_eq!(previews.borrow().last().map(String::as_str), Some("dark"));
+    assert_eq!(cancellations.get(), 0);
+}
+
+#[test]
+fn automatic_mode_opens_the_dark_theme_picker() {
+    setup(&[]);
+    let selector = component(
+        &SettingsConfig {
+            current_theme: "light/dark".to_string(),
+            available_themes: vec!["dark".to_string(), "light".to_string(), "other".to_string()],
+            ..config()
+        },
+        noop_callbacks(),
+    );
+    let list = selector.get_settings_list();
+
+    list.select_item("theme");
+    list.handle_input("\r");
+    list.handle_input("\x1b[B");
+    list.handle_input("\r");
+    assert!(output(list.as_ref(), 120).contains("→ ✓ dark"));
+
+    list.handle_input("\x1b");
+    assert!(output(list.as_ref(), 120).contains("Automatic Theme"));
+}
+
+#[test]
+fn model_step_search_filters_and_navigates_back() {
+    setup(&[]);
+    let model = thinking_model();
+    let model_key = "test-provider/thinking-model".to_string();
+    let selector = component(
+        &SettingsConfig {
+            default_model: model_key,
+            available_default_models: vec![model],
+            ..config()
+        },
+        noop_callbacks(),
+    );
+    let list = selector.get_settings_list();
+
+    list.select_item("model-thinking");
+    list.handle_input("\r");
+    for character in "thinking".chars() {
+        list.handle_input(&character.to_string());
+    }
+    assert!(output(list.as_ref(), 120).contains("thinking-model"));
+    list.handle_input("\r");
+    assert!(
+        output(list.as_ref(), 120).contains("Thinking Level for thinking-model"),
+        "{}",
+        output(list.as_ref(), 120)
+    );
+
+    list.handle_input("\x1b");
+    assert!(
+        output(list.as_ref(), 120).contains("Per-Model Thinking Level"),
+        "{}",
+        output(list.as_ref(), 120)
+    );
+    list.handle_input("\x1b");
+}
+
+#[test]
+fn changing_a_per_model_level_reports_the_override() {
+    setup(&[]);
+    let changes = Rc::new(RefCell::new(Vec::<(String, String, ThinkingLevel)>::new()));
+    let model = thinking_model();
+    let model_key = "test-provider/thinking-model".to_string();
+    let selector = component(
+        &SettingsConfig {
+            default_model: model_key,
+            available_default_models: vec![model],
+            thinking_level: ThinkingLevel::High,
+            ..config()
+        },
+        SettingsCallbacks {
+            on_model_thinking_level_change: {
+                let changes = Rc::clone(&changes);
+                Rc::new(move |provider, model_id, level| {
+                    changes
+                        .borrow_mut()
+                        .push((provider.to_string(), model_id.to_string(), level));
+                })
+            },
+            ..noop_callbacks()
+        },
+    );
+    let list = selector.get_settings_list();
+
+    list.select_item("model-thinking");
+    list.handle_input("\r");
+    list.handle_input("\r");
+    for _ in 0..4 {
+        list.handle_input("\x1b[B");
+    }
+    list.handle_input("\r");
+    assert_eq!(
+        *changes.borrow(),
+        vec![(
+            "test-provider".to_string(),
+            "thinking-model".to_string(),
+            ThinkingLevel::High
+        )]
+    );
+
+    list.handle_input("\x1b");
+    assert!(output(list.as_ref(), 120).contains("1 configured"));
+}
+
+fn select_item(value: &str) -> SelectItem {
+    SelectItem {
+        value: value.to_string(),
+        label: value.to_string(),
+        description: None,
+    }
+}
+
+#[test]
+fn component_trait_surfaces_delegate_and_render() {
+    setup(&[]);
+    let selector = component(&config(), noop_callbacks());
+    let _ = selector.render(80);
+    selector.handle_input("\x1b");
+    selector.invalidate();
+    assert!(!selector.children().is_empty());
+    let _ = selector.handle_mouse(&click(0, 20));
+
+    let done: SettingsSubmenuDone = Rc::new(|_, _| {});
+    let select = SelectSubmenu::new(
+        "Title",
+        "Description",
+        vec![select_item("a")],
+        "a",
+        Rc::new(|_| {}),
+        Rc::new(|| {}),
+        None,
+        None,
+    );
+    let _ = select.render(80);
+    select.invalidate();
+    assert!(!select.children().is_empty());
+    let _ = select.handle_mouse(&click(0, 20));
+    select.handle_input("\x1b");
+
+    let step = SteppedSubmenuStep {
+        key: "key".to_string(),
+        title: SteppedSubmenuText::Static("Title".to_string()),
+        description: SteppedSubmenuText::Static("Description".to_string()),
+        options: Rc::new(|_| vec![select_item("a")]),
+        preselect: None,
+        searchable: false,
+        layout: None,
+    };
+    let stepped = SteppedSubmenu::new(
+        vec![step],
+        Rc::new(|_| {}),
+        Rc::new(|| {}),
+        SteppedSubmenuOptions::default(),
+    );
+    let _ = stepped.render(80);
+    stepped.invalidate();
+    assert!(!stepped.children().is_empty());
+    let _ = stepped.handle_mouse(&click(0, 20));
+    stepped.handle_input("\r");
+
+    let theme = ThemeSubmenu::new(
+        "dark",
+        TerminalTheme::Dark,
+        vec!["dark".to_string()],
+        noop_callbacks(),
+        done,
+    );
+    let _ = theme.render(80);
+    theme.invalidate();
+    assert!(!theme.children().is_empty());
+    let _ = theme.handle_mouse(&click(0, 20));
+    theme.handle_input("\x1b");
 }
