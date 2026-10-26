@@ -1583,6 +1583,7 @@ mod tests {
 
     #[test]
     fn warning_submenu_delegates_component_surfaces() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
         let done: SettingsSubmenuDone = Rc::new(|_, _| {});
         let submenu =
             WarningSettingsSubmenu::new(WarningSettings::default(), Rc::new(|_| {}), done);
