@@ -8,3 +8,14 @@ pub fn get_model_search_text(id: &str, provider: &str, name: Option<&str>) -> St
         .map_or_else(String::new, |name| format!(" {name}"));
     format!("{id} {provider} {provider}/{id} {provider} {id}{name}")
 }
+
+/// The `/model` picker hoists provider-prefixed matches ahead of proxy
+/// provider ids such as `openrouter/openai/gpt-5`, so the bare model id stays
+/// out of the leading position.
+#[must_use]
+pub fn get_model_selector_search_text(id: &str, provider: &str, name: Option<&str>) -> String {
+    let name = name
+        .filter(|name| !name.is_empty())
+        .map_or_else(String::new, |name| format!(" {name}"));
+    format!("{provider} {provider}/{id} {provider} {id}{name}")
+}
