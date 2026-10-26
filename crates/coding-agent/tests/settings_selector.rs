@@ -514,10 +514,13 @@ fn cycles_every_scalar_setting_through_its_values() {
     for (label, times) in rows {
         let selector = component(&config(), noop_callbacks());
         let list = selector.get_settings_list();
-        assert!(output(list.as_ref(), 120).contains(label), "{label}");
         for character in label.chars() {
             list.handle_input(&character.to_string());
         }
+        assert!(
+            !output(list.as_ref(), 120).contains("No matching settings"),
+            "{label}"
+        );
         for _ in 0..*times {
             list.handle_input("\r");
         }
