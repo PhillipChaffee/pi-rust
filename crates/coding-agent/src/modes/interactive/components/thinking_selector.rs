@@ -21,7 +21,7 @@ use super::keybinding_hints::key_display_text;
 use crate::modes::interactive::theme::theme::{get_select_list_theme, theme};
 
 /// Reasoning descriptions without guessed provider budgets (#195).
-const fn level_details(level: ThinkingLevel) -> (&'static str, &'static str) {
+pub(crate) const fn level_details(level: ThinkingLevel) -> (&'static str, &'static str) {
     match level {
         ThinkingLevel::Off => ("off", "No reasoning"),
         ThinkingLevel::Minimal => ("minimal", "Very brief reasoning"),
