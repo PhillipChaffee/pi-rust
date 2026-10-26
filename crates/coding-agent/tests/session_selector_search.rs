@@ -225,16 +225,18 @@ fn unbalanced_quote_falls_back_to_whitespace_tokens() {
     second.all_messages_text = "node something".to_string();
 
     let parsed = parse_search_query("\"node cve");
+    // Upstream's fallback splits on whitespace and keeps the quote character,
+    // so no ordinary message text matches the first token.
     assert_eq!(parsed.tokens.len(), 2);
     assert!(parsed.error.is_none());
-    assert_eq!(
+    assert!(
         filter(
             &[first, second],
             "\"node cve",
             SortMode::Recent,
             NameFilter::All
-        ),
-        ["a"]
+        )
+        .is_empty()
     );
 }
 
