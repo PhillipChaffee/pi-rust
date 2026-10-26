@@ -3,6 +3,7 @@
 //!
 pub mod dynamic_border;
 pub mod keybinding_hints;
+pub mod scoped_models_selector;
 pub mod theme_selector;
 pub mod thinking_selector;
 pub mod trust_selector;
