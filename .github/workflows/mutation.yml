@@ -1,8 +1,7 @@
 # Nightly mutation testing: a mutant run multiplies the test suite by the
 # mutant count, so it stays off the PR path — this workflow runs on a cron
 # and fails the scheduled run only when the mutation score drops below the
-# floor. Command, pin, floor, and reason: see the README's mutation-testing
-# section.
+# floor. Scope and floor rationale: see the step comments below.
 permissions:
   contents: read  # least privilege: no step in this workflow writes to the repo (GitHub secure-use reference)
 name: mutation
@@ -30,20 +29,25 @@ jobs:
           echo "dfe6dc37d0342c891d2829b5a695aa57c2d0edecef7e7d0399a30cc6e206411e  /tmp/mutants.tar.gz" | sha256sum --check --status
           mkdir -p /tmp/mutx && tar xz -C /tmp/mutx -f /tmp/mutants.tar.gz
           sudo mv /tmp/mutx/cargo-mutants /usr/local/bin/
-      # The run's own zero-missed CI mode exits 2 on ANY surviving mutant, and
-      # the template fixture provably carries equivalent mutants (clamp's
-      # boundary comparisons return the same bound either way) that no test
-      # can kill. The floor step below is the gate. Internal errors exit 1+ —
-      # those must stay red, and outcomes.json is written incrementally, so a
-      # mid-run crash with partial data could otherwise read as green: the
-      # wrapper tolerates ONLY exit 2 and fails on every other code.
+      # Scope: the root aggregate only (`-p pi-rust`). cargo-mutants defaults
+      # to the package in the working directory, and a full-workspace run
+      # multiplies the port's ~8,600-test suite by thousands of mutants, which
+      # cannot fit the nightly budget. The root package's single behavioral
+      # test pins the exact manifest version, so both generated mutants die.
+      # Widening the scope needs a bounded target and a separate decision.
+      #
+      # The run's own zero-missed CI mode exits 2 on ANY surviving mutant; the
+      # floor step below is the gate. Internal errors exit 1+ — those must stay
+      # red, and outcomes.json is written incrementally, so a mid-run crash
+      # with partial data could otherwise read as green: the wrapper tolerates
+      # ONLY exit 2 and fails on every other code.
       - name: Run cargo-mutants (survivors tolerated, errors fail)
         run: |
-          cargo mutants || code=$?
+          cargo mutants -p pi-rust || code=$?
           if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then
             echo "cargo mutants failed with exit $code"
             exit "$code"
           fi
-      - name: Mutation score floor (85, reason in the README)
+      - name: Mutation score floor (85, root-package mutants)
         run: |
           python3 -c "import json, sys; s = json.load(open('mutants.out/outcomes.json')); score = 100 * s['caught'] // s['total_mutants']; print('mutation score %d%% (caught %d/%d, floor 85)' % (score, s['caught'], s['total_mutants'])); sys.exit(0 if score >= 85 else 1)"

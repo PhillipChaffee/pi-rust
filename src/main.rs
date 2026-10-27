@@ -17,7 +17,7 @@ mod tests {
     use super::version;
 
     #[test]
-    fn version_is_set() {
-        assert!(!version().is_empty());
+    fn version_is_the_manifest_version() {
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 }
