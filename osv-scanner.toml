@@ -96,6 +96,17 @@ reason = "rustls 0.21.12 rides only the AWS SDK's legacy hyper-0.14 connector, w
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0349"
 reason = "rustls 0.21.12 rides only the AWS SDK's legacy hyper-0.14 connector, which the Bedrock adapter never selects, and the belt populates no session-store key-group prediction; fixed in the 0.23.46 line hyper 0.14 cannot consume"
+
+# GHSA-h2v8-394m-p7vv / RUSTSEC-2026-0348 (Brotli certificate decompression
+# can allocate up to 1 GiB before authentication) triggers only when the
+# Brotli decoder is enabled. rustls 0.21.12 has no Brotli feature and no
+# Brotli call sites, and it rides the same AWS legacy-connector-only stack as
+# its sibling entries above; the fix lands in the 0.23.46 line hyper 0.14
+# cannot consume. The ignore comes off when the AWS SDK drops the legacy
+# stack, at which point the carrier disappears.
+[[IgnoredVulns]]
+id = "GHSA-h2v8-394m-p7vv"
+reason = "rustls 0.21.12 has no Brotli certificate-decompression feature or code, and it rides only the AWS SDK's legacy hyper-0.14 connector the Bedrock adapter never selects; fixed in the 0.23.46 line hyper 0.14 cannot consume"
 # RUSTSEC-2023-0071 (Marvin Attack) is a decryption side channel against RSA
 # implementations; pi-ai only signs (the RS256 service-account JWT for the
 # Vertex ADC exchange through jsonwebtoken) and never decrypts
