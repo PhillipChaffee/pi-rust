@@ -273,9 +273,8 @@ impl TreeList {
         list.build_active_path();
         list.apply_filter();
 
-        let target = initial_selected_id
-            .and_then(|id| list.tree.id_index.get(id).copied())
-            .or(current_leaf_node);
+        let target =
+            initial_selected_id.map_or(current_leaf_node, |id| list.tree.id_index.get(id).copied());
         let index = list.nearest_visible_from(target);
         list.selected_index.set(index);
         if let Some(&flat_index) = list.filtered_nodes.borrow().get(index) {

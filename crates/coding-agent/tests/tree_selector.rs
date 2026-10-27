@@ -597,7 +597,7 @@ fn empty_tree_renders_the_empty_state_and_ignores_navigation() {
 
 #[test]
 fn every_entry_kind_renders_its_row() {
-    setup(&[("app.tree.filter.cycleBackward", &["ctrl+b"])]);
+    setup(&[("app.tree.filter.cycleBackward", &["ctrl+y"])]);
     let tree = build_tree(vec![
         user_message("user-1", None, "hello"),
         entry(json!({
@@ -675,10 +675,14 @@ fn every_entry_kind_renders_its_row() {
     selector.handle_input("\x0f");
     assert!(output(selector.as_ref(), 200).contains("[user]"));
     selector.handle_input("\x0f");
-    assert!(output(selector.as_ref(), 200).contains("[labeled]"));
+    let rendered = output(selector.as_ref(), 200);
+    assert!(
+        rendered.contains("[labeled]"),
+        "missing [labeled]: {rendered}"
+    );
     selector.handle_input("\x0f");
     assert!(output(selector.as_ref(), 200).contains("[all]"));
-    selector.handle_input("\x02");
+    selector.handle_input("\x19");
     assert!(output(selector.as_ref(), 200).contains("[labeled]"));
 }
 
@@ -811,6 +815,9 @@ fn label_input_edits_cancels_and_clears_labels() {
     assert!(output(selector.as_ref(), 120).contains("Session Tree"));
 
     selector.handle_input("L");
+    for _ in 0.."checkpoint".len() {
+        selector.handle_input("\x1b[C");
+    }
     for _ in 0.."checkpoint".len() {
         selector.handle_input("\x7f");
     }
@@ -1076,7 +1083,7 @@ fn initial_selection_ids_and_labels_round_trip() {
         assistant_message("asst-1", Some("user-1"), "hi"),
         user_message("user-2", Some("asst-1"), "bye"),
     ]);
-    tree[2].label = Some("last".to_string());
+    tree[0].children[0].children[0].label = Some("last".to_string());
     let selector = TreeSelectorComponent::new(
         &tree,
         Some("asst-1"),
