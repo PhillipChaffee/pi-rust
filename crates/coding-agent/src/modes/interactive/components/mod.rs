@@ -5,8 +5,9 @@
 //! renderers (#188), the thinking/trust selectors (#195), the scoped-model
 //! picker (#198), the ordinary model picker (#200), the session picker with
 //! its search helper (#202), the OAuth provider selector (#204), and the
-//! settings selector with its submenus (#206); the extension dialogs and the
-//! app frame's remaining selectors land with #131.
+//! settings selector with its submenus (#206), and the session tree selector
+//! (#208); the extension dialogs and the app frame's remaining selectors land
+//! with #131.
 
 pub mod assistant_message;
 pub mod bash_execution;
@@ -26,6 +27,7 @@ pub mod settings_submenu;
 pub mod theme_selector;
 pub mod thinking_selector;
 pub mod tool_execution;
+pub mod tree_selector;
 pub mod trust_selector;
 pub mod user_message;
 pub mod visual_truncate;
