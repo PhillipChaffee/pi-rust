@@ -921,7 +921,18 @@ fn copy_returns_none_for_rows_without_text() {
         user_message("user-1", None, "hello"),
         model_change("model-1", Some("user-1")),
     ]);
-    let selector = selector(&tree, Some("model-1"));
+    let selector = TreeSelectorComponent::new(
+        &tree,
+        Some("model-1"),
+        24,
+        TreeSelectorOptions {
+            on_select: Rc::new(|_| {}),
+            on_cancel: Rc::new(|| {}),
+            on_label_change: None,
+            initial_selected_id: None,
+            initial_filter_mode: Some(FilterMode::All),
+        },
+    );
     let copied = Rc::new(RefCell::new(Some("sentinel".to_string())));
     let captured = Rc::clone(&copied);
     selector.set_on_copy(Rc::new(move |text| {
