@@ -152,3 +152,16 @@ reason = "unpublished workspace crate; license declared in crates/coding-agent/C
 name = "pi-import"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/import/Cargo.toml"
+
+# block-buffer 0.10.4 (GHSA-qwgh-2vcv-g2f7) is retained by jsonwebtoken
+# 10.4's curve25519-dalek/ecdsa/rsa digest-0.10 line, which cannot consume
+# the fixed 0.12.1 release. The advisory's corrupted-cursor state requires a
+# caller-supplied compression callback to panic and the panic to be caught;
+# neither our direct sha2 0.10 call sites nor the JWT sign/verify path ever
+# supplies a panicking callback or catches one, so the out-of-bounds read
+# cannot be observed here. The ignore comes off when jsonwebtoken moves to
+# digest 0.11/block-buffer 0.12. Verified with
+# `cargo tree -i block-buffer@0.10.4 --workspace`. See #208.
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "block-buffer 0.10.4 rides jsonwebtoken's digest-0.10 cryptography line, which cannot consume 0.12.1; the advisory needs a caller-supplied compression callback to panic and be caught, which no call site here does"
