@@ -327,6 +327,7 @@ async fn copies_the_last_assistant_message_with_an_active_fullscreen_selection_w
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    drop(clipboard);
     assert_eq!(copied, vec!["assistant response".to_owned()]);
     assert!(harness.terminal.writes().contains("Copied!"));
     assert!(!harness.chat_text().contains("Copied last agent message"));
