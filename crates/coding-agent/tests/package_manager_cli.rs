@@ -12,8 +12,8 @@
 //!   artifact (`${installerApiBase}/<version>/download` unpacks to the
 //!   release directory, smoke-tested through `bin/pi --version`), and the
 //!   non-managed rename/pnpm-hint cases drop with the cargo redesign.
-//! - The config-selector cycling case rides the interactive slice's
-//!   selector component (the map's interactive-shell ticket) and defers.
+//! - The config-selector cycling case ports in `tests/config_selector.rs`
+//!   with the interactive slice's selector component (#213).
 //! - The `project_trust` extension-handler cases defer with the
 //!   extension-system slice (ADR 0007's spawn surface).
 //! - `process.exitCode` assertions restate to the returned

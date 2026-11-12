@@ -6,14 +6,18 @@
 //! picker (#198), the ordinary model picker (#200), the session picker with
 //! its search helper (#202), the OAuth provider selector (#204), the
 //! settings selector with its submenus (#206), the session tree selector
-//! (#208), and the user-message/show-images selectors (#210); the extension
-//! dialogs and the app frame's remaining selectors land with #131.
+//! (#208), the user-message/show-images selectors (#210), and the
+//! config/extension selectors with their countdown timer (#213); the app
+//! frame's remaining selectors land with #131.
 
 pub mod assistant_message;
 pub mod bash_execution;
+pub mod config_selector;
+pub mod countdown_timer;
 pub mod custom_message;
 pub mod diff;
 pub mod dynamic_border;
+pub mod extension_selector;
 pub mod keybinding_hints;
 pub mod markdown_transform;
 pub mod mermaid;
