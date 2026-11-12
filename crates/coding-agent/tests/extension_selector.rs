@@ -258,6 +258,9 @@ fn component_surface_answers_contract_queries() {
     assert!(selector.wants_input());
     assert_eq!(selector.children().len(), 9);
     selector.invalidate();
+    let as_component: &dyn Component = &selector;
+    as_component.handle_input("j");
+    assert!(output(&selector, 80).contains("→ Alpha"));
     assert!(format!("{selector:?}").contains("options"));
     assert!(format!("{:?}", ExtensionSelectorOptions::default()).contains("timeout_ms"));
     let countdown = selector.countdown().expect("countdown armed");

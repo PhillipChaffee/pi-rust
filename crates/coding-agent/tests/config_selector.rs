@@ -15,8 +15,8 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use pi_coding_agent::modes::interactive::components::config_selector::{
-    ConfigSelectorComponent, ConfigSelectorOptions, ConfigWriteScope, ScopedResolvedPaths,
-    SelectorCallback,
+    ConfigSelectorComponent, ConfigSelectorOptions, ConfigWriteScope, ResourceType,
+    ScopedResolvedPaths, SelectorCallback,
 };
 use pi_coding_agent::package_manager::{PathMetadata, ResolvedPaths, ResolvedResource};
 use pi_coding_agent::settings_manager::{
@@ -894,6 +894,10 @@ fn component_surface_answers_contract_queries() {
     list.invalidate();
     assert!(format!("{selector:?}").contains("write_scope"));
     assert!(format!("{list:?}").contains("selected_index"));
+    assert!(format!("{:?}", ResourceType::Extensions).contains("Extensions"));
+    assert!(format!("{:?}", ConfigWriteScope::Project).contains("Project"));
+    assert!(format!("{:?}", ScopedResolvedPaths::default()).contains("global"));
+    assert!(format!("{:?}", ConfigSelectorOptions::default()).contains("write_scope"));
 }
 
 #[test]
@@ -949,6 +953,7 @@ fn toggle_callback_reports_the_item_and_its_new_state() {
         Rc::new(|| {}),
     );
     *selector.resource_list().on_toggle.borrow_mut() = Some(Rc::new(move |item, enabled| {
+        let _ = format!("{item:?}");
         captured
             .borrow_mut()
             .push((item.path.clone(), enabled, item.enabled()));

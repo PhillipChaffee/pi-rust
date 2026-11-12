@@ -100,7 +100,7 @@ pub enum ConfigWriteScope {
 
 /// The writable scope a resource resolves against, upstream's
 /// `SettingsScope`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsScope {
     User,
     Project,
@@ -118,7 +118,7 @@ impl SettingsScope {
 
 /// A project resource's override state, upstream's
 /// `ProjectOverrideState`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ProjectOverrideState {
     Inherit,
     Load,
@@ -158,14 +158,12 @@ impl ResourceItem {
 }
 
 /// One resource-type section, upstream's `ResourceSubgroup`.
-#[derive(Debug)]
 struct ResourceSubgroup {
     label: String,
     items: Vec<Rc<ResourceItem>>,
 }
 
 /// One provenance group, upstream's `ResourceGroup`.
-#[derive(Debug)]
 struct ResourceGroup {
     label: String,
     scope: SourceScope,
@@ -173,7 +171,7 @@ struct ResourceGroup {
 }
 
 /// A flattened render row, upstream's `FlatEntry`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum FlatEntry {
     Group(Rc<ResourceGroup>),
     Subgroup {
