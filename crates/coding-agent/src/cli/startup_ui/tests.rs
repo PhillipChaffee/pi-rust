@@ -93,3 +93,92 @@ fn plain_entry_reads_the_process_environment_and_settings_path() {
         should_run_first_time_setup_with(&default_env_lookup(), &get_settings_path())
     );
 }
+
+/// The built-in dark palette on disk, a valid theme document for loader tests.
+const DARK_JSON: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/modes/interactive/theme/dark.json"
+);
+
+/// The built-in light palette on disk.
+const LIGHT_JSON: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/modes/interactive/theme/light.json"
+);
+
+fn theme_resource(path: &str, enabled: bool) -> ResolvedResource {
+    ResolvedResource {
+        path: path.to_string(),
+        enabled,
+        metadata: crate::package_manager::PathMetadata {
+            source: "local".to_string(),
+            scope: crate::source_info::SourceScope::User,
+            origin: crate::source_info::SourceOrigin::TopLevel,
+            base_dir: None,
+        },
+    }
+}
+
+#[test]
+fn loads_only_enabled_themes() {
+    let themes = load_themes(&[
+        theme_resource(DARK_JSON, true),
+        theme_resource(LIGHT_JSON, false),
+    ]);
+    let names: Vec<&str> = themes.iter().filter_map(|theme| theme.name()).collect();
+    assert_eq!(names, vec!["dark"]);
+}
+
+#[test]
+fn keeps_the_first_of_two_themes_with_one_name() {
+    let themes = load_themes(&[
+        theme_resource(DARK_JSON, true),
+        theme_resource(DARK_JSON, true),
+    ]);
+    assert_eq!(themes.len(), 1);
+    assert_eq!(themes[0].source_path(), Some(DARK_JSON));
+}
+
+#[test]
+fn skips_broken_theme_files() {
+    let themes = load_themes(&[
+        theme_resource("/nonexistent/theme.json", true),
+        theme_resource(DARK_JSON, true),
+    ]);
+    let names: Vec<&str> = themes.iter().filter_map(|theme| theme.name()).collect();
+    assert_eq!(names, vec!["dark"]);
+}
+
+#[test]
+fn skips_names_reserved_for_automatic_settings() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("slash.json");
+    let content = std::fs::read_to_string(DARK_JSON).expect("read dark theme");
+    std::fs::write(
+        &path,
+        content.replace("\"name\": \"dark\"", "\"name\": \"custom/dark\""),
+    )
+    .expect("write theme");
+    assert!(load_themes(&[theme_resource(path.to_str().expect("utf-8 path"), true)]).is_empty());
+}
+
+#[tokio::test]
+async fn resolves_themes_from_the_global_settings_array() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut settings = crate::settings_manager::Settings::new();
+    settings.insert("themes".to_string(), serde_json::json!([DARK_JSON]));
+    let manager = SettingsManager::in_memory(
+        &settings,
+        SettingsManagerCreateOptions {
+            project_trusted: Some(false),
+        },
+    );
+    let themes = load_startup_themes(
+        &manager,
+        dir.path().to_str().expect("utf-8 cwd"),
+        dir.path().to_str().expect("utf-8 agent dir"),
+    )
+    .await;
+    let names: Vec<&str> = themes.iter().filter_map(|theme| theme.name()).collect();
+    assert_eq!(names, vec!["dark"]);
+}
