@@ -1525,8 +1525,13 @@ impl crate::trust_manager::ProjectTrustSelector for TrustContext {
 }
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
-    /// Show the settings selector, upstream's `showSettingsSelector`.
-    pub fn show_settings_selector(&self) {
+    /// Resolve the settings snapshot the selector renders. Public so the
+    /// acceptance suite can drive the component with the frame's real
+    /// callbacks.
+    #[must_use]
+    pub fn settings_config(
+        &self,
+    ) -> crate::modes::interactive::components::settings_selector::SettingsConfig {
         // The theme controller reads the settings manager; resolve it before
         // taking the guard below or the same mutex deadlocks.
         let current_theme = self
@@ -1600,6 +1605,12 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             warnings: warning_settings(&settings),
         };
         drop(settings);
+        config
+    }
+
+    /// Show the settings selector, upstream's `showSettingsSelector`.
+    pub fn show_settings_selector(&self) {
+        let config = self.settings_config();
         let callbacks = self.settings_callbacks();
         self.show_selector(|_done| {
             let selector =
@@ -2315,7 +2326,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Handle `/login [provider]`, upstream's `handleLoginCommand`.
-    pub(crate) async fn handle_login_command(&self, provider_ref: Option<&str>) {
+    pub async fn handle_login_command(&self, provider_ref: Option<&str>) {
         let Some(provider_ref) = provider_ref
             .map(str::trim)
             .filter(|value| !value.is_empty())

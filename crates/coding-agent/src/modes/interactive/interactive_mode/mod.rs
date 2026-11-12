@@ -1046,6 +1046,15 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         manager.entries().into_iter().cloned().collect()
     }
 
+    /// The session tree the `/tree` selector renders.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn session_tree(&self) -> Vec<crate::session_manager::SessionTreeNode> {
+        let session = self.session();
+        let manager = lock(&session.session_manager);
+        manager.get_tree()
+    }
+
     /// The settings manager the current session shares.
     pub(crate) fn settings(&self) -> Arc<Mutex<SettingsManager<S>>> {
         self.settings
@@ -1101,6 +1110,14 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     #[must_use]
     pub fn loaded_resources_container(&self) -> Rc<Container> {
         Rc::clone(&self.loaded_resources_container)
+    }
+
+    /// The footer component, upstream's `footer` field.
+    #[must_use]
+    pub fn footer_component(
+        &self,
+    ) -> Rc<crate::modes::interactive::components::footer::FooterComponent> {
+        Rc::clone(&self.footer)
     }
 
     /// The standalone status-indicator container, upstream's
@@ -1166,6 +1183,13 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     #[doc(hidden)]
     pub fn set_changelog_markdown_for_test(&self, markdown: Option<String>) {
         *self.changelog_markdown.borrow_mut() = markdown;
+    }
+
+    /// Arm the implicit project-trust target, the acceptance suite's seam for
+    /// the post-reload save.
+    #[doc(hidden)]
+    pub fn set_auto_trust_on_reload_for_test(&self, cwd: Option<String>) {
+        *self.auto_trust_on_reload_cwd.borrow_mut() = cwd;
     }
 
     /// The extension UI context the session's extensions are bound with.

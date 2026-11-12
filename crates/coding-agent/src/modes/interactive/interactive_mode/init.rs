@@ -18,7 +18,7 @@ use super::InteractiveMode;
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Initialize the mounted frame, upstream's `init`.
-    pub(crate) async fn init(self: &Rc<Self>) {
+    pub async fn init(self: &Rc<Self>) {
         if self.is_initialized.get() {
             return;
         }

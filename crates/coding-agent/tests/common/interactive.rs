@@ -542,6 +542,8 @@ pub struct HarnessOptions {
         pi_coding_agent::modes::interactive::interactive_mode::InteractiveModeOptions,
     /// Mount over this project cwd instead of a fresh temp path.
     pub cwd_override: Option<String>,
+    /// Leave the frame's `tui_mode` unset so it reads the settings' mode.
+    pub use_settings_tui_mode: bool,
 }
 
 impl Default for HarnessOptions {
@@ -561,6 +563,7 @@ impl Default for HarnessOptions {
             verbose: false,
             frame_options: pi_coding_agent::modes::interactive::interactive_mode::InteractiveModeOptions::default(),
             cwd_override: None,
+            use_settings_tui_mode: false,
         }
     }
 }
@@ -696,7 +699,9 @@ impl Harness {
         .expect("runtime");
         let terminal = RecordingTerminal::new(options.terminal_size.0, options.terminal_size.1);
         let mut frame_options = options.frame_options;
-        frame_options.tui_mode = Some(options.tui_mode);
+        if !options.use_settings_tui_mode {
+            frame_options.tui_mode = Some(options.tui_mode);
+        }
         frame_options.verbose = options.verbose;
         let frame = InteractiveMode::new_with_terminal(
             runtime,
