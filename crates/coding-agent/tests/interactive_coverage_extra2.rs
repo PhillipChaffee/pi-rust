@@ -17,11 +17,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use common::interactive::{Harness, HarnessOptions};
+use pi_ai::types::Message;
 use pi_coding_agent::modes::interactive::components::footer::FooterComponent;
 use pi_coding_agent::modes::interactive::components::session_selector::{
     SessionScope, SessionSelectorComponent, SessionSelectorOptions,
 };
 use pi_coding_agent::session_manager::{SessionInfo, SessionManager};
+use pi_coding_agent::settings_manager::Settings;
 use pi_tui::tui::Component;
 
 #[tokio::test]
@@ -73,7 +75,7 @@ fn selector_sessions() -> (Vec<SessionInfo>, String) {
         .expect("current message");
     current
         .append_message(pi_agent_core::types::AgentMessage::Standard(
-            pi_ai::types::Message::Assistant(common::agent_session::assistant_message("reply", 2)),
+            Message::Assistant(common::agent_session::assistant_message("reply", 2)),
         ))
         .expect("current reply");
     let current_path = current.session_file().expect("current file").to_owned();
@@ -161,8 +163,8 @@ async fn tree_selector_renders_every_row_kind_and_filter_view() {
             namespace: None,
         },
     )];
-    let tool_result = pi_agent_core::types::AgentMessage::Standard(
-        pi_ai::types::Message::ToolResult(pi_ai::types::ToolResultMessage {
+    let tool_result = pi_agent_core::types::AgentMessage::Standard(Message::ToolResult(
+        pi_ai::types::ToolResultMessage {
             tool_call_id: "call".to_owned(),
             tool_name: "read".to_owned(),
             content: vec![pi_ai::types::ToolResultBlock::Text(
@@ -176,8 +178,8 @@ async fn tree_selector_renders_every_row_kind_and_filter_view() {
             added_tool_names: None,
             is_error: false,
             timestamp: 3,
-        }),
-    );
+        },
+    ));
     let harness = Harness::new(HarnessOptions {
         seed_manager: Some(Box::new(move |manager: &mut SessionManager| {
             let tool_call = tool_call.clone();
@@ -187,7 +189,7 @@ async fn tree_selector_renders_every_row_kind_and_filter_view() {
                 .expect("user");
             manager
                 .append_message(pi_agent_core::types::AgentMessage::Standard(
-                    pi_ai::types::Message::Assistant(tool_call),
+                    Message::Assistant(tool_call),
                 ))
                 .expect("tool call");
             manager.append_message(tool_result).expect("tool result");
@@ -827,7 +829,7 @@ async fn automatic_theme_submenu_light_and_dark_selects_apply() {
 
 #[tokio::test]
 async fn create_startup_tui_default_wrapper_builds_a_frame() {
-    let settings = pi_coding_agent::settings_manager::Settings::new();
+    let settings = Settings::new();
     let ui =
         pi_coding_agent::cli::startup_ui::create_startup_tui(&settings_manager(&settings)).await;
     assert!(ui.terminal_columns() > 0);
@@ -835,7 +837,7 @@ async fn create_startup_tui_default_wrapper_builds_a_frame() {
 }
 
 fn settings_manager(
-    settings: &pi_coding_agent::settings_manager::Settings,
+    settings: &Settings,
 ) -> pi_coding_agent::settings_manager::SettingsManager<
     pi_coding_agent::settings_manager::InMemorySettingsStorage,
 > {
@@ -843,4 +845,237 @@ fn settings_manager(
         settings,
         pi_coding_agent::settings_manager::SettingsManagerCreateOptions::default(),
     )
+}
+
+#[tokio::test]
+async fn custom_agent_rows_cover_default_and_missing_field_branches() {
+    let harness = Harness::new(HarnessOptions {
+        fixtures: Some(common::interactive::renderer_fixtures()),
+        messages: common::interactive::exchange_messages(),
+        ..HarnessOptions::default()
+    })
+    .await;
+    harness.frame.add_message_to_chat(
+        &common::interactive::custom_agent_message(
+            "bashExecution",
+            serde_json::json!({ "command": "ls" }),
+        ),
+        true,
+    );
+    harness.frame.add_message_to_chat(
+        &common::interactive::custom_agent_message(
+            "bashExecution",
+            serde_json::json!({
+                "command": "rg",
+                "cancelled": true,
+                "truncated": false,
+                "exitCode": null
+            }),
+        ),
+        false,
+    );
+    harness.frame.add_message_to_chat(
+        &common::interactive::custom_agent_message(
+            "custom",
+            serde_json::json!({ "display": true, "customType": "unknown" }),
+        ),
+        false,
+    );
+    harness.frame.add_message_to_chat(
+        &common::interactive::custom_agent_message("compactionSummary", serde_json::json!({})),
+        false,
+    );
+    harness.frame.add_message_to_chat(
+        &common::interactive::custom_agent_message("branchSummary", serde_json::json!({})),
+        false,
+    );
+    harness.frame.add_message_to_chat(
+        &common::interactive::custom_agent_message("unknown", serde_json::json!({})),
+        false,
+    );
+    harness.frame.show_loaded_resources(true);
+    harness.frame.set_tools_expanded(true);
+    harness.frame.set_tools_expanded(false);
+    assert!(!harness.chat_text().is_empty());
+}
+
+#[tokio::test]
+async fn assistant_diagnostics_singular_disabled_and_incomplete_branches() {
+    let mut settings = Settings::new();
+    settings.insert(
+        "showCacheMissNotices".to_owned(),
+        serde_json::Value::Bool(false),
+    );
+    let harness = Harness::new(HarnessOptions {
+        settings,
+        ..HarnessOptions::default()
+    })
+    .await;
+    let mut message = common::agent_session::assistant_message("reply", 1);
+    message.diagnostics = Some(vec![pi_ai::types::AssistantMessageDiagnostic {
+        kind: "anthropic_input_transformations".to_owned(),
+        timestamp: 1,
+        error: None,
+        details: Some(std::collections::BTreeMap::new()),
+    }]);
+    harness.frame.maybe_show_assistant_diagnostics(&message);
+    assert!(harness.chat_text().is_empty());
+
+    let mut settings = Settings::new();
+    settings.insert(
+        "showCacheMissNotices".to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    let harness = Harness::new(HarnessOptions {
+        settings,
+        ..HarnessOptions::default()
+    })
+    .await;
+    let mut details = std::collections::BTreeMap::new();
+    details.insert(
+        "transformations".to_owned(),
+        serde_json::json!([
+            { "type": "thinking_dropped", "reason": "empty" },
+            { "type": "other" }
+        ]),
+    );
+    message.diagnostics = Some(vec![pi_ai::types::AssistantMessageDiagnostic {
+        kind: "anthropic_input_transformations".to_owned(),
+        timestamp: 1,
+        error: None,
+        details: Some(details),
+    }]);
+    harness.frame.maybe_show_assistant_diagnostics(&message);
+    assert!(harness.chat_text().contains("thinking block"));
+}
+
+#[tokio::test]
+async fn render_entries_cover_error_no_message_and_unrendered_custom_rows() {
+    let harness = Harness::new(HarnessOptions::default()).await;
+    let mut assistant = common::agent_session::assistant_message("error", 1);
+    assistant.stop_reason = pi_ai::types::StopReason::Error;
+    assistant.error_message = None;
+    assistant.content = vec![pi_ai::types::AssistantBlock::ToolCall(
+        pi_ai::types::ToolCall {
+            id: "call-error".to_owned(),
+            name: "read".to_owned(),
+            arguments: serde_json::Map::new(),
+            thought_signature: None,
+            namespace: None,
+        },
+    )];
+    let entry: pi_coding_agent::session_manager::FileEntry =
+        serde_json::from_value(serde_json::json!({
+            "type": "message",
+            "id": "assistant-error",
+            "parentId": null,
+            "timestamp": "2025-01-01T00:00:00Z",
+            "message": serde_json::to_value(pi_agent_core::types::AgentMessage::Standard(
+                Message::Assistant(assistant)
+            ))
+            .expect("assistant serializes")
+        }))
+        .expect("entry parses");
+    harness.frame.render_session_entries(&[entry], false, false);
+    let text = harness.chat_text();
+    assert!(text.contains("Error"), "{text}");
+
+    harness.frame.add_custom_entry_to_chat(
+        &serde_json::from_value(serde_json::json!({
+            "type": "custom",
+            "customType": "missing",
+            "id": "custom-missing",
+            "parentId": null,
+            "timestamp": "2025-01-01T00:00:00Z",
+            "data": {}
+        }))
+        .expect("custom entry"),
+    );
+    assert!(harness.chat_text().contains("Error"));
+}
+
+#[tokio::test]
+async fn autocomplete_covers_scoped_models_templates_thinking_and_extension_commands() {
+    use pi_coding_agent::resource_loader::ContextFile;
+
+    let fixtures = common::interactive::ResourceFixtures {
+        prompts: vec![(
+            "two".to_owned(),
+            "/tmp/prompts/two.md".to_owned(),
+            pi_coding_agent::source_info::SourceInfo {
+                path: "/tmp/prompts/two.md".to_owned(),
+                source: "local".to_owned(),
+                scope: pi_coding_agent::source_info::SourceScope::Project,
+                origin: pi_coding_agent::source_info::SourceOrigin::TopLevel,
+                base_dir: None,
+            },
+        )],
+        context_files: vec![ContextFile {
+            path: "/tmp/project/AGENTS.md".to_owned(),
+            content: String::new(),
+        }],
+        extension_factories: common::interactive::command_fixtures(&["demo"]).extension_factories,
+        ..common::interactive::ResourceFixtures::default()
+    };
+    let harness = common::interactive::harness_with(HarnessOptions {
+        fixtures: Some(fixtures),
+        ..HarnessOptions::default()
+    })
+    .await;
+    let model = harness.frame.session().model().expect("model");
+    harness
+        .frame
+        .apply_scoped_models(Some(vec![format!("{}/{}", model.provider.0, model.id)]));
+    let provider = harness.frame.create_base_autocomplete_provider();
+    for line in [
+        "/model faux",
+        "/thinking h",
+        "/login faux",
+        "/two",
+        "/demo",
+        "/missing",
+    ] {
+        let _ = provider.get_suggestions(
+            &[line.to_owned()],
+            0,
+            line.len(),
+            &pi_tui::autocomplete::AutocompleteQueryOptions {
+                signal: tokio_util::sync::CancellationToken::new(),
+                force: true,
+            },
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_info_renders_multi_model_cost_breakdown() {
+    let usage = pi_ai::types::Usage {
+        input: 10,
+        output: 5,
+        total_tokens: 15,
+        cost: pi_ai::types::UsageCost {
+            total: 0.25,
+            ..pi_ai::types::UsageCost::default()
+        },
+        ..pi_ai::types::Usage::default()
+    };
+    let mut first = common::agent_session::assistant_with_usage("one", usage, 2);
+    first.model = "faux-1".to_owned();
+    let mut second = common::agent_session::assistant_with_usage("two", usage, 3);
+    second.model = "faux-2".to_owned();
+    second.provider = pi_ai::types::ProviderId("other".to_owned());
+    let harness = Harness::new(HarnessOptions {
+        messages: vec![
+            common::agent_session::user_message("prompt", 1),
+            pi_agent_core::types::AgentMessage::Standard(Message::Assistant(first)),
+            pi_agent_core::types::AgentMessage::Standard(Message::Assistant(second)),
+        ],
+        ..HarnessOptions::default()
+    })
+    .await;
+    harness.frame.session().set_session_name("multi model");
+    common::interactive::submit(&harness, "/session").await;
+    let text = harness.chat_text();
+    assert!(text.contains("multi model"), "{text}");
+    assert!(text.contains("Cost"), "{text}");
 }

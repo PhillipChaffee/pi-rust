@@ -80,12 +80,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 self.pending_tools.borrow_mut().clear();
                 self.tui.request_render(false);
             }
-            AgentSessionEvent::AgentSettled => {
-                if self.shutdown_requested.get() {
-                    self.shutdown_flag
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
+            AgentSessionEvent::AgentSettled => {}
             AgentSessionEvent::CompactionStart { .. } => {
                 if self
                     .settings()

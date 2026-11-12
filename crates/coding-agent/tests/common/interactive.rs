@@ -1057,6 +1057,23 @@ pub fn command_fixtures(names: &[&str]) -> ResourceFixtures {
     }
 }
 
+/// A custom agent message fixture carrying `role` and a JSON object body.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "call sites read as the JSON literal they pass"
+)]
+pub fn custom_agent_message(
+    role: &str,
+    data: serde_json::Value,
+) -> pi_agent_core::types::AgentMessage {
+    pi_agent_core::types::AgentMessage::Custom(pi_agent_core::types::CustomAgentMessage {
+        role: role.to_owned(),
+        timestamp: 1,
+        data: data.as_object().cloned().unwrap_or_default(),
+    })
+}
+
 /// An Anthropic OAuth credential, the subscription-auth fixture.
 #[must_use]
 pub fn anthropic_oauth_auth() -> pi_coding_agent::auth_storage::AuthStorageData {

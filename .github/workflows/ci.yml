@@ -158,6 +158,14 @@ jobs:
                   rows.append((missing, item["filename"]))
           for missing, filename in sorted(rows, reverse=True)[:40]:
               print(f"uncovered functions {missing:3}  {filename}")
+          rows = []
+          for item in json.load(open("coverage.json"))["data"][0]["files"]:
+              lines = item["summary"]["lines"]
+              missing = lines["count"] - lines["covered"]
+              if missing:
+                  rows.append((missing, item["filename"]))
+          for missing, filename in sorted(rows, reverse=True)[:30]:
+              print(f"uncovered lines {missing:6}  {filename}")
           PY
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
