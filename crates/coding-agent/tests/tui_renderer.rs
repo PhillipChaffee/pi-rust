@@ -109,13 +109,9 @@ fn reference_delegates_and_follows_a_re_point() {
 
     reference.repoint(Rc::clone(&second_tui));
     assert!(Rc::ptr_eq(&reference.current(), &second_tui));
-    assert!(
-        Rc::ptr_eq(
-            &reference.get_focused_component().expect("focus survives"),
-            &first_component
-        ),
-        "the old TUI keeps the focus set before the swap"
-    );
+    // The proxy forwards to the replacement TUI, which starts unfocused; the
+    // frame re-applies focus after mounting, as upstream re-points the proxy.
+    assert!(reference.get_focused_component().is_none());
 
     reference.set_focus(Some(Rc::clone(&second_component)));
     assert!(Rc::ptr_eq(

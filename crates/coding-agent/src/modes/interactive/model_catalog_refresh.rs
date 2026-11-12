@@ -64,7 +64,9 @@ fn refresh_runtime(
     model_runtime: &ModelRuntime,
     options: ModelsRefreshOptions,
 ) -> BoxedFuture<'_, ModelsRefreshResult> {
-    Box::pin(model_runtime.refresh(options))
+    // `ModelRuntime` derefs to its core; naming the core's method keeps the
+    // call from resolving back to this trait's `refresh`.
+    Box::pin(ModelRuntimeCore::refresh(model_runtime, options))
 }
 
 impl ModelCatalogRuntime for ModelRuntime {

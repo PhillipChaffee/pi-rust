@@ -1524,6 +1524,16 @@ impl crate::trust_manager::ProjectTrustSelector for TrustContext {
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show the settings selector, upstream's `showSettingsSelector`.
     pub(crate) fn show_settings_selector(&self) {
+        // The theme controller reads the settings manager; resolve it before
+        // taking the guard below or the same mutex deadlocks.
+        let current_theme = self
+            .theme_controller
+            .get_theme_selection()
+            .unwrap_or_else(|| "dark".to_owned());
+        let terminal_theme = self.theme_controller.get_terminal_theme();
+        // `auto_compaction_enabled` reads the settings manager; resolve it
+        // before taking the guard below or the same mutex deadlocks.
+        let auto_compact = self.session().auto_compaction_enabled();
         let settings = self.settings();
         let settings = settings
             .lock()
@@ -1544,7 +1554,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             })
             .collect();
         let config = crate::modes::interactive::components::settings_selector::SettingsConfig {
-            auto_compact: self.session().auto_compaction_enabled(),
+            auto_compact,
             default_model,
             current_model: self.session().model(),
             available_default_models: self.session().model_runtime().get_available_snapshot(),
@@ -1562,11 +1572,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 .unwrap_or(crate::defaults::DEFAULT_THINKING_LEVEL),
             available_thinking_levels: crate::defaults::THINKING_LEVEL_OPTIONS.to_vec(),
             model_thinking_levels,
-            current_theme: self
-                .theme_controller
-                .get_theme_selection()
-                .unwrap_or_else(|| "dark".to_owned()),
-            terminal_theme: self.theme_controller.get_terminal_theme(),
+            current_theme,
+            terminal_theme,
             available_themes: crate::modes::interactive::theme::theme::get_available_themes(),
             hide_thinking_block: self.hide_thinking_block.get(),
             mermaid_rendering_mode: settings.get_mermaid_rendering_mode(),
@@ -1971,7 +1978,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Restatement: the share ladder needs process and HTTP seams the frame
     /// does not own yet; it reports unavailability instead of half-running.
     pub(crate) async fn handle_share_command(&self) {
-        self.show_error("Session sharing is not wired in this build yet.");
+        super::share::share_current_session(self).await;
     }
 
     /// Handle `/name`.

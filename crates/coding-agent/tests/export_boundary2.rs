@@ -548,8 +548,8 @@ struct ProbeSource {
     radius: bool,
 }
 impl pi_coding_agent::session_share::ShareSessionSource for ProbeSource {
-    fn session_manager(&self) -> &SessionManager {
-        &self.session
+    fn session_manager(&self) -> SessionManager {
+        self.session.clone()
     }
     fn system_prompt(&self) -> Option<String> {
         None

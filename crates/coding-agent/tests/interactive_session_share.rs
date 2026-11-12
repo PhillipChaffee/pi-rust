@@ -50,8 +50,8 @@ impl FakeSession {
 }
 
 impl ShareSessionSource for FakeSession {
-    fn session_manager(&self) -> &SessionManager {
-        &self.manager
+    fn session_manager(&self) -> SessionManager {
+        self.manager.clone()
     }
 
     fn system_prompt(&self) -> Option<String> {

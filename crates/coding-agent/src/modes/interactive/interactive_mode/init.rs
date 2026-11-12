@@ -187,6 +187,14 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         }
     }
 
+    /// Drain queued frame commands once, the run loop's command half.
+    ///
+    /// The acceptance suites submit a line through `submit_text` and drain it
+    /// here instead of starting the loop.
+    pub async fn drain_commands(&self) {
+        self.drain_queues_and_commands().await;
+    }
+
     async fn drain_queues_and_commands(&self) {
         self.drain_events_and_ui();
         loop {

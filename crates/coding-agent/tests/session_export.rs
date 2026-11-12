@@ -215,8 +215,8 @@ struct StubSource {
 }
 
 impl ShareSessionSource for StubSource {
-    fn session_manager(&self) -> &SessionManager {
-        &self.session
+    fn session_manager(&self) -> SessionManager {
+        self.session.clone()
     }
 
     fn system_prompt(&self) -> Option<String> {
@@ -474,8 +474,8 @@ struct NamedSource {
 }
 
 impl ShareSessionSource for NamedSource {
-    fn session_manager(&self) -> &SessionManager {
-        &self.session
+    fn session_manager(&self) -> SessionManager {
+        self.session.clone()
     }
 
     fn system_prompt(&self) -> Option<String> {
@@ -607,8 +607,8 @@ struct RadiusNoTokenSource {
 }
 
 impl ShareSessionSource for RadiusNoTokenSource {
-    fn session_manager(&self) -> &SessionManager {
-        &self.session
+    fn session_manager(&self) -> SessionManager {
+        self.session.clone()
     }
 
     fn system_prompt(&self) -> Option<String> {
@@ -740,8 +740,8 @@ struct RadiusTokenSource {
 }
 
 impl ShareSessionSource for RadiusTokenSource {
-    fn session_manager(&self) -> &SessionManager {
-        &self.session
+    fn session_manager(&self) -> SessionManager {
+        self.session.clone()
     }
 
     fn system_prompt(&self) -> Option<String> {
