@@ -145,6 +145,7 @@ async fn session_selector_covers_scope_sort_filter_rename_and_delete_paths() {
 
 #[tokio::test]
 async fn tree_selector_renders_every_row_kind_and_filter_view() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     use pi_coding_agent::modes::interactive::components::tree_selector::{
         TreeSelectorComponent, TreeSelectorOptions,
     };
@@ -299,6 +300,7 @@ async fn default_editor_mouse_and_history_members_are_reached() {
 
 #[tokio::test]
 async fn session_selector_delete_confirmation_removes_a_non_current_session() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     let (sessions, current_path) = selector_sessions();
     let deleted = Rc::new(RefCell::new(None));
     let deleted_for_callback = Rc::clone(&deleted);
@@ -423,6 +425,7 @@ async fn tree_selector_renders_labels_settings_and_custom_entries() {
 
 #[tokio::test]
 async fn status_spinner_hidden_and_retry_countdown_branches() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     use pi_coding_agent::modes::interactive::components::status_indicator::{
         RetryStatusIndicator, StatusIndicator, StatusIndicatorKind,
     };
@@ -672,6 +675,7 @@ fn app_editor_default_members_are_callable() {
     reason = "one fixture exercises every provenance shape in a single render pass"
 )]
 async fn loaded_resource_renderer_handles_every_provenance_shape() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     use pi_coding_agent::modes::interactive::interactive_mode::{
         LoadedPromptEntry, LoadedResource, LoadedResourcesOptions, LoadedResourcesView,
         LoadedSkillEntry, LoadedThemeEntry, render_loaded_resource_sections,
