@@ -31,7 +31,10 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 20  # bounds a hung network gate; GitHub's default is 360
+    # The instrumented workspace suite grew past the old 20-minute bound when
+    # the interactive frame's coverage suites landed (#131); tests finish in
+    # ~14 minutes, the llvm-cov report takes the rest.
+    timeout-minutes: 30  # bounds a hung network gate; GitHub's default is 360
     env:
       # sccache fronts rustc for the build-heavy steps below so repeated runs
       # stop rebuilding the instrumented 57K-line tree from scratch. GitHub
