@@ -145,10 +145,11 @@ async fn session_selector_covers_scope_sort_filter_rename_and_delete_paths() {
 
 #[tokio::test]
 async fn tree_selector_renders_every_row_kind_and_filter_view() {
-    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     use pi_coding_agent::modes::interactive::components::tree_selector::{
         TreeSelectorComponent, TreeSelectorOptions,
     };
+
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
 
     let mut tool_call = common::agent_session::assistant_message("tool", 2);
     tool_call.content = vec![pi_ai::types::AssistantBlock::ToolCall(
