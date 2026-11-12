@@ -15,7 +15,36 @@ use pi_ai::types::BoxedFuture;
 use crate::extensions::ToolDefinition;
 use crate::extensions::events::ExtensionEvent;
 use crate::extensions::results::HandlerResult;
+use crate::extensions::types::{MarkdownTransformer, MessageRenderer};
+use crate::modes::interactive::components::custom_entry::EntryRenderer;
 use crate::source_info::SourceInfo;
+
+/// One shortcut handler, upstream's `registerShortcut` handler.
+pub type ShortcutHandler = Arc<dyn Fn(HandlerContext) -> BoxedFuture<'static, ()> + Send + Sync>;
+
+/// One registered keyboard shortcut, upstream's `ExtensionShortcut`.
+#[derive(Clone)]
+pub struct RegisteredShortcut {
+    /// The shortcut key id the extension registered, upstream verbatim.
+    pub key: String,
+    /// The action description shown in `/hotkeys`.
+    pub description: Option<String>,
+    /// The extension that registered it.
+    pub extension_path: String,
+    /// The handler.
+    pub handler: ShortcutHandler,
+}
+
+impl std::fmt::Debug for RegisteredShortcut {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegisteredShortcut")
+            .field("key", &self.key)
+            .field("description", &self.description)
+            .field("extension_path", &self.extension_path)
+            .finish_non_exhaustive()
+    }
+}
 
 /// One event handler, upstream's `ExtensionHandler`.
 pub type ExtensionHandler = Arc<
@@ -117,6 +146,15 @@ pub struct Extension {
     pub tools: Mutex<Vec<RegisteredTool>>,
     /// The registered commands, upstream's `commands: Map`.
     pub commands: Mutex<Vec<ResolvedCommand>>,
+    /// The registered shortcuts, upstream's `shortcuts: Map`. A later
+    /// registration of the same key replaces the earlier one.
+    shortcuts: Mutex<Vec<RegisteredShortcut>>,
+    /// The single Markdown transformer, upstream's `markdownTransformer`.
+    markdown_transformer: Mutex<Option<MarkdownTransformer>>,
+    /// The custom-message renderers keyed by `customType`.
+    message_renderers: Mutex<HashMap<String, MessageRenderer>>,
+    /// The custom-entry renderers keyed by `customType`.
+    entry_renderers: Mutex<HashMap<String, EntryRenderer>>,
     /// The registered flags, upstream's `flags: Map` in registration order.
     flags: Mutex<Vec<ExtensionFlag>>,
 }
@@ -133,6 +171,10 @@ impl Extension {
             handlers: Mutex::new(HashMap::new()),
             tools: Mutex::new(Vec::new()),
             commands: Mutex::new(Vec::new()),
+            shortcuts: Mutex::new(Vec::new()),
+            markdown_transformer: Mutex::new(None),
+            message_renderers: Mutex::new(HashMap::new()),
+            entry_renderers: Mutex::new(HashMap::new()),
             flags: Mutex::new(Vec::new()),
         }
     }
@@ -207,6 +249,89 @@ impl Extension {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(command);
+    }
+
+    /// Register one keyboard shortcut, upstream's `pi.registerShortcut`; a
+    /// later registration of the same key replaces the earlier one.
+    pub fn register_shortcut(&self, shortcut: RegisteredShortcut) {
+        let mut shortcuts = self
+            .shortcuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = shortcuts
+            .iter_mut()
+            .find(|existing| existing.key == shortcut.key)
+        {
+            *existing = shortcut;
+            return;
+        }
+        shortcuts.push(shortcut);
+    }
+
+    /// Register the Markdown transformer, upstream's
+    /// `pi.registerMarkdownTransformer`; a later registration replaces it.
+    pub fn register_markdown_transformer(&self, transformer: MarkdownTransformer) {
+        *self
+            .markdown_transformer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(transformer);
+    }
+
+    /// Register a custom-message renderer, upstream's
+    /// `pi.registerMessageRenderer`.
+    pub fn register_message_renderer(&self, custom_type: String, renderer: MessageRenderer) {
+        self.message_renderers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(custom_type, renderer);
+    }
+
+    /// Register a custom-entry renderer, upstream's
+    /// `pi.registerEntryRenderer`.
+    pub fn register_entry_renderer(&self, custom_type: String, renderer: EntryRenderer) {
+        self.entry_renderers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(custom_type, renderer);
+    }
+
+    /// The registered shortcuts in registration order, the read the runner's
+    /// `getShortcuts` walks.
+    #[must_use]
+    pub fn shortcuts(&self) -> Vec<RegisteredShortcut> {
+        self.shortcuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The registered Markdown transformer, when one exists.
+    #[must_use]
+    pub fn markdown_transformer(&self) -> Option<MarkdownTransformer> {
+        self.markdown_transformer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// One custom-message renderer by type.
+    #[must_use]
+    pub fn message_renderer(&self, custom_type: &str) -> Option<MessageRenderer> {
+        self.message_renderers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(custom_type)
+            .cloned()
+    }
+
+    /// One custom-entry renderer by type.
+    #[must_use]
+    pub fn entry_renderer(&self, custom_type: &str) -> Option<EntryRenderer> {
+        self.entry_renderers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(custom_type)
+            .cloned()
     }
 }
 
@@ -538,6 +663,19 @@ impl std::fmt::Debug for Extension {
             .field("handlers", &handlers.keys().collect::<Vec<_>>())
             .field("tools", &tools.len())
             .field("commands", &commands.len())
+            .field("shortcuts", &self.shortcuts().len())
+            .field(
+                "markdown_transformer",
+                &self.markdown_transformer().is_some(),
+            )
+            .field(
+                "message_renderers",
+                &self.message_renderers.lock().map_or(0, |map| map.len()),
+            )
+            .field(
+                "entry_renderers",
+                &self.entry_renderers.lock().map_or(0, |map| map.len()),
+            )
             .field(
                 "flags",
                 &flags.iter().map(|flag| &flag.name).collect::<Vec<_>>(),

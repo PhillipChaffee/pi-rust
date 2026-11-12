@@ -40,6 +40,8 @@ use std::ops::Deref;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use pi_tui::autocomplete::AutocompleteProvider;
+use pi_tui::components::EditorComponent;
 use pi_tui::components::editor::{
     Editor, EditorCallback, EditorColorFn, EditorOptions, EditorTheme,
 };
@@ -432,6 +434,40 @@ impl Focusable for CustomEditor {
 
     fn is_focused(&self) -> bool {
         self.editor.is_focused()
+    }
+}
+
+impl EditorComponent for CustomEditor {
+    fn get_text(&self) -> String {
+        self.editor.get_text()
+    }
+
+    fn set_text(&self, text: &str) {
+        self.editor.set_text(text);
+    }
+
+    fn add_to_history(&self, text: &str) {
+        self.editor.add_to_history(text);
+    }
+
+    fn insert_text_at_cursor(&self, text: &str) {
+        self.editor.insert_text_at_cursor(text);
+    }
+
+    fn get_expanded_text(&self) -> Option<String> {
+        Some(self.editor.get_expanded_text())
+    }
+
+    fn set_padding_x(&self, padding: usize) {
+        self.editor.set_padding_x(padding);
+    }
+
+    fn set_autocomplete_provider(&self, provider: std::sync::Arc<dyn AutocompleteProvider>) {
+        self.editor.set_autocomplete_provider(provider);
+    }
+
+    fn set_autocomplete_max_visible(&self, max_visible: usize) {
+        self.editor.set_autocomplete_max_visible(max_visible);
     }
 }
 

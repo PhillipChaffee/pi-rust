@@ -1169,6 +1169,20 @@ impl Tui {
         Arc::clone(&self.key_parser)
     }
 
+    /// Replace the rendering strategy behind this TUI, the port's seam for
+    /// upstream's `TuiBase` subclass swap between the main-screen and
+    /// alternate-screen presentations.
+    ///
+    /// The interactive frame keeps one stable `Tui` so components holding its
+    /// `Rc` keep rendering through the replacement; the renderer is re-handed
+    /// its base the same way [`Tui::new`] does after construction.
+    pub fn set_renderer(&self, renderer: Box<dyn TuiRenderer>) {
+        *self.renderer.borrow_mut() = renderer;
+        if let Some(tui) = self.self_weak.upgrade() {
+            self.renderer.borrow().attach_base(&tui);
+        }
+    }
+
     /// Install the callback for the debug key (Shift+Ctrl+D), called before
     /// input is forwarded to the focused component, upstream's public
     /// `onDebug` field.

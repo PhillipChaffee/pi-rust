@@ -34,7 +34,10 @@ use crate::extensions::runtime::{
     CommandHandler, Extension, ExtensionFlag, ExtensionHandler, FlagType, FlagValue,
     RegisteredTool, ResolvedCommand,
 };
+use crate::extensions::runtime::{RegisteredShortcut, ShortcutHandler};
 use crate::extensions::types::ToolDefinition;
+use crate::extensions::types::{MarkdownTransformer, MessageRenderer};
+use crate::modes::interactive::components::custom_entry::EntryRenderer;
 use crate::provider_composer::ProviderConfigInput;
 use crate::source_info::{
     SourceOrigin, SourceScope, SyntheticSourceOptions, create_synthetic_source_info,
@@ -822,6 +825,72 @@ impl ExtensionApi {
             source_info: self.extension.source_info.clone(),
             handler,
         });
+        Ok(())
+    }
+
+    /// Register one keyboard shortcut, upstream's `pi.registerShortcut`.
+    ///
+    /// # Errors
+    /// When the API may not act.
+    pub fn register_shortcut(
+        &self,
+        key: String,
+        description: Option<String>,
+        handler: ShortcutHandler,
+    ) -> Result<(), String> {
+        self.assert_active()?;
+        self.extension.register_shortcut(RegisteredShortcut {
+            key,
+            description,
+            extension_path: self.extension.path.clone(),
+            handler,
+        });
+        Ok(())
+    }
+
+    /// Register the Markdown transformer, upstream's
+    /// `pi.registerMarkdownTransformer`.
+    ///
+    /// # Errors
+    /// When the API may not act.
+    pub fn register_markdown_transformer(
+        &self,
+        transformer: MarkdownTransformer,
+    ) -> Result<(), String> {
+        self.assert_active()?;
+        self.extension.register_markdown_transformer(transformer);
+        Ok(())
+    }
+
+    /// Register a custom-message renderer, upstream's
+    /// `pi.registerMessageRenderer`.
+    ///
+    /// # Errors
+    /// When the API may not act.
+    pub fn register_message_renderer(
+        &self,
+        custom_type: String,
+        renderer: MessageRenderer,
+    ) -> Result<(), String> {
+        self.assert_active()?;
+        self.extension
+            .register_message_renderer(custom_type, renderer);
+        Ok(())
+    }
+
+    /// Register a custom-entry renderer, upstream's
+    /// `pi.registerEntryRenderer`.
+    ///
+    /// # Errors
+    /// When the API may not act.
+    pub fn register_entry_renderer(
+        &self,
+        custom_type: String,
+        renderer: EntryRenderer,
+    ) -> Result<(), String> {
+        self.assert_active()?;
+        self.extension
+            .register_entry_renderer(custom_type, renderer);
         Ok(())
     }
     /// Register one CLI flag, upstream's `pi.registerFlag`: a default must
