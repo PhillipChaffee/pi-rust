@@ -312,11 +312,22 @@ async fn copies_the_last_assistant_message_with_an_active_fullscreen_selection_w
     })
     .await;
     select_first_two_lines(&harness, &harness.terminal);
+    // Copy-on-select may hand its write to the clipboard worker; let it
+    // settle before clearing so the explicit copy is the only recorded write.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     clipboard.clear();
 
     harness.frame.handle_copy_command(true, true).await;
 
-    assert_eq!(clipboard.copied(), vec!["assistant response".to_owned()]);
+    let mut copied = Vec::new();
+    for _ in 0..100 {
+        copied = clipboard.copied();
+        if !copied.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(copied, vec!["assistant response".to_owned()]);
     assert!(harness.terminal.writes().contains("Copied!"));
     assert!(!harness.chat_text().contains("Copied last agent message"));
 }
