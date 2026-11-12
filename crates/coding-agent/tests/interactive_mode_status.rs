@@ -759,6 +759,7 @@ async fn labels_windows_npm_siblings_relative_to_the_declaring_package() {
 
 #[tokio::test]
 async fn shows_context_paths_relative_to_cwd_while_preserving_full_external_paths() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     let home = "/home/user";
     let cwd = "/home/user/Development/pi-mono";
     let view = LoadedResourcesView {
@@ -791,6 +792,7 @@ async fn shows_context_paths_relative_to_cwd_while_preserving_full_external_path
 
 #[tokio::test]
 async fn shows_full_context_paths_when_expanded() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     let home = "/home/user";
     let cwd = "/home/user/Development/pi-mono";
     let view = LoadedResourcesView {
@@ -819,6 +821,7 @@ async fn shows_full_context_paths_when_expanded() {
 
 #[tokio::test]
 async fn shows_system_prompt_context_paths_before_project_context_files() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     let view = LoadedResourcesView {
         context_files: vec![
             "/tmp/project/.pi/SYSTEM.md".to_owned(),
