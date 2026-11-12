@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use pi_coding_agent::modes::interactive::components::config_selector::{
     ConfigSelectorComponent, ConfigSelectorOptions, ConfigWriteScope, ScopedResolvedPaths,
+    SelectorCallback,
 };
 use pi_coding_agent::package_manager::{PathMetadata, ResolvedPaths, ResolvedResource};
 use pi_coding_agent::settings_manager::{
@@ -93,25 +94,78 @@ fn project_settings(manager: &MemoryManager) -> Value {
     Value::Object(manager.lock().expect("manager").get_project_settings())
 }
 
-fn selector(
+fn selector_with(
     scoped: &ScopedResolvedPaths,
     manager: &MemoryManager,
-    write_scope: ConfigWriteScope,
-    project_mode_available: bool,
+    options: ConfigSelectorOptions,
+    on_close: SelectorCallback,
+    on_exit: SelectorCallback,
 ) -> ConfigSelectorComponent<InMemorySettingsStorage> {
     ConfigSelectorComponent::new(
         scoped,
         Arc::clone(manager),
         CWD.to_string(),
         AGENT_DIR.to_string(),
+        on_close,
+        on_exit,
         Rc::new(|| {}),
-        Rc::new(|| {}),
-        Rc::new(|| {}),
+        options,
+    )
+}
+
+fn selector(
+    scoped: &ScopedResolvedPaths,
+    manager: &MemoryManager,
+    write_scope: ConfigWriteScope,
+    project_mode_available: bool,
+) -> ConfigSelectorComponent<InMemorySettingsStorage> {
+    selector_with(
+        scoped,
+        manager,
         ConfigSelectorOptions {
             terminal_height: Some(24),
             write_scope,
             project_mode_available,
         },
+        Rc::new(|| {}),
+        Rc::new(|| {}),
+    )
+}
+
+fn selector_scoped(
+    global: ResolvedPaths,
+    project: ResolvedPaths,
+    manager: &MemoryManager,
+    write_scope: ConfigWriteScope,
+) -> ConfigSelectorComponent<InMemorySettingsStorage> {
+    selector(
+        &ScopedResolvedPaths { global, project },
+        manager,
+        write_scope,
+        true,
+    )
+}
+
+fn selector_both(
+    paths: ResolvedPaths,
+    manager: &MemoryManager,
+    write_scope: ConfigWriteScope,
+) -> ConfigSelectorComponent<InMemorySettingsStorage> {
+    selector_scoped(paths.clone(), paths, manager, write_scope)
+}
+
+fn empty_selector(
+    manager: &MemoryManager,
+    project_mode_available: bool,
+) -> ConfigSelectorComponent<InMemorySettingsStorage> {
+    selector(
+        &ScopedResolvedPaths {
+            global: empty_paths(),
+            project: empty_paths(),
+        },
+        manager,
+        ConfigWriteScope::Global,
+        project_mode_available,
     )
 }
 
@@ -133,15 +187,7 @@ fn cycles_project_package_overrides_in_config_local_mode() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Project,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Project);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(
@@ -176,15 +222,7 @@ fn global_scope_ignores_project_resources() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_scoped(empty_paths(), paths, &manager, ConfigWriteScope::Global);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(global_settings(&manager)["extensions"], json!([]));
@@ -207,15 +245,7 @@ fn global_scope_toggles_top_level_user_resource() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(
@@ -243,15 +273,7 @@ fn project_scope_cycles_top_level_override_through_inherit() {
         true,
     );
     let paths = resolved_paths(vec![inherited], Vec::new(), Vec::new(), Vec::new());
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Project,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Project);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(
@@ -292,15 +314,7 @@ fn global_scope_package_toggle_appends_filters_to_the_source_entry() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(
@@ -349,15 +363,7 @@ fn renders_group_labels_resource_types_and_scope_hint() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
 
     let rendered = output(&selector, 100);
     assert!(rendered.contains("Global Resources"), "{rendered}");
@@ -441,15 +447,7 @@ fn search_filters_resources_and_reports_empty_results() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
     let list = selector.resource_list();
 
     list.handle_input("alpha");
@@ -466,15 +464,7 @@ fn search_filters_resources_and_reports_empty_results() {
 fn tab_switches_to_project_scope_when_available() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: empty_paths(),
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = empty_selector(&manager, true);
 
     assert_eq!(selector.write_scope(), ConfigWriteScope::Global);
     selector.handle_input("\t");
@@ -490,15 +480,7 @@ fn tab_switches_to_project_scope_when_available() {
 fn tab_is_inert_without_project_mode() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: empty_paths(),
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        false,
-    );
+    let selector = empty_selector(&manager, false);
 
     let rendered = output(&selector, 100);
     assert!(!rendered.contains("switch mode"), "{rendered}");
@@ -566,15 +548,7 @@ fn renders_home_prefixed_labels_and_settings_sources() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
 
     let rendered = output(&selector, 120);
     assert!(rendered.contains("User (~/custom/)"), "{rendered}");
@@ -623,15 +597,7 @@ fn renders_every_resource_type_and_extension_subfolder_names() {
             true,
         )],
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
 
     let rendered = output(&selector, 120);
     assert!(rendered.contains("nested/deep.ts"), "{rendered}");
@@ -659,15 +625,7 @@ fn project_scope_toggles_project_top_level_resource() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Project,
-        true,
-    );
+    let selector = selector_scoped(empty_paths(), paths, &manager, ConfigWriteScope::Project);
     let list = selector.resource_list();
 
     list.handle_input(" ");
@@ -705,15 +663,7 @@ fn project_scope_cycles_disabled_inherited_resource_through_load_and_unload() {
         false,
     );
     let paths = resolved_paths(vec![inherited], Vec::new(), Vec::new(), Vec::new());
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Project,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Project);
     let list = selector.resource_list();
     let path = format!("{AGENT_DIR}/extensions/a.ts");
 
@@ -754,15 +704,7 @@ fn project_scope_package_override_uses_project_relative_local_source() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Project,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Project);
     let list = selector.resource_list();
 
     list.handle_input(" ");
@@ -800,15 +742,7 @@ fn project_package_empty_filter_reads_as_unload_and_cycles_to_load() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Project,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Project);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(
@@ -841,15 +775,7 @@ fn search_matches_resource_type_and_path() {
         )],
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
     let list = selector.resource_list();
 
     list.handle_input("prompts");
@@ -907,14 +833,11 @@ fn one_of_each(base: &str, scope: SourceScope) -> ResolvedPaths {
 fn global_scope_toggles_every_resource_type() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: one_of_each(AGENT_DIR, SourceScope::User),
-            project: empty_paths(),
-        },
+    let selector = selector_scoped(
+        one_of_each(AGENT_DIR, SourceScope::User),
+        empty_paths(),
         &manager,
         ConfigWriteScope::Global,
-        true,
     );
     let list = selector.resource_list();
 
@@ -935,14 +858,11 @@ fn project_scope_toggles_every_resource_type() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
     let project_base = format!("{CWD}/.pi");
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: one_of_each(&project_base, SourceScope::Project),
-        },
+    let selector = selector_scoped(
+        empty_paths(),
+        one_of_each(&project_base, SourceScope::Project),
         &manager,
         ConfigWriteScope::Project,
-        true,
     );
     let list = selector.resource_list();
 
@@ -962,15 +882,7 @@ fn project_scope_toggles_every_resource_type() {
 fn component_surface_answers_contract_queries() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: empty_paths(),
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = empty_selector(&manager, true);
     let list = selector.resource_list();
 
     assert!(selector.wants_input());
@@ -1001,15 +913,7 @@ fn global_scope_package_toggle_ignores_unknown_source() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: paths.clone(),
-            project: paths,
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = selector_both(paths, &manager, ConfigWriteScope::Global);
 
     selector.resource_list().handle_input(" ");
     assert_eq!(global_settings(&manager)["packages"], json!(["npm:other"]));
@@ -1034,18 +938,15 @@ fn toggle_callback_reports_the_item_and_its_new_state() {
         Vec::new(),
         Vec::new(),
     );
-    let selector = ConfigSelectorComponent::new(
+    let selector = selector_with(
         &ScopedResolvedPaths {
             global: paths.clone(),
             project: paths,
         },
-        Arc::clone(&manager),
-        CWD.to_string(),
-        AGENT_DIR.to_string(),
-        Rc::new(|| {}),
-        Rc::new(|| {}),
-        Rc::new(|| {}),
+        &manager,
         ConfigSelectorOptions::default(),
+        Rc::new(|| {}),
+        Rc::new(|| {}),
     );
     *selector.resource_list().on_toggle.borrow_mut() = Some(Rc::new(move |item, enabled| {
         captured
@@ -1069,15 +970,7 @@ fn switch_write_scope_method_and_default_options() {
     assert!(options.project_mode_available);
     assert_eq!(options.terminal_height, None);
 
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: empty_paths(),
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = empty_selector(&manager, true);
     selector.switch_write_scope();
     assert_eq!(selector.write_scope(), ConfigWriteScope::Project);
     let rendered = output(&selector, 100);
@@ -1089,22 +982,16 @@ fn cancel_callback_fires_on_escape() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
     let (cancel_count, on_close) = cancellation();
-    let selector = ConfigSelectorComponent::new(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: empty_paths(),
-        },
-        Arc::clone(&manager),
-        CWD.to_string(),
-        AGENT_DIR.to_string(),
-        on_close,
-        Rc::new(|| {}),
-        Rc::new(|| {}),
+    let selector = selector_with(
+        &ScopedResolvedPaths::default(),
+        &manager,
         ConfigSelectorOptions {
             terminal_height: Some(24),
             write_scope: ConfigWriteScope::Global,
             project_mode_available: true,
         },
+        on_close,
+        Rc::new(|| {}),
     );
 
     selector.resource_list().handle_input("\x1b");
@@ -1115,15 +1002,7 @@ fn cancel_callback_fires_on_escape() {
 fn focus_propagates_to_the_resource_list() {
     setup(&[]);
     let manager = manager_with(&Value::Null, &Value::Null);
-    let selector = selector(
-        &ScopedResolvedPaths {
-            global: empty_paths(),
-            project: empty_paths(),
-        },
-        &manager,
-        ConfigWriteScope::Global,
-        true,
-    );
+    let selector = empty_selector(&manager, true);
     let list = selector.resource_list();
 
     assert!(!selector.is_focused());
@@ -1151,22 +1030,18 @@ fn navigation_skips_headers_and_pages_by_the_visible_window() {
         })
         .collect();
     let paths = resolved_paths(extensions, Vec::new(), Vec::new(), Vec::new());
-    let selector = ConfigSelectorComponent::new(
+    let selector = selector_with(
         &ScopedResolvedPaths {
             global: paths.clone(),
             project: paths,
         },
-        Arc::clone(&manager),
-        CWD.to_string(),
-        AGENT_DIR.to_string(),
-        Rc::new(|| {}),
-        Rc::new(|| {}),
-        Rc::new(|| {}),
+        &manager,
         ConfigSelectorOptions {
             terminal_height: Some(13),
-            write_scope: ConfigWriteScope::Global,
-            project_mode_available: true,
+            ..ConfigSelectorOptions::default()
         },
+        Rc::new(|| {}),
+        Rc::new(|| {}),
     );
     let list = selector.resource_list();
 
