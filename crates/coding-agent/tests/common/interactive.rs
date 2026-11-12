@@ -234,6 +234,29 @@ impl pi_coding_agent::utils::clipboard::NativeClipboard for RecordingClipboard {
     }
 }
 
+/// Records the clipboard-helper invocations the Linux copy path makes.
+struct RecordingCommandRunner {
+    clipboard: Arc<RecordingClipboard>,
+}
+
+impl pi_coding_agent::utils::clipboard_command::ClipboardCommandRunner for RecordingCommandRunner {
+    fn run<'a>(
+        &'a self,
+        _command: &'a str,
+        _args: &'a [String],
+        options: &'a pi_coding_agent::utils::clipboard_command::ClipboardCommandOptions,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Option<Vec<u8>>> + 'a>> {
+        if let Some(input) = &options.input {
+            self.clipboard
+                .copied
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(input.clone());
+        }
+        Box::pin(async { Some(Vec::new()) })
+    }
+}
+
 /// The clipboard override's lifetime: holds the process-wide lock and
 /// restores the previous override on drop.
 pub struct ClipboardGuard {
@@ -258,6 +281,11 @@ impl ClipboardGuard {
         pi_coding_agent::utils::clipboard::set_native_clipboard_override(Some(
             clipboard_for_override,
         ));
+        pi_coding_agent::utils::clipboard::set_clipboard_command_runner_override(Some(Arc::new(
+            RecordingCommandRunner {
+                clipboard: Arc::clone(&clipboard),
+            },
+        )));
         Self {
             clipboard,
             _serial: serial,
@@ -297,6 +325,7 @@ impl ClipboardGuard {
 impl Drop for ClipboardGuard {
     fn drop(&mut self) {
         pi_coding_agent::utils::clipboard::set_native_clipboard_override(None);
+        pi_coding_agent::utils::clipboard::set_clipboard_command_runner_override(None);
     }
 }
 

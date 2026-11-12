@@ -142,6 +142,8 @@ thread_local! {
     static NATIVE_CLIPBOARD_OVERRIDE: std::cell::RefCell<Option<NativeOverride>> =
         const { std::cell::RefCell::new(None) };
     static OSC52_SINK: std::cell::RefCell<Option<OscSink>> = const { std::cell::RefCell::new(None) };
+    static CLIPBOARD_COMMAND_RUNNER: std::cell::RefCell<Option<Arc<dyn ClipboardCommandRunner>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// The native clipboard of the running session, upstream's
@@ -170,6 +172,27 @@ pub fn set_native_clipboard_override(overridden: Option<NativeClipboardBox>) {
     NATIVE_CLIPBOARD_OVERRIDE.with(|cell| {
         *cell.borrow_mut() = overridden.map(NativeOverride::Clipboard);
     });
+}
+
+/// Install the command-runner override for the suites, upstream's mock of
+/// the platform clipboard helpers (`pbcopy`, `xclip`, `wl-copy`).
+///
+/// The native-clipboard override cannot stand in on Linux, where the
+/// production path skips the native writer and runs the helper command; a
+/// suite that wants the copy recorded supplies this runner too.
+pub fn set_clipboard_command_runner_override(runner: Option<Arc<dyn ClipboardCommandRunner>>) {
+    CLIPBOARD_COMMAND_RUNNER.with(|cell| {
+        *cell.borrow_mut() = runner;
+    });
+}
+
+/// The command runner the copy path uses: the suite override when set, the
+/// process runner otherwise.
+#[must_use]
+pub fn clipboard_command_runner() -> Arc<dyn ClipboardCommandRunner> {
+    CLIPBOARD_COMMAND_RUNNER
+        .with(|cell| cell.borrow().clone())
+        .unwrap_or_else(|| Arc::new(ProcessClipboardCommandRunner))
 }
 
 /// Force the no-native-helper state for the suites, upstream's mocked
@@ -345,11 +368,12 @@ pub async fn read_clipboard_text_with(
 /// native, command, and the OSC 52 terminal fallback in remote sessions —
 /// failed.
 pub async fn copy_to_clipboard(text: &str) -> Result<(), ClipboardError> {
+    let runner = clipboard_command_runner();
     copy_to_clipboard_with(
         text,
         &crate::config::default_env_lookup(),
         Platform::of_process(),
-        &ProcessClipboardCommandRunner,
+        runner.as_ref(),
     )
     .await
 }
