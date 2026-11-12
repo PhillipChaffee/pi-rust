@@ -164,15 +164,11 @@ name = "pi-import"
 license.override = ["MIT"]
 reason = "unpublished workspace crate; license declared in crates/import/Cargo.toml"
 
-# block-buffer 0.10.4 (GHSA-qwgh-2vcv-g2f7) is retained by jsonwebtoken
-# 10.4's curve25519-dalek/ecdsa/rsa digest-0.10 line, which cannot consume
-# the fixed 0.12.1 release. The advisory's corrupted-cursor state requires a
-# caller-supplied compression callback to panic and the panic to be caught;
-# neither our direct sha2 0.10 call sites nor the JWT sign/verify path ever
-# supplies a panicking callback or catches one, so the out-of-bounds read
-# cannot be observed here. The ignore comes off when jsonwebtoken moves to
-# digest 0.11/block-buffer 0.12. Verified with
-# `cargo tree -i block-buffer@0.10.4 --workspace`. See #208.
+# pin-utils 0.1.1 is the archived upstream's final release, pulled by
+# aws-smithy-http's pin-projection helper inside the AWS SDK. The advisory is
+# the informational unmaintained notice, not a code defect, and no fixed
+# release exists; the ignore comes off when the AWS SDK drops the pull.
 [[IgnoredVulns]]
-id = "GHSA-qwgh-2vcv-g2f7"
-reason = "block-buffer 0.10.4 rides jsonwebtoken's digest-0.10 cryptography line, which cannot consume 0.12.1; the advisory needs a caller-supplied compression callback to panic and be caught, which no call site here does"
+id = "RUSTSEC-2026-0441"
+reason = "pin-utils 0.1.1 rides aws-smithy-http's pin-projection helper inside the AWS SDK; the advisory is the informational unmaintained notice with no fixed release"
+
