@@ -25,57 +25,9 @@ use pi_coding_agent::extensions::host::UiCallHandler;
 use pi_coding_agent::settings_manager::Settings;
 use pi_tui::tui::Component;
 
-async fn harness_with(options: HarnessOptions) -> Harness {
-    let harness = Harness::new(options).await;
-    harness.start_tui();
-    harness
-}
-
-async fn submit(harness: &Harness, line: &str) {
-    harness.frame.submit_text(line).await;
-    harness.frame.drain_commands().await;
-    harness.frame.drain_events();
-}
-
-fn seeds_messages() -> Vec<AgentMessage> {
-    vec![
-        common::agent_session::user_message("first", 1),
-        AgentMessage::Standard(Message::Assistant(
-            common::agent_session::assistant_message("reply", 2),
-        )),
-    ]
-}
-
-/// A stream that opens immediately and settles only when `release` notifies.
-fn gated_stream(release: Arc<tokio::sync::Notify>) -> pi_agent_core::types::StreamFn {
-    use pi_ai::types::{AssistantMessageEvent, StopReason};
-    Arc::new(move |model, _context, _options| {
-        let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
-        let mut message = common::sdk_fixture::done_message();
-        message.provider = model.provider.clone();
-        message.model.clone_from(&model.id);
-        stream.push(AssistantMessageEvent::Start {
-            partial: pi_ai::types::AssistantMessage {
-                content: Vec::new(),
-                ..message.clone()
-            },
-        });
-        let settle = stream.clone();
-        let release = Arc::clone(&release);
-        tokio::spawn(async move {
-            release.notified().await;
-            settle.push(AssistantMessageEvent::Done {
-                reason: StopReason::Stop,
-                message,
-            });
-        });
-        stream
-    })
-}
-
 #[tokio::test]
 async fn login_provider_filters_and_completion_text_cover_both_auth_types() {
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         model: common::agent_session::anthropic_model(),
         ..HarnessOptions::default()
     })
@@ -143,7 +95,7 @@ async fn login_provider_filters_and_completion_text_cover_both_auth_types() {
 async fn model_and_thinking_cycle_failure_arms() {
     let mut model = common::sdk_fixture::faux_model();
     model.reasoning = false;
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         model,
         ..HarnessOptions::default()
     })
@@ -167,7 +119,7 @@ async fn model_and_thinking_cycle_failure_arms() {
 
 #[tokio::test]
 async fn model_selector_reads_the_default_model_setting() {
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         settings: {
             let mut settings = Settings::new();
             settings.insert(
@@ -198,9 +150,9 @@ async fn every_tree_filter_mode_selects_its_component_mode() {
             "treeFilterMode".to_owned(),
             serde_json::Value::String(mode.to_owned()),
         );
-        let harness = harness_with(HarnessOptions {
+        let harness = common::interactive::harness_with(HarnessOptions {
             settings,
-            messages: seeds_messages(),
+            messages: common::interactive::exchange_messages(),
             ..HarnessOptions::default()
         })
         .await;
@@ -211,20 +163,20 @@ async fn every_tree_filter_mode_selects_its_component_mode() {
 
 #[tokio::test]
 async fn resume_selector_uses_the_default_session_directory() {
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/resume").await;
+    common::interactive::submit(&harness, "/resume").await;
     harness.send_input("\x1b");
 }
 
 #[tokio::test]
 async fn reload_while_streaming_warns_and_keeps_the_run() {
     let release = Arc::new(tokio::sync::Notify::new());
-    let harness = harness_with(HarnessOptions {
-        stream: Some(gated_stream(Arc::clone(&release))),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        stream: Some(common::interactive::gated_stream(Arc::clone(&release))),
         ..HarnessOptions::default()
     })
     .await;
@@ -234,7 +186,7 @@ async fn reload_while_streaming_warns_and_keeps_the_run() {
         async move { session.prompt("first".to_owned(), None).await }
     });
     tokio::time::sleep(Duration::from_millis(20)).await;
-    submit(&harness, "/reload").await;
+    common::interactive::submit(&harness, "/reload").await;
     assert!(
         harness
             .chat_text()
@@ -246,12 +198,12 @@ async fn reload_while_streaming_warns_and_keeps_the_run() {
 
 #[tokio::test]
 async fn name_normalization_warns_and_fork_errors_report() {
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/name line\nbreak").await;
+    common::interactive::submit(&harness, "/name line\nbreak").await;
     assert!(
         harness.chat_text().contains("normalized"),
         "{}",
@@ -264,7 +216,7 @@ async fn name_normalization_warns_and_fork_errors_report() {
 
 #[tokio::test]
 async fn tui_mode_change_is_blocked_by_an_overlay() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let overlay: Rc<dyn Component> =
         Rc::new(pi_tui::components::Text::with_padding("overlay", 0, 0));
     let _ = harness.frame.tui().show_overlay(overlay, None);
@@ -316,7 +268,7 @@ async fn skill_and_extension_commands_reach_autocomplete() {
         "enableSkillCommands".to_owned(),
         serde_json::Value::Bool(true),
     );
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         fixtures: Some(fixtures),
         settings,
         ..HarnessOptions::default()
@@ -371,10 +323,8 @@ async fn successful_login_selects_the_provider_default_model() {
 
 #[tokio::test]
 async fn default_editor_and_footer_adapters_expose_every_member() {
-    use pi_tui::tui::Component;
-
     let harness = Harness::new(HarnessOptions {
-        messages: seeds_messages(),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
@@ -573,23 +523,7 @@ async fn initial_messages_render_trust_warning_and_plural_compactions() {
 
 #[tokio::test]
 async fn flush_compaction_queue_prompts_static_commands_and_mixed_rows() {
-    let fixtures = ResourceFixtures {
-        extension_factories: vec![(
-            Some("commands".to_owned()),
-            false,
-            Arc::new(|api| {
-                Box::pin(async move {
-                    api.register_command(
-                        "demo".to_owned(),
-                        None,
-                        Arc::new(|_args, _ctx| Box::pin(async {})),
-                    )?;
-                    Ok(())
-                })
-            }),
-        )],
-        ..ResourceFixtures::default()
-    };
+    let fixtures = common::interactive::command_fixtures(&["demo"]);
     let harness = Harness::new(HarnessOptions {
         fixtures: Some(fixtures),
         ..HarnessOptions::default()
@@ -918,29 +852,8 @@ async fn settings_selector_submenus_toggle_warnings_models_and_themes() {
 
 #[tokio::test]
 async fn switching_to_a_session_with_a_missing_cwd_retries_with_the_fallback() {
-    use pi_coding_agent::session_manager::SessionManager;
-
     let root = tempfile::TempDir::new().expect("tempdir");
-    let old_cwd = root.path().join("old-project");
-    let session_dir = root.path().join("sessions");
-    std::fs::create_dir_all(&old_cwd).expect("old cwd");
-    let mut manager = SessionManager::create(
-        &old_cwd.display().to_string(),
-        Some(&session_dir.display().to_string()),
-        None,
-    )
-    .expect("manager");
-    manager
-        .append_message(common::agent_session::user_message("old", 1))
-        .expect("user");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            common::agent_session::assistant_message("reply", 2),
-        )))
-        .expect("assistant");
-    let session_file = manager.session_file().expect("session file").to_owned();
-    drop(manager);
-    std::fs::remove_dir_all(&old_cwd).expect("remove old cwd");
+    let session_file = common::interactive::missing_cwd_session_file(root.path());
 
     let harness = Harness::new(HarnessOptions::default()).await;
     harness
@@ -962,19 +875,13 @@ async fn navigate_tree_can_abort_the_branch_summary() {
     use std::time::Duration;
 
     let release = Arc::new(tokio::sync::Notify::new());
-    let harness = harness_with(HarnessOptions {
-        stream: Some(gated_stream(Arc::clone(&release))),
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        stream: Some(common::interactive::gated_stream(Arc::clone(&release))),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    let target = harness
-        .frame
-        .session()
-        .user_messages_for_forking()
-        .first()
-        .map(|(id, _)| id.clone())
-        .expect("user message");
+    let target = common::interactive::first_user_message_id(&harness);
 
     let navigate = harness.frame.navigate_tree(&target);
     tokio::pin!(navigate);
@@ -1005,12 +912,12 @@ async fn missing_provider_credentials_fall_back_when_refreshing_login_options() 
         "ghost-provider".to_owned(),
         serde_json::json!({ "type": "api_key", "key": "ghost" }),
     );
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         auth,
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/logout").await;
+    common::interactive::submit(&harness, "/logout").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(
@@ -1033,7 +940,7 @@ async fn missing_provider_credentials_fall_back_when_refreshing_login_options() 
 
 #[tokio::test]
 async fn model_catalogs_refresh_with_errors_and_timeouts_are_reported() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     harness.frame.show_models_selector().await;
     harness.send_input("\x1b");
 }
@@ -1162,12 +1069,12 @@ async fn reset_extension_ui_restores_defaults_with_a_custom_editor() {
 async fn login_command_with_a_single_provider_match_starts_it() {
     let mut solo = common::model_layer::model("solo-provider", "solo-model");
     solo.name = "Solo".to_owned();
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         extra_models: vec![solo],
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/login solo-provider").await;
+    common::interactive::submit(&harness, "/login solo-provider").await;
     harness
         .frame
         .finish_login("Solo", AuthType::ApiKey, Err("unsupported".to_owned()))
@@ -1177,23 +1084,10 @@ async fn login_command_with_a_single_provider_match_starts_it() {
 
 #[tokio::test]
 async fn footer_renders_a_subscription_model_and_extension_statuses() {
-    use pi_ai::auth::types::{Credential, OAuthCredentials};
-
-    let credential = Credential::OAuth(OAuthCredentials {
-        refresh: "refresh".to_owned(),
-        access: "access".to_owned(),
-        expires: 4_102_444_800_000,
-        extra: std::collections::BTreeMap::new(),
-    });
-    let mut auth = pi_coding_agent::auth_storage::AuthStorageData::new();
-    auth.insert(
-        "anthropic".to_owned(),
-        serde_json::to_value(&credential).expect("credential serializes"),
-    );
     let harness = Harness::new(HarnessOptions {
         model: common::agent_session::anthropic_model(),
-        auth,
-        messages: seeds_messages(),
+        auth: common::interactive::anthropic_oauth_auth(),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
@@ -1218,7 +1112,7 @@ async fn custom_oauth_login_drives_every_auth_prompt_channel() {
         OAuthSelectPrompt, ProviderConfigInput,
     };
 
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let runtime = harness.frame.session().model_runtime().clone();
     let login: pi_coding_agent::provider_composer::ExtensionOAuthLoginFn =
         Arc::new(|callbacks: OAuthLoginCallbacks| {
@@ -1430,7 +1324,7 @@ async fn tree_selector_copy_selected_reaches_the_copy_callback() {
     };
 
     let harness = Harness::new(HarnessOptions {
-        messages: seeds_messages(),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
@@ -1464,13 +1358,13 @@ async fn tree_selector_copy_selected_reaches_the_copy_callback() {
 
 #[tokio::test]
 async fn session_selector_rename_callback_persists_through_the_frame() {
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         persisted: true,
-        messages: seeds_messages(),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/resume").await;
+    common::interactive::submit(&harness, "/resume").await;
     harness.send_input("\x12");
     harness.send_input("renamed session");
     harness.send_input("\r");
@@ -1483,7 +1377,7 @@ async fn session_selector_rename_callback_persists_through_the_frame() {
 async fn models_refresh_with_a_failing_provider_reports_partial_failure() {
     use pi_coding_agent::provider_composer::ProviderConfigInput;
 
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let runtime = harness.frame.session().model_runtime().clone();
     runtime
         .register_provider(
@@ -1561,7 +1455,7 @@ async fn switching_to_a_project_with_resources_asks_for_trust_and_cancels() {
         .expect("assistant");
     let path = manager.session_file().expect("file").to_owned();
 
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     harness
         .frame
         .session()
@@ -1587,28 +1481,22 @@ async fn switching_to_a_project_with_resources_asks_for_trust_and_cancels() {
 async fn trust_selector_renders_a_saved_decision() {
     use pi_coding_agent::trust_manager::ProjectTrustStore;
 
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let agent_dir = harness.agent_dir.clone();
     let store = ProjectTrustStore::new(&agent_dir);
     store.set(&harness.cwd, Some(true)).expect("trust entry");
-    submit(&harness, "/trust").await;
+    common::interactive::submit(&harness, "/trust").await;
     harness.send_input("\x1b");
 }
 
 #[tokio::test]
 async fn navigating_with_a_summary_completes_and_clears_the_indicator() {
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    let target = harness
-        .frame
-        .session()
-        .user_messages_for_forking()
-        .first()
-        .map(|(id, _)| id.clone())
-        .expect("user message");
+    let target = common::interactive::first_user_message_id(&harness);
     let navigate = harness.frame.navigate_tree(&target);
     tokio::pin!(navigate);
     tokio::select! {
@@ -1632,22 +1520,9 @@ async fn navigating_with_a_summary_completes_and_clears_the_indicator() {
 
 #[tokio::test]
 async fn finish_login_with_available_default_selects_the_model() {
-    use pi_ai::auth::types::{Credential, OAuthCredentials};
-
-    let credential = Credential::OAuth(OAuthCredentials {
-        refresh: "refresh".to_owned(),
-        access: "access".to_owned(),
-        expires: 4_102_444_800_000,
-        extra: std::collections::BTreeMap::new(),
-    });
-    let mut auth = pi_coding_agent::auth_storage::AuthStorageData::new();
-    auth.insert(
-        "anthropic".to_owned(),
-        serde_json::to_value(&credential).expect("credential serializes"),
-    );
     let harness = Harness::new(HarnessOptions {
         model: common::agent_session::anthropic_model(),
-        auth,
+        auth: common::interactive::anthropic_oauth_auth(),
         ..HarnessOptions::default()
     })
     .await;
@@ -1722,13 +1597,13 @@ async fn clearing_queues_drains_compaction_entries_and_session_entries() {
 
 #[tokio::test]
 async fn session_selector_toggles_scope_sort_and_name_filter() {
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         persisted: true,
-        messages: seeds_messages(),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/resume").await;
+    common::interactive::submit(&harness, "/resume").await;
     harness.send_input("\x01");
     harness.send_input("\x13");
     harness.send_input("\x0e");
@@ -1739,29 +1614,8 @@ async fn session_selector_toggles_scope_sort_and_name_filter() {
 
 #[tokio::test]
 async fn import_of_a_session_with_a_missing_cwd_reports_without_hanging() {
-    use pi_coding_agent::session_manager::SessionManager;
-
     let root = tempfile::TempDir::new().expect("tempdir");
-    let old_cwd = root.path().join("old");
-    let session_dir = root.path().join("sessions");
-    std::fs::create_dir_all(&old_cwd).expect("cwd");
-    let mut manager = SessionManager::create(
-        &old_cwd.display().to_string(),
-        Some(&session_dir.display().to_string()),
-        None,
-    )
-    .expect("manager");
-    manager
-        .append_message(common::agent_session::user_message("old", 1))
-        .expect("user");
-    manager
-        .append_message(AgentMessage::Standard(Message::Assistant(
-            common::agent_session::assistant_message("reply", 2),
-        )))
-        .expect("assistant");
-    let path = manager.session_file().expect("file").to_owned();
-    drop(manager);
-    std::fs::remove_dir_all(&old_cwd).expect("remove");
+    let path = common::interactive::missing_cwd_session_file(root.path());
 
     let harness = Harness::new(HarnessOptions {
         persisted: true,
@@ -1778,7 +1632,7 @@ async fn import_of_a_session_with_a_missing_cwd_reports_without_hanging() {
 #[tokio::test]
 async fn footer_adapter_reads_session_entries_and_subscription() {
     let harness = Harness::new(HarnessOptions {
-        messages: seeds_messages(),
+        messages: common::interactive::exchange_messages(),
         ..HarnessOptions::default()
     })
     .await;

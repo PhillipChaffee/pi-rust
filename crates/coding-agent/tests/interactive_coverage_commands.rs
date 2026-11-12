@@ -30,35 +30,13 @@ use pi_coding_agent::settings_manager::{
 use pi_tui::components::scroll_view::ScrollViewScrollbar;
 use pi_tui::tui::TuiMode;
 
-async fn harness_with(options: HarnessOptions) -> Harness {
-    let harness = Harness::new(options).await;
-    harness.start_tui();
-    harness
-}
-
-async fn submit(harness: &Harness, line: &str) {
-    harness.frame.submit_text(line).await;
-    harness.frame.drain_commands().await;
-    harness.frame.drain_events();
-}
-
-fn seeds_messages() -> Vec<pi_agent_core::types::AgentMessage> {
-    vec![
-        common::agent_session::user_message("first", 1),
-        pi_agent_core::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(
-            common::agent_session::assistant_message("reply", 2),
-        )),
-        common::agent_session::user_message("second", 3),
-    ]
-}
-
 #[tokio::test]
 #[allow(
     clippy::too_many_lines,
     reason = "the callback bag is driven as one scenario so the settings snapshot reads together"
 )]
 async fn settings_callbacks_write_every_setting_and_send_every_command() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let callbacks = harness.frame.settings_callbacks();
     let settings = harness.frame.session().settings_manager();
 
@@ -171,54 +149,54 @@ async fn settings_callbacks_write_every_setting_and_send_every_command() {
 
 #[tokio::test]
 async fn model_and_thinking_selectors_select_persist_and_cancel() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
 
-    submit(&harness, "/model").await;
+    common::interactive::submit(&harness, "/model").await;
     harness.send_input("\x1b");
-    submit(&harness, "/model").await;
+    common::interactive::submit(&harness, "/model").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(harness.chat_text().contains("Model:"));
-    submit(&harness, "/model").await;
+    common::interactive::submit(&harness, "/model").await;
     harness.send_input("\x13");
     harness.frame.drain_commands().await;
     assert!(harness.chat_text().contains("Default model:"));
 
-    submit(&harness, "/thinking").await;
+    common::interactive::submit(&harness, "/thinking").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
-    submit(&harness, "/thinking").await;
+    common::interactive::submit(&harness, "/thinking").await;
     harness.send_input("\x13");
     harness.frame.drain_commands().await;
-    submit(&harness, "/thinking").await;
+    common::interactive::submit(&harness, "/thinking").await;
     harness.send_input("\x1b");
 
-    submit(&harness, "/thinking high").await;
+    common::interactive::submit(&harness, "/thinking high").await;
     assert_eq!(
         harness.frame.session().thinking_level(),
         pi_agent_core::types::ThinkingLevel::High
     );
-    submit(&harness, "/thinking bogus").await;
+    common::interactive::submit(&harness, "/thinking bogus").await;
     assert!(harness.chat_text().contains("Unknown thinking level"));
 }
 
 #[tokio::test]
 async fn model_search_arguments_match_exact_and_show_the_selector() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let model = harness.frame.session().model().expect("model");
     let exact = format!("{}/{}", model.provider.0, model.id);
 
-    submit(&harness, &format!("/model {exact}")).await;
+    common::interactive::submit(&harness, &format!("/model {exact}")).await;
     assert_eq!(harness.frame.session().model().expect("model").id, model.id);
 
-    submit(&harness, "/model def-not-a-model").await;
+    common::interactive::submit(&harness, "/model def-not-a-model").await;
     assert!(harness.frame.extension_selector().is_none());
     harness.send_input("\x1b");
 }
 
 #[tokio::test]
 async fn thinking_and_model_cycles_and_daxnuts_row_are_reachable_directly() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
 
     harness.frame.cycle_thinking_level();
     for direction in [
@@ -238,9 +216,9 @@ async fn thinking_and_model_cycles_and_daxnuts_row_are_reachable_directly() {
 
 #[tokio::test]
 async fn scoped_models_selector_toggles_enable_all_clear_all_and_persists() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
 
-    submit(&harness, "/scoped-models").await;
+    common::interactive::submit(&harness, "/scoped-models").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     harness.send_input("\x01");
@@ -250,13 +228,13 @@ async fn scoped_models_selector_toggles_enable_all_clear_all_and_persists() {
     harness.send_input("\x13");
     harness.frame.drain_commands().await;
     harness.send_input("\x1b");
-    submit(&harness, "/scoped-models").await;
+    common::interactive::submit(&harness, "/scoped-models").await;
     harness.send_input("\x1b");
 }
 
 #[tokio::test]
 async fn scoped_model_application_and_persistence_cover_every_branch() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let models = harness
         .frame
         .session()
@@ -290,14 +268,14 @@ async fn scoped_model_application_and_persistence_cover_every_branch() {
 
 #[tokio::test]
 async fn trust_selector_saves_a_decision_and_cancels() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
 
-    submit(&harness, "/trust").await;
+    common::interactive::submit(&harness, "/trust").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(harness.chat_text().contains("Saved trust decision"));
 
-    submit(&harness, "/trust").await;
+    common::interactive::submit(&harness, "/trust").await;
     harness.send_input("\x1b");
 }
 
@@ -368,8 +346,8 @@ async fn fullscreen_scrollbar_setting_applies_without_a_transcript() {
 
 #[tokio::test]
 async fn tree_selector_navigates_to_an_entry_and_reports_the_leaf() {
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::conversation_messages(),
         settings: {
             let mut settings = Settings::new();
             settings.insert(
@@ -382,7 +360,7 @@ async fn tree_selector_navigates_to_an_entry_and_reports_the_leaf() {
     })
     .await;
 
-    submit(&harness, "/tree").await;
+    common::interactive::submit(&harness, "/tree").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(harness.chat_text().contains("Navigated to selected point"));
@@ -396,13 +374,13 @@ async fn tree_selector_navigates_to_an_entry_and_reports_the_leaf() {
 
 #[tokio::test]
 async fn tree_selector_prompt_awaits_the_summary_choice() {
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::conversation_messages(),
         ..HarnessOptions::default()
     })
     .await;
 
-    submit(&harness, "/tree").await;
+    common::interactive::submit(&harness, "/tree").await;
     harness.send_input("\r");
     let mut drain = Box::pin(harness.frame.drain_commands());
     tokio::select! {
@@ -417,7 +395,7 @@ async fn tree_selector_prompt_awaits_the_summary_choice() {
         "the navigation outcome is reported"
     );
 
-    submit(&harness, "/tree").await;
+    common::interactive::submit(&harness, "/tree").await;
     harness.send_input("\r");
     let mut drain = Box::pin(harness.frame.drain_commands());
     tokio::select! {
@@ -429,7 +407,7 @@ async fn tree_selector_prompt_awaits_the_summary_choice() {
     }
     harness.send_input("\x1b");
 
-    submit(&harness, "/tree").await;
+    common::interactive::submit(&harness, "/tree").await;
     harness.send_input("\r");
     let mut drain = Box::pin(harness.frame.drain_commands());
     tokio::select! {
@@ -448,15 +426,15 @@ async fn tree_selector_prompt_awaits_the_summary_choice() {
 
 #[tokio::test]
 async fn user_message_selector_forks_and_cancels() {
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::conversation_messages(),
         ..HarnessOptions::default()
     })
     .await;
 
-    submit(&harness, "/fork").await;
+    common::interactive::submit(&harness, "/fork").await;
     harness.send_input("\x1b");
-    submit(&harness, "/fork").await;
+    common::interactive::submit(&harness, "/fork").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(!harness.chat_text().contains("No messages to fork from"));
@@ -464,33 +442,33 @@ async fn user_message_selector_forks_and_cancels() {
 
 #[tokio::test]
 async fn fork_command_without_messages_and_clone_at_the_leaf() {
-    let harness = harness_with(HarnessOptions::default()).await;
-    submit(&harness, "/fork").await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
+    common::interactive::submit(&harness, "/fork").await;
     assert!(harness.chat_text().contains("No messages to fork from"));
-    submit(&harness, "/clone").await;
+    common::interactive::submit(&harness, "/clone").await;
     assert!(!harness.chat_text().is_empty());
 
-    let harness = harness_with(HarnessOptions {
-        messages: seeds_messages(),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        messages: common::interactive::conversation_messages(),
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/clone").await;
+    common::interactive::submit(&harness, "/clone").await;
     assert!(harness.chat_text().contains("Cloned to new session"));
 }
 
 #[tokio::test]
 async fn session_selector_switches_and_cancels() {
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         persisted: true,
-        messages: seeds_messages(),
+        messages: common::interactive::conversation_messages(),
         ..HarnessOptions::default()
     })
     .await;
 
-    submit(&harness, "/resume").await;
+    common::interactive::submit(&harness, "/resume").await;
     harness.send_input("\x1b");
-    submit(&harness, "/resume").await;
+    common::interactive::submit(&harness, "/resume").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(!harness.chat_text().is_empty());
@@ -498,7 +476,7 @@ async fn session_selector_switches_and_cancels() {
 
 #[tokio::test]
 async fn switching_to_a_missing_session_reports_an_error() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let result = harness
         .frame
         .switch_session("/definitely/missing/session.jsonl")
@@ -509,8 +487,8 @@ async fn switching_to_a_missing_session_reports_an_error() {
 
 #[tokio::test]
 async fn settings_selector_mounts_and_cancels() {
-    let harness = harness_with(HarnessOptions::default()).await;
-    submit(&harness, "/settings").await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
+    common::interactive::submit(&harness, "/settings").await;
     harness.send_input("\x1b");
     assert!(harness.chat_text().is_empty());
 }
@@ -559,7 +537,7 @@ fn api_key_auth(key: &str) -> pi_coding_agent::auth_storage::AuthStorageData {
 async fn export_html_jsonl_and_failure_paths_report_status() {
     let harness = Harness::new(HarnessOptions {
         persisted: true,
-        messages: seeds_messages(),
+        messages: common::interactive::conversation_messages(),
         ..HarnessOptions::default()
     })
     .await;
@@ -568,24 +546,24 @@ async fn export_html_jsonl_and_failure_paths_report_status() {
     let html = root.join("session.html");
     let jsonl = root.join("session.jsonl");
 
-    submit(&harness, &format!("/export {}", html.display())).await;
+    common::interactive::submit(&harness, &format!("/export {}", html.display())).await;
     assert!(harness.chat_text().contains("Session exported to:"));
-    submit(&harness, &format!("/export {}", jsonl.display())).await;
+    common::interactive::submit(&harness, &format!("/export {}", jsonl.display())).await;
     assert!(html.exists());
     assert!(jsonl.exists());
 
-    submit(&harness, "/export /definitely/missing/out.html").await;
+    common::interactive::submit(&harness, "/export /definitely/missing/out.html").await;
     assert!(harness.chat_text().contains("Failed to export session"));
 }
 
 #[tokio::test]
 async fn name_command_reports_usage_sets_and_reads_the_name() {
     let harness = Harness::new(HarnessOptions::default()).await;
-    submit(&harness, "/name").await;
+    common::interactive::submit(&harness, "/name").await;
     assert!(harness.chat_text().contains("Usage: /name <name>"));
-    submit(&harness, "/name boundary").await;
+    common::interactive::submit(&harness, "/name boundary").await;
     assert!(harness.chat_text().contains("Session name set: boundary"));
-    submit(&harness, "/name").await;
+    common::interactive::submit(&harness, "/name").await;
     assert!(harness.chat_text().contains("Session name: boundary"));
 }
 
@@ -613,7 +591,7 @@ async fn session_info_renders_cost_breakdown_and_usage() {
         ..HarnessOptions::default()
     })
     .await;
-    submit(&harness, "/session").await;
+    common::interactive::submit(&harness, "/session").await;
     let text = harness.chat_text();
     assert!(harness.frame.session().session_stats().cost > 0.0, "{text}");
     assert!(text.contains("Session Info"));
@@ -622,12 +600,12 @@ async fn session_info_renders_cost_breakdown_and_usage() {
 #[tokio::test]
 async fn copy_command_copies_the_last_assistant_message() {
     let harness = Harness::new(HarnessOptions {
-        messages: seeds_messages(),
+        messages: common::interactive::conversation_messages(),
         ..HarnessOptions::default()
     })
     .await;
     let clipboard = common::interactive::ClipboardGuard::new(None);
-    submit(&harness, "/copy").await;
+    common::interactive::submit(&harness, "/copy").await;
     assert_eq!(clipboard.copied(), vec!["reply".to_owned()]);
     assert!(harness.chat_text().contains("Copied last agent message"));
 }
@@ -641,20 +619,20 @@ async fn login_and_logout_selectors_cover_selection_and_cancel() {
     .await;
     harness.start_tui();
 
-    submit(&harness, "/logout").await;
+    common::interactive::submit(&harness, "/logout").await;
     harness.send_input("\x1b");
-    submit(&harness, "/logout").await;
+    common::interactive::submit(&harness, "/logout").await;
     harness.send_input("\r");
     harness.frame.drain_commands().await;
     assert!(harness.chat_text().contains("Removed stored credential"));
 
-    submit(&harness, "/login").await;
+    common::interactive::submit(&harness, "/login").await;
     harness.send_input("\x1b");
-    submit(&harness, "/login not-a-provider").await;
+    common::interactive::submit(&harness, "/login not-a-provider").await;
     harness.send_input("\x1b");
 
     let empty = Harness::new(HarnessOptions::default()).await;
-    submit(&empty, "/logout").await;
+    common::interactive::submit(&empty, "/logout").await;
     assert!(
         harness
             .frame
@@ -671,7 +649,7 @@ async fn login_command_starts_a_provider_and_finishes_on_the_frame_command() {
 
     let harness = Harness::new(HarnessOptions::default()).await;
     harness.start_tui();
-    submit(&harness, "/login faux").await;
+    common::interactive::submit(&harness, "/login faux").await;
     harness.send_input("\x1b");
     harness
         .frame

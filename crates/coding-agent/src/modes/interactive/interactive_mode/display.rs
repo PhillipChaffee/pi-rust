@@ -149,18 +149,6 @@ impl Expandable for BranchSummaryMessageComponent {
     }
 }
 
-/// Quote a path for a shell when it carries characters outside the safe set.
-pub(crate) fn quote_if_needed(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_-./~:@".contains(character))
-    {
-        return value.to_owned();
-    }
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
 /// Format a cost the way JavaScript's `toFixed(2)` does for the values a
 /// provider reports: round half away from zero on the decimal scale. Rust's
 /// float formatting rounds half to even, which turns upstream's `$0.13`
@@ -538,22 +526,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         }
         let expandable: Rc<dyn Expandable> = component.clone();
         self.register_expandable(&expandable);
-        if let Some(streaming) = self.streaming_component.borrow().as_ref()
-            && let Some(index) = self
-                .chat_container
-                .children
-                .borrow()
-                .iter()
-                .position(|child| {
-                    Rc::as_ptr(child).cast::<()>() == Rc::as_ptr(streaming).cast::<()>()
-                })
-        {
-            self.chat_container
-                .children
-                .borrow_mut()
-                .insert(index, component);
-            return;
-        }
         self.chat_container.add_child(component);
     }
 
@@ -1282,10 +1254,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             assistant.set_hide_thinking_block(self.hide_thinking_block.get());
             assistant.set_hidden_thinking_label(&label);
         }
-        if let Some(component) = self.streaming_component.borrow().as_ref() {
-            component.set_hide_thinking_block(self.hide_thinking_block.get());
-            component.set_hidden_thinking_label(&label);
-        }
         self.tui.request_render(false);
     }
 
@@ -1395,32 +1363,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         self.render_widgets();
     }
 
-    /// Set or clear an extension component widget.
-    pub(crate) fn set_extension_widget_component(
-        &self,
-        key: &str,
-        component: Option<Rc<dyn Component>>,
-        placement: super::UiWidgetPlacement,
-    ) {
-        self.extension_widgets_above.borrow_mut().remove(key);
-        self.extension_widgets_below.borrow_mut().remove(key);
-        if let Some(component) = component {
-            match placement {
-                super::UiWidgetPlacement::AboveEditor => {
-                    self.extension_widgets_above
-                        .borrow_mut()
-                        .insert(key.to_owned(), component);
-                }
-                super::UiWidgetPlacement::BelowEditor => {
-                    self.extension_widgets_below
-                        .borrow_mut()
-                        .insert(key.to_owned(), component);
-                }
-            }
-        }
-        self.render_widgets();
-    }
-
     /// Clear every extension widget.
     pub fn clear_extension_widgets(&self) {
         self.extension_widgets_above.borrow_mut().clear();
@@ -1484,42 +1426,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         self.tui.request_render(false);
     }
 
-    /// Set a custom header, upstream's `setExtensionHeader`.
-    pub fn set_extension_header(&self, header: Option<Rc<dyn Component>>) {
-        let Some(built_in) = self.built_in_header.borrow().clone() else {
-            return;
-        };
-        let current = self
-            .custom_header
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| Rc::clone(&built_in));
-        let index = self
-            .header_container
-            .children
-            .borrow()
-            .iter()
-            .position(|child| Rc::ptr_eq(child, &current));
-        match header {
-            Some(header) => {
-                *self.custom_header.borrow_mut() = Some(Rc::clone(&header));
-                let mut children = self.header_container.children.borrow_mut();
-                match index {
-                    Some(index) => children[index] = header,
-                    None => children.insert(0, header),
-                }
-            }
-            None => {
-                *self.custom_header.borrow_mut() = None;
-                let mut children = self.header_container.children.borrow_mut();
-                if let Some(index) = index {
-                    children[index] = built_in;
-                }
-            }
-        }
-        self.tui.request_render(false);
-    }
-
     /// Register an extension terminal input listener, upstream's
     /// `addExtensionTerminalInputListener`.
     pub fn add_extension_terminal_input_listener(&self, handler: TuiInputListener) -> Rc<dyn Fn()> {
@@ -1565,21 +1471,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Replace the home directory with `~`, upstream's `formatDisplayPath`.
     fn format_display_path(&self, path: &str) -> String {
         display_path(path, std::env::var("HOME").ok().as_deref())
-    }
-
-    /// Get a short path relative to the package root, upstream's
-    /// `getShortPath`.
-    fn get_short_path(&self, full_path: &str, source_info: Option<&SourceInfo>) -> String {
-        short_path(
-            full_path,
-            source_info,
-            std::env::var("HOME").ok().as_deref(),
-        )
-    }
-
-    /// The section header format, upstream's `sectionHeader`.
-    fn section_header(&self, name: &str) -> String {
-        theme().fg("mdHeading", &format!("[{name}]"))
     }
 
     /// Show the loaded-resource listing, upstream's `showLoadedResources`.
@@ -2493,7 +2384,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         self.tui.hide_overlay();
         self.clear_extension_terminal_input_listeners();
         self.set_extension_footer(None);
-        self.set_extension_header(None);
         self.clear_extension_widgets();
         self.footer_data_provider.clear_extension_statuses();
         self.footer.invalidate();

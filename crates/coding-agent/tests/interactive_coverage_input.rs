@@ -24,18 +24,6 @@ use common::interactive::{ClipboardGuard, Harness, HarnessOptions};
 use pi_coding_agent::modes::interactive::interactive_mode::QueueDelivery;
 use pi_coding_agent::settings_manager::Settings;
 
-async fn harness_with(options: HarnessOptions) -> Harness {
-    let harness = Harness::new(options).await;
-    harness.start_tui();
-    harness
-}
-
-async fn submit(harness: &Harness, line: &str) {
-    harness.frame.submit_text(line).await;
-    harness.frame.drain_commands().await;
-    harness.frame.drain_events();
-}
-
 fn double_escape(action: &str) -> Settings {
     let mut settings = Settings::new();
     settings.insert(
@@ -45,36 +33,9 @@ fn double_escape(action: &str) -> Settings {
     settings
 }
 
-/// A stream that opens immediately and settles only when `release` notifies.
-fn gated_stream(release: Arc<tokio::sync::Notify>) -> pi_agent_core::types::StreamFn {
-    use pi_ai::types::{AssistantMessageEvent, StopReason};
-    Arc::new(move |model, _context, _options| {
-        let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
-        let mut message = common::sdk_fixture::done_message();
-        message.provider = model.provider.clone();
-        message.model.clone_from(&model.id);
-        stream.push(AssistantMessageEvent::Start {
-            partial: pi_ai::types::AssistantMessage {
-                content: Vec::new(),
-                ..message.clone()
-            },
-        });
-        let settle = stream.clone();
-        let release = Arc::clone(&release);
-        tokio::spawn(async move {
-            release.notified().await;
-            settle.push(AssistantMessageEvent::Done {
-                reason: StopReason::Stop,
-                message,
-            });
-        });
-        stream
-    })
-}
-
 #[tokio::test]
 async fn submit_routes_every_non_network_slash_command() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     for line in [
         "/session",
         "/settings",
@@ -95,25 +56,25 @@ async fn submit_routes_every_non_network_slash_command() {
         "/compact",
         "/scoped-models",
     ] {
-        submit(&harness, line).await;
+        common::interactive::submit(&harness, line).await;
         assert!(!harness.chat_text().is_empty(), "{line}");
     }
 }
 
 #[tokio::test]
 async fn submit_runs_bash_in_both_context_modes() {
-    let harness = harness_with(HarnessOptions::default()).await;
-    submit(&harness, "!echo hello").await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
+    common::interactive::submit(&harness, "!echo hello").await;
     assert!(harness.chat_text().contains("hello"));
-    submit(&harness, "!!echo excluded").await;
+    common::interactive::submit(&harness, "!!echo excluded").await;
     assert!(harness.chat_text().contains("excluded"));
-    submit(&harness, "!").await;
-    submit(&harness, "   ").await;
+    common::interactive::submit(&harness, "!").await;
+    common::interactive::submit(&harness, "   ").await;
 }
 
 #[tokio::test]
 async fn submit_warns_when_bash_is_already_running() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let session = harness.frame.session();
     let bash = tokio::spawn({
         let session = Arc::clone(&session);
@@ -129,7 +90,7 @@ async fn submit_warns_when_bash_is_already_running() {
     });
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(session.is_bash_running());
-    submit(&harness, "!echo later").await;
+    common::interactive::submit(&harness, "!echo later").await;
     assert!(harness.chat_text().contains("already running"));
     session.abort_bash();
     let _ = bash.await;
@@ -137,7 +98,7 @@ async fn submit_warns_when_bash_is_already_running() {
 
 #[tokio::test]
 async fn follow_up_handles_empty_idle_and_streaming_states() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     harness.frame.handle_follow_up().await;
 
     harness.frame.editor().set_text("idle follow up");
@@ -145,8 +106,8 @@ async fn follow_up_handles_empty_idle_and_streaming_states() {
     assert!(harness.frame.editor().get_text().is_empty());
 
     let release = Arc::new(tokio::sync::Notify::new());
-    let harness = harness_with(HarnessOptions {
-        stream: Some(gated_stream(Arc::clone(&release))),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        stream: Some(common::interactive::gated_stream(Arc::clone(&release))),
         ..HarnessOptions::default()
     })
     .await;
@@ -179,7 +140,7 @@ async fn follow_up_handles_empty_idle_and_streaming_states() {
 
 #[tokio::test]
 async fn dequeue_reports_empty_and_restores_queued_messages() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     harness.frame.handle_dequeue();
     assert!(
         harness
@@ -198,7 +159,7 @@ async fn dequeue_reports_empty_and_restores_queued_messages() {
 
 #[tokio::test]
 async fn clipboard_paste_inserts_text_and_image_paths() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let clipboard = ClipboardGuard::new(Some("pasted text"));
     harness.frame.handle_clipboard_paste().await;
     assert_eq!(harness.frame.editor().get_text(), "pasted text");
@@ -250,8 +211,8 @@ async fn external_editor_round_trips_the_editor_text() {
 #[tokio::test]
 async fn escape_streaming_restores_queued_messages_and_aborts() {
     let release = Arc::new(tokio::sync::Notify::new());
-    let harness = harness_with(HarnessOptions {
-        stream: Some(gated_stream(Arc::clone(&release))),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        stream: Some(common::interactive::gated_stream(Arc::clone(&release))),
         ..HarnessOptions::default()
     })
     .await;
@@ -273,7 +234,7 @@ async fn escape_streaming_restores_queued_messages_and_aborts() {
 
 #[tokio::test]
 async fn escape_bash_mode_and_idle_double_escape_ladders() {
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         settings: double_escape("tree"),
         ..HarnessOptions::default()
     })
@@ -284,7 +245,7 @@ async fn escape_bash_mode_and_idle_double_escape_ladders() {
     harness.frame.handle_escape().await;
     harness.frame.handle_escape().await;
 
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         settings: double_escape("fork"),
         ..HarnessOptions::default()
     })
@@ -292,7 +253,7 @@ async fn escape_bash_mode_and_idle_double_escape_ladders() {
     harness.frame.handle_escape().await;
     harness.frame.handle_escape().await;
 
-    let harness = harness_with(HarnessOptions {
+    let harness = common::interactive::harness_with(HarnessOptions {
         settings: double_escape("none"),
         ..HarnessOptions::default()
     })
@@ -305,7 +266,7 @@ async fn escape_bash_mode_and_idle_double_escape_ladders() {
 
 #[tokio::test]
 async fn escape_aborts_a_bash_run() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     let session = harness.frame.session();
     let bash = tokio::spawn({
         let session = Arc::clone(&session);
@@ -349,24 +310,8 @@ async fn ctrl_c_clears_then_shuts_down_and_ctrl_d_shuts_down() {
 
 #[tokio::test]
 async fn extension_command_detection_uses_the_registered_runner() {
-    let fixtures = common::interactive::ResourceFixtures {
-        extension_factories: vec![(
-            Some("commands".to_owned()),
-            false,
-            Arc::new(|api| {
-                Box::pin(async move {
-                    api.register_command(
-                        "demo".to_owned(),
-                        None,
-                        Arc::new(|_args, _ctx| Box::pin(async {})),
-                    )?;
-                    Ok(())
-                })
-            }),
-        )],
-        ..common::interactive::ResourceFixtures::default()
-    };
-    let harness = harness_with(HarnessOptions {
+    let fixtures = common::interactive::command_fixtures(&["demo"]);
+    let harness = common::interactive::harness_with(HarnessOptions {
         fixtures: Some(fixtures),
         ..HarnessOptions::default()
     })
@@ -379,8 +324,8 @@ async fn extension_command_detection_uses_the_registered_runner() {
 #[tokio::test]
 async fn deferred_bash_components_move_into_the_transcript() {
     let release = Arc::new(tokio::sync::Notify::new());
-    let harness = harness_with(HarnessOptions {
-        stream: Some(gated_stream(Arc::clone(&release))),
+    let harness = common::interactive::harness_with(HarnessOptions {
+        stream: Some(common::interactive::gated_stream(Arc::clone(&release))),
         ..HarnessOptions::default()
     })
     .await;
@@ -402,7 +347,7 @@ async fn deferred_bash_components_move_into_the_transcript() {
 
 #[tokio::test]
 async fn compact_command_without_messages_is_a_no_op() {
-    let harness = harness_with(HarnessOptions::default()).await;
+    let harness = common::interactive::harness_with(HarnessOptions::default()).await;
     harness.frame.handle_compact_command(None).await;
     harness
         .frame

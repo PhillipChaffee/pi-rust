@@ -100,7 +100,7 @@ async fn switch_tui_mode_restores_progress_and_blocks_on_overlays() {
     let release = Arc::new(tokio::sync::Notify::new());
     let harness = Harness::new(HarnessOptions {
         settings,
-        stream: Some(gated_stream(Arc::clone(&release))),
+        stream: Some(common::interactive::gated_stream(Arc::clone(&release))),
         ..HarnessOptions::default()
     })
     .await;
@@ -151,33 +151,6 @@ async fn switch_tui_mode_restores_progress_and_blocks_on_overlays() {
     );
     release.notify_waiters();
     let _ = prompt.await;
-}
-
-/// A stream that opens immediately and settles only when `release` notifies.
-fn gated_stream(release: Arc<tokio::sync::Notify>) -> pi_agent_core::types::StreamFn {
-    use pi_ai::types::{AssistantMessageEvent, StopReason};
-    Arc::new(move |model, _context, _options| {
-        let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
-        let mut message = common::sdk_fixture::done_message();
-        message.provider = model.provider.clone();
-        message.model.clone_from(&model.id);
-        stream.push(AssistantMessageEvent::Start {
-            partial: pi_ai::types::AssistantMessage {
-                content: Vec::new(),
-                ..message.clone()
-            },
-        });
-        let settle = stream.clone();
-        let release = Arc::clone(&release);
-        tokio::spawn(async move {
-            release.notified().await;
-            settle.push(AssistantMessageEvent::Done {
-                reason: StopReason::Stop,
-                message,
-            });
-        });
-        stream
-    })
 }
 
 #[tokio::test]

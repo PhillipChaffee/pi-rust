@@ -14,7 +14,6 @@
 mod common;
 
 use std::rc::Rc;
-use std::sync::Arc;
 
 use common::interactive::{Harness, HarnessOptions, ResourceFixtures};
 use pi_agent_core::types::{AgentMessage, CustomAgentMessage};
@@ -35,43 +34,6 @@ fn source(path: &str, source: &str, scope: SourceScope) -> SourceInfo {
         scope,
         origin: SourceOrigin::TopLevel,
         base_dir: None,
-    }
-}
-
-fn renderer_fixtures() -> ResourceFixtures {
-    ResourceFixtures {
-        extension_factories: vec![(
-            Some("renderers".to_owned()),
-            false,
-            Arc::new(|api| {
-                Box::pin(async move {
-                    let message_renderer: pi_coding_agent::extensions::types::MessageRenderer =
-                        Arc::new(|_message, _options, _theme| {
-                            let text: Rc<dyn Component> = Rc::new(
-                                pi_tui::components::Text::with_padding("CUSTOM MESSAGE", 0, 0),
-                            );
-                            Some(text)
-                        });
-                    api.register_message_renderer("note".to_owned(), message_renderer)?;
-                    let entry_renderer: pi_coding_agent::modes::interactive::components::custom_entry::EntryRenderer =
-                        Arc::new(|_entry, _options, _theme| {
-                            let text: Rc<dyn Component> =
-                                Rc::new(pi_tui::components::Text::with_padding(
-                                    "CUSTOM ENTRY",
-                                    0,
-                                    0,
-                                ));
-                            Some(text)
-                        });
-                    api.register_entry_renderer("note-entry".to_owned(), entry_renderer)?;
-                    let transformer: pi_coding_agent::extensions::types::MarkdownTransformer =
-                        Arc::new(|text, _context| text.replace("@@", "!"));
-                    api.register_markdown_transformer(transformer)?;
-                    Ok(())
-                })
-            }),
-        )],
-        ..ResourceFixtures::default()
     }
 }
 
@@ -157,7 +119,7 @@ fn custom(role: &str, data: serde_json::Value) -> AgentMessage {
 #[tokio::test]
 async fn custom_agent_messages_cover_every_branch() {
     let harness = Harness::new(HarnessOptions {
-        fixtures: Some(renderer_fixtures()),
+        fixtures: Some(common::interactive::renderer_fixtures()),
         ..HarnessOptions::default()
     })
     .await;
@@ -225,7 +187,7 @@ async fn custom_agent_messages_cover_every_branch() {
 #[tokio::test]
 async fn render_session_entries_renders_tools_results_and_custom_entries() {
     let harness = Harness::new(HarnessOptions {
-        fixtures: Some(renderer_fixtures()),
+        fixtures: Some(common::interactive::renderer_fixtures()),
         settings: settings_with("showCacheMissNotices", serde_json::Value::Bool(true)),
         seed_manager: Some(Box::new(|manager: &mut SessionManager| {
             manager
@@ -296,7 +258,7 @@ fn custom_entry(custom_type: &str) -> pi_coding_agent::session_manager::SessionE
 #[tokio::test]
 async fn custom_entries_render_only_with_a_renderer_and_content() {
     let harness = Harness::new(HarnessOptions {
-        fixtures: Some(renderer_fixtures()),
+        fixtures: Some(common::interactive::renderer_fixtures()),
         ..HarnessOptions::default()
     })
     .await;
@@ -469,13 +431,6 @@ async fn extension_widgets_footer_and_terminal_listeners_are_wired() {
     ));
     harness.frame.set_extension_footer(Some(footer));
     harness.frame.set_extension_footer(None);
-    let header: Rc<dyn Component> = Rc::new(pi_tui::components::Text::with_padding(
-        "custom header",
-        0,
-        0,
-    ));
-    harness.frame.set_extension_header(Some(header));
-    harness.frame.set_extension_header(None);
 
     let listener: TuiInputListener = Rc::new(|_data| None);
     let unsubscribe = harness

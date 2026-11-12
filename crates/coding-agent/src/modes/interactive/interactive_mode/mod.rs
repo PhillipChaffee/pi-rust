@@ -653,9 +653,7 @@ pub struct InteractiveMode<S: SettingsStorageKind> {
     /// `chatContainer.children` for `setExpanded` each toggle.
     expandable_rows: RefCell<Vec<std::rc::Weak<dyn Expandable>>>,
     managed_tool_status_started: Cell<bool>,
-    streaming_component: RefCell<Option<Rc<AssistantMessageComponent>>>,
     assistant_rows: RefCell<Vec<Rc<AssistantMessageComponent>>>,
-    streaming_message: RefCell<Option<pi_ai::types::AssistantMessage>>,
     pending_tools: RefCell<HashMap<String, Rc<ToolExecutionComponent>>>,
     tool_output_expanded: Cell<bool>,
     hide_thinking_block: Cell<bool>,
@@ -681,8 +679,6 @@ pub struct InteractiveMode<S: SettingsStorageKind> {
     widget_container_below: Rc<Container>,
     custom_footer: RefCell<Option<Rc<dyn Component>>>,
     header_container: Rc<Container>,
-    built_in_header: RefCell<Option<Rc<dyn Component>>>,
-    custom_header: RefCell<Option<Rc<dyn Component>>>,
     login_dialog: RefCell<
         Option<Rc<crate::modes::interactive::components::login_dialog::LoginDialogComponent>>,
     >,
@@ -949,8 +945,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 expandable_rows: RefCell::new(Vec::new()),
                 managed_tool_status_started: Cell::new(false),
                 assistant_rows: RefCell::new(Vec::new()),
-                streaming_component: RefCell::new(None),
-                streaming_message: RefCell::new(None),
                 pending_tools: RefCell::new(HashMap::new()),
                 tool_output_expanded: Cell::new(false),
                 hide_thinking_block: Cell::new(hide_thinking_block),
@@ -976,8 +970,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 widget_container_below,
                 custom_footer: RefCell::new(None),
                 header_container,
-                built_in_header: RefCell::new(None),
-                custom_header: RefCell::new(None),
                 login_dialog: RefCell::new(None),
                 options: RefCell::new(options),
                 auto_trust_on_reload_cwd: RefCell::new(auto_trust_on_reload_cwd),
@@ -1061,11 +1053,6 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    /// Replace the settings slot after a session replacement.
-    pub(crate) fn set_settings_manager(&self, manager: Arc<Mutex<SettingsManager<S>>>) {
-        *self.settings.lock().unwrap_or_else(PoisonError::into_inner) = manager;
     }
 
     /// The current TUI.

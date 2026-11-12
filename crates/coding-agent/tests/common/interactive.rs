@@ -37,6 +37,7 @@
     clippy::missing_fields_in_debug,
     clippy::too_many_lines,
     clippy::type_complexity,
+    clippy::large_futures,
     reason = "the fixture's Debug and builder read best in one place, and every suite recompiles it"
 )]
 
@@ -980,5 +981,182 @@ impl pi_coding_agent::modes::interactive::interactive_mode::AppEditor for TestEd
 
     fn embed_working_status(&self) -> bool {
         self.embed_working_status
+    }
+}
+
+/// Mount a frame and start its recording terminal.
+pub async fn harness_with(options: HarnessOptions) -> Harness {
+    let harness = Harness::new(options).await;
+    harness.start_tui();
+    harness
+}
+
+/// The first user-message entry id, the tree/fork suites' navigation target.
+#[must_use]
+pub fn first_user_message_id(harness: &Harness) -> String {
+    harness
+        .frame
+        .session()
+        .user_messages_for_forking()
+        .first()
+        .map(|(id, _)| id.clone())
+        .expect("the fixture seeds a user message")
+}
+
+/// A persisted session whose stored cwd no longer exists, the switch/import
+/// failure fixture; the session directory survives the cwd removal.
+pub fn missing_cwd_session_file(root: &std::path::Path) -> String {
+    let old_cwd = root.join("old-project");
+    let session_dir = root.join("sessions");
+    std::fs::create_dir_all(&old_cwd).expect("old cwd");
+    let mut manager = SessionManager::create(
+        &old_cwd.display().to_string(),
+        Some(&session_dir.display().to_string()),
+        None,
+    )
+    .expect("session manager");
+    for message in exchange_messages() {
+        manager.append_message(message).expect("seeded message");
+    }
+    let session_file = manager.session_file().expect("session file").to_owned();
+    drop(manager);
+    std::fs::remove_dir_all(&old_cwd).expect("remove old cwd");
+    session_file
+}
+
+/// Submit one slash line and drain the frame's command/event queues.
+pub async fn submit(harness: &Harness, line: &str) {
+    harness.frame.submit_text(line).await;
+    harness.frame.drain_commands().await;
+    harness.frame.drain_events();
+}
+
+/// An inline extension that registers the given commands.
+#[must_use]
+pub fn command_fixtures(names: &[&str]) -> ResourceFixtures {
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    ResourceFixtures {
+        extension_factories: vec![(
+            Some("commands".to_owned()),
+            false,
+            Arc::new(move |api| {
+                let names = names.clone();
+                Box::pin(async move {
+                    for name in names {
+                        api.register_command(
+                            name,
+                            None,
+                            Arc::new(|_args, _ctx| Box::pin(async {})),
+                        )?;
+                    }
+                    Ok(())
+                })
+            }),
+        )],
+        ..ResourceFixtures::default()
+    }
+}
+
+/// An Anthropic OAuth credential, the subscription-auth fixture.
+#[must_use]
+pub fn anthropic_oauth_auth() -> pi_coding_agent::auth_storage::AuthStorageData {
+    let credential = pi_ai::auth::types::Credential::OAuth(pi_ai::auth::types::OAuthCredentials {
+        refresh: "refresh".to_owned(),
+        access: "access".to_owned(),
+        expires: 4_102_444_800_000,
+        extra: std::collections::BTreeMap::new(),
+    });
+    let mut auth = pi_coding_agent::auth_storage::AuthStorageData::new();
+    auth.insert(
+        "anthropic".to_owned(),
+        serde_json::to_value(&credential).expect("credential serializes"),
+    );
+    auth
+}
+
+/// A two-message exchange: user then assistant.
+#[must_use]
+pub fn exchange_messages() -> Vec<pi_agent_core::types::AgentMessage> {
+    vec![
+        super::agent_session::user_message("first", 1),
+        pi_agent_core::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(
+            super::agent_session::assistant_message("reply", 2),
+        )),
+    ]
+}
+
+/// A three-message conversation: user, assistant, user.
+#[must_use]
+pub fn conversation_messages() -> Vec<pi_agent_core::types::AgentMessage> {
+    let mut messages = exchange_messages();
+    messages.push(super::agent_session::user_message("second", 3));
+    messages
+}
+
+/// A stream that opens immediately and settles only when `release` notifies,
+/// the gated stream shared by the command, input, and lifecycle tests.
+pub fn gated_stream(release: Arc<tokio::sync::Notify>) -> pi_agent_core::types::StreamFn {
+    use pi_ai::types::{AssistantMessageEvent, StopReason};
+    Arc::new(move |model, _context, _options| {
+        let stream = pi_ai::utils::event_stream::assistant_message_event_stream();
+        let mut message = super::sdk_fixture::done_message();
+        message.provider = model.provider.clone();
+        message.model.clone_from(&model.id);
+        stream.push(AssistantMessageEvent::Start {
+            partial: pi_ai::types::AssistantMessage {
+                content: Vec::new(),
+                ..message.clone()
+            },
+        });
+        let settle = stream.clone();
+        let release = Arc::clone(&release);
+        tokio::spawn(async move {
+            release.notified().await;
+            settle.push(AssistantMessageEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            });
+        });
+        stream
+    })
+}
+
+/// The renderer fixtures shared by the display and extra suites: a custom
+/// message renderer, an entry renderer, and a Markdown transformer.
+#[must_use]
+pub fn renderer_fixtures() -> ResourceFixtures {
+    ResourceFixtures {
+        extension_factories: vec![(
+            Some("renderers".to_owned()),
+            false,
+            Arc::new(|api| {
+                Box::pin(async move {
+                    let message_renderer: pi_coding_agent::extensions::types::MessageRenderer =
+                        Arc::new(|_message, _options, _theme| {
+                            let text: Rc<dyn pi_tui::tui::Component> = Rc::new(
+                                pi_tui::components::Text::with_padding("CUSTOM MESSAGE", 0, 0),
+                            );
+                            Some(text)
+                        });
+                    api.register_message_renderer("note".to_owned(), message_renderer)?;
+                    let entry_renderer: pi_coding_agent::modes::interactive::components::custom_entry::EntryRenderer =
+                        Arc::new(|_entry, _options, _theme| {
+                            let text: Rc<dyn pi_tui::tui::Component> =
+                                Rc::new(pi_tui::components::Text::with_padding(
+                                    "CUSTOM ENTRY",
+                                    0,
+                                    0,
+                                ));
+                            Some(text)
+                        });
+                    api.register_entry_renderer("note-entry".to_owned(), entry_renderer)?;
+                    let transformer: pi_coding_agent::extensions::types::MarkdownTransformer =
+                        Arc::new(|text, _context| text.replace("@@", "!"));
+                    api.register_markdown_transformer(transformer)?;
+                    Ok(())
+                })
+            }),
+        )],
+        ..ResourceFixtures::default()
     }
 }

@@ -72,20 +72,11 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 self.add_message_to_chat(&message, false);
                 self.tui.request_render(false);
             }
-            AgentSessionEvent::MessageEnd { message } => {
-                if let pi_agent_core::types::AgentMessage::Standard(
-                    pi_ai::types::Message::Assistant(_),
-                ) = &message
-                {
-                    *self.streaming_message.borrow_mut() = None;
-                    *self.streaming_component.borrow_mut() = None;
-                }
+            AgentSessionEvent::MessageEnd { .. } => {
                 self.tui.request_render(false);
             }
             AgentSessionEvent::AgentEnd { .. } => {
                 self.clear_status_indicator(Some(StatusIndicatorKind::Working));
-                *self.streaming_component.borrow_mut() = None;
-                *self.streaming_message.borrow_mut() = None;
                 self.pending_tools.borrow_mut().clear();
                 self.tui.request_render(false);
             }
@@ -267,19 +258,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                     self.tui.request_render(false);
                 }
             }
-            AgentSessionEvent::MessageUpdate { message, .. } => {
-                let pi_agent_core::types::AgentMessage::Standard(pi_ai::types::Message::Assistant(
-                    assistant,
-                )) = &message
-                else {
-                    return;
-                };
-                if let Some(component) = self.streaming_component.borrow().clone() {
-                    *self.streaming_message.borrow_mut() = Some(assistant.clone());
-                    component.update_content(assistant, true);
-                    self.tui.request_render(false);
-                }
-            }
+            AgentSessionEvent::MessageUpdate { .. } => {}
             AgentSessionEvent::BashExecutionUpdate { .. } => {}
         }
     }
