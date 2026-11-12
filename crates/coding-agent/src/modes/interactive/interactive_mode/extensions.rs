@@ -38,7 +38,7 @@ use crate::modes::interactive::components::login_dialog::LoginDialogComponent;
 
 /// The interactive extension UI context, upstream's `createExtensionUIContext`
 /// object.
-pub(crate) struct InteractiveUiContext {
+pub struct InteractiveUiContext {
     sender: mpsc::UnboundedSender<UiRequest>,
 }
 
@@ -209,6 +209,34 @@ impl InteractiveUiContext {
     /// Set tool output expansion.
     pub(crate) fn set_tools_expanded(&self, expanded: bool) {
         self.send(UiRequest::SetToolsExpanded(expanded));
+    }
+
+    /// Set the active theme by name, persisting it; upstream's
+    /// `setTheme` on the UI context.
+    #[must_use]
+    pub fn set_theme(&self, name: &str) -> BoxedFuture<'static, ThemeUpdateResult> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.send(UiRequest::SetTheme(name.to_owned(), reply));
+        Box::pin(async move { receiver.await.unwrap_or_default() })
+    }
+
+    /// Every available theme as `(name, path)`.
+    #[must_use]
+    pub fn get_all_themes(&self) -> BoxedFuture<'static, Vec<(String, String)>> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.send(UiRequest::GetAllThemes(reply));
+        Box::pin(async move { receiver.await.unwrap_or_default() })
+    }
+
+    /// One theme instance by name, upstream's `getTheme`.
+    #[must_use]
+    pub fn get_theme(
+        &self,
+        name: &str,
+    ) -> BoxedFuture<'static, Option<Arc<crate::modes::interactive::theme::theme::Theme>>> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.send(UiRequest::GetTheme(name.to_owned(), reply));
+        Box::pin(async move { receiver.await.ok().flatten() })
     }
 
     /// Marshal one login prompt onto the frame.
@@ -407,6 +435,56 @@ impl InteractiveUiContext {
                 let future = self.get_tools_expanded();
                 Box::pin(async move { Ok(Value::from(future.await)) })
             }
+            "setTheme" => {
+                let name = params
+                    .as_ref()
+                    .and_then(|params| params.get("name").or_else(|| params.get("theme")))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                match name {
+                    Some(name) => {
+                        let future = self.set_theme(&name);
+                        Box::pin(async move {
+                            let result = future.await;
+                            Ok(serde_json::json!({
+                                "success": result.success,
+                                "error": result.error,
+                            }))
+                        })
+                    }
+                    None => Box::pin(async {
+                        Err(HostCallError::new("invalid_params", "missing `name`"))
+                    }),
+                }
+            }
+            "getAllThemes" => {
+                let future = self.get_all_themes();
+                Box::pin(async move {
+                    Ok(Value::from(
+                        future
+                            .await
+                            .into_iter()
+                            .map(|(name, path)| serde_json::json!({ "name": name, "path": path }))
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+            }
+            "getTheme" => {
+                let name = params
+                    .as_ref()
+                    .and_then(|params| params.get("name"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                match name {
+                    Some(name) => {
+                        let future = self.get_theme(&name);
+                        Box::pin(async move { Ok(Value::from(future.await.is_some())) })
+                    }
+                    None => Box::pin(async {
+                        Err(HostCallError::new("invalid_params", "missing `name`"))
+                    }),
+                }
+            }
             "setToolsExpanded" => {
                 let expanded = params
                     .as_ref()
@@ -492,7 +570,7 @@ impl InteractiveUiContext {
 }
 
 impl<S: crate::settings_manager::SettingsStorageKind> InteractiveMode<S> {
-    fn show_extension_selector(
+    pub(crate) fn show_extension_selector(
         &self,
         title: &str,
         options: Vec<String>,
@@ -585,7 +663,7 @@ impl<S: crate::settings_manager::SettingsStorageKind> InteractiveMode<S> {
         self.show_dialog_component(input);
     }
 
-    fn show_extension_editor(
+    pub(crate) fn show_extension_editor(
         &self,
         title: &str,
         prefill: Option<&str>,
@@ -1030,7 +1108,7 @@ impl<S: crate::settings_manager::SettingsStorageKind> InteractiveMode<S> {
     /// iterating its `Map`; the port's `AppEditor` does not enumerate them, so
     /// a custom editor receives submit/change wiring and the appearance
     /// settings, and app actions fall back to the extension's own bindings.
-    pub(crate) fn set_custom_editor_component(&self, factory: Option<EditorFactory>) {
+    pub fn set_custom_editor_component(&self, factory: Option<EditorFactory>) {
         *self.editor_component_factory.borrow_mut() = factory.clone();
         let current_text = self.editor().get_text();
         self.dispose_active_selector();

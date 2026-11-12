@@ -92,6 +92,63 @@ impl Component for ExpandableText {
     }
 }
 
+/// A transcript row that can flip between its collapsed and expanded body,
+/// upstream's `isExpandable` protocol.
+pub(crate) trait Expandable {
+    /// Apply the expanded state.
+    fn set_expanded(&self, expanded: bool);
+}
+
+impl Expandable for ExpandableText {
+    fn set_expanded(&self, expanded: bool) {
+        self.apply_expanded(expanded);
+    }
+}
+
+impl Expandable for ToolExecutionComponent {
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
+impl Expandable for BashExecutionComponent {
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
+impl Expandable for crate::modes::interactive::components::custom_message::CustomMessageComponent {
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
+impl Expandable for CustomEntryComponent {
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
+impl Expandable
+    for crate::modes::interactive::components::skill_invocation_message::SkillInvocationMessageComponent
+{
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
+impl Expandable for CompactionSummaryMessageComponent {
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
+impl Expandable for BranchSummaryMessageComponent {
+    fn set_expanded(&self, expanded: bool) {
+        Self::set_expanded(self, expanded);
+    }
+}
+
 /// Quote a path for a shell when it carries characters outside the safe set.
 pub(crate) fn quote_if_needed(value: &str) -> String {
     if !value.is_empty()
@@ -102,6 +159,22 @@ pub(crate) fn quote_if_needed(value: &str) -> String {
         return value.to_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Format a cost the way JavaScript's `toFixed(2)` does for the values a
+/// provider reports: round half away from zero on the decimal scale. Rust's
+/// float formatting rounds half to even, which turns upstream's `$0.13`
+/// notice for a `0.125` total into `$0.12`.
+fn format_cost_2(value: f64) -> String {
+    let cents = (value * 100.0).round();
+    let sign = if cents < 0.0 { "-" } else { "" };
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the absolute rounded cost is a small non-negative integer of cents"
+    )]
+    let cents = cents.abs() as u64;
+    format!("{sign}{}.{:02}", cents / 100, cents % 100)
 }
 
 /// Build an error tool result.
@@ -189,14 +262,14 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show an error line, upstream's `showError`.
-    pub(crate) fn show_error(&self, message: &str) {
+    pub fn show_error(&self, message: &str) {
         self.chat_container.add_child(Rc::new(Spacer::new()));
         self.chat_container.add_child(error_line(message));
         self.tui.request_render(false);
     }
 
     /// Show a warning line, upstream's `showWarning`.
-    pub(crate) fn show_warning(&self, message: &str) {
+    pub fn show_warning(&self, message: &str) {
         self.chat_container.add_child(Rc::new(Spacer::new()));
         let line: Rc<dyn Component> = Rc::new(Text::with_padding(
             theme().fg("warning", &format!("Warning: {message}")),
@@ -209,7 +282,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Show a dim status line, coalescing consecutive updates, upstream's
     /// `showStatus`.
-    pub(crate) fn show_status(&self, message: &str) {
+    pub fn show_status(&self, message: &str) {
         let last = self.chat_container.children.borrow().last().cloned();
         let second_last = {
             let children = self.chat_container.children.borrow();
@@ -249,10 +322,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show a managed-tool status update, upstream's `showManagedToolStatus`.
-    pub(crate) fn show_managed_tool_status(
-        &self,
-        status: &crate::utils::tools_manager::ToolStatus,
-    ) {
+    pub fn show_managed_tool_status(&self, status: &crate::utils::tools_manager::ToolStatus) {
         if !self.managed_tool_status_started.get() {
             self.chat_container.add_child(Rc::new(Spacer::new()));
             self.managed_tool_status_started.set(true);
@@ -275,7 +345,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Add one agent message to the transcript, upstream's
     /// `addMessageToChat`.
-    pub(crate) fn add_message_to_chat(&self, message: &AgentMessage, populate_history: bool) {
+    pub fn add_message_to_chat(&self, message: &AgentMessage, populate_history: bool) {
         match message {
             AgentMessage::Custom(custom) => self.add_custom_agent_message(custom),
             AgentMessage::Standard(Message::User(user)) => {
@@ -292,6 +362,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                         Some(self.markdown_theme_with_settings()),
                     ));
                     component.set_expanded(self.tool_output_expanded.get());
+                    let expandable: Rc<dyn Expandable> = component.clone();
+                    self.register_expandable(&expandable);
                     self.chat_container.add_child(component);
                     if let Some(user_message) = &skill_block.user_message {
                         self.chat_container.add_child(Rc::new(Spacer::new()));
@@ -387,6 +459,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                         self.output_pad.get(),
                     ));
                     component.set_expanded(self.tool_output_expanded.get());
+                    let expandable: Rc<dyn Expandable> = component.clone();
+                    self.register_expandable(&expandable);
                     self.chat_container.add_child(component);
                 }
             }
@@ -413,6 +487,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                     Some(self.markdown_theme_with_settings()),
                 ));
                 component.set_expanded(self.tool_output_expanded.get());
+                let expandable: Rc<dyn Expandable> = component.clone();
+                self.register_expandable(&expandable);
                 self.chat_container.add_child(component);
             }
             "branchSummary" => {
@@ -436,6 +512,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                     Some(self.markdown_theme_with_settings()),
                 ));
                 component.set_expanded(self.tool_output_expanded.get());
+                let expandable: Rc<dyn Expandable> = component.clone();
+                self.register_expandable(&expandable);
                 self.chat_container.add_child(component);
             }
             _ => {}
@@ -459,6 +537,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         if !component.has_content() {
             return;
         }
+        let expandable: Rc<dyn Expandable> = component.clone();
+        self.register_expandable(&expandable);
         if let Some(streaming) = self.streaming_component.borrow().as_ref()
             && let Some(index) = self
                 .chat_container
@@ -480,7 +560,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Render typed session entries to chat, upstream's
     /// `renderSessionEntries`.
-    pub(crate) fn render_session_entries(
+    pub fn render_session_entries(
         &self,
         entries: &[FileEntry],
         update_footer: bool,
@@ -499,28 +579,16 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             self.update_editor_border_color();
         }
         for entry in entries {
-            match entry {
-                FileEntry::Entry(SessionEntry::Custom(_)) => {
-                    if let FileEntry::Entry(custom) = entry {
-                        self.add_custom_entry_to_chat(custom);
-                    }
-                    continue;
+            if let FileEntry::Entry(SessionEntry::Custom(_)) = entry {
+                if let FileEntry::Entry(custom) = entry {
+                    self.add_custom_entry_to_chat(custom);
                 }
-                FileEntry::Entry(SessionEntry::Compaction(compaction)) => {
-                    if let Some(usage) = compaction.usage {
-                        self.add_compaction_cost_notice("Compaction", &usage);
-                    }
-                }
-                FileEntry::Entry(SessionEntry::BranchSummary(branch)) => {
-                    if let Some(usage) = branch.usage {
-                        self.add_compaction_cost_notice("Branch summary", &usage);
-                    }
-                }
-                _ => {}
+                continue;
             }
-            for message in session_entry_to_context_messages(entry) {
+            let messages = session_entry_to_context_messages(entry);
+            for message in &messages {
                 if let AgentMessage::Standard(Message::Assistant(assistant)) = &message {
-                    self.add_message_to_chat(&message, populate_history);
+                    self.add_message_to_chat(message, populate_history);
                     for block in &assistant.content {
                         let pi_ai::types::AssistantBlock::ToolCall(call) = block else {
                             continue;
@@ -535,6 +603,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                             &self.session().cwd(),
                         ));
                         component.set_expanded(self.tool_output_expanded.get());
+                        let expandable: Rc<dyn Expandable> = component.clone();
+                        self.register_expandable(&expandable);
                         self.chat_container.add_child(component.clone());
                         if matches!(
                             assistant.stop_reason,
@@ -571,13 +641,27 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                     self.add_message_to_chat(&message, populate_history);
                 }
             }
+            // Upstream appends the billing notice after the summary it paid
+            // for, and only when the entry produced a message.
+            if !messages.is_empty() {
+                if let FileEntry::Entry(SessionEntry::Compaction(compaction)) = entry {
+                    if let Some(usage) = compaction.usage {
+                        self.add_compaction_cost_notice("Compaction", &usage);
+                    }
+                }
+                if let FileEntry::Entry(SessionEntry::BranchSummary(branch)) = entry {
+                    if let Some(usage) = branch.usage {
+                        self.add_compaction_cost_notice("Branch summary", &usage);
+                    }
+                }
+            }
         }
         self.pending_tools.borrow_mut().extend(rendered_pending);
         self.tui.request_render(false);
     }
 
     /// Render the initial session context, upstream's `renderInitialMessages`.
-    pub(crate) fn render_initial_messages(&self) {
+    pub fn render_initial_messages(&self) {
         let entries: Vec<FileEntry> = {
             let session = self.session();
             let manager = crate::core::agent_session::lock(&session.session_manager);
@@ -674,7 +758,15 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show an Anthropic drop notice for the assistant message.
-    fn maybe_show_assistant_diagnostics(&self, message: &AssistantMessage) {
+    pub fn maybe_show_assistant_diagnostics(&self, message: &AssistantMessage) {
+        if !self
+            .settings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_show_cache_miss_notices()
+        {
+            return;
+        }
         for diagnostic in message.diagnostics.as_deref().unwrap_or_default() {
             if diagnostic.kind != "anthropic_input_transformations" {
                 continue;
@@ -731,7 +823,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Add a billing notice for a compaction or branch summary.
-    fn add_compaction_cost_notice(&self, label: &str, usage: &pi_ai::types::Usage) {
+    pub fn add_compaction_cost_notice(&self, label: &str, usage: &pi_ai::types::Usage) {
         let show = self
             .settings()
             .lock()
@@ -742,7 +834,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         }
         let tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
         let cost = if usage.cost.total >= 0.01 {
-            format!(" (~${:.2})", usage.cost.total)
+            format!(" (~${})", format_cost_2(usage.cost.total))
         } else {
             String::new()
         };
@@ -794,7 +886,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             return;
         }
         let cost = if miss.missed_cost >= 0.01 {
-            format!(" (~${:.2})", miss.missed_cost)
+            format!(" (~${})", format_cost_2(miss.missed_cost))
         } else {
             String::new()
         };
@@ -975,7 +1067,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Queue a message while compaction runs, upstream's
     /// `queueCompactionMessage`.
-    pub(crate) fn queue_compaction_message(&self, text: &str, mode: QueueDelivery) {
+    pub fn queue_compaction_message(&self, text: &str, mode: QueueDelivery) {
         self.compaction_queued_messages
             .borrow_mut()
             .push(CompactionQueuedMessage {
@@ -989,7 +1081,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Drain the compaction queue, upstream's `flushCompactionQueue`.
-    pub(crate) fn flush_compaction_queue(&self, will_retry: bool) {
+    pub fn flush_compaction_queue(&self, will_retry: bool) {
         if self.compaction_queued_messages.borrow().is_empty() {
             return;
         }
@@ -1087,7 +1179,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show or replace the status indicator.
-    pub(crate) fn show_status_indicator(&self, indicator: Rc<StatusIndicator>) {
+    pub fn show_status_indicator(&self, indicator: Rc<StatusIndicator>) {
         if let Some(previous) = self.active_status_indicator.borrow_mut().take() {
             previous.dispose();
         }
@@ -1104,7 +1196,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Clear the active indicator, optionally only when it carries `kind`.
-    pub(crate) fn clear_status_indicator(&self, kind: Option<StatusIndicatorKind>) {
+    pub fn clear_status_indicator(&self, kind: Option<StatusIndicatorKind>) {
         if let Some(kind) = kind
             && self
                 .active_status_indicator
@@ -1121,7 +1213,9 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         self.active_working_indicator_embedded.set(false);
         self.status_container.clear();
         self.default_editor.set_working_status_indicator(None);
-        self.editor().set_working_status_indicator(None);
+        if self.editor().embed_working_status() {
+            self.editor().set_working_status_indicator(None);
+        }
         if !was_embedded
             && self.options.borrow().tui_mode == Some(pi_tui::tui::TuiMode::Regular)
             && self.tui.get_clear_on_shrink()
@@ -1147,7 +1241,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show or hide the working indicator.
-    pub(crate) fn set_working_visible(&self, visible: bool) {
+    pub fn set_working_visible(&self, visible: bool) {
         self.working_visible.set(visible);
         if !visible {
             self.clear_status_indicator(Some(StatusIndicatorKind::Working));
@@ -1216,15 +1310,33 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Expand or collapse tool output.
-    pub(crate) fn set_tools_expanded(&self, expanded: bool) {
+    pub fn set_tools_expanded(&self, expanded: bool) {
         if expanded == self.tool_output_expanded.get() {
             return;
         }
         self.tool_output_expanded.set(expanded);
+        let rows: Vec<Rc<dyn Expandable>> = self
+            .expandable_rows
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .collect();
+        for row in rows {
+            row.set_expanded(expanded);
+        }
         self.show_status(&format!(
             "Tool output: {}",
             if expanded { "expanded" } else { "collapsed" }
         ));
+    }
+
+    /// Register one expandable row the frame mounted, the record upstream's
+    /// container scan rediscovers each toggle. The built-in header has no
+    /// ported expandable row, so the header stays out of the toggle.
+    pub(crate) fn register_expandable(&self, row: &Rc<dyn Expandable>) {
+        let mut rows = self.expandable_rows.borrow_mut();
+        rows.retain(|weak| weak.strong_count() > 0);
+        rows.push(Rc::downgrade(row));
     }
 
     /// Toggle tool output expansion.
@@ -1456,35 +1568,17 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Replace the home directory with `~`, upstream's `formatDisplayPath`.
     fn format_display_path(&self, path: &str) -> String {
-        let Some(home) = std::env::var_os("HOME") else {
-            return path.to_owned();
-        };
-        let home = home.to_string_lossy();
-        path.strip_prefix(home.as_ref())
-            .map_or_else(|| path.to_owned(), |rest| format!("~{rest}"))
+        display_path(path, std::env::var("HOME").ok().as_deref())
     }
 
     /// Get a short path relative to the package root, upstream's
     /// `getShortPath`.
     fn get_short_path(&self, full_path: &str, source_info: Option<&SourceInfo>) -> String {
-        let normalized = full_path.replace('\\', "/");
-        if let Some(source) = source_info {
-            if let Some(captures) = npm_path_capture(&normalized, &source.source) {
-                return captures;
-            }
-            if source.source.starts_with("git:") {
-                if let Some(index) = normalized.find("/git/") {
-                    let rest = &normalized[index + 5..];
-                    let mut parts = rest.splitn(3, '/');
-                    let _ = parts.next();
-                    let _ = parts.next();
-                    if let Some(tail) = parts.next() {
-                        return tail.to_owned();
-                    }
-                }
-            }
-        }
-        self.format_display_path(full_path)
+        short_path(
+            full_path,
+            source_info,
+            std::env::var("HOME").ok().as_deref(),
+        )
     }
 
     /// The section header format, upstream's `sectionHeader`.
@@ -1493,7 +1587,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show the loaded-resource listing, upstream's `showLoadedResources`.
-    pub(crate) fn show_loaded_resources(&self, show_diagnostics_when_quiet: bool) {
+    pub fn show_loaded_resources(&self, show_diagnostics_when_quiet: bool) {
         self.loaded_resources_container.clear();
         let verbose = self.options.borrow().verbose;
         let quiet = self
@@ -1536,74 +1630,79 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                     .into_iter()
                     .map(|file| file.path),
             );
-            if !context.is_empty() {
-                self.add_loaded_section(
-                    "Context",
-                    &context
-                        .iter()
-                        .map(|path| self.format_display_path(path))
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if !skills.skills.is_empty() {
-                self.add_loaded_section(
-                    "Skills",
-                    &skills
-                        .skills
-                        .iter()
-                        .map(|skill| {
-                            format!(
-                                "{} {}",
-                                skill.name,
-                                theme().fg(
-                                    "muted",
-                                    &self
-                                        .get_short_path(&skill.file_path, Some(&skill.source_info))
-                                )
-                            )
+            let view = LoadedResourcesView {
+                context_files: context,
+                skills: skills
+                    .skills
+                    .iter()
+                    .map(|skill| LoadedSkillEntry {
+                        name: skill.name.clone(),
+                        resource: LoadedResource {
+                            path: skill.file_path.clone(),
+                            source_info: Some(skill.source_info.clone()),
+                        },
+                    })
+                    .collect(),
+                prompts: prompts
+                    .prompts
+                    .iter()
+                    .map(|prompt| LoadedPromptEntry {
+                        name: prompt.name.clone(),
+                        resource: LoadedResource {
+                            path: prompt.file_path.clone(),
+                            source_info: Some(prompt.source_info.clone()),
+                        },
+                    })
+                    .collect(),
+                extensions: extensions
+                    .iter()
+                    .map(|extension| LoadedResource {
+                        path: extension.path.clone(),
+                        source_info: extension.source_info.clone(),
+                    })
+                    .collect(),
+                themes: themes
+                    .themes
+                    .iter()
+                    .filter_map(|handle| {
+                        handle.source_path.as_ref().map(|path| LoadedThemeEntry {
+                            name: handle.name.clone(),
+                            resource: LoadedResource {
+                                path: path.clone(),
+                                source_info: handle.source_info.clone(),
+                            },
                         })
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if !prompts.prompts.is_empty() {
-                self.add_loaded_section(
-                    "Prompts",
-                    &prompts
-                        .prompts
-                        .iter()
-                        .map(|prompt| format!("/{}", prompt.name))
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if !extensions.is_empty() {
-                self.add_loaded_section(
-                    "Extensions",
-                    &extensions
-                        .iter()
-                        .map(|extension| {
-                            self.get_short_path(&extension.path, extension.source_info.as_ref())
-                        })
-                        .collect::<Vec<_>>(),
-                );
-            }
-            let custom_themes: Vec<_> = themes
-                .themes
-                .iter()
-                .filter(|handle| handle.source_path.is_some())
-                .collect();
-            if !custom_themes.is_empty() {
-                self.add_loaded_section(
-                    "Themes",
-                    &custom_themes
-                        .iter()
-                        .map(|handle| {
-                            handle
-                                .name
-                                .clone()
-                                .unwrap_or_else(|| handle.source_path.clone().unwrap_or_default())
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                    })
+                    .collect(),
+            };
+            let options = LoadedResourcesOptions {
+                expanded: self.get_startup_expansion_state(),
+                cwd: crate::core::agent_session::lock(&session.session_manager)
+                    .cwd()
+                    .to_owned(),
+                home: Some(crate::config::home_dir()),
+            };
+            let sections = render_loaded_resource_sections(&view, &options);
+            let has_context = !view.context_files.is_empty();
+            for (index, section) in sections.into_iter().enumerate() {
+                if index == 0 && has_context {
+                    self.loaded_resources_container
+                        .add_child(Rc::new(Spacer::new()));
+                }
+                let collapsed = section.collapsed.clone();
+                let expanded = section.expanded.clone();
+                let expandable_text = Rc::new(ExpandableText::new(
+                    move || collapsed.clone(),
+                    move || expanded.clone(),
+                    options.expanded,
+                    0,
+                    0,
+                ));
+                let expandable: Rc<dyn Expandable> = expandable_text.clone();
+                self.register_expandable(&expandable);
+                self.loaded_resources_container.add_child(expandable_text);
+                self.loaded_resources_container
+                    .add_child(Rc::new(Spacer::new()));
             }
         }
         if show_diagnostics {
@@ -1635,36 +1734,584 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         }
         self.tui.request_render(false);
     }
+}
 
-    fn add_loaded_section(&self, name: &str, lines: &[String]) {
-        let body = lines
+/// One loaded resource path with its provenance, upstream's
+/// `{ path, sourceInfo }` listing item.
+#[derive(Clone, Debug)]
+pub struct LoadedResource {
+    /// The resource's own path.
+    pub path: String,
+    /// Where the resource came from.
+    pub source_info: Option<SourceInfo>,
+}
+
+/// One skill row in the startup listing.
+#[derive(Clone, Debug)]
+pub struct LoadedSkillEntry {
+    /// The skill's name.
+    pub name: String,
+    /// The skill's file and provenance.
+    pub resource: LoadedResource,
+}
+
+/// One prompt row in the startup listing.
+#[derive(Clone, Debug)]
+pub struct LoadedPromptEntry {
+    /// The template name without the leading slash.
+    pub name: String,
+    /// The template's file and provenance.
+    pub resource: LoadedResource,
+}
+
+/// One loaded theme row in the startup listing.
+#[derive(Clone, Debug)]
+pub struct LoadedThemeEntry {
+    /// The theme's declared name.
+    pub name: Option<String>,
+    /// The theme's file and provenance.
+    pub resource: LoadedResource,
+}
+
+/// The startup resource listing, upstream's per-loader result set.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedResourcesView {
+    /// System-prompt, append-system-prompt, and context-file paths.
+    pub context_files: Vec<String>,
+    /// Loaded skills.
+    pub skills: Vec<LoadedSkillEntry>,
+    /// Loaded prompt templates.
+    pub prompts: Vec<LoadedPromptEntry>,
+    /// Loaded extensions, hidden entries already removed.
+    pub extensions: Vec<LoadedResource>,
+    /// Loaded custom themes.
+    pub themes: Vec<LoadedThemeEntry>,
+}
+
+/// The listing options, upstream's `getStartupExpansionState` and the
+/// formatting environment.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedResourcesOptions {
+    /// Render the expanded (scope/package tree) bodies.
+    pub expanded: bool,
+    /// The project cwd context paths resolve against.
+    pub cwd: String,
+    /// The home directory `~` abbreviates.
+    pub home: Option<String>,
+}
+
+/// One rendered section, its collapsed and expanded bodies.
+#[derive(Clone, Debug)]
+pub struct LoadedResourceSection {
+    /// The section title, e.g. `Skills`.
+    pub name: String,
+    /// The compact body, upstream's `collapsedBody`.
+    pub collapsed: String,
+    /// The scope/package tree, upstream's `expandedBody`.
+    pub expanded: String,
+}
+
+/// Render the startup listing sections, upstream's `showLoadedResources`
+/// body collection.
+#[must_use]
+pub fn render_loaded_resource_sections(
+    view: &LoadedResourcesView,
+    options: &LoadedResourcesOptions,
+) -> Vec<LoadedResourceSection> {
+    let mut sections = Vec::new();
+    let home = options.home.as_deref();
+    if !view.context_files.is_empty() {
+        let context_list = view
+            .context_files
             .iter()
-            .map(|line| theme().fg("dim", &format!("  {line}")))
+            .map(|path| theme().fg("dim", &format!("  {}", display_path(path, home))))
             .collect::<Vec<_>>()
             .join("\n");
-        let text: Rc<dyn Component> = Rc::new(Text::with_padding(
-            format!("{}\n{body}", self.section_header(name)),
-            0,
-            0,
-        ));
-        self.loaded_resources_container.add_child(text);
-        self.loaded_resources_container
-            .add_child(Rc::new(Spacer::new()));
+        let context_compact = format_compact_list(
+            &view
+                .context_files
+                .iter()
+                .map(|path| context_path(path, &options.cwd, home))
+                .collect::<Vec<_>>(),
+            false,
+        );
+        sections.push(section("Context", &context_compact, &context_list));
+    }
+    if !view.skills.is_empty() {
+        let groups = build_scope_groups(
+            view.skills
+                .iter()
+                .map(|skill| skill.resource.clone())
+                .collect(),
+        );
+        let skill_list =
+            format_scope_groups(&groups, &|item| display_path(&item.path, home), &|item| {
+                short_path(&item.path, item.source_info.as_ref(), home)
+            });
+        let skill_compact = format_compact_list(
+            &view
+                .skills
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect::<Vec<_>>(),
+            true,
+        );
+        sections.push(section("Skills", &skill_compact, &skill_list));
+    }
+    if !view.prompts.is_empty() {
+        let groups = build_scope_groups(
+            view.prompts
+                .iter()
+                .map(|prompt| prompt.resource.clone())
+                .collect(),
+        );
+        let by_path: std::collections::HashMap<&str, &str> = view
+            .prompts
+            .iter()
+            .map(|prompt| (prompt.resource.path.as_str(), prompt.name.as_str()))
+            .collect();
+        let template_list = format_scope_groups(
+            &groups,
+            &|item| {
+                by_path
+                    .get(item.path.as_str())
+                    .map_or_else(|| display_path(&item.path, home), |name| format!("/{name}"))
+            },
+            &|item| {
+                by_path
+                    .get(item.path.as_str())
+                    .map_or_else(|| display_path(&item.path, home), |name| format!("/{name}"))
+            },
+        );
+        let prompt_compact = format_compact_list(
+            &view
+                .prompts
+                .iter()
+                .map(|prompt| format!("/{}", prompt.name))
+                .collect::<Vec<_>>(),
+            true,
+        );
+        sections.push(section("Prompts", &prompt_compact, &template_list));
+    }
+    if !view.extensions.is_empty() {
+        let groups = build_scope_groups(view.extensions.clone());
+        let extension_list = format_scope_groups(
+            &groups,
+            &|item| extension_display_path(&item.path, home),
+            &|item| {
+                extension_display_path(
+                    &short_path(&item.path, item.source_info.as_ref(), home),
+                    home,
+                )
+            },
+        );
+        let extension_compact =
+            format_compact_list(&compact_extension_labels(&view.extensions, home), true);
+        sections.push(section("Extensions", &extension_compact, &extension_list));
+    }
+    if !view.themes.is_empty() {
+        let groups = build_scope_groups(
+            view.themes
+                .iter()
+                .map(|theme_entry| theme_entry.resource.clone())
+                .collect(),
+        );
+        let theme_list =
+            format_scope_groups(&groups, &|item| display_path(&item.path, home), &|item| {
+                short_path(&item.path, item.source_info.as_ref(), home)
+            });
+        let theme_compact = format_compact_list(
+            &view
+                .themes
+                .iter()
+                .map(|theme_entry| {
+                    theme_entry.name.clone().unwrap_or_else(|| {
+                        compact_path_label(
+                            &theme_entry.resource.path,
+                            theme_entry.resource.source_info.as_ref(),
+                            home,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>(),
+            true,
+        );
+        sections.push(section("Themes", &theme_compact, &theme_list));
+    }
+    sections
+}
+
+fn section(name: &str, collapsed_body: &str, expanded_body: &str) -> LoadedResourceSection {
+    let header = theme().fg("mdHeading", &format!("[{name}]"));
+    LoadedResourceSection {
+        name: name.to_owned(),
+        collapsed: format!("{header}\n{collapsed_body}"),
+        expanded: format!("{header}\n{expanded_body}"),
     }
 }
 
-/// Capture the path under a package's `node_modules` root.
-fn npm_path_capture(path: &str, source: &str) -> Option<String> {
-    if !source.starts_with("npm:") {
-        return None;
+/// Replace the home directory with `~`, upstream's `formatDisplayPath`.
+fn display_path(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_owned();
+    };
+    path.strip_prefix(home)
+        .map_or_else(|| path.to_owned(), |rest| format!("~{rest}"))
+}
+
+/// Strip a trailing `/index.ts` or `/index.js`, upstream's
+/// `formatExtensionDisplayPath`.
+fn extension_display_path(path: &str, home: Option<&str>) -> String {
+    let result = display_path(path, home);
+    if let Some(stripped) = result.strip_suffix("/index.ts") {
+        return stripped.to_owned();
     }
-    let marker = "node_modules/";
-    let index = path.find(marker)?;
-    let rest = &path[index + marker.len()..];
-    let mut parts = rest.splitn(3, '/');
-    let _package = parts.next()?;
-    parts.next()?;
-    parts.next().map(str::to_owned)
+    if let Some(stripped) = result.strip_suffix("/index.js") {
+        return stripped.to_owned();
+    }
+    result
+}
+
+/// Resolve a context path against the cwd, falling back to `~`, upstream's
+/// `formatContextPath`.
+fn context_path(path: &str, cwd: &str, home: Option<&str>) -> String {
+    let absolute = if path.starts_with('/') || path.contains(":/") {
+        path.to_owned()
+    } else {
+        format!("{}/{}", cwd.trim_end_matches('/'), path)
+    };
+    crate::utils::paths::get_cwd_relative_path(&absolute, cwd)
+        .unwrap_or_else(|| display_path(&absolute, home))
+}
+
+/// POSIX `path.relative`, the subset the listing needs.
+fn posix_relative(from: &str, to: &str) -> String {
+    let from_segments: Vec<&str> = from.split('/').filter(|part| !part.is_empty()).collect();
+    let to_segments: Vec<&str> = to.split('/').filter(|part| !part.is_empty()).collect();
+    let common = from_segments
+        .iter()
+        .zip(to_segments.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut parts: Vec<&str> = vec![".."; from_segments.len() - common];
+    parts.extend(to_segments[common..].iter().copied());
+    parts.join("/")
+}
+
+/// Split a package base directory into its `node_modules` root and the
+/// package path, upstream's `/^(.*\/node_modules)\/(@?[^/]+(?:\/[^/]+)?)$/`.
+fn npm_root_split(base_dir: &str) -> Option<(&str, &str)> {
+    let marker = "/node_modules/";
+    let index = base_dir.rfind(marker)?;
+    Some((
+        &base_dir[..index + marker.len() - 1],
+        &base_dir[index + marker.len()..],
+    ))
+}
+
+/// Get a short path relative to the package root, upstream's `getShortPath`.
+fn short_path(full_path: &str, source_info: Option<&SourceInfo>, home: Option<&str>) -> String {
+    let normalized = full_path.replace('\\', "/");
+    if let Some(source) = source_info {
+        if is_package_source(source_info)
+            && let Some(base_dir) = source.base_dir.as_ref()
+        {
+            let normalized_base = base_dir.replace('\\', "/");
+            if let Some((root, _package)) = npm_root_split(&normalized_base)
+                && normalized.starts_with(&format!("{root}/"))
+            {
+                return posix_relative(&normalized_base, &normalized);
+            }
+            let relative = posix_relative(&normalized_base, &normalized);
+            if !relative.is_empty()
+                && relative != "."
+                && !relative.starts_with("..")
+                && !relative.starts_with("../")
+            {
+                return relative;
+            }
+        }
+        if source.source.starts_with("npm:")
+            && let Some((_, rest)) = normalized.split_once("node_modules/")
+        {
+            if let Some((package, remainder)) = rest.split_once('/') {
+                if package.starts_with('@') {
+                    if let Some((_scope, remainder)) = remainder.split_once('/') {
+                        return remainder.to_owned();
+                    }
+                } else {
+                    return remainder.to_owned();
+                }
+            }
+        }
+        if source.source.starts_with("git:")
+            && let Some(index) = normalized.find("git/")
+        {
+            let rest = &normalized[index + 4..];
+            let mut parts = rest.splitn(3, '/');
+            let _ = parts.next();
+            let _ = parts.next();
+            if let Some(tail) = parts.next() {
+                return tail.to_owned();
+            }
+        }
+    }
+    display_path(full_path, home)
+}
+
+/// The final path segment, upstream's `getCompactPathLabel`.
+fn compact_path_label(
+    resource_path: &str,
+    source_info: Option<&SourceInfo>,
+    home: Option<&str>,
+) -> String {
+    let short = short_path(resource_path, source_info, home);
+    let normalized = short.replace('\\', "/");
+    let segments: Vec<&str> = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "~")
+        .collect();
+    segments
+        .last()
+        .map_or_else(|| short.clone(), |last| (*last).to_owned())
+}
+
+/// The package's source label, upstream's `getCompactPackageSourceLabel`.
+fn compact_package_source_label(source_info: Option<&SourceInfo>) -> String {
+    let source = source_info.map_or("", |source| source.source.as_str());
+    if let Some(name) = source.strip_prefix("npm:") {
+        return if name.is_empty() {
+            source.to_owned()
+        } else {
+            name.to_owned()
+        };
+    }
+    if let Some(git) = crate::utils::git::parse_git_url(source) {
+        return if git.path.is_empty() {
+            source.to_owned()
+        } else {
+            git.path
+        };
+    }
+    source.to_owned()
+}
+
+/// One extension's compact label, upstream's `getCompactExtensionLabel`.
+fn compact_extension_label(
+    resource_path: &str,
+    source_info: Option<&SourceInfo>,
+    home: Option<&str>,
+) -> String {
+    if !is_package_source(source_info) {
+        return compact_path_label(resource_path, source_info, home);
+    }
+    let source_label = compact_package_source_label(source_info);
+    if source_label.is_empty() {
+        return compact_path_label(resource_path, source_info, home);
+    }
+    let short = short_path(resource_path, source_info, home).replace('\\', "/");
+    let package_path = short.strip_prefix("extensions/").unwrap_or(short.as_str());
+    let (directory, file) = package_path
+        .rsplit_once('/')
+        .map_or(("", package_path), |(directory, file)| (directory, file));
+    let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    if stem == "index" {
+        return if directory.is_empty() || directory == "." {
+            source_label
+        } else {
+            format!("{source_label}:{directory}")
+        };
+    }
+    format!("{source_label}:{package_path}")
+}
+
+/// The displayed path segments, upstream's `getCompactDisplayPathSegments`.
+fn compact_display_path_segments(resource_path: &str, home: Option<&str>) -> Vec<String> {
+    display_path(resource_path, home)
+        .replace('\\', "/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "~")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The shortest unique trailing path for one non-package extension,
+/// upstream's `getCompactNonPackageExtensionLabel`.
+fn compact_non_package_extension_label(index: usize, all_paths: &[Vec<String>]) -> String {
+    let Some(segments) = all_paths.get(index) else {
+        return String::new();
+    };
+    if segments.is_empty() {
+        return String::new();
+    }
+    for segment_count in 1..=segments.len() {
+        let candidate = segments[segments.len() - segment_count..].join("/");
+        let unique = all_paths.iter().enumerate().all(|(other_index, other)| {
+            other_index == index
+                || other[other.len().saturating_sub(segment_count)..].join("/") != candidate
+        });
+        if unique {
+            return candidate;
+        }
+    }
+    segments.join("/")
+}
+
+/// Every extension's compact label, upstream's `getCompactExtensionLabels`.
+fn compact_extension_labels(extensions: &[LoadedResource], home: Option<&str>) -> Vec<String> {
+    let non_package: Vec<(usize, Vec<String>)> = extensions
+        .iter()
+        .enumerate()
+        .filter(|(_, extension)| !is_package_source(extension.source_info.as_ref()))
+        .map(|(index, extension)| {
+            let mut segments = compact_display_path_segments(&extension.path, home);
+            if segments.len() > 1
+                && matches!(
+                    segments.last().map(String::as_str),
+                    Some("index.ts" | "index.js")
+                )
+            {
+                segments.pop();
+            }
+            (index, segments)
+        })
+        .collect();
+    let segment_lists: Vec<Vec<String>> = non_package
+        .iter()
+        .map(|(_, segments)| segments.clone())
+        .collect();
+    extensions
+        .iter()
+        .enumerate()
+        .map(|(index, extension)| {
+            if is_package_source(extension.source_info.as_ref()) {
+                return compact_extension_label(
+                    &extension.path,
+                    extension.source_info.as_ref(),
+                    home,
+                );
+            }
+            non_package
+                .iter()
+                .position(|(other, _)| *other == index)
+                .map_or_else(
+                    || compact_path_label(&extension.path, extension.source_info.as_ref(), home),
+                    |position| compact_non_package_extension_label(position, &segment_lists),
+                )
+        })
+        .collect()
+}
+
+/// The scope group a resource sorts under, upstream's `getScopeGroup`.
+fn scope_group_key(source_info: Option<&SourceInfo>) -> &'static str {
+    let source = source_info.map_or("local", |source| source.source.as_str());
+    let scope = source_info.map(|source| source.scope);
+    if source == "cli" || scope == Some(crate::source_info::SourceScope::Temporary) {
+        return "path";
+    }
+    match scope {
+        Some(crate::source_info::SourceScope::User) => "user",
+        Some(crate::source_info::SourceScope::Project) => "project",
+        _ => "path",
+    }
+}
+
+/// Whether the resource came from a package, upstream's `isPackageSource`.
+fn is_package_source(source_info: Option<&SourceInfo>) -> bool {
+    source_info.is_some_and(|source| {
+        source.source.starts_with("npm:") || source.source.starts_with("git:")
+    })
+}
+
+/// One scope group, upstream's `buildScopeGroups` entry.
+#[derive(Clone, Debug, Default)]
+struct ScopeGroup {
+    scope: &'static str,
+    paths: Vec<LoadedResource>,
+    packages: std::collections::BTreeMap<String, Vec<LoadedResource>>,
+}
+
+/// Group resources by scope and package, upstream's `buildScopeGroups`.
+fn build_scope_groups(items: Vec<LoadedResource>) -> Vec<ScopeGroup> {
+    let mut project = ScopeGroup {
+        scope: "project",
+        ..ScopeGroup::default()
+    };
+    let mut user = ScopeGroup {
+        scope: "user",
+        ..ScopeGroup::default()
+    };
+    let mut path = ScopeGroup {
+        scope: "path",
+        ..ScopeGroup::default()
+    };
+    for item in items {
+        let group = match scope_group_key(item.source_info.as_ref()) {
+            "user" => &mut user,
+            "path" => &mut path,
+            _ => &mut project,
+        };
+        if is_package_source(item.source_info.as_ref()) {
+            let source = item
+                .source_info
+                .as_ref()
+                .map_or_else(|| "local".to_owned(), |source| source.source.clone());
+            group.packages.entry(source).or_default().push(item);
+        } else {
+            group.paths.push(item);
+        }
+    }
+    [project, user, path]
+        .into_iter()
+        .filter(|group| !group.paths.is_empty() || !group.packages.is_empty())
+        .collect()
+}
+
+/// Render the scope tree, upstream's `formatScopeGroups`.
+fn format_scope_groups(
+    groups: &[ScopeGroup],
+    format_path: &dyn Fn(&LoadedResource) -> String,
+    format_package_path: &dyn Fn(&LoadedResource) -> String,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for group in groups {
+        lines.push(format!("  {}", theme().fg("accent", group.scope)));
+        let mut sorted_paths: Vec<&LoadedResource> = group.paths.iter().collect();
+        sorted_paths.sort_by(|left, right| compare_labels(&left.path, &right.path));
+        for item in sorted_paths {
+            lines.push(theme().fg("dim", &format!("    {}", format_path(item))));
+        }
+        for (source, items) in &group.packages {
+            lines.push(format!("    {}", theme().fg("mdLink", source)));
+            let mut sorted_items: Vec<&LoadedResource> = items.iter().collect();
+            sorted_items.sort_by(|left, right| compare_labels(&left.path, &right.path));
+            for item in sorted_items {
+                lines.push(theme().fg("dim", &format!("      {}", format_package_path(item))));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Case-insensitive label ordering, the ordering JavaScript's default
+/// `localeCompare` gives the listing's lowercase and mixed-case labels.
+fn compare_labels(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left.cmp(right))
+}
+
+/// The dim, comma-joined compact list, upstream's `formatCompactList`.
+fn format_compact_list(items: &[String], sort: bool) -> String {
+    let mut labels: Vec<String> = items
+        .iter()
+        .map(|item| item.trim().to_owned())
+        .filter(|item| !item.is_empty())
+        .collect();
+    if sort {
+        labels.sort_by(|left, right| compare_labels(left, right));
+    }
+    theme().fg("dim", &format!("  {}", labels.join(", ")))
 }
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {

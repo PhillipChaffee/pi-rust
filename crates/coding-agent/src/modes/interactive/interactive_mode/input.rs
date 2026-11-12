@@ -132,7 +132,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     ///
     /// Restatement: the port has no process-group signal seam, so suspension
     /// reports the platform status instead of raising `SIGTSTP`.
-    pub(crate) fn handle_ctrl_z(&self) {
+    pub fn handle_ctrl_z(&self) {
         self.show_status("Suspend to background is not supported in this build");
     }
 
@@ -179,7 +179,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Paste the clipboard's text into the focused component.
-    pub(crate) async fn handle_right_click_paste(&self) {
+    pub async fn handle_right_click_paste(&self) {
         let Some(target) = self.tui.get_focused_component() else {
             return;
         };
@@ -312,7 +312,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Copy the last assistant message, upstream's `handleCopyCommand`.
-    pub(crate) async fn handle_copy_command(&self, flash: bool, prefer_selection: bool) {
+    pub async fn handle_copy_command(&self, flash: bool, prefer_selection: bool) {
         if prefer_selection
             && let Some(alt) = self.alt_screen.borrow().as_ref()
             && !alt.get_copy_on_select()
@@ -340,7 +340,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Dispatch one submitted editor text, upstream's `onSubmit` routing.
-    pub(crate) async fn submit_text(&self, text: &str) {
+    pub async fn submit_text(&self, text: &str) {
         let text = text.trim().to_owned();
         if text.is_empty() {
             return;

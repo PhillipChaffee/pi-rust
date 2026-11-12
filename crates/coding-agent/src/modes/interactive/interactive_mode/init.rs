@@ -284,7 +284,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Switch the renderer between regular and fullscreen, upstream's
     /// `switchTuiMode`. The stable base keeps the mounted components; only the
     /// renderer strategy and the fullscreen layout root change.
-    pub(crate) fn switch_tui_mode(
+    pub fn switch_tui_mode(
         &self,
         mode: TuiMode,
         restore_progress: bool,
@@ -297,6 +297,10 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             return false;
         }
         let focus = self.tui.get_focused_component();
+        // The renderer swap keeps the same base Tui, whose `clear` empties
+        // the mounted children; re-mount them after the swap, upstream's
+        // `mountInteractiveTui(nextUi, components)`.
+        let components = self.tui.children();
         if let Some(main) = self.main_screen.borrow().as_ref() {
             *self.main_screen_render_state.borrow_mut() = Some(main.capture_render_state());
         }
@@ -334,6 +338,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             }
         }
         self.options.borrow_mut().tui_mode = Some(mode);
+        self.mount_interactive_tui(&components);
         if self.tui.is_viewport_tui() {
             let root = self.fullscreen_layout_root.borrow().clone();
             self.tui.set_layout_root(root);
@@ -516,12 +521,12 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         if let Some(unsubscribe) = self.unsubscribe.borrow_mut().take() {
             unsubscribe();
         }
-        if self.is_initialized.get() {
+        if self.is_initialized.get() || !self.tui.is_stopped() {
             self.tui.stop(TuiStopOptions {
                 preserve_screen: self.tui.mode() == TuiMode::Fullscreen,
             });
-            self.is_initialized.set(false);
         }
+        self.is_initialized.set(false);
     }
 
     /// Shut the frame down.

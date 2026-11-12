@@ -67,15 +67,79 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Build the combined autocomplete provider, upstream's
     /// `createBaseAutocompleteProvider`.
-    pub(crate) fn create_base_autocomplete_provider(&self) -> Arc<dyn AutocompleteProvider> {
+    pub fn create_base_autocomplete_provider(&self) -> Arc<dyn AutocompleteProvider> {
+        let models: Vec<Model> = {
+            let scoped = self.session().scoped_models();
+            if scoped.is_empty() {
+                self.session().model_runtime().get_available_snapshot()
+            } else {
+                scoped.into_iter().map(|scoped| scoped.model).collect()
+            }
+        };
+        let mut model_completions: Option<pi_tui::autocomplete::SlashArgumentCompletionsFn> =
+            Some(Box::new(move |prefix: &str| {
+                fuzzy_autocomplete_items(
+                    &models,
+                    prefix,
+                    |model| {
+                        crate::modes::interactive::model_search::get_model_search_text(
+                            &model.id,
+                            &model.provider.0,
+                            Some(&model.name),
+                        )
+                    },
+                    |model| pi_tui::autocomplete::AutocompleteItem {
+                        value: format!("{}/{}", model.provider.0, model.id),
+                        label: model.id.clone(),
+                        description: Some(model.provider.0.clone()),
+                    },
+                )
+            }));
+        let thinking_levels = self.session().available_thinking_levels();
+        let mut thinking_completions: Option<pi_tui::autocomplete::SlashArgumentCompletionsFn> =
+            Some(Box::new(move |prefix: &str| {
+                fuzzy_autocomplete_items(
+                    &thinking_levels,
+                    prefix,
+                    |level| thinking_level_name(*level).to_owned(),
+                    |level| {
+                        let name = thinking_level_name(*level).to_owned();
+                        pi_tui::autocomplete::AutocompleteItem {
+                            value: name.clone(),
+                            label: name,
+                            description: None,
+                        }
+                    },
+                )
+            }));
+        let login_providers = login_completion_options(&self.get_login_provider_options(None));
+        let mut login_completions: Option<pi_tui::autocomplete::SlashArgumentCompletionsFn> =
+            Some(Box::new(move |prefix: &str| {
+                fuzzy_autocomplete_items(
+                    &login_providers,
+                    prefix,
+                    |provider| provider.search_text(),
+                    |provider| pi_tui::autocomplete::AutocompleteItem {
+                        value: provider.id.clone(),
+                        label: provider.id.clone(),
+                        description: Some(provider.description()),
+                    },
+                )
+            }));
         let mut commands: Vec<CommandEntry> = crate::core::slash_commands::BUILTIN_SLASH_COMMANDS
             .iter()
             .map(|command| {
+                let get_argument_completions = match command.name {
+                    "model" => model_completions.take(),
+                    "thinking" => thinking_completions.take(),
+                    "login" => login_completions.take(),
+                    _ => None,
+                };
                 CommandEntry::Slash(SlashCommand {
                     name: command.name.to_owned(),
                     description: Some(command.description.to_owned()),
                     argument_hint: command.argument_hint.map(str::to_owned),
-                    get_argument_completions: None,
+                    get_argument_completions,
                 })
             })
             .collect();
@@ -144,12 +208,26 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Build and install the autocomplete provider, upstream's
     /// `setupAutocompleteProvider`.
-    pub(crate) fn setup_autocomplete_provider(&self) {
+    pub fn setup_autocomplete_provider(&self) {
         let mut provider = self.create_base_autocomplete_provider();
         let wrappers: Vec<super::AutocompleteProviderFactory> =
             self.autocomplete_provider_wrappers.borrow().clone();
+        let mut trigger_characters: Vec<String> = Vec::new();
         for wrapper in wrappers {
             provider = wrapper(provider);
+            trigger_characters.extend(provider.trigger_characters());
+        }
+        if !trigger_characters.is_empty() {
+            let mut merged: Vec<String> = Vec::new();
+            for character in trigger_characters {
+                if !merged.contains(&character) {
+                    merged.push(character);
+                }
+            }
+            provider = Arc::new(TriggerCharacterProvider {
+                inner: provider,
+                trigger_characters: merged,
+            });
         }
         self.default_editor
             .set_autocomplete_provider(Arc::clone(&provider));
@@ -158,6 +236,21 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 .set_autocomplete_provider(Arc::clone(&provider));
         }
         *self.autocomplete_provider.borrow_mut() = Some(provider);
+    }
+
+    /// Register one in-process autocomplete wrapper and rebuild, upstream's
+    /// `addAutocompleteProvider` on the extension UI context.
+    pub fn add_autocomplete_provider(&self, wrapper: super::AutocompleteProviderFactory) {
+        self.autocomplete_provider_wrappers
+            .borrow_mut()
+            .push(wrapper);
+        self.setup_autocomplete_provider();
+    }
+
+    /// The provider installed on the editor, upstream's `autocompleteProvider`.
+    #[must_use]
+    pub fn autocomplete_provider(&self) -> Option<Arc<dyn AutocompleteProvider>> {
+        self.autocomplete_provider.borrow().clone()
     }
 
     /// Cycle the thinking level, upstream's `cycleThinkingLevel`.
@@ -238,6 +331,150 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             }
             Err(error) => self.show_error(&error),
         }
+    }
+}
+
+/// One deduplicated login provider completion row, upstream's
+/// `LoginProviderCompletionOption`.
+#[derive(Clone, Debug)]
+struct LoginCompletionOption {
+    id: String,
+    name: String,
+    auth_types: Vec<AuthType>,
+}
+
+impl LoginCompletionOption {
+    /// The fuzzy-search text, upstream's `getLoginProviderSearchText`.
+    fn search_text(&self) -> String {
+        let auth_types = self
+            .auth_types
+            .iter()
+            .map(|auth_type| {
+                format!(
+                    "{} {}",
+                    match auth_type {
+                        AuthType::OAuth => "oauth",
+                        AuthType::ApiKey => "api_key",
+                    },
+                    crate::modes::interactive::components::oauth_selector::format_auth_selector_provider_type(*auth_type)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} {} {auth_types}", self.id, self.name)
+    }
+
+    /// The picker description, upstream's
+    /// `formatLoginProviderCompletionDescription`.
+    fn description(&self) -> String {
+        let auth_types = self
+            .auth_types
+            .iter()
+            .map(|auth_type| {
+                crate::modes::interactive::components::oauth_selector::format_auth_selector_provider_type(*auth_type)
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        if self.name == self.id {
+            auth_types
+        } else {
+            format!("{} · {auth_types}", self.name)
+        }
+    }
+}
+
+/// Deduplicate provider options by id, merging auth types, upstream's
+/// `getLoginProviderCompletionOptions`.
+fn login_completion_options(
+    providers: &[crate::modes::interactive::components::oauth_selector::AuthSelectorProvider],
+) -> Vec<LoginCompletionOption> {
+    let mut by_id: Vec<LoginCompletionOption> = Vec::new();
+    for provider in providers {
+        if let Some(existing) = by_id.iter_mut().find(|option| option.id == provider.id) {
+            if !existing.auth_types.contains(&provider.auth_type) {
+                existing.auth_types.push(provider.auth_type);
+                existing
+                    .auth_types
+                    .sort_by_key(|auth_type| match auth_type {
+                        AuthType::OAuth => 0,
+                        AuthType::ApiKey => 1,
+                    });
+            }
+            continue;
+        }
+        by_id.push(LoginCompletionOption {
+            id: provider.id.clone(),
+            name: provider.name.clone(),
+            auth_types: vec![provider.auth_type],
+        });
+    }
+    by_id.sort_by(|left, right| {
+        left.name
+            .to_lowercase()
+            .cmp(&right.name.to_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    by_id
+}
+
+/// Fuzzy-filter `items` and map them, upstream's
+/// `createFuzzyAutocompleteItems`; `None` when nothing matches.
+fn fuzzy_autocomplete_items<T>(
+    items: &[T],
+    prefix: &str,
+    get_text: impl Fn(&T) -> String,
+    to_item: impl Fn(&T) -> pi_tui::autocomplete::AutocompleteItem,
+) -> Option<Vec<pi_tui::autocomplete::AutocompleteItem>> {
+    let filtered = pi_tui::fuzzy::fuzzy_filter(items, prefix, get_text);
+    if filtered.is_empty() {
+        return None;
+    }
+    Some(filtered.into_iter().map(to_item).collect())
+}
+
+/// A provider whose trigger characters are the merged set of every wrapper
+/// upstream sets by assignment on the final provider.
+struct TriggerCharacterProvider {
+    inner: Arc<dyn AutocompleteProvider>,
+    trigger_characters: Vec<String>,
+}
+
+impl AutocompleteProvider for TriggerCharacterProvider {
+    fn trigger_characters(&self) -> Vec<String> {
+        self.trigger_characters.clone()
+    }
+
+    fn get_suggestions(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        options: &pi_tui::autocomplete::AutocompleteQueryOptions,
+    ) -> Option<pi_tui::autocomplete::AutocompleteSuggestions> {
+        self.inner
+            .get_suggestions(lines, cursor_line, cursor_col, options)
+    }
+
+    fn apply_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+        item: &pi_tui::autocomplete::AutocompleteItem,
+        prefix: &str,
+    ) -> pi_tui::autocomplete::AutocompleteApplyResult {
+        self.inner
+            .apply_completion(lines, cursor_line, cursor_col, item, prefix)
+    }
+
+    fn should_trigger_file_completion(
+        &self,
+        lines: &[String],
+        cursor_line: usize,
+        cursor_col: usize,
+    ) -> bool {
+        self.inner
+            .should_trigger_file_completion(lines, cursor_line, cursor_col)
     }
 }
 
@@ -461,14 +698,11 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Warn once when Anthropic subscription auth is in use.
-    pub(crate) async fn maybe_warn_about_anthropic_subscription_auth(&self, model: Option<&Model>) {
+    pub async fn maybe_warn_about_anthropic_subscription_auth(&self, model: Option<&Model>) {
         let model = model.cloned().or_else(|| self.session().model());
         let Some(model) = model else {
             return;
         };
-        if model.provider.0 != "anthropic" {
-            return;
-        }
         let disabled = self
             .settings()
             .lock()
@@ -479,6 +713,29 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
             == Some(false);
         if disabled || self.anthropic_subscription_warning_shown.get() {
             return;
+        }
+        if model.provider.0 != "anthropic" {
+            return;
+        }
+        let session = self.session();
+        let runtime = session.model_runtime();
+        let oauth = runtime
+            .check_auth("anthropic", None)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|check| check.auth_type == AuthType::OAuth);
+        if !oauth {
+            let api_key = runtime
+                .get_auth("anthropic", None)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|result| result.auth.api_key);
+            let subscription_key = api_key.is_some_and(|key| key.starts_with("sk-ant-oat"));
+            if !subscription_key {
+                return;
+            }
         }
         self.anthropic_subscription_warning_shown.set(true);
         self.show_warning(
@@ -617,7 +874,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show the session-tree selector, upstream's `showTreeSelector`.
-    pub(crate) async fn show_tree_selector(&self, initial_selected: Option<&str>) {
+    pub async fn show_tree_selector(&self, initial_selected: Option<&str>) {
         let tree = crate::core::agent_session::lock(&self.session().session_manager).get_tree();
         if tree.is_empty() {
             self.show_status("No entries in session");
@@ -856,33 +1113,181 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         }
     }
 
-    /// Navigate the session tree to one entry.
-    pub(crate) async fn navigate_tree(&self, entry_id: &str) {
-        let session = self.session();
-        match session
-            .navigate_tree(entry_id, NavigateTreeOptions::default())
-            .await
-        {
-            Ok(outcome) => {
-                if outcome.cancelled || outcome.aborted {
-                    self.show_status("Navigation cancelled");
+    /// Navigate the session tree to one entry, upstream's tree-selector
+    /// callback: ask about summarization, abort a live response, recheck the
+    /// operation guards, then replace the transcript.
+    pub async fn navigate_tree(&self, entry_id: &str) {
+        let leaf = crate::core::agent_session::lock(&self.session().session_manager)
+            .get_leaf_id()
+            .map(str::to_owned);
+        if leaf.as_deref() == Some(entry_id) {
+            self.dispose_active_selector();
+            self.show_status("Already at this point");
+            return;
+        }
+        self.dispose_active_selector();
+
+        let mut wants_summary = false;
+        let mut custom_instructions = None;
+        let skip_prompt = self
+            .settings()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_branch_summary_skip_prompt();
+        if !skip_prompt {
+            loop {
+                let Some(choice) = self
+                    .ask_extension_select(
+                        "Summarize branch?",
+                        vec![
+                            "No summary".to_owned(),
+                            "Summarize".to_owned(),
+                            "Summarize with custom prompt".to_owned(),
+                        ],
+                    )
+                    .await
+                else {
+                    self.show_tree_selector(Some(entry_id)).await;
                     return;
+                };
+                wants_summary = choice != "No summary";
+                if choice == "Summarize with custom prompt" {
+                    let Some(instructions) = self
+                        .ask_extension_editor("Custom summarization instructions")
+                        .await
+                    else {
+                        continue;
+                    };
+                    custom_instructions = Some(instructions);
                 }
-                self.chat_container.clear();
-                self.render_initial_messages();
-                if let Some(text) = outcome.editor_text
-                    && self.editor().get_text().trim().is_empty()
-                {
-                    self.editor().set_text(&text);
+                break;
+            }
+        }
+
+        if self.session().is_streaming() {
+            self.restore_queued_messages_to_editor(false, None);
+            self.session().abort().await;
+        }
+        if self.session().is_compacting() {
+            self.show_error(
+                "Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+            );
+            return;
+        }
+
+        let original_on_escape = self.editor().on_escape();
+        let mut showing_summary_indicator = false;
+        if wants_summary {
+            let session = self.session();
+            self.default_editor.set_on_escape(Some(Rc::new(move || {
+                session.abort_branch_summary();
+            })));
+            self.chat_container.add_child(Rc::new(Spacer::new()));
+            let indicator = self.build_status(
+                crate::modes::interactive::components::status_indicator::StatusIndicatorKind::BranchSummary,
+                "Summarizing branch...".to_owned(),
+                None,
+            );
+            self.show_status_indicator(indicator);
+            showing_summary_indicator = true;
+            self.tui.request_render(false);
+        }
+
+        let result = self
+            .session()
+            .navigate_tree(
+                entry_id,
+                NavigateTreeOptions {
+                    summarize: wants_summary,
+                    custom_instructions,
+                    ..NavigateTreeOptions::default()
+                },
+            )
+            .await;
+        match result {
+            Ok(outcome) => {
+                if outcome.aborted {
+                    self.show_status("Branch summarization cancelled");
+                    self.show_tree_selector(Some(entry_id)).await;
+                } else if outcome.cancelled {
+                    self.show_status("Navigation cancelled");
+                } else {
+                    self.chat_container.clear();
+                    self.assistant_rows.borrow_mut().clear();
+                    self.render_initial_messages();
+                    if let Some(text) = outcome.editor_text
+                        && self.editor().get_text().trim().is_empty()
+                    {
+                        self.editor().set_text(&text);
+                    }
+                    self.show_status("Navigated to selected point");
+                    self.flush_compaction_queue(false);
                 }
-                self.show_status("Navigated to selected point");
             }
             Err(error) => self.show_error(&error),
         }
+        if showing_summary_indicator {
+            self.clear_status_indicator(Some(
+                crate::modes::interactive::components::status_indicator::StatusIndicatorKind::BranchSummary,
+            ));
+        }
+        self.default_editor.set_on_escape(original_on_escape);
+    }
+
+    /// Show one extension selector and await its answer while the run loop
+    /// keeps servicing the TUI, upstream's `await this.showExtensionSelector`.
+    async fn ask_extension_select(&self, title: &str, options: Vec<String>) -> Option<String> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Rc::new(std::cell::RefCell::new(Some(sender)));
+        let complete = Rc::new(move |value: Option<String>| {
+            if let Some(sender) = sender.borrow_mut().take() {
+                let _ = sender.send(value);
+            }
+        });
+        self.show_extension_selector(title, options, None, complete);
+        let mut receiver = receiver;
+        self.drive(async {
+            loop {
+                match receiver.try_recv() {
+                    Ok(value) => return value,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
+    }
+
+    /// Show the extension editor and await its text, upstream's
+    /// `await this.showExtensionEditor`.
+    async fn ask_extension_editor(&self, title: &str) -> Option<String> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let sender = Rc::new(std::cell::RefCell::new(Some(sender)));
+        let complete = Rc::new(move |value: Option<String>| {
+            if let Some(sender) = sender.borrow_mut().take() {
+                let _ = sender.send(value);
+            }
+        });
+        self.show_extension_editor(title, None, complete);
+        let mut receiver = receiver;
+        self.drive(async {
+            loop {
+                match receiver.try_recv() {
+                    Ok(value) => return value,
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => return None,
+                }
+            }
+        })
+        .await
     }
 
     /// Clone the session at its current leaf.
-    pub(crate) async fn handle_clone_command(&self) {
+    pub async fn handle_clone_command(&self) {
         let leaf = crate::core::agent_session::lock(&self.session().session_manager)
             .get_leaf_id()
             .map(str::to_owned);
@@ -970,7 +1375,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Report a startup submission while initialization is still running.
-    pub(crate) fn handle_startup_submit(&self, text: &str) {
+    pub fn handle_startup_submit(&self, text: &str) {
         self.editor().set_text(text);
         self.show_status("Startup is still in progress");
     }
@@ -1054,7 +1459,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// All queued messages, session and compaction queues combined.
-    pub(crate) fn get_all_queued_messages(&self) -> (Vec<String>, Vec<String>) {
+    #[must_use]
+    pub fn get_all_queued_messages(&self) -> (Vec<String>, Vec<String>) {
         let mut steering = self.session().steering_messages();
         let mut follow_up = self.session().follow_up_messages();
         for message in self.compaction_queued_messages.borrow().iter() {
@@ -1498,6 +1904,13 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         }
     }
 
+    /// Read the first path argument after `command`, honoring simple quotes,
+    /// upstream's `getPathCommandArgument`.
+    #[must_use]
+    pub fn get_path_command_argument(&self, text: &str, command: &str) -> Option<String> {
+        command_argument(text, command)
+    }
+
     /// Handle `/export [path]`.
     pub(crate) async fn handle_export_command(&self, text: &str) {
         let output = command_argument(text, "/export");
@@ -1525,7 +1938,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     ///
     /// Restatement: the confirmation dialog is skipped; the import runs on
     /// the named path directly.
-    pub(crate) async fn handle_import_command(&self, text: &str) {
+    pub async fn handle_import_command(&self, text: &str) {
         let Some(path) = command_argument(text, "/import") else {
             self.show_error("Usage: /import <path.jsonl>");
             return;

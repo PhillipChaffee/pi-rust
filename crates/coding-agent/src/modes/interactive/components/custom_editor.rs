@@ -177,6 +177,12 @@ impl CustomEditor {
         *self.on_escape.borrow_mut() = handler;
     }
 
+    /// The installed Escape handler, upstream's `onEscape` field read.
+    #[must_use]
+    pub fn on_escape(&self) -> Option<AppActionHandler> {
+        self.on_escape.borrow().clone()
+    }
+
     /// Install the Ctrl+D handler that overrides the registered `app.exit`
     /// action, upstream's assigned `onCtrlD`.
     pub fn set_on_ctrl_d(&self, handler: Option<AppActionHandler>) {

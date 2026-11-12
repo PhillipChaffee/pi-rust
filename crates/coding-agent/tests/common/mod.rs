@@ -39,6 +39,11 @@ pub mod extensions_examples;
     unused,
     reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
 )]
+pub mod interactive;
+#[allow(
+    unused,
+    reason = "each test binary recompiles the fixture module and consumes only the helpers its suite drives"
+)]
 pub mod model_layer;
 #[allow(
     unused,

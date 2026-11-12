@@ -57,9 +57,16 @@
 //!   `ThemeHandle` carries no constructed theme.
 //! - Upstream's `getUserInput` promise becomes the editor submit channel:
 //!   the run loop drains the same text the promise would have resolved.
-//! - The provenance helpers that build the per-scope/package resource tree
-//!   (`buildScopeGroups`, `formatScopeGroups`, `getShortPath` variants) are
-//!   not ported; the listing prints one flat path line per resource.
+//! - The startup resource listing renders the same compact and expanded
+//!   bodies upstream builds ([`render_loaded_resource_sections`]); the
+//!   diagnostic groups keep the port's flat path/message form instead of the
+//!   per-scope tree.
+//! - Upstream scans `chatContainer.children` for `setExpanded` on each tool
+//!   toggle; the port records every expandable row it mounts in a weak list
+//!   (`Expandable`) because the component trait has no downcast.
+//! - The acceptance suites drive the private methods upstream's vitest tests
+//!   reach through `Reflect.get`, so those methods and the narrow state
+//!   accessors they read are `pub` here.
 //! - `checkForPackageUpdates`, `checkTmuxKeyboardSetup`,
 //!   `reportInstallTelemetry`, and the Node terminal-crash handlers
 //!   (`emergencyTerminalExit`, `uncaughtCrash`) have no process seam here and
@@ -165,6 +172,14 @@ use crate::modes::interactive::tui_renderer::{InteractiveTuiOptions, create_inte
 use crate::session_manager::FileEntry;
 use crate::settings_manager::{SettingsManager, SettingsStorageKind};
 
+use self::display::Expandable;
+
+pub use self::display::{
+    LoadedPromptEntry, LoadedResource, LoadedResourceSection, LoadedResourcesOptions,
+    LoadedResourcesView, LoadedSkillEntry, LoadedThemeEntry, render_loaded_resource_sections,
+};
+pub use self::extensions::InteractiveUiContext;
+
 /// The shared settings slot, replaced when a session replacement swaps the
 /// manager.
 pub(crate) type SettingsSlot<S> = Arc<Mutex<Arc<Mutex<SettingsManager<S>>>>>;
@@ -196,15 +211,19 @@ pub struct InteractiveModeOptions {
 
 /// A message queued while compaction runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CompactionQueuedMessage {
-    pub(crate) text: String,
-    pub(crate) mode: QueueDelivery,
+pub struct CompactionQueuedMessage {
+    /// The queued text.
+    pub text: String,
+    /// How the message delivers after compaction.
+    pub mode: QueueDelivery,
 }
 
 /// The delivery mode of a compaction-queued message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QueueDelivery {
+pub enum QueueDelivery {
+    /// Send the message while the agent run continues.
     Steer,
+    /// Send the message after the current run.
     FollowUp,
 }
 
@@ -384,23 +403,25 @@ pub(crate) enum UiWidgetPlacement {
 
 /// The result of a theme write, upstream's `ThemeResult`.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ThemeUpdateResult {
-    pub(crate) success: bool,
-    pub(crate) error: Option<String>,
+pub struct ThemeUpdateResult {
+    /// Whether the theme was applied.
+    pub success: bool,
+    /// The failure message when it was not.
+    pub error: Option<String>,
 }
 
 /// An extension editor factory, upstream's `EditorFactory`.
-pub(crate) type EditorFactory =
+pub type EditorFactory =
     Rc<dyn Fn(&Rc<Tui>, EditorTheme, Rc<AppKeybindingsManager>) -> Rc<dyn AppEditor>>;
 
 /// An autocomplete-provider wrapper, upstream's
 /// `AutocompleteProviderFactory`.
-pub(crate) type AutocompleteProviderFactory =
+pub type AutocompleteProviderFactory =
     Rc<dyn Fn(Arc<dyn AutocompleteProvider>) -> Arc<dyn AutocompleteProvider>>;
 
 /// The app-level editor surface, upstream's duck-typed `EditorComponent`
 /// plus the app-only members the frame assigns.
-pub(crate) trait AppEditor: pi_tui::components::EditorComponent {
+pub trait AppEditor: pi_tui::components::EditorComponent {
     /// Replace the border color function, upstream's `borderColor`.
     fn set_border_color(&self, _color: EditorColorFn) {}
     /// The current border color function.
@@ -417,6 +438,10 @@ pub(crate) trait AppEditor: pi_tui::components::EditorComponent {
     fn set_on_extension_shortcut(&self, _handler: Option<ExtensionShortcutHandler>) {}
     /// Install the Escape handler.
     fn set_on_escape(&self, _handler: Option<AppActionHandler>) {}
+    /// The installed Escape handler.
+    fn on_escape(&self) -> Option<AppActionHandler> {
+        None
+    }
     /// Install the Ctrl+D handler.
     fn set_on_ctrl_d(&self, _handler: Option<AppActionHandler>) {}
     /// Install the clipboard-paste handler.
@@ -518,6 +543,9 @@ impl AppEditor for DefaultEditor {
     fn set_on_escape(&self, handler: Option<AppActionHandler>) {
         self.inner.set_on_escape(handler);
     }
+    fn on_escape(&self) -> Option<AppActionHandler> {
+        self.inner.on_escape()
+    }
     fn set_on_ctrl_d(&self, handler: Option<AppActionHandler>) {
         self.inner.set_on_ctrl_d(handler);
     }
@@ -617,6 +645,9 @@ pub struct InteractiveMode<S: SettingsStorageKind> {
     anthropic_subscription_warning_shown: Cell<bool>,
     last_status_spacer: RefCell<Option<Rc<Spacer>>>,
     last_status_text: RefCell<Option<Rc<Text>>>,
+    /// The expandable transcript rows the frame created, upstream scans
+    /// `chatContainer.children` for `setExpanded` each toggle.
+    expandable_rows: RefCell<Vec<std::rc::Weak<dyn Expandable>>>,
     managed_tool_status_started: Cell<bool>,
     streaming_component: RefCell<Option<Rc<AssistantMessageComponent>>>,
     assistant_rows: RefCell<Vec<Rc<AssistantMessageComponent>>>,
@@ -683,50 +714,63 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Never: poisoned settings locks are recovered.
     #[must_use]
     pub fn new(runtime_host: AgentSessionRuntime<S>, options: InteractiveModeOptions) -> Rc<Self> {
+        Self::new_with_terminal(runtime_host, options, None)
+    }
+
+    /// Build the frame over `runtime_host`, rendering through `terminal`.
+    ///
+    /// Upstream's `createInteractiveTui` takes the terminal as an option; the
+    /// frame's constructor did not previously expose it. Tests supply a
+    /// headless terminal here so key input and rendered writes stay off the
+    /// process TTY.
+    ///
+    /// # Panics
+    ///
+    /// Never: poisoned settings locks are recovered.
+    #[must_use]
+    pub fn new_with_terminal(
+        runtime_host: AgentSessionRuntime<S>,
+        options: InteractiveModeOptions,
+        terminal: Option<Box<dyn pi_tui::terminal::Terminal>>,
+    ) -> Rc<Self> {
         let session = Arc::clone(runtime_host.session());
         let settings: SettingsSlot<S> = Arc::new(Mutex::new(session.settings_manager()));
         let initial_settings = session.settings_manager();
-        let tui_mode = options.tui_mode.unwrap_or_else(|| {
-            initial_settings
+        // Read every setting before the TUI options: a guard held in one
+        // struct-literal field stays alive until the statement ends, so a
+        // second lock in the next field would deadlock.
+        let (tui_mode, show_hardware_cursor, fullscreen_copy_on_select, clear_on_shrink) = {
+            let settings = initial_settings
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_tui_mode()
-        });
+                .unwrap_or_else(PoisonError::into_inner);
+            (
+                options.tui_mode.unwrap_or_else(|| settings.get_tui_mode()),
+                settings.get_show_hardware_cursor(),
+                settings.get_fullscreen_copy_on_select(),
+                settings.get_clear_on_shrink(),
+            )
+        };
+        let capability_overrides = initial_settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_terminal_capability_overrides();
         let mut options = options;
         options.tui_mode = Some(tui_mode);
 
-        pi_tui::terminal_image::set_capability_overrides(
-            initial_settings
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_terminal_capability_overrides(),
-        );
+        pi_tui::terminal_image::set_capability_overrides(capability_overrides);
 
         let interactive = create_interactive_tui(InteractiveTuiOptions {
             tui_mode,
-            show_hardware_cursor: initial_settings
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_show_hardware_cursor(),
+            show_hardware_cursor,
             log_directory: get_agent_dir().display().to_string(),
-            terminal: None,
+            terminal,
             on_right_click_paste: None,
-            fullscreen_copy_on_select: Some(
-                initial_settings
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get_fullscreen_copy_on_select(),
-            ),
+            fullscreen_copy_on_select: Some(fullscreen_copy_on_select),
         });
         let tui = interactive.tui();
         let alt_screen = interactive.viewport().cloned();
         let main_screen = interactive.main_screen().cloned();
-        tui.set_clear_on_shrink(
-            initial_settings
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_clear_on_shrink(),
-        );
+        tui.set_clear_on_shrink(clear_on_shrink);
 
         let header_container = Rc::new(Container::default());
         let loaded_resources_container = Rc::new(Container::default());
@@ -898,6 +942,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 anthropic_subscription_warning_shown: Cell::new(false),
                 last_status_spacer: RefCell::new(None),
                 last_status_text: RefCell::new(None),
+                expandable_rows: RefCell::new(Vec::new()),
                 managed_tool_status_started: Cell::new(false),
                 assistant_rows: RefCell::new(Vec::new()),
                 streaming_component: RefCell::new(None),
@@ -969,7 +1014,15 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The current session.
-    pub(crate) fn session(&self) -> Arc<AgentSession<S>> {
+    ///
+    /// Public because the acceptance suites assert the session-side outcome
+    /// of a frame action the way upstream's tests read the mocked session.
+    ///
+    /// # Panics
+    ///
+    /// During a runtime replacement, while the host is taken.
+    #[must_use]
+    pub fn session(&self) -> Arc<AgentSession<S>> {
         Arc::clone(
             self.runtime_host
                 .borrow()
@@ -993,7 +1046,11 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The current TUI.
-    pub(crate) fn tui(&self) -> Rc<Tui> {
+    ///
+    /// The acceptance suites read `mode`, focus, and children through it, the
+    /// state upstream's tests reach through the frame's `ui` field.
+    #[must_use]
+    pub fn tui(&self) -> Rc<Tui> {
         Rc::clone(&self.tui)
     }
 
@@ -1003,7 +1060,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The current editor.
-    pub(crate) fn editor(&self) -> Rc<dyn AppEditor> {
+    #[must_use]
+    pub fn editor(&self) -> Rc<dyn AppEditor> {
         Rc::clone(&self.editor.borrow())
     }
 
@@ -1013,8 +1071,92 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The current mode of the mounted TUI, in the settings' vocabulary.
-    pub(crate) fn current_tui_mode(&self) -> TuiMode {
+    #[must_use]
+    pub fn current_tui_mode(&self) -> TuiMode {
         self.tui.mode()
+    }
+
+    /// The transcript container, upstream's `chatContainer`.
+    #[must_use]
+    pub fn chat_container(&self) -> Rc<Container> {
+        Rc::clone(&self.chat_container)
+    }
+
+    /// The startup resource-listing container, upstream's
+    /// `loadedResourcesContainer`.
+    #[must_use]
+    pub fn loaded_resources_container(&self) -> Rc<Container> {
+        Rc::clone(&self.loaded_resources_container)
+    }
+
+    /// The standalone status-indicator container, upstream's
+    /// `statusContainer`.
+    #[must_use]
+    pub fn status_container(&self) -> Rc<Container> {
+        Rc::clone(&self.status_container)
+    }
+
+    /// The active status indicator's kind, upstream's
+    /// `activeStatusIndicator?.kind`.
+    #[must_use]
+    pub fn active_status_kind(
+        &self,
+    ) -> Option<crate::modes::interactive::components::status_indicator::StatusIndicatorKind> {
+        self.active_status_indicator
+            .borrow()
+            .as_ref()
+            .map(|indicator| indicator.kind())
+    }
+
+    /// The active generic extension selector, upstream's
+    /// `extensionSelector` field.
+    #[must_use]
+    pub fn extension_selector(
+        &self,
+    ) -> Option<
+        Rc<crate::modes::interactive::components::extension_selector::ExtensionSelectorComponent>,
+    > {
+        self.extension_selector.borrow().clone()
+    }
+
+    /// The extension UI context the session's extensions are bound with.
+    #[must_use]
+    pub fn ui_context(&self) -> Arc<extensions::InteractiveUiContext> {
+        Arc::clone(&self.ui_context)
+    }
+
+    /// Drain every queued session event synchronously, the run loop's event
+    /// half. The acceptance suites drive one event and apply it without
+    /// starting the loop.
+    pub fn drain_events(&self) {
+        loop {
+            let event = self
+                .event_rx
+                .borrow_mut()
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok());
+            match event {
+                Some(event) => self.handle_event(event),
+                None => break,
+            }
+        }
+    }
+
+    /// Drain every queued extension UI request synchronously, the run loop's
+    /// `drainEventsAndUI` half without the session-event half. The acceptance
+    /// suites drive one wire call and apply it without starting the loop.
+    pub fn drain_ui_requests(&self) {
+        loop {
+            let request = self
+                .ui_requests
+                .borrow_mut()
+                .as_mut()
+                .and_then(|receiver| receiver.try_recv().ok());
+            match request {
+                Some(request) => self.present_ui_request(request),
+                None => break,
+            }
+        }
     }
 }
 
