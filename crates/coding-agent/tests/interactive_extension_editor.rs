@@ -124,7 +124,9 @@ fn escape_cancels() {
 #[test]
 fn long_titles_keep_every_line_within_width() {
     let (component, _) = new_component(&"한글".repeat(20), None, None);
-    for width in [1, 10, 20, 40] {
+    // Wide glyphs are two cells, so one-cell widths cannot hold the title;
+    // the invariant starts at the smallest width a grapheme fits.
+    for width in [2, 10, 20, 40] {
         for line in component.render(width) {
             assert!(
                 visible_width(&line) <= width,

@@ -9,15 +9,15 @@
 //! # Split
 //!
 //! - this file — the struct, construction, and the shared editor adapter;
-//! - [`init`] — startup, the run loop, renderer switching, rebinding,
+//! - `init` — startup, the run loop, renderer switching, rebinding,
 //!   shutdown, and signal handling;
-//! - [`events`] — the session-event switch;
-//! - [`input`] — key handlers, submit dispatch, clipboard, bash, external
+//! - `events` — the session-event switch;
+//! - `input` — key handlers, submit dispatch, clipboard, bash, external
 //!   editing;
-//! - [`display`] — transcript rendering, status lines, notifications,
+//! - `display` — transcript rendering, status lines, notifications,
 //!   queued messages, extension widgets/header/footer;
-//! - [`extensions`] — the extension UI context and its dialogs;
-//! - [`commands`] — selectors, login, and slash-command handlers.
+//! - `extensions` — the extension UI context and its dialogs;
+//! - `commands` — selectors, login, and slash-command handlers.
 //!
 //! # Restatements
 //!
@@ -30,10 +30,10 @@
 //!   a `setRebindSession` callback: that callback must be `Send + Sync`, and
 //!   the frame is `!Send`.
 //! - Input handlers, selector callbacks, and extension dialogs enqueue a
-//!   [`FrameCommand`]; the run loop performs work that needs the runtime host
+//!   `FrameCommand`; the run loop performs work that needs the runtime host
 //!   or an await.
 //! - Upstream duck-types optional editor members; the port carries them on
-//!   [`AppEditor`], implemented by the default editor and extension
+//!   `AppEditor`, implemented by the default editor and extension
 //!   factories.
 //! - The status wrappers build their own `StatusIndicator` in the component
 //!   slice. The frame needs one `Rc<StatusIndicator>` for both the
@@ -454,7 +454,7 @@ pub trait AppEditor: pi_tui::components::EditorComponent {
     fn on_action(&self, _action: &str, _handler: AppActionHandler) {}
 }
 
-/// The default editor as an [`AppEditor`].
+/// The default editor as an `AppEditor`.
 pub(crate) struct DefaultEditor {
     inner: Rc<CustomEditor>,
 }

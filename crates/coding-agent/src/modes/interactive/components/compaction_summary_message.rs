@@ -5,7 +5,7 @@
 //! Collapsed, the row shows the pre-compaction token count and the expand
 //! binding; expanded, it renders the summary as Markdown under a bold header.
 //! Restatement: upstream's `tokensBefore.toLocaleString()` becomes
-//! [`format_tokens`], which groups digits with commas as the en-US locale
+//! `format_tokens`, which groups digits with commas as the en-US locale
 //! does. The count itself comes from the compaction entry; nothing here
 //! estimates it.
 

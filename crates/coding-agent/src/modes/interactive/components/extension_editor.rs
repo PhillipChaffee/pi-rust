@@ -17,7 +17,7 @@
 //!   [`super::custom_editor::CustomEditor`].
 //! - The command fallback's `explicit || VISUAL || EDITOR || platform
 //!   default` order lives in the shared module's
-//!   [`resolve_external_editor_command_with`].
+//!   [`crate::modes::interactive::external_editor::resolve_external_editor_command_with`].
 
 use std::cell::Cell;
 use std::rc::Rc;
