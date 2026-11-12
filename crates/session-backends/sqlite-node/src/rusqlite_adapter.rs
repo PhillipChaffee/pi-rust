@@ -127,11 +127,7 @@ impl RusqliteStatement {
             .as_ref()
             .ok_or_else(|| SqliteAdapterError::new(CLOSED_MESSAGE))?;
         let mut statement = connection.prepare_cached(&self.sql)?;
-        let names: Vec<String> = statement
-            .column_names()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let names: Vec<String> = statement.column_names().map(ToString::to_string).collect();
         Ok(statement
             .query_row(params, |row| build_row(&names, row))
             .optional()?)
@@ -143,11 +139,7 @@ impl RusqliteStatement {
             .as_ref()
             .ok_or_else(|| SqliteAdapterError::new(CLOSED_MESSAGE))?;
         let mut statement = connection.prepare_cached(&self.sql)?;
-        let names: Vec<String> = statement
-            .column_names()
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let names: Vec<String> = statement.column_names().map(ToString::to_string).collect();
         let rows = statement
             .query_map(params, |row| build_row(&names, row))?
             .collect::<rusqlite::Result<Vec<SqliteRow>>>()?;
