@@ -55,9 +55,7 @@ use pi_coding_agent::core::agent_session_services::{
     create_agent_session_from_services, create_agent_session_services,
 };
 use pi_coding_agent::core::sdk::CreateAgentSessionError;
-use pi_coding_agent::modes::interactive::interactive_mode::{
-    InteractiveMode, InteractiveModeOptions,
-};
+use pi_coding_agent::modes::interactive::interactive_mode::InteractiveMode;
 use pi_coding_agent::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::session_manager::SessionManager;
 use pi_coding_agent::settings_manager::{
@@ -76,6 +74,12 @@ struct TerminalState {
     progress: Vec<bool>,
     input_handler: Option<Box<dyn FnMut(String)>>,
     resize_handler: Option<ResizeHandler>,
+    /// Chunks the terminal delivers on its next `poll`, the startup dialogs'
+    /// only way to answer before they return.
+    poll_inputs: std::collections::VecDeque<String>,
+    /// Chunks held until their deadline, for prompts that start after a
+    /// blocking theme probe.
+    delayed_poll_inputs: std::collections::VecDeque<(std::time::Instant, String)>,
 }
 
 /// The headless recording terminal, upstream's `RecordingTerminal` over
@@ -142,6 +146,24 @@ impl RecordingTerminal {
     pub fn progress(&self) -> Vec<bool> {
         self.state.borrow().progress.clone()
     }
+
+    /// Deliver one chunk on the next `poll` instead of immediately. A caller
+    /// that has to answer a dialog before its blocking prompt loop returns
+    /// (the startup selectors) queues the input here.
+    pub fn queue_poll_input(&self, data: &str) {
+        self.state
+            .borrow_mut()
+            .poll_inputs
+            .push_back(data.to_owned());
+    }
+
+    /// Deliver one chunk on the first `poll` at least `delay` from now.
+    pub fn queue_poll_input_after(&self, delay: Duration, data: &str) {
+        self.state
+            .borrow_mut()
+            .delayed_poll_inputs
+            .push_back((std::time::Instant::now() + delay, data.to_owned()));
+    }
 }
 
 impl Terminal for RecordingTerminal {
@@ -192,7 +214,25 @@ impl Terminal for RecordingTerminal {
         self.state.borrow_mut().progress.push(active);
     }
 
-    fn poll(&mut self, _timeout: Duration) {}
+    fn poll(&mut self, _timeout: Duration) {
+        let mut state = self.state.borrow_mut();
+        let now = std::time::Instant::now();
+        while let Some((due, _)) = state.delayed_poll_inputs.front() {
+            if *due > now {
+                break;
+            }
+            let (_, data) = state
+                .delayed_poll_inputs
+                .pop_front()
+                .expect("the due chunk is present");
+            state.poll_inputs.push_back(data);
+        }
+        while let Some(data) = state.poll_inputs.pop_front() {
+            if let Some(handler) = state.input_handler.as_mut() {
+                handler(data);
+            }
+        }
+    }
 }
 
 /// Serialize the clipboard suites: the native-clipboard override is
@@ -208,6 +248,8 @@ pub struct RecordingClipboard {
     pub copied: Mutex<Vec<String>>,
     /// Every read.
     pub reads: Mutex<usize>,
+    /// The image bytes an image read returns; `None` is empty.
+    pub image: Mutex<Option<Vec<u8>>>,
 }
 
 impl pi_coding_agent::utils::clipboard::NativeClipboard for RecordingClipboard {
@@ -222,7 +264,12 @@ impl pi_coding_agent::utils::clipboard::NativeClipboard for RecordingClipboard {
     }
 
     fn get_image(&self) -> Result<Vec<u8>, pi_coding_agent::utils::clipboard::ClipboardError> {
-        Ok(Vec::new())
+        Ok(self
+            .image
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default())
     }
 
     fn set_text(&self, text: &str) -> bool {
@@ -268,6 +315,12 @@ impl ClipboardGuard {
     /// Install a clipboard seeded with `text`.
     #[must_use]
     pub fn new(text: Option<&str>) -> Self {
+        Self::with_image(text, None)
+    }
+
+    /// Install a clipboard whose image read returns `image`.
+    #[must_use]
+    pub fn with_image(text: Option<&str>, image: Option<Vec<u8>>) -> Self {
         let serial = CLIPBOARD_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -275,6 +328,7 @@ impl ClipboardGuard {
             text: Mutex::new(text.map(str::to_owned)),
             copied: Mutex::new(Vec::new()),
             reads: Mutex::new(0),
+            image: Mutex::new(image),
         });
         let clipboard_for_override: Arc<dyn pi_coding_agent::utils::clipboard::NativeClipboard> =
             clipboard.clone();
@@ -345,6 +399,12 @@ pub struct ResourceFixtures {
     pub context_files: Vec<pi_coding_agent::resource_loader::ContextFile>,
     /// Skill diagnostics.
     pub skill_diagnostics: Vec<pi_coding_agent::diagnostics::ResourceDiagnostic>,
+    /// Inline extensions, as `(name, hidden, factory)`.
+    pub extension_factories: Vec<(
+        Option<String>,
+        bool,
+        pi_coding_agent::extensions::api::ExtensionFactory,
+    )>,
 }
 
 /// The resource-loader options the fixture's loader is built from.
@@ -360,10 +420,21 @@ fn loader_options(
     let context = fixtures.context_files.clone();
     let diagnostics = fixtures.skill_diagnostics.clone();
     let extensions = fixtures.extensions;
+    let extension_factories = fixtures
+        .extension_factories
+        .iter()
+        .map(
+            |(name, hidden, factory)| pi_coding_agent::extensions::api::InlineExtension {
+                name: name.clone(),
+                hidden: *hidden,
+                factory: Arc::clone(factory),
+            },
+        )
+        .collect();
     DefaultResourceLoaderOptions {
         cwd: cwd.to_owned(),
         agent_dir: agent_dir.to_owned(),
-        extension_factories: Vec::new(),
+        extension_factories,
         no_extensions: false,
         no_skills: false,
         no_prompt_templates: false,
@@ -464,6 +535,13 @@ pub struct HarnessOptions {
     pub seed_manager: Option<ManagerSeeder>,
     /// The frame's verbose startup flag, upstream's `InteractiveModeOptions.verbose`.
     pub verbose: bool,
+    /// Additional frame options (startup diagnostics, startup prompts, the
+    /// deferred trust target). The harness overrides `verbose` and `tui_mode`
+    /// from the dedicated fields above.
+    pub frame_options:
+        pi_coding_agent::modes::interactive::interactive_mode::InteractiveModeOptions,
+    /// Mount over this project cwd instead of a fresh temp path.
+    pub cwd_override: Option<String>,
 }
 
 impl Default for HarnessOptions {
@@ -481,6 +559,8 @@ impl Default for HarnessOptions {
             stream: None,
             seed_manager: None,
             verbose: false,
+            frame_options: pi_coding_agent::modes::interactive::interactive_mode::InteractiveModeOptions::default(),
+            cwd_override: None,
         }
     }
 }
@@ -509,7 +589,10 @@ impl Harness {
     pub async fn new(mut options: HarnessOptions) -> Self {
         pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
         let temp = TempDir::new().expect("tempdir");
-        let cwd = temp.path().join("project").display().to_string();
+        let cwd = options
+            .cwd_override
+            .clone()
+            .unwrap_or_else(|| temp.path().join("project").display().to_string());
         let agent_dir = temp.path().join("agent").display().to_string();
         std::fs::create_dir_all(&cwd).expect("cwd");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
@@ -612,13 +695,12 @@ impl Harness {
         .await
         .expect("runtime");
         let terminal = RecordingTerminal::new(options.terminal_size.0, options.terminal_size.1);
+        let mut frame_options = options.frame_options;
+        frame_options.tui_mode = Some(options.tui_mode);
+        frame_options.verbose = options.verbose;
         let frame = InteractiveMode::new_with_terminal(
             runtime,
-            InteractiveModeOptions {
-                tui_mode: Some(options.tui_mode),
-                verbose: options.verbose,
-                ..InteractiveModeOptions::default()
-            },
+            frame_options,
             Some(Box::new(terminal.clone())),
         );
         Self {
@@ -647,6 +729,24 @@ impl Harness {
     /// Start the mounted TUI so key input reaches the focused component.
     pub fn start_tui(&self) {
         self.frame.tui().start();
+    }
+
+    /// Deliver one decoded input chunk to the focused component. The TUI must
+    /// be started or the terminal has no handler yet.
+    pub fn send_input(&self, data: &str) {
+        self.terminal.send_input(data);
+    }
+
+    /// Deliver one chunk on the terminal's next `poll`, for dialogs whose
+    /// prompt loop blocks before the test regains control.
+    pub fn queue_poll_input(&self, data: &str) {
+        self.terminal.queue_poll_input(data);
+    }
+
+    /// Poll the TUI once so queued terminal input lands and the scheduler
+    /// repaints.
+    pub fn pump_tui(&self) {
+        self.frame.tui().poll(Duration::ZERO);
     }
 
     /// Stop the mounted TUI.

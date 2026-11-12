@@ -113,7 +113,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Handle Ctrl+C: clear the editor, or exit on a second press.
-    pub(crate) async fn handle_ctrl_c(&self) {
+    pub async fn handle_ctrl_c(&self) {
         let now = now_ms();
         if now - self.last_sigint_time.get() < 500 {
             self.shutdown().await;
@@ -124,7 +124,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Handle Ctrl+D.
-    pub(crate) async fn handle_ctrl_d(&self) {
+    pub async fn handle_ctrl_d(&self) {
         self.shutdown().await;
     }
 
@@ -137,7 +137,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Handle Escape, upstream's assigned `onEscape`.
-    pub(crate) async fn handle_escape(&self) {
+    pub async fn handle_escape(&self) {
         if self.session().is_streaming() {
             self.restore_queued_messages_to_editor(true, None);
         } else if self.session().is_bash_running() {
@@ -170,7 +170,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Update the bash-mode border when the editor text changes.
-    pub(crate) fn handle_editor_changed(&self, text: &str) {
+    pub fn handle_editor_changed(&self, text: &str) {
         let was_bash = self.is_bash_mode.get();
         self.is_bash_mode.set(text.trim_start().starts_with('!'));
         if was_bash != self.is_bash_mode.get() {
@@ -193,7 +193,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Paste the clipboard's image or text into the editor.
-    pub(crate) async fn handle_clipboard_paste(&self) {
+    pub async fn handle_clipboard_paste(&self) {
         let env = crate::config::default_env_lookup();
         let platform = crate::utils::clipboard::Platform::of_process();
         if let Ok(Some(image)) =
@@ -218,7 +218,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Open the external editor over the current prompt.
-    pub(crate) async fn handle_open_external_editor(&self) {
+    pub async fn handle_open_external_editor(&self) {
         let command = self
             .settings()
             .lock()
@@ -246,7 +246,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Queue the editor's text as a follow-up, upstream's `handleFollowUp`.
-    pub(crate) async fn handle_follow_up(&self) {
+    pub async fn handle_follow_up(&self) {
         let text = self
             .editor()
             .get_expanded_text()
@@ -283,7 +283,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Restore every queued message to the editor.
-    pub(crate) fn handle_dequeue(&self) {
+    pub fn handle_dequeue(&self) {
         let restored = self.restore_queued_messages_to_editor(false, None);
         if restored == 0 {
             self.show_status("No queued messages to restore");
@@ -296,7 +296,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Whether the text names a registered extension command.
-    pub(crate) fn is_extension_command(&self, text: &str) -> bool {
+    pub fn is_extension_command(&self, text: &str) -> bool {
         if !text.starts_with('/') {
             return false;
         }
@@ -556,7 +556,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Run one bash command, upstream's `handleBashCommand`.
-    pub(crate) async fn handle_bash_command(&self, command: &str, exclude_from_context: bool) {
+    pub async fn handle_bash_command(&self, command: &str, exclude_from_context: bool) {
         let session = self.session();
         let _ = session
             .extension_runner()
@@ -614,7 +614,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Run compaction, upstream's `handleCompactCommand`.
-    pub(crate) async fn handle_compact_command(&self, instructions: Option<String>) {
+    pub async fn handle_compact_command(&self, instructions: Option<String>) {
         self.clear_status_indicator(None);
         let _ = self.session().compact(instructions).await;
     }

@@ -138,12 +138,27 @@ impl ShareHttpClient for RadiusHttpClient {
 /// Share the current session, upstream `handleShareCommand`'s call into
 /// `shareSession`.
 pub(crate) async fn share_current_session<S: SettingsStorageKind>(frame: &InteractiveMode<S>) {
-    let mut session: Arc<AgentSession<S>> = frame.session();
-    let mut ui = FrameShareUi { frame };
     let mut process = GhProcessRunner;
     let mut http = RadiusHttpClient;
-    if let Err(error) = share_session(&mut session, &mut ui, &mut process, &mut http).await {
-        frame.show_error(&format!("Failed to share session: {error}"));
+    frame
+        .share_current_session_with(&mut process, &mut http)
+        .await;
+}
+
+impl<S: SettingsStorageKind> InteractiveMode<S> {
+    /// Share the current session over caller-supplied process and HTTP seams,
+    /// the acceptance suite's stand-in for the real `gh` and Radius clients.
+    #[doc(hidden)]
+    pub async fn share_current_session_with(
+        &self,
+        process: &mut dyn ShareProcessRunner,
+        http: &mut dyn ShareHttpClient,
+    ) {
+        let mut session: Arc<AgentSession<S>> = self.session();
+        let mut ui = FrameShareUi { frame: self };
+        if let Err(error) = share_session(&mut session, &mut ui, process, http).await {
+            self.show_error(&format!("Failed to share session: {error}"));
+        }
+        self.tui().request_render(false);
     }
-    frame.tui().request_render(false);
 }

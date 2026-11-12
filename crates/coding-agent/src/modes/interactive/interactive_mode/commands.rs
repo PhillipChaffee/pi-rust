@@ -254,7 +254,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Cycle the thinking level, upstream's `cycleThinkingLevel`.
-    pub(crate) fn cycle_thinking_level(&self) {
+    pub fn cycle_thinking_level(&self) {
         match self
             .session()
             .cycle_thinking_level(ModelMutationOptions::default())
@@ -269,7 +269,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Cycle the model, upstream's `cycleModel`.
-    pub(crate) async fn cycle_model(&self, direction: crate::core::agent_session::CycleDirection) {
+    pub async fn cycle_model(&self, direction: crate::core::agent_session::CycleDirection) {
         match self
             .session()
             .cycle_model(direction, ModelMutationOptions::default())
@@ -309,7 +309,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Set the session model.
-    pub(crate) async fn set_model(&self, model: Model, persist: bool) {
+    pub async fn set_model(&self, model: Model, persist: bool) {
         match self
             .session()
             .set_model(model.clone(), ModelMutationOptions { persist })
@@ -493,7 +493,7 @@ fn thinking_level_name(level: ThinkingLevel) -> &'static str {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Handle `/thinking [term]`, upstream's `handleThinkingCommand`.
-    pub(crate) fn handle_thinking_command(&self, search_term: Option<&str>) {
+    pub fn handle_thinking_command(&self, search_term: Option<&str>) {
         let available = self.session().available_thinking_levels();
         let Some(search_term) = search_term.filter(|term| !term.trim().is_empty()) else {
             self.show_thinking_selector();
@@ -519,7 +519,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Apply a thinking level.
-    pub(crate) fn select_thinking_level(&self, level: ThinkingLevel, persist: bool) {
+    pub fn select_thinking_level(&self, level: ThinkingLevel, persist: bool) {
         self.session()
             .set_thinking_level(level, ModelMutationOptions { persist });
         self.footer.invalidate();
@@ -536,7 +536,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show the thinking-level selector.
-    pub(crate) fn show_thinking_selector(&self) {
+    pub fn show_thinking_selector(&self) {
         self.show_selector(|done| {
             let select_done = Rc::clone(&done);
             let cancel_done = Rc::clone(&done);
@@ -579,7 +579,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Handle `/model [term]`, upstream's `handleModelCommand`.
-    pub(crate) async fn handle_model_command(&self, search_term: Option<String>) {
+    pub async fn handle_model_command(&self, search_term: Option<String>) {
         let Some(search_term) = search_term.filter(|term| !term.trim().is_empty()) else {
             self.show_model_selector(None);
             return;
@@ -592,7 +592,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Find an exact model reference, refreshing the catalogs when needed.
-    pub(crate) async fn find_exact_model_match(&self, search_term: &str) -> Option<Model> {
+    pub async fn find_exact_model_match(&self, search_term: &str) -> Option<Model> {
         let scoped = self.session().scoped_models();
         let cached: Vec<Model> = if scoped.is_empty() {
             self.session().model_runtime().get_available_snapshot()
@@ -619,7 +619,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show the model selector.
-    pub(crate) fn show_model_selector(&self, initial_search: Option<&str>) {
+    pub fn show_model_selector(&self, initial_search: Option<&str>) {
         self.show_selector(|done| {
             let commands = self.commands();
             let cancel_done = Rc::clone(&done);
@@ -681,7 +681,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Refresh the footer's provider count.
-    pub(crate) async fn update_available_provider_count(&self) {
+    pub async fn update_available_provider_count(&self) {
         let models = if self.session().scoped_models().is_empty() {
             self.session().model_runtime().get_available_snapshot()
         } else {
@@ -744,7 +744,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The Daxnuts easter egg.
-    pub(crate) fn check_daxnuts_easter_egg(&self, model: &Model) {
+    pub fn check_daxnuts_easter_egg(&self, model: &Model) {
         if model.provider.0 == "opencode" && model.id.to_lowercase().contains("kimi-k2.5") {
             self.handle_daxnuts();
         }
@@ -753,7 +753,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show the scoped-model picker, upstream's `showModelsSelector`.
-    pub(crate) async fn show_models_selector(&self) {
+    pub async fn show_models_selector(&self) {
         let available = self.session().model_runtime().get_available_snapshot();
         let configured = self
             .settings()
@@ -827,7 +827,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Apply a scoped-model selection to the session.
-    pub(crate) fn apply_scoped_models(&self, enabled: Option<Vec<String>>) {
+    pub fn apply_scoped_models(&self, enabled: Option<Vec<String>>) {
         let available = self.session().model_runtime().get_available_snapshot();
         let has_available = enabled.as_ref().is_some_and(|ids| {
             ids.iter().any(|id| {
@@ -855,7 +855,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Persist a scoped-model selection.
-    pub(crate) fn persist_scoped_models(&self, enabled: Option<Vec<String>>) {
+    pub fn persist_scoped_models(&self, enabled: Option<Vec<String>>) {
         let available = self.session().model_runtime().get_available_snapshot();
         let all_enabled = enabled.as_ref().is_some_and(|ids| {
             ids.len() == available.len()
@@ -929,7 +929,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show the user-message fork picker.
-    pub(crate) fn show_user_message_selector(&self) {
+    pub fn show_user_message_selector(&self) {
         let messages = self.session().user_messages_for_forking();
         if messages.is_empty() {
             self.show_status("No messages to fork from");
@@ -967,7 +967,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show the session picker, upstream's `showSessionSelector`.
-    pub(crate) async fn show_session_selector(&self) {
+    pub async fn show_session_selector(&self) {
         let (cwd, session_dir, session_file, uses_default) = {
             let session = self.session();
             let manager = crate::core::agent_session::lock(&session.session_manager);
@@ -1030,7 +1030,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show the project-trust selector.
-    pub(crate) fn show_trust_selector(&self) {
+    pub fn show_trust_selector(&self) {
         let cwd = crate::core::agent_session::lock(&self.session().session_manager)
             .cwd()
             .to_owned();
@@ -1081,7 +1081,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Fork one entry from a user message.
-    pub(crate) async fn fork_entry(&self, entry_id: &str, at: bool) {
+    pub async fn fork_entry(&self, entry_id: &str, at: bool) {
         let mut runtime = self.take_runtime();
         let entry_id = entry_id.to_owned();
         let options = ForkOptions {
@@ -1299,7 +1299,10 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Switch to another session file.
-    pub(crate) async fn switch_session(
+    ///
+    /// # Errors
+    /// The runtime's switch failure, after reporting it in the transcript.
+    pub async fn switch_session(
         &self,
         path: &str,
     ) -> Result<(), crate::core::agent_session_runtime::AgentSessionRuntimeError> {
@@ -1384,7 +1387,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     ///
     /// Restatement: the port has no process exit; the frame reports the error,
     /// stops the theme watcher and TUI, and asks the loop to exit.
-    pub(crate) async fn handle_fatal_runtime_error(&self, prefix: &str, error: &str) {
+    pub async fn handle_fatal_runtime_error(&self, prefix: &str, error: &str) {
         self.show_error(&format!("{prefix}: {error}"));
         crate::modes::interactive::theme::theme::stop_theme_watcher();
         self.stop(
@@ -1398,7 +1401,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Save an implicit project-trust decision after reload.
-    pub(crate) fn maybe_save_implicit_project_trust_after_reload(&self) -> bool {
+    pub fn maybe_save_implicit_project_trust_after_reload(&self) -> bool {
         let cwd = crate::core::agent_session::lock(&self.session().session_manager)
             .cwd()
             .to_owned();
@@ -1439,7 +1442,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Apply the fullscreen scrollbar setting.
-    pub(crate) fn apply_fullscreen_scrollbar_setting(&self) {
+    pub fn apply_fullscreen_scrollbar_setting(&self) {
         if let Some(transcript) = self.transcript_scroll_view.borrow().as_ref() {
             transcript.set_scrollbar(
                 self.settings()
@@ -1451,7 +1454,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Extract the text of a user message.
-    pub(crate) fn get_user_message_text(&self, message: &pi_ai::types::Message) -> String {
+    pub fn get_user_message_text(&self, message: &pi_ai::types::Message) -> String {
         let pi_ai::types::Message::User(user) = message else {
             return String::new();
         };
@@ -1473,7 +1476,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Clear both queues and return their contents.
-    pub(crate) fn clear_all_queues(&self) -> (Vec<String>, Vec<String>) {
+    pub fn clear_all_queues(&self) -> (Vec<String>, Vec<String>) {
         let (mut steering, mut follow_up) = self.session().clear_queue();
         for message in std::mem::take(&mut *self.compaction_queued_messages.borrow_mut()) {
             match message.mode {
@@ -1485,7 +1488,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Find provider options by id or display name.
-    pub(crate) fn find_login_provider_options(
+    pub fn find_login_provider_options(
         &self,
         provider_ref: &str,
     ) -> Vec<crate::modes::interactive::components::oauth_selector::AuthSelectorProvider> {
@@ -1523,7 +1526,7 @@ impl crate::trust_manager::ProjectTrustSelector for TrustContext {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Show the settings selector, upstream's `showSettingsSelector`.
-    pub(crate) fn show_settings_selector(&self) {
+    pub fn show_settings_selector(&self) {
         // The theme controller reads the settings manager; resolve it before
         // taking the guard below or the same mutex deadlocks.
         let current_theme = self
@@ -1671,7 +1674,11 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Build the settings callbacks.
-    fn settings_callbacks(
+    ///
+    /// Public for the acceptance suite, which drives each frame callback the
+    /// settings selector would invoke after a change.
+    #[must_use]
+    pub fn settings_callbacks(
         &self,
     ) -> crate::modes::interactive::components::settings_selector::SettingsCallbacks {
         use crate::modes::interactive::components::settings_selector::SettingsCallbacks;
@@ -2260,7 +2267,7 @@ fn now_timestamp() -> String {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// The provider options the login selector offers.
-    fn get_login_provider_options(
+    pub fn get_login_provider_options(
         &self,
         auth_type: Option<AuthType>,
     ) -> Vec<crate::modes::interactive::components::oauth_selector::AuthSelectorProvider> {
@@ -2325,7 +2332,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show the provider selector for login or logout.
-    pub(crate) async fn show_oauth_selector(&self, login: bool) {
+    pub async fn show_oauth_selector(&self, login: bool) {
         use crate::modes::interactive::components::oauth_selector::{
             AuthSelectorProvider, OAuthSelectorComponent, OAuthSelectorMode,
         };
@@ -2404,7 +2411,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Start one provider login, upstream's `startProviderLogin`.
-    pub(crate) async fn start_provider_login(
+    pub async fn start_provider_login(
         &self,
         provider: crate::modes::interactive::components::oauth_selector::AuthSelectorProvider,
     ) {
@@ -2460,7 +2467,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Finish a login, restore the editor, and select the provider's default
     /// model, upstream's `completeProviderAuthentication`.
-    pub(crate) async fn finish_login(
+    pub async fn finish_login(
         &self,
         provider_name: &str,
         auth_type: AuthType,
@@ -2503,7 +2510,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Remove a stored credential.
-    pub(crate) async fn logout_provider(&self, provider_id: &str) {
+    pub async fn logout_provider(&self, provider_id: &str) {
         match self
             .session()
             .model_runtime()

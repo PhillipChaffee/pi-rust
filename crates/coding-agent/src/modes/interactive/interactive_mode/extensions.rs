@@ -79,6 +79,42 @@ impl InteractiveUiContext {
         Box::pin(async move { receiver.await.ok().flatten() })
     }
 
+    /// Show a selector seeded with a signal, the pre-aborted arm's seam.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn select_with_signal(
+        &self,
+        title: String,
+        options: Vec<String>,
+        signal: pi_agent_core::harness::context::AbortSignal,
+    ) -> BoxedFuture<'static, Option<String>> {
+        self.select(title, options, Some(signal), None)
+    }
+
+    /// The confirmation counterpart of [`Self::select_with_signal`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn confirm_with_signal(
+        &self,
+        title: String,
+        message: String,
+        signal: pi_agent_core::harness::context::AbortSignal,
+    ) -> BoxedFuture<'static, bool> {
+        self.confirm(title, message, Some(signal), None)
+    }
+
+    /// The input counterpart of [`Self::select_with_signal`].
+    #[doc(hidden)]
+    #[must_use]
+    pub fn input_with_signal(
+        &self,
+        title: String,
+        placeholder: Option<String>,
+        signal: pi_agent_core::harness::context::AbortSignal,
+    ) -> BoxedFuture<'static, Option<String>> {
+        self.input(title, placeholder, Some(signal), None)
+    }
+
     /// Show a confirmation and wait for its reply.
     pub(crate) fn confirm(
         &self,
@@ -240,7 +276,8 @@ impl InteractiveUiContext {
     }
 
     /// Marshal one login prompt onto the frame.
-    pub(crate) fn send_auth_prompt(
+    #[doc(hidden)]
+    pub fn send_auth_prompt(
         &self,
         prompt: pi_ai::auth::types::AuthPrompt,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
@@ -249,7 +286,8 @@ impl InteractiveUiContext {
     }
 
     /// Marshal one login event onto the frame.
-    pub(crate) fn send_auth_notify(&self, event: pi_ai::auth::types::AuthEvent) {
+    #[doc(hidden)]
+    pub fn send_auth_notify(&self, event: pi_ai::auth::types::AuthEvent) {
         self.send(UiRequest::AuthNotify(event));
     }
 }
@@ -1068,7 +1106,7 @@ fn watcher_send(
 impl<S: crate::settings_manager::SettingsStorageKind> InteractiveMode<S> {
     /// Install the extension-registered keyboard shortcuts, upstream's
     /// `setupExtensionShortcuts`.
-    pub(crate) fn setup_extension_shortcuts(&self) {
+    pub fn setup_extension_shortcuts(&self) {
         let shortcuts = self.session().extension_runner().get_shortcuts();
         if shortcuts.is_empty() {
             self.default_editor.set_on_extension_shortcut(None);

@@ -208,6 +208,9 @@ pub struct InteractiveModeOptions {
     pub tui_mode: Option<TuiMode>,
     /// The theme setting supplied for this invocation.
     pub initial_theme_setting: Option<String>,
+    /// Skip the `fd`/`rg` prefetch. The acceptance suites run `init` headless
+    /// and must not reach the network for a missing managed tool.
+    pub skip_managed_tool_setup: bool,
 }
 
 /// A message queued while compaction runs.
@@ -1033,6 +1036,16 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         )
     }
 
+    /// The session's typed entries, the acceptance suite's read of the
+    /// manager the frame renders.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn session_entries(&self) -> Vec<FileEntry> {
+        let session = self.session();
+        let manager = lock(&session.session_manager);
+        manager.entries().into_iter().cloned().collect()
+    }
+
     /// The settings manager the current session shares.
     pub(crate) fn settings(&self) -> Arc<Mutex<SettingsManager<S>>> {
         self.settings
@@ -1118,6 +1131,41 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         Rc<crate::modes::interactive::components::extension_selector::ExtensionSelectorComponent>,
     > {
         self.extension_selector.borrow().clone()
+    }
+
+    /// The active extension text prompt, upstream's `extensionInput` field.
+    #[must_use]
+    pub fn extension_input(
+        &self,
+    ) -> Option<Rc<crate::modes::interactive::components::extension_input::ExtensionInputComponent>>
+    {
+        self.extension_input.borrow().clone()
+    }
+
+    /// The active extension editor prompt, upstream's `extensionEditor`
+    /// field.
+    #[must_use]
+    pub fn extension_editor(
+        &self,
+    ) -> Option<Rc<crate::modes::interactive::components::extension_editor::ExtensionEditorComponent>>
+    {
+        self.extension_editor.borrow().clone()
+    }
+
+    /// The active login dialog, upstream's `loginDialog` field.
+    #[must_use]
+    pub fn login_dialog(
+        &self,
+    ) -> Option<Rc<crate::modes::interactive::components::login_dialog::LoginDialogComponent>> {
+        self.login_dialog.borrow().clone()
+    }
+
+    /// Seed the pending startup changelog, the seam that lets the acceptance
+    /// suite drive both collapsed and expanded notices without a packaged
+    /// CHANGELOG.md.
+    #[doc(hidden)]
+    pub fn set_changelog_markdown_for_test(&self, markdown: Option<String>) {
+        *self.changelog_markdown.borrow_mut() = markdown;
     }
 
     /// The extension UI context the session's extensions are bound with.

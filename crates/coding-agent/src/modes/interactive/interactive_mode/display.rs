@@ -205,7 +205,7 @@ fn error_line(message: &str) -> Rc<dyn Component> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// The assistant-row options every live and replayed row shares.
-    pub(crate) fn assistant_options(&self) -> AssistantMessageOptions {
+    pub fn assistant_options(&self) -> AssistantMessageOptions {
         AssistantMessageOptions {
             hide_thinking_block: self.hide_thinking_block.get(),
             markdown_theme: Some(self.markdown_theme_with_settings()),
@@ -216,7 +216,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The Markdown theme with the code-block indent setting applied.
-    pub(crate) fn markdown_theme_with_settings(&self) -> pi_tui::components::MarkdownTheme {
+    pub fn markdown_theme_with_settings(&self) -> pi_tui::components::MarkdownTheme {
         let mut markdown = get_markdown_theme();
         let indent = self
             .settings()
@@ -231,9 +231,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// The Markdown transformers the message rows apply: the mermaid
     /// transformer then the extensions' registered transformers.
-    pub(crate) fn markdown_transformers(
-        &self,
-    ) -> Arc<Vec<crate::extensions::types::MarkdownTransformer>> {
+    pub fn markdown_transformers(&self) -> Arc<Vec<crate::extensions::types::MarkdownTransformer>> {
         let extension = self.session().extension_runner();
         let mut transformers = vec![Arc::clone(&self.mermaid_markdown_transformer)];
         transformers.extend(extension.get_markdown_transformers());
@@ -242,7 +240,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// The startup-expansion state, upstream's `getStartupExpansionState`.
     /// Repaint the editor border for the current thinking level or bash mode.
-    pub(crate) fn update_editor_border_color(&self) {
+    pub fn update_editor_border_color(&self) {
         let color = if self.is_bash_mode.get() {
             crate::modes::interactive::theme::theme::get_bash_mode_border_color()
         } else {
@@ -257,7 +255,8 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
         self.tui.request_render(false);
     }
 
-    pub(crate) fn get_startup_expansion_state(&self) -> bool {
+    /// Whether startup expansion (verbose or expanded tool output) is active.
+    pub fn get_startup_expansion_state(&self) -> bool {
         self.options.borrow().verbose || self.tool_output_expanded.get()
     }
 
@@ -521,7 +520,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Add a custom session entry when a renderer exists.
-    pub(crate) fn add_custom_entry_to_chat(&self, custom: &SessionEntry) {
+    pub fn add_custom_entry_to_chat(&self, custom: &SessionEntry) {
         let SessionEntry::Custom(entry) = custom else {
             return;
         };
@@ -723,7 +722,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Rebuild the chat from the session context.
-    pub(crate) fn rebuild_chat_from_messages(&self) {
+    pub fn rebuild_chat_from_messages(&self) {
         self.chat_container.clear();
         self.render_initial_messages();
     }
@@ -731,7 +730,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// The tool-row options from settings.
-    pub(crate) fn tool_options(
+    pub fn tool_options(
         &self,
     ) -> crate::modes::interactive::components::tool_execution::ToolExecutionOptions {
         let settings = self.settings();
@@ -747,7 +746,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The registered tool definition with the built-in renderers applied.
-    pub(crate) fn registered_tool_definition(
+    pub fn registered_tool_definition(
         &self,
         name: &str,
     ) -> Option<crate::extensions::types::ToolDefinition> {
@@ -851,7 +850,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show a cache-miss notice for a just-completed assistant message.
-    pub(crate) fn maybe_show_cache_miss_notice(&self, message: &AssistantMessage) {
+    pub fn maybe_show_cache_miss_notice(&self, message: &AssistantMessage) {
         let show = self
             .settings()
             .lock()
@@ -979,7 +978,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Refresh the queued-message rows, upstream's
     /// `updatePendingMessagesDisplay`.
-    pub(crate) fn update_pending_messages_display(&self) {
+    pub fn update_pending_messages_display(&self) {
         self.pending_messages_container.clear();
         let steering = self.session().steering_messages();
         let follow_up = self.session().follow_up_messages();
@@ -1033,7 +1032,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Restore every queued message to the editor, upstream's
     /// `restoreQueuedMessagesToEditor`.
-    pub(crate) fn restore_queued_messages_to_editor(
+    pub fn restore_queued_messages_to_editor(
         &self,
         abort: bool,
         current_text: Option<&str>,
@@ -1167,7 +1166,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Move pending bash components into the chat, upstream's
     /// `flushPendingBashComponents`.
-    pub(crate) fn flush_pending_bash_components(&self) {
+    pub fn flush_pending_bash_components(&self) {
         let components = std::mem::take(&mut *self.pending_bash_components.borrow_mut());
         for component in components {
             let component: Rc<dyn Component> = component;
@@ -1226,7 +1225,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show the working indicator.
-    pub(crate) fn show_working_status_indicator(&self) {
+    pub fn show_working_status_indicator(&self) {
         let message = self
             .working_message
             .borrow()
@@ -1258,7 +1257,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Set the working indicator options.
-    pub(crate) fn set_working_indicator(&self, options: Option<LoaderIndicatorOptions>) {
+    pub fn set_working_indicator(&self, options: Option<LoaderIndicatorOptions>) {
         *self.working_indicator_options.borrow_mut() = options.clone();
         if let Some(indicator) = self.active_status_indicator.borrow().as_ref()
             && indicator.kind() == StatusIndicatorKind::Working
@@ -1269,7 +1268,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Set the hidden-thinking label on every assistant row.
-    pub(crate) fn set_hidden_thinking_label(&self, label: Option<&str>) {
+    pub fn set_hidden_thinking_label(&self, label: Option<&str>) {
         let label = label.unwrap_or(Self::DEFAULT_HIDDEN_THINKING_LABEL);
         *self.hidden_thinking_label.borrow_mut() = label.to_owned();
         self.update_thinking_block_visibility();
@@ -1277,7 +1276,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Apply the hide-thinking setting to every assistant row.
-    pub(crate) fn update_thinking_block_visibility(&self) {
+    pub fn update_thinking_block_visibility(&self) {
         let label = self.hidden_thinking_label.borrow().clone();
         for assistant in self.assistant_rows.borrow().iter() {
             assistant.set_hide_thinking_block(self.hide_thinking_block.get());
@@ -1291,7 +1290,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Toggle thinking-block visibility.
-    pub(crate) fn toggle_thinking_block_visibility(&self) {
+    pub fn toggle_thinking_block_visibility(&self) {
         self.hide_thinking_block
             .set(!self.hide_thinking_block.get());
         self.settings()
@@ -1340,7 +1339,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Toggle tool output expansion.
-    pub(crate) fn toggle_tool_output_expansion(&self) {
+    pub fn toggle_tool_output_expansion(&self) {
         self.set_tools_expanded(!self.tool_output_expanded.get());
     }
 
@@ -1423,14 +1422,14 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Clear every extension widget.
-    pub(crate) fn clear_extension_widgets(&self) {
+    pub fn clear_extension_widgets(&self) {
         self.extension_widgets_above.borrow_mut().clear();
         self.extension_widgets_below.borrow_mut().clear();
         self.render_widgets();
     }
 
     /// Render the widget stacks into their containers.
-    pub(crate) fn render_widgets(&self) {
+    pub fn render_widgets(&self) {
         self.render_widget_container(
             &self.widget_container_above,
             &self.extension_widgets_above,
@@ -1469,7 +1468,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Set a custom footer, upstream's `setExtensionFooter`.
-    pub(crate) fn set_extension_footer(&self, footer: Option<Rc<dyn Component>>) {
+    pub fn set_extension_footer(&self, footer: Option<Rc<dyn Component>>) {
         self.footer_container.clear();
         match footer {
             Some(footer) => {
@@ -1486,7 +1485,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Set a custom header, upstream's `setExtensionHeader`.
-    pub(crate) fn set_extension_header(&self, header: Option<Rc<dyn Component>>) {
+    pub fn set_extension_header(&self, header: Option<Rc<dyn Component>>) {
         let Some(built_in) = self.built_in_header.borrow().clone() else {
             return;
         };
@@ -1523,10 +1522,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Register an extension terminal input listener, upstream's
     /// `addExtensionTerminalInputListener`.
-    pub(crate) fn add_extension_terminal_input_listener(
-        &self,
-        handler: TuiInputListener,
-    ) -> Rc<dyn Fn()> {
+    pub fn add_extension_terminal_input_listener(&self, handler: TuiInputListener) -> Rc<dyn Fn()> {
         let id = self.tui.add_input_listener(Rc::clone(&handler));
         self.extension_terminal_input_subscriptions
             .borrow_mut()
@@ -1540,7 +1536,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Re-bind the terminal listeners after a renderer swap.
-    pub(crate) fn rebind_extension_terminal_input_listeners(&self) {
+    pub fn rebind_extension_terminal_input_listeners(&self) {
         let listeners: Vec<(ListenerId, TuiInputListener)> =
             self.extension_terminal_input_subscriptions.borrow().clone();
         for (id, _) in &listeners {
@@ -1555,7 +1551,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Drop every terminal input listener.
-    pub(crate) fn clear_extension_terminal_input_listeners(&self) {
+    pub fn clear_extension_terminal_input_listeners(&self) {
         for (id, _) in self.extension_terminal_input_subscriptions.borrow().iter() {
             self.tui.remove_input_listener(*id);
         }
@@ -2316,7 +2312,7 @@ fn format_compact_list(items: &[String], sort: bool) -> String {
 
 impl<S: SettingsStorageKind> InteractiveMode<S> {
     /// Append one diagnostic group to the loaded-resources area.
-    pub(crate) fn add_loaded_diagnostics(
+    pub fn add_loaded_diagnostics(
         &self,
         title: &str,
         diagnostics: &[crate::diagnostics::ResourceDiagnostic],
@@ -2351,7 +2347,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Render the startup changelog notices.
-    pub(crate) fn show_startup_notices_if_needed(&self) {
+    pub fn show_startup_notices_if_needed(&self) {
         if self.startup_notices_shown.get() {
             return;
         }
@@ -2397,12 +2393,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Show an extension failure in the transcript, upstream's
     /// `showExtensionError`.
-    pub(crate) fn show_extension_error(
-        &self,
-        extension_path: &str,
-        error: &str,
-        stack: Option<&str>,
-    ) {
+    pub fn show_extension_error(&self, extension_path: &str, error: &str, stack: Option<&str>) {
         let message = format!("Extension \"{extension_path}\" error: {error}");
         let line: Rc<dyn Component> =
             Rc::new(Text::with_padding(theme().fg("error", &message), 1, 0));
@@ -2423,7 +2414,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show a new-version notification.
-    pub(crate) fn show_new_version_notification(
+    pub fn show_new_version_notification(
         &self,
         release: &crate::utils::version_check::LatestPiRelease,
     ) {
@@ -2469,7 +2460,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Show a package-update notification.
-    pub(crate) fn show_package_update_notification(&self, packages: &[String]) {
+    pub fn show_package_update_notification(&self, packages: &[String]) {
         self.chat_container.add_child(Rc::new(Spacer::new()));
         let packages = packages
             .iter()
@@ -2495,7 +2486,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Reset the extension UI surface, upstream's `resetExtensionUI`.
-    pub(crate) fn reset_extension_ui(&self) {
+    pub fn reset_extension_ui(&self) {
         self.hide_extension_selector();
         self.hide_extension_input();
         self.hide_extension_editor();

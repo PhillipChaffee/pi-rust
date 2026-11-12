@@ -99,20 +99,23 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
                 mode.show_managed_tool_status(status);
             }
         };
+        let tools_offline = self.options.borrow().skip_managed_tool_setup;
         let client = pi_ai::http::default_http_client();
-        let fd = crate::utils::tools_manager::ensure_tool(
-            &client,
-            crate::utils::tools_manager::ManagedTool::Fd,
-            Some(&on_status),
-        )
-        .await;
-        let _ = crate::utils::tools_manager::ensure_tool(
-            &client,
-            crate::utils::tools_manager::ManagedTool::Rg,
-            Some(&on_status),
-        )
-        .await;
-        *self.fd_path.borrow_mut() = fd.map(std::path::PathBuf::from);
+        if !tools_offline {
+            let fd = crate::utils::tools_manager::ensure_tool(
+                &client,
+                crate::utils::tools_manager::ManagedTool::Fd,
+                Some(&on_status),
+            )
+            .await;
+            let _ = crate::utils::tools_manager::ensure_tool(
+                &client,
+                crate::utils::tools_manager::ManagedTool::Rg,
+                Some(&on_status),
+            )
+            .await;
+            *self.fd_path.borrow_mut() = fd.map(std::path::PathBuf::from);
+        }
         self.setup_key_handlers();
         self.setup_editor_submit_handler();
         self.bind_current_session_extensions().await;
@@ -383,7 +386,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
 
     /// Toggle the terminal progress indicator through the terminal write
     /// seam.
-    pub(crate) fn set_terminal_progress(&self, active: bool) {
+    pub fn set_terminal_progress(&self, active: bool) {
         let sequence = if active {
             "\x1b]9;4;3\x07"
         } else {
@@ -393,7 +396,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Write the terminal title.
-    pub(crate) fn update_terminal_title(&self) {
+    pub fn update_terminal_title(&self) {
         let session = self.session();
         let manager = crate::core::agent_session::lock(&session.session_manager);
         let cwd_basename = crate::utils::paths::basename_posix(manager.cwd());
@@ -407,7 +410,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Apply the settings that change while the frame runs.
-    pub(crate) fn apply_runtime_settings(&self) {
+    pub fn apply_runtime_settings(&self) {
         let (padding, visible, hide_thinking, output_pad, cursor, clear, capability) = {
             let settings = self.settings();
             let settings = settings
@@ -449,7 +452,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The changelog entries to show at startup.
-    pub(crate) fn changelog_for_display(&self) -> Option<String> {
+    pub fn changelog_for_display(&self) -> Option<String> {
         if !self.session().agent().state().messages.is_empty() {
             return None;
         }
@@ -538,7 +541,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// Shut the frame down.
-    pub(crate) async fn shutdown(&self) {
+    pub async fn shutdown(&self) {
         if self.is_shutting_down.get() {
             return;
         }

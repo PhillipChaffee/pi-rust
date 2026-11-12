@@ -285,7 +285,7 @@ impl<S: SettingsStorageKind> InteractiveMode<S> {
     }
 
     /// The status indicator constructor the event arms share.
-    pub(crate) fn build_status(
+    pub fn build_status(
         &self,
         kind: StatusIndicatorKind,
         message: String,
