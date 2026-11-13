@@ -33,8 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     # The instrumented workspace suite grew past the old 20-minute bound when
     # the interactive frame's coverage suites landed (#131); tests finish in
-    # ~14 minutes, the llvm-cov report takes the rest.
-    timeout-minutes: 30  # bounds a hung network gate; GitHub's default is 360
+    # ~14 minutes, the llvm-cov report takes the rest, and a cold sccache
+    # build pushes the job past 31 minutes. 45 keeps the report step inside
+    # the bound while still capping a hung network gate.
+    timeout-minutes: 45  # bounds a hung network gate; GitHub's default is 360
     env:
       # sccache fronts rustc for the build-heavy steps below so repeated runs
       # stop rebuilding the instrumented 57K-line tree from scratch. GitHub
@@ -170,6 +172,18 @@ jobs:
           for missing, filename in sorted(rows, reverse=True)[:30]:
               print(f"uncovered lines {missing:6}  {filename}")
           PY
+      # The lcov and JSON reports are the only line-level record of a run the
+      # cancelled-timeout era lost; keep them on the run so a red gate can be
+      # read without rerunning it.
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage.json
+          if-no-files-found: ignore
       # Free for public repositories, no account and no secret: the action
       # takes the built-in GITHUB_TOKEN. Pinned action version. The lcov
       # format is Coveralls' native one.
