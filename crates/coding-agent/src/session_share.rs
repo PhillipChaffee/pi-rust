@@ -29,8 +29,9 @@ use crate::session_manager::{SessionManager, SessionManagerError};
 /// and `session.state`/`session.modelRuntime` reads the flow consumes.
 pub trait ShareSessionSource {
     /// The session manager the share export walks, upstream's
-    /// `session.sessionManager`.
-    fn session_manager(&self) -> &SessionManager;
+    /// `session.sessionManager`. The port returns a snapshot because the
+    /// session owns its manager behind a lock.
+    fn session_manager(&self) -> SessionManager;
 
     /// The system prompt, upstream's `session.state.systemPrompt`.
     fn system_prompt(&self) -> Option<String>;
@@ -117,8 +118,9 @@ pub fn export_session_for_share(
 ) -> Result<String, SessionManagerError> {
     let system_prompt = session.system_prompt();
     let tools = session.tools();
+    let manager = session.session_manager();
     export_session_to_jsonl(
-        session.session_manager(),
+        &manager,
         Some(file_path),
         Some(&|parent_id, timestamp| {
             let mut data = serde_json::Map::new();

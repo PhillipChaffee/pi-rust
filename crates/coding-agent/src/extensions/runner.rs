@@ -40,7 +40,7 @@ use crate::extensions::results::{
     ToolResultResult, UserBashResult,
 };
 use crate::extensions::runtime::{
-    AssertActiveFn, ContextActions, Extension, ExtensionError, HandlerContext,
+    AssertActiveFn, ContextActions, Extension, ExtensionError, HandlerContext, RegisteredShortcut,
 };
 
 /// A listener the runner reports dispatch errors to, upstream's
@@ -979,6 +979,60 @@ impl ExtensionRunner {
         self.resolve_registered_commands()
             .into_iter()
             .find(|command| command.invocation_name == name)
+    }
+
+    /// The registered keyboard shortcuts, upstream's `getShortcuts`.
+    ///
+    /// Keys are lowercased and a later registration of the same key replaces
+    /// the earlier one. Upstream also filters collisions against the resolved
+    /// builtin bindings and records diagnostics; the port leaves collision
+    /// handling to the caller because the frame matches keys itself.
+    #[must_use]
+    pub fn get_shortcuts(&self) -> Vec<(String, RegisteredShortcut)> {
+        let mut shortcuts: Vec<(String, RegisteredShortcut)> = Vec::new();
+        for extension in &self.extensions {
+            for shortcut in extension.shortcuts() {
+                let key = shortcut.key.to_lowercase();
+                if let Some(existing) = shortcuts.iter_mut().find(|(bound, _)| *bound == key) {
+                    existing.1 = shortcut;
+                } else {
+                    shortcuts.push((key, shortcut));
+                }
+            }
+        }
+        shortcuts
+    }
+
+    /// The registered Markdown transformers, upstream's
+    /// `getMarkdownTransformers`.
+    #[must_use]
+    pub fn get_markdown_transformers(&self) -> Vec<crate::extensions::types::MarkdownTransformer> {
+        self.extensions
+            .iter()
+            .filter_map(|extension| extension.markdown_transformer())
+            .collect()
+    }
+
+    /// One custom-message renderer by type, upstream's `getMessageRenderer`.
+    #[must_use]
+    pub fn get_message_renderer(
+        &self,
+        custom_type: &str,
+    ) -> Option<crate::extensions::types::MessageRenderer> {
+        self.extensions
+            .iter()
+            .find_map(|extension| extension.message_renderer(custom_type))
+    }
+
+    /// One custom-entry renderer by type, upstream's `getEntryRenderer`.
+    #[must_use]
+    pub fn get_entry_renderer(
+        &self,
+        custom_type: &str,
+    ) -> Option<crate::modes::interactive::components::custom_entry::EntryRenderer> {
+        self.extensions
+            .iter()
+            .find_map(|extension| extension.entry_renderer(custom_type))
     }
 
     /// Request a graceful shutdown, upstream's `shutdown`: the bound

@@ -484,8 +484,8 @@ struct StubSource {
 }
 
 impl ShareSessionSource for StubSource {
-    fn session_manager(&self) -> &SessionManager {
-        &self.session
+    fn session_manager(&self) -> SessionManager {
+        self.session.clone()
     }
 
     fn system_prompt(&self) -> Option<String> {

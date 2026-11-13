@@ -43,6 +43,11 @@ impl<S: SettingsStorage + 'static> super::AgentSession<S> {
         lock(&self.session_manager).get_leaf_id().map(str::to_owned)
     }
 
+    /// Clear the leaf pointer, upstream's `sessionManager.resetLeaf()`.
+    pub fn reset_leaf(&self) {
+        lock(&self.session_manager).reset_leaf();
+    }
+
     /// The current model.
     #[must_use]
     pub fn model(&self) -> Option<Model> {
